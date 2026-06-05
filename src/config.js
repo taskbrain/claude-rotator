@@ -21,11 +21,15 @@ export function createDefaultConfig() {
   };
 }
 
-export async function loadConfig(path = defaultConfigPath()) {
+export function getConfigPath(env = process.env) {
+  return env.CLAUDE_ROTATOR_CONFIG || defaultConfigPath(env);
+}
+
+export async function loadConfig(path = getConfigPath()) {
   return readJsonFile(path, null);
 }
 
-export async function loadOrCreateConfig(path = defaultConfigPath()) {
+export async function loadOrCreateConfig(path = getConfigPath()) {
   const existing = await loadConfig(path);
   if (existing) return existing;
   const config = createDefaultConfig();
@@ -33,7 +37,7 @@ export async function loadOrCreateConfig(path = defaultConfigPath()) {
   return config;
 }
 
-export async function saveConfig(config, path = defaultConfigPath()) {
+export async function saveConfig(config, path = getConfigPath()) {
   await writeJsonFile(path, config);
 }
 
