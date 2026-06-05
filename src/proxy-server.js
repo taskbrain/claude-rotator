@@ -1,6 +1,8 @@
 import http from 'node:http';
 import https from 'node:https';
 
+import { isTokenExpiringSoon, refreshAccessToken } from './oauth.js';
+
 const HOP_HEADERS = new Set([
   'host',
   'connection',
@@ -13,7 +15,13 @@ const HOP_HEADERS = new Set([
   'upgrade',
 ]);
 
-export function createProxyServer({ accountManager, secretStore, config, reloadAccounts = null }) {
+export function createProxyServer({
+  accountManager,
+  secretStore,
+  config,
+  reloadAccounts = null,
+  tokenRefresher = refreshAccessToken,
+}) {
   const upstream = config.upstream || 'https://api.anthropic.com';
 
   return http.createServer(async (req, res) => {
@@ -48,7 +56,15 @@ export function createProxyServer({ accountManager, secretStore, config, reloadA
       }
 
       const body = await readBody(req);
-      await forwardWithRotation({ req, res, body, upstream, accountManager, secretStore });
+      await forwardWithRotation({
+        req,
+        res,
+        body,
+        upstream,
+        accountManager,
+        secretStore,
+        tokenRefresher,
+      });
     } catch (error) {
       if (!res.headersSent) {
         sendJson(res, 502, {
@@ -62,7 +78,15 @@ export function createProxyServer({ accountManager, secretStore, config, reloadA
   });
 }
 
-async function forwardWithRotation({ req, res, body, upstream, accountManager, secretStore }) {
+async function forwardWithRotation({
+  req,
+  res,
+  body,
+  upstream,
+  accountManager,
+  secretStore,
+  tokenRefresher,
+}) {
   const maxAttempts = Math.max(1, accountManager.accounts.length);
 
   for (let attempt = 0; attempt < maxAttempts; attempt++) {
@@ -81,7 +105,56 @@ async function forwardWithRotation({ req, res, body, upstream, accountManager, s
       continue;
     }
 
-    const result = await forwardOnce({ req, res, body, upstream, account, secret, accountManager });
+    let freshSecret;
+    try {
+      freshSecret = await refreshSecretIfExpiring({
+        account,
+        secret,
+        secretStore,
+        tokenRefresher,
+      });
+    } catch {
+      account.status = 'error';
+      continue;
+    }
+
+    const result = await forwardOnce({
+      req,
+      res,
+      body,
+      upstream,
+      account,
+      secret: freshSecret,
+      accountManager,
+    });
+    if (result.retryAfterRefresh) {
+      let refreshedSecret;
+      try {
+        refreshedSecret = await refreshAndStoreSecret({
+          account,
+          secret: freshSecret,
+          secretStore,
+          tokenRefresher,
+        });
+      } catch {
+        account.status = 'error';
+        continue;
+      }
+      const retryResult = await forwardOnce({
+        req,
+        res,
+        body,
+        upstream,
+        account,
+        secret: refreshedSecret,
+        accountManager,
+      });
+      if (retryResult.retryNextAccount || retryResult.retryAfterRefresh) {
+        account.status = 'error';
+        continue;
+      }
+      return;
+    }
     if (result.retryNextAccount) continue;
     return;
   }
@@ -92,6 +165,23 @@ async function forwardWithRotation({ req, res, body, upstream, accountManager, s
       error: { type: 'rate_limit_error', message: 'No account could satisfy the request.' },
     });
   }
+}
+
+async function refreshSecretIfExpiring({ account, secret, secretStore, tokenRefresher }) {
+  if (!canRefreshSecret(account, secret)) return secret;
+  if (!isTokenExpiringSoon(secret.expiresAt)) return secret;
+  return refreshAndStoreSecret({ account, secret, secretStore, tokenRefresher });
+}
+
+async function refreshAndStoreSecret({ account, secret, secretStore, tokenRefresher }) {
+  const refreshed = await tokenRefresher(secret.refreshToken);
+  const nextSecret = { ...secret, ...refreshed };
+  await secretStore.set(account.id, nextSecret);
+  return nextSecret;
+}
+
+function canRefreshSecret(account, secret) {
+  return account.type !== 'apikey' && !secret.apiKey && Boolean(secret.refreshToken);
 }
 
 async function forwardOnce({ req, res, body, upstream, account, secret, accountManager }) {
@@ -113,6 +203,11 @@ async function forwardOnce({ req, res, body, upstream, account, secret, accountM
         return false;
       }
 
+      if (upstreamRes.statusCode === 401 && canRefreshSecret(account, secret)) {
+        upstreamRes.resume();
+        return false;
+      }
+
       const responseHeaders = {};
       for (const [key, value] of Object.entries(upstreamRes.headers)) {
         if (!HOP_HEADERS.has(key.toLowerCase())) responseHeaders[key] = value;
@@ -127,6 +222,10 @@ async function forwardOnce({ req, res, body, upstream, account, secret, accountM
 
   if (upstreamResponse.statusCode === 429) {
     return { retryNextAccount: true };
+  }
+
+  if (upstreamResponse.statusCode === 401 && canRefreshSecret(account, secret)) {
+    return { retryAfterRefresh: true };
   }
 
   if (upstreamResponse.body.length > 0) {

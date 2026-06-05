@@ -88,6 +88,7 @@ export class AccountManager {
         type: account.type || 'oauth',
         accountUuid: account.accountUuid || null,
         priority: account.priority ?? index,
+        status: existing.status === 'error' ? 'ready' : existing.status,
       };
     });
     if (this.currentIndex >= this.accounts.length) this.currentIndex = 0;

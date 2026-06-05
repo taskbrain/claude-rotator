@@ -56,6 +56,160 @@ describe('createProxyServer', () => {
     await close(upstream.server);
   });
 
+  it('refreshes an expired OAuth token before forwarding', async () => {
+    const upstreamSeen = [];
+    const upstream = await listen(http.createServer(async (req, res) => {
+      upstreamSeen.push({ authorization: req.headers.authorization });
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ ok: true }));
+    }));
+
+    const secretStore = new MemorySecretStore();
+    await secretStore.set('acct_1', {
+      accessToken: 'expired-token',
+      refreshToken: 'refresh-token-1',
+      expiresAt: 900,
+    });
+    const accountManager = new AccountManager({
+      accounts: [{ id: 'acct_1', name: 'a@example.com', type: 'oauth' }],
+      now: () => 1000,
+    });
+    const proxy = await listen(createProxyServer({
+      accountManager,
+      secretStore,
+      config: { upstream: upstream.url },
+      tokenRefresher: async refreshToken => {
+        assert.equal(refreshToken, 'refresh-token-1');
+        return {
+          accessToken: 'fresh-token',
+          refreshToken: 'refresh-token-2',
+          expiresAt: 100000,
+        };
+      },
+    }));
+
+    const response = await requestJson(`${proxy.url}/v1/messages`, {
+      method: 'POST',
+      body: JSON.stringify({ model: 'sonnet' }),
+    });
+
+    assert.equal(response.status, 200);
+    assert.equal(upstreamSeen[0].authorization, 'Bearer fresh-token');
+    assert.deepEqual(await secretStore.get('acct_1'), {
+      accessToken: 'fresh-token',
+      refreshToken: 'refresh-token-2',
+      expiresAt: 100000,
+    });
+
+    await close(proxy.server);
+    await close(upstream.server);
+  });
+
+  it('refreshes and retries once when upstream rejects the OAuth token', async t => {
+    const upstreamSeen = [];
+    const upstream = await listen(http.createServer(async (req, res) => {
+      upstreamSeen.push(req.headers.authorization);
+      if (upstreamSeen.length === 1) {
+        res.writeHead(401, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: { message: 'Invalid authentication credentials' } }));
+        return;
+      }
+
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ ok: true }));
+    }));
+
+    const secretStore = new MemorySecretStore();
+    await secretStore.set('acct_1', {
+      accessToken: 'stale-token',
+      refreshToken: 'refresh-token-1',
+      expiresAt: Date.now() + 60 * 60 * 1000,
+    });
+    const accountManager = new AccountManager({
+      accounts: [{ id: 'acct_1', name: 'a@example.com', type: 'oauth' }],
+      now: () => 1000,
+    });
+    const proxy = await listen(createProxyServer({
+      accountManager,
+      secretStore,
+      config: { upstream: upstream.url },
+      tokenRefresher: async refreshToken => {
+        assert.equal(refreshToken, 'refresh-token-1');
+        return {
+          accessToken: 'fresh-token',
+          refreshToken: 'refresh-token-2',
+          expiresAt: 200000,
+        };
+      },
+    }));
+    t.after(async () => {
+      await close(proxy.server);
+      await close(upstream.server);
+    });
+
+    const response = await requestJson(`${proxy.url}/v1/messages`, {
+      method: 'POST',
+      body: JSON.stringify({ model: 'sonnet' }),
+    });
+
+    assert.equal(response.status, 200);
+    assert.deepEqual(upstreamSeen, ['Bearer stale-token', 'Bearer fresh-token']);
+    assert.deepEqual(await secretStore.get('acct_1'), {
+      accessToken: 'fresh-token',
+      refreshToken: 'refresh-token-2',
+      expiresAt: 200000,
+    });
+  });
+
+  it('skips to the next account when refreshing an expired token fails', async t => {
+    const upstreamSeen = [];
+    const upstream = await listen(http.createServer(async (req, res) => {
+      upstreamSeen.push(req.headers.authorization);
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ ok: true }));
+    }));
+
+    const secretStore = new MemorySecretStore();
+    await secretStore.set('acct_1', {
+      accessToken: 'expired-token',
+      refreshToken: 'invalid-refresh-token',
+      expiresAt: 900,
+    });
+    await secretStore.set('acct_2', {
+      accessToken: 'access-token-2',
+      refreshToken: 'refresh-token-2',
+      expiresAt: Date.now() + 60 * 60 * 1000,
+    });
+    const accountManager = new AccountManager({
+      accounts: [
+        { id: 'acct_1', name: 'a@example.com', type: 'oauth' },
+        { id: 'acct_2', name: 'b@example.com', type: 'oauth' },
+      ],
+      now: () => 1000,
+    });
+    const proxy = await listen(createProxyServer({
+      accountManager,
+      secretStore,
+      config: { upstream: upstream.url },
+      tokenRefresher: async () => {
+        throw new Error('refresh token revoked');
+      },
+    }));
+    t.after(async () => {
+      await close(proxy.server);
+      await close(upstream.server);
+    });
+
+    const response = await requestJson(`${proxy.url}/v1/messages`, {
+      method: 'POST',
+      body: JSON.stringify({ model: 'sonnet' }),
+    });
+
+    assert.equal(response.status, 200);
+    assert.deepEqual(upstreamSeen, ['Bearer access-token-2']);
+    assert.equal(accountManager.getStatus().currentAccount, 'acct_2');
+  });
+
   it('exposes health and status without secrets', async () => {
     const secretStore = new MemorySecretStore();
     await secretStore.set('acct_1', { accessToken: 'access-token-1' });

@@ -116,4 +116,22 @@ describe('AccountManager', () => {
     assert.equal(status.accounts[0].name, 'b@example.com');
     assert.equal(status.accounts[0].accountUuid, 'uuid-2');
   });
+
+  it('allows an errored existing account to be retried after reload', () => {
+    const manager = new AccountManager({
+      accounts: [
+        { id: 'acct_1', name: 'a@example.com', type: 'oauth' },
+        { id: 'acct_2', name: 'b@example.com', type: 'oauth' },
+      ],
+      now: () => 1000,
+    });
+    manager.accounts[0].status = 'error';
+
+    manager.replaceAccounts([
+      { id: 'acct_1', name: 'a@example.com', type: 'oauth' },
+      { id: 'acct_2', name: 'b@example.com', type: 'oauth' },
+    ]);
+
+    assert.equal(manager.getActiveAccount().id, 'acct_1');
+  });
 });
