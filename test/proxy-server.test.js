@@ -78,6 +78,32 @@ describe('createProxyServer', () => {
 
     await close(proxy.server);
   });
+
+  it('reloads accounts from the current config without restarting the server', async () => {
+    const secretStore = new MemorySecretStore();
+    const accountManager = new AccountManager({
+      accounts: [{ id: 'acct_1', name: 'a@example.com', type: 'oauth' }],
+      now: () => 1000,
+    });
+    const proxy = await listen(createProxyServer({
+      accountManager,
+      secretStore,
+      config: { upstream: 'http://127.0.0.1:1' },
+      reloadAccounts: async () => [
+        { id: 'acct_2', name: 'b@example.com', type: 'oauth' },
+      ],
+    }));
+
+    const response = await requestJson(`${proxy.url}/internal/reload`, {
+      method: 'POST',
+    });
+
+    assert.equal(response.status, 200);
+    assert.equal(response.body.currentAccount, 'acct_2');
+    assert.equal(response.body.accounts[0].name, 'b@example.com');
+
+    await close(proxy.server);
+  });
 });
 
 async function listen(server) {

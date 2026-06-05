@@ -99,4 +99,21 @@ describe('AccountManager', () => {
     manager.switchTo('acct_1');
     assert.equal(manager.getActiveAccount().id, 'acct_1');
   });
+
+  it('replaces account metadata for server reload', () => {
+    const manager = new AccountManager({
+      accounts: [{ id: 'acct_1', name: 'a@example.com', type: 'oauth' }],
+      now: () => 1000,
+    });
+
+    manager.replaceAccounts([
+      { id: 'acct_2', name: 'b@example.com', type: 'oauth', accountUuid: 'uuid-2' },
+    ]);
+
+    const status = manager.getStatus();
+    assert.equal(status.currentAccount, 'acct_2');
+    assert.equal(status.accounts.length, 1);
+    assert.equal(status.accounts[0].name, 'b@example.com');
+    assert.equal(status.accounts[0].accountUuid, 'uuid-2');
+  });
 });

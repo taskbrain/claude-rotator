@@ -5,22 +5,7 @@ export class AccountManager {
     this.now = now;
     this.switchThreshold = switchThreshold;
     this.events = [];
-    this.accounts = accounts.map((account, index) => ({
-      id: account.id,
-      name: account.name || account.email || account.id,
-      type: account.type || 'oauth',
-      accountUuid: account.accountUuid || null,
-      priority: account.priority ?? index,
-      status: 'ready',
-      quota: emptyQuota(),
-      usage: {
-        totalInputTokens: 0,
-        totalOutputTokens: 0,
-        totalRequests: 0,
-        lastUsed: null,
-      },
-      rateLimitedUntil: null,
-    }));
+    this.accounts = accounts.map((account, index) => this.createAccount(account, index));
     this.currentIndex = 0;
   }
 
@@ -89,6 +74,28 @@ export class AccountManager {
       type: 'throttled',
       account: account.id,
       retryAfterSeconds,
+    });
+  }
+
+  replaceAccounts(accounts) {
+    const existingById = new Map(this.accounts.map(account => [account.id, account]));
+    this.accounts = accounts.map((account, index) => {
+      const existing = existingById.get(account.id);
+      if (!existing) return this.createAccount(account, index);
+      return {
+        ...existing,
+        name: account.name || account.email || account.id,
+        type: account.type || 'oauth',
+        accountUuid: account.accountUuid || null,
+        priority: account.priority ?? index,
+      };
+    });
+    if (this.currentIndex >= this.accounts.length) this.currentIndex = 0;
+    if (this.accounts.length > 0 && !this.accounts[this.currentIndex]) this.currentIndex = 0;
+    this.events.unshift({
+      at: new Date(this.now()).toISOString(),
+      type: 'reload',
+      accounts: this.accounts.length,
     });
   }
 
@@ -190,6 +197,25 @@ export class AccountManager {
     const account = this.accounts.find(item => item.id === accountId || item.name === accountId);
     if (!account) throw new Error(`Unknown account: ${accountId}`);
     return account;
+  }
+
+  createAccount(account, index) {
+    return {
+      id: account.id,
+      name: account.name || account.email || account.id,
+      type: account.type || 'oauth',
+      accountUuid: account.accountUuid || null,
+      priority: account.priority ?? index,
+      status: 'ready',
+      quota: emptyQuota(),
+      usage: {
+        totalInputTokens: 0,
+        totalOutputTokens: 0,
+        totalRequests: 0,
+        lastUsed: null,
+      },
+      rateLimitedUntil: null,
+    };
   }
 }
 

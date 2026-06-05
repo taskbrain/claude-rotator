@@ -41,11 +41,13 @@ describe('runCli', () => {
   it('imports current Claude Code credentials through injected reader', async () => {
     const io = createIo();
     const imported = [];
+    let reloaded = false;
 
     const code = await runCli(['import-current', '--id', 'acct_1', '--name', 'a@example.com'], {
       ...io,
       readCurrentCredentials: async () => ({ accessToken: 'access', refreshToken: 'refresh' }),
       saveImportedAccount: async account => imported.push(account),
+      reloadServer: async () => { reloaded = true; },
     });
 
     assert.equal(code, 0);
@@ -54,7 +56,30 @@ describe('runCli', () => {
       name: 'a@example.com',
       secret: { accessToken: 'access', refreshToken: 'refresh' },
     }]);
+    assert.equal(reloaded, true);
     assert.match(io.output(), /Imported a@example\.com/);
+  });
+
+  it('uses current Claude Code login when login is called without token JSON', async () => {
+    const io = createIo();
+    const imported = [];
+
+    const code = await runCli(['login'], {
+      ...io,
+      readCurrentCredentials: async () => ({ accessToken: 'access', refreshToken: 'refresh' }),
+      fetchProfile: async () => ({ email: 'person@example.com', accountUuid: 'uuid-1' }),
+      saveImportedAccount: async account => imported.push(account),
+      reloadServer: async () => {},
+    });
+
+    assert.equal(code, 0);
+    assert.deepEqual(imported, [{
+      id: 'person-example-com',
+      name: 'person@example.com',
+      accountUuid: 'uuid-1',
+      secret: { accessToken: 'access', refreshToken: 'refresh' },
+    }]);
+    assert.match(io.output(), /Imported person@example\.com/);
   });
 });
 

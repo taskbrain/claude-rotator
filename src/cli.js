@@ -11,6 +11,7 @@ import { createProxyServer } from './proxy-server.js';
 import { createSecretStore } from './secret-store.js';
 import { renderStatus } from './monitor.js';
 import { readCurrentClaudeCredentials } from './claude-credentials.js';
+import { fetchProfile } from './oauth.js';
 import {
   installSettings,
   renderLaunchAgentPlist,
@@ -83,7 +84,8 @@ export async function runCli(argv = [], deps = {}) {
     }
 
     if (command === 'login') {
-      await loginJsonCommand({ argv, write });
+      if (argValue(argv, '--json')) await loginJsonCommand({ argv, write, deps });
+      else await loginCurrentCommand({ argv, write, deps });
       return 0;
     }
 
@@ -109,6 +111,7 @@ export function helpText() {
   claude-rotator monitor
   claude-rotator switch <account>
   claude-rotator accounts
+  claude-rotator login [--id <id>] [--name <email>]
   claude-rotator login --id <id> --name <email> --json <token-json>
   claude-rotator import-current --id <id> --name <email>
   claude-rotator doctor
@@ -119,7 +122,12 @@ async function runServer({ write }) {
   const config = await loadOrCreateConfig();
   const secretStore = createSecretStore();
   const accountManager = new AccountManager({ accounts: config.accounts, switchThreshold: config.switchThreshold });
-  const server = createProxyServer({ accountManager, secretStore, config });
+  const server = createProxyServer({
+    accountManager,
+    secretStore,
+    config,
+    reloadAccounts: async () => (await loadOrCreateConfig()).accounts,
+  });
   await new Promise(resolve => server.listen(config.proxy.port, config.proxy.host, resolve));
   write(`claude-rotator listening on ${proxyBaseUrl(config)}\n`);
   await waitForShutdown(server);
@@ -170,7 +178,7 @@ async function uninstallCommand({ argv, write }) {
   write('Uninstalled claude-rotator\n');
 }
 
-async function loginJsonCommand({ argv, write }) {
+async function loginJsonCommand({ argv, write, deps }) {
   const id = argValue(argv, '--id');
   const name = argValue(argv, '--name') || id;
   const json = argValue(argv, '--json');
@@ -186,7 +194,26 @@ async function loginJsonCommand({ argv, write }) {
   if (existing >= 0) config.accounts[existing] = account;
   else config.accounts.push(account);
   await saveConfig(config);
+  await notifyReload({ deps, write });
   write(`Added ${name}\n`);
+}
+
+async function loginCurrentCommand({ argv, write, deps }) {
+  const secret = deps.readCurrentCredentials
+    ? await deps.readCurrentCredentials()
+    : await readCurrentClaudeCredentials();
+  const profile = await readProfileForLogin(secret, deps);
+  const config = await loadOrCreateConfig();
+  const name = argValue(argv, '--name') || profile?.email || argValue(argv, '--id') || nextAccountId(config);
+  const id = argValue(argv, '--id') || accountIdFromName(name);
+
+  if (deps.saveImportedAccount) {
+    await deps.saveImportedAccount({ id, name, accountUuid: profile?.accountUuid || null, secret });
+  } else {
+    await saveImportedAccount({ id, name, accountUuid: profile?.accountUuid || null, secret });
+  }
+  await notifyReload({ deps, write });
+  write(`Imported ${name}\n`);
 }
 
 async function importCurrentCommand({ argv, write, deps }) {
@@ -202,18 +229,57 @@ async function importCurrentCommand({ argv, write, deps }) {
   } else {
     await saveImportedAccount({ id, name, secret });
   }
+  await notifyReload({ deps, write });
   write(`Imported ${name}\n`);
 }
 
-async function saveImportedAccount({ id, name, secret }) {
+async function saveImportedAccount({ id, name, accountUuid = null, secret }) {
   const config = await loadOrCreateConfig();
   const store = createSecretStore();
   await store.set(id, secret);
-  const account = { id, name, type: secret.apiKey ? 'apikey' : 'oauth' };
+  const account = { id, name, type: secret.apiKey ? 'apikey' : 'oauth', accountUuid };
   const existing = config.accounts.findIndex(item => item.id === id);
   if (existing >= 0) config.accounts[existing] = account;
   else config.accounts.push(account);
   await saveConfig(config);
+}
+
+async function readProfileForLogin(secret, deps) {
+  if (secret.apiKey || !secret.accessToken) return null;
+  try {
+    return deps.fetchProfile ? await deps.fetchProfile(secret.accessToken) : await fetchProfile(secret.accessToken);
+  } catch {
+    return null;
+  }
+}
+
+async function notifyReload({ deps, write }) {
+  try {
+    if (deps.reloadServer) await deps.reloadServer();
+    else await reloadServer();
+  } catch (caught) {
+    write(`Saved account. Server reload skipped: ${caught.message}\n`);
+  }
+}
+
+async function reloadServer() {
+  await postJson('/internal/reload', {});
+}
+
+function accountIdFromName(name) {
+  return String(name)
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, '-')
+    .replace(/^-+|-+$/g, '') || 'account';
+}
+
+function nextAccountId(config) {
+  const used = new Set((config.accounts || []).map(account => account.id));
+  for (let i = 1; i < 1000; i++) {
+    const id = `account${i}`;
+    if (!used.has(id)) return id;
+  }
+  return `account${Date.now()}`;
 }
 
 async function installServiceFile({ configPath }) {

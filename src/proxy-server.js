@@ -13,7 +13,7 @@ const HOP_HEADERS = new Set([
   'upgrade',
 ]);
 
-export function createProxyServer({ accountManager, secretStore, config }) {
+export function createProxyServer({ accountManager, secretStore, config, reloadAccounts = null }) {
   const upstream = config.upstream || 'https://api.anthropic.com';
 
   return http.createServer(async (req, res) => {
@@ -34,6 +34,15 @@ export function createProxyServer({ accountManager, secretStore, config }) {
       if (req.method === 'POST' && req.url === '/internal/switch') {
         const body = JSON.parse((await readBody(req)).toString('utf8') || '{}');
         accountManager.switchTo(body.account);
+        sendJson(res, 200, accountManager.getStatus());
+        return;
+      }
+
+      if (req.method === 'POST' && req.url === '/internal/reload') {
+        if (reloadAccounts) {
+          const accounts = await reloadAccounts();
+          accountManager.replaceAccounts(accounts);
+        }
         sendJson(res, 200, accountManager.getStatus());
         return;
       }
