@@ -122,6 +122,17 @@ async function runServer({ write }) {
   const server = createProxyServer({ accountManager, secretStore, config });
   await new Promise(resolve => server.listen(config.proxy.port, config.proxy.host, resolve));
   write(`claude-rotator listening on ${proxyBaseUrl(config)}\n`);
+  await waitForShutdown(server);
+}
+
+function waitForShutdown(server) {
+  return new Promise(resolve => {
+    const shutdown = () => {
+      server.close(() => resolve());
+    };
+    process.once('SIGINT', shutdown);
+    process.once('SIGTERM', shutdown);
+  });
 }
 
 async function installCommand({ argv, write }) {
