@@ -24,6 +24,10 @@ export class AccountManager {
     return null;
   }
 
+  getCurrentAccount() {
+    return this.accounts[this.currentIndex] || null;
+  }
+
   switchTo(accountId) {
     const index = this.accounts.findIndex(account => account.id === accountId || account.name === accountId);
     if (index < 0) throw new Error(`Unknown account: ${accountId}`);
@@ -77,6 +81,19 @@ export class AccountManager {
     });
   }
 
+  markError(accountId, type = 'account_error', message = null) {
+    const account = this.find(accountId);
+    account.status = 'error';
+    account.errorReason = { type };
+    if (message) account.errorReason.message = message;
+    this.events.unshift({
+      at: new Date(this.now()).toISOString(),
+      type: 'account-error',
+      account: account.id,
+      reason: account.errorReason,
+    });
+  }
+
   replaceAccounts(accounts) {
     const existingById = new Map(this.accounts.map(account => [account.id, account]));
     this.accounts = accounts.map((account, index) => {
@@ -89,6 +106,7 @@ export class AccountManager {
         accountUuid: account.accountUuid || null,
         priority: account.priority ?? index,
         status: existing.status === 'error' ? 'ready' : existing.status,
+        errorReason: existing.status === 'error' ? null : existing.errorReason,
       };
     });
     if (this.currentIndex >= this.accounts.length) this.currentIndex = 0;
@@ -119,6 +137,7 @@ export class AccountManager {
           rateLimitedUntil: account.rateLimitedUntil
             ? new Date(account.rateLimitedUntil).toISOString()
             : null,
+          unavailableReason: this.unavailableReason(account),
         };
       }),
       events: this.events.slice(0, 50),
@@ -178,11 +197,42 @@ export class AccountManager {
       account.status = 'throttled';
       return;
     }
-    if (isNearQuota(q, this.switchThreshold)) {
+    const quotaReason = quotaUnavailableReason(q, this.switchThreshold);
+    if (quotaReason) {
       account.status = 'exhausted';
+      this.recordQuotaExhausted(account, quotaReason);
       return;
     }
+    account.quotaExhaustionEventKey = null;
     if (account.status === 'exhausted' || account.status === 'throttled') account.status = 'ready';
+  }
+
+  recordQuotaExhausted(account, reason) {
+    const key = `${reason.type}:${reason.window || ''}:${reason.resetAt || ''}`;
+    if (account.quotaExhaustionEventKey === key) return;
+    account.quotaExhaustionEventKey = key;
+    this.events.unshift({
+      at: new Date(this.now()).toISOString(),
+      type: 'quota-exhausted',
+      account: account.id,
+      reason,
+    });
+  }
+
+  unavailableReason(account) {
+    if (!account) return null;
+    const quotaReason = quotaUnavailableReason(account.quota, this.switchThreshold);
+    if (quotaReason) return quotaReason;
+    if (account.rateLimitedUntil && this.now() < account.rateLimitedUntil) {
+      return {
+        type: 'temporary_throttle',
+        retryAt: new Date(account.rateLimitedUntil).toISOString(),
+      };
+    }
+    if (account.status === 'error') {
+      return account.errorReason || { type: 'account_error' };
+    }
+    return null;
   }
 
   displayStatus(account) {
@@ -216,8 +266,50 @@ export class AccountManager {
         lastUsed: null,
       },
       rateLimitedUntil: null,
+      errorReason: null,
+      quotaExhaustionEventKey: null,
     };
   }
+}
+
+export function quotaUnavailableReason(quota, threshold) {
+  if (quota.unified5h != null && quota.unified5h >= threshold) {
+    return {
+      type: 'quota_exhausted',
+      window: '5h',
+      utilization: quota.unified5h,
+      resetAt: quota.unified5hReset ? new Date(quota.unified5hReset).toISOString() : null,
+    };
+  }
+  if (quota.unified7d != null && quota.unified7d >= threshold) {
+    return {
+      type: 'quota_exhausted',
+      window: '7d',
+      utilization: quota.unified7d,
+      resetAt: quota.unified7dReset ? new Date(quota.unified7dReset).toISOString() : null,
+    };
+  }
+  if (quota.tokensLimit != null && quota.tokensRemaining != null) {
+    const utilization = 1 - quota.tokensRemaining / quota.tokensLimit;
+    if (utilization >= threshold) {
+      return {
+        type: 'token_rate_limit_exhausted',
+        utilization,
+        resetAt: quota.resetsAt || null,
+      };
+    }
+  }
+  if (quota.requestsLimit != null && quota.requestsRemaining != null) {
+    const utilization = 1 - quota.requestsRemaining / quota.requestsLimit;
+    if (utilization >= threshold) {
+      return {
+        type: 'request_rate_limit_exhausted',
+        utilization,
+        resetAt: quota.resetsAt || null,
+      };
+    }
+  }
+  return null;
 }
 
 export function isNearQuota(quota, threshold) {

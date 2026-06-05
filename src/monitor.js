@@ -28,6 +28,8 @@ export function renderStatus(status, options = {}) {
 
   for (const account of status.accounts || []) {
     lines.push(`${account.name.padEnd(26)} ${account.status}`);
+    const reason = renderUnavailableReason(account.unavailableReason);
+    if (reason) lines.push(`reason: ${reason}`);
     lines.push(renderQuotaRow('5h', account.quota?.unified5h, account.quota?.unified5hReset, now));
     lines.push(renderQuotaRow('7d', account.quota?.unified7d, account.quota?.unified7dReset, now));
     lines.push(`requests: ${account.usage?.totalRequests ?? 0}`);
@@ -55,7 +57,29 @@ function renderEvent(event) {
   if (event.type === 'manual-switch') {
     return `${event.at || ''} manual switch -> ${event.account}`.trim();
   }
+  if (event.type === 'quota-exhausted') {
+    const reason = renderUnavailableReason(event.reason);
+    return `${event.at || ''} quota exhausted ${event.account || ''}${reason ? ` (${reason})` : ''}`.trim();
+  }
+  if (event.type === 'account-error') {
+    const reason = renderUnavailableReason(event.reason);
+    return `${event.at || ''} account error ${event.account || ''}${reason ? ` (${reason})` : ''}`.trim();
+  }
   return `${event.at || ''} ${event.type || 'event'}`.trim();
+}
+
+function renderUnavailableReason(reason) {
+  if (!reason) return null;
+  if (reason.type === 'quota_exhausted') {
+    const reset = reason.resetAt ? `; reset -> ${formatDate(Date.parse(reason.resetAt))}` : '';
+    return `${reason.window} quota exhausted${reset}`;
+  }
+  if (reason.type === 'temporary_throttle') {
+    const retry = reason.retryAt ? `; retry -> ${formatDate(Date.parse(reason.retryAt))}` : '';
+    return `temporary throttle${retry}`;
+  }
+  if (reason.message) return `${reason.type}: ${reason.message}`;
+  return reason.type;
 }
 
 function formatDate(ts) {

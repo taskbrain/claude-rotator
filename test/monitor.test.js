@@ -22,6 +22,7 @@ describe('monitor rendering', () => {
 
     assert.match(output, /Claude Rotator\s+active: b@example\.com/);
     assert.match(output, /a@example\.com\s+exhausted/);
+    assert.match(output, /reason: 5h quota exhausted; reset -> 06\/04 10:00/);
     assert.match(output, /5h ██████████ 100%/);
     assert.match(output, /7d ███████░░░  76%/);
     assert.match(output, /b@example\.com\s+active/);
@@ -46,6 +47,12 @@ function sampleStatus() {
           unified7dReset: Date.parse('2026-06-06T18:00:00Z'),
         },
         usage: { totalRequests: 12 },
+        unavailableReason: {
+          type: 'quota_exhausted',
+          window: '5h',
+          utilization: 1,
+          resetAt: '2026-06-04T10:00:00.000Z',
+        },
       },
       {
         id: 'acct_2',

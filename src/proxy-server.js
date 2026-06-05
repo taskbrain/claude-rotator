@@ -92,16 +92,22 @@ async function forwardWithRotation({
   for (let attempt = 0; attempt < maxAttempts; attempt++) {
     const account = accountManager.getActiveAccount();
     if (!account) {
-      sendJson(res, 429, {
-        type: 'error',
-        error: { type: 'rate_limit_error', message: 'All configured accounts are unavailable.' },
-      });
+      if (await forwardCurrentUnavailableAccount({
+        req,
+        res,
+        body,
+        upstream,
+        accountManager,
+        secretStore,
+        tokenRefresher,
+      })) return;
+      sendUnavailableAccounts(res);
       return;
     }
 
     const secret = await secretStore.get(account.id);
     if (!secret) {
-      account.status = 'error';
+      accountManager.markError(account.id, 'credential_missing', 'No stored credential for account');
       continue;
     }
 
@@ -114,7 +120,7 @@ async function forwardWithRotation({
         tokenRefresher,
       });
     } catch {
-      account.status = 'error';
+      accountManager.markError(account.id, 'oauth_refresh_failed', 'OAuth token refresh failed');
       continue;
     }
 
@@ -137,7 +143,7 @@ async function forwardWithRotation({
           tokenRefresher,
         });
       } catch {
-        account.status = 'error';
+        accountManager.markError(account.id, 'oauth_refresh_failed', 'OAuth token refresh failed');
         continue;
       }
       const retryResult = await forwardOnce({
@@ -150,7 +156,7 @@ async function forwardWithRotation({
         accountManager,
       });
       if (retryResult.retryNextAccount || retryResult.retryAfterRefresh) {
-        account.status = 'error';
+        accountManager.markError(account.id, 'authentication_error', 'OAuth token rejected');
         continue;
       }
       return;
@@ -160,11 +166,57 @@ async function forwardWithRotation({
   }
 
   if (!res.headersSent) {
-    sendJson(res, 429, {
-      type: 'error',
-      error: { type: 'rate_limit_error', message: 'No account could satisfy the request.' },
-    });
+    if (await forwardCurrentUnavailableAccount({
+      req,
+      res,
+      body,
+      upstream,
+      accountManager,
+      secretStore,
+      tokenRefresher,
+    })) return;
+    sendUnavailableAccounts(res);
   }
+}
+
+async function forwardCurrentUnavailableAccount({
+  req,
+  res,
+  body,
+  upstream,
+  accountManager,
+  secretStore,
+  tokenRefresher,
+}) {
+  const account = accountManager.getCurrentAccount();
+  if (!account) return false;
+
+  const secret = await secretStore.get(account.id);
+  if (!secret) return false;
+
+  let freshSecret;
+  try {
+    freshSecret = await refreshSecretIfExpiring({
+      account,
+      secret,
+      secretStore,
+      tokenRefresher,
+    });
+  } catch {
+    freshSecret = secret;
+  }
+
+  await forwardOnce({
+    req,
+    res,
+    body,
+    upstream,
+    account,
+    secret: freshSecret,
+    accountManager,
+    passthroughErrors: true,
+  });
+  return true;
 }
 
 async function refreshSecretIfExpiring({ account, secret, secretStore, tokenRefresher }) {
@@ -184,7 +236,16 @@ function canRefreshSecret(account, secret) {
   return account.type !== 'apikey' && !secret.apiKey && Boolean(secret.refreshToken);
 }
 
-async function forwardOnce({ req, res, body, upstream, account, secret, accountManager }) {
+async function forwardOnce({
+  req,
+  res,
+  body,
+  upstream,
+  account,
+  secret,
+  accountManager,
+  passthroughErrors = false,
+}) {
   const target = new URL(req.url, upstream);
   const headers = buildUpstreamHeaders(req.headers, account, secret);
 
@@ -196,14 +257,14 @@ async function forwardOnce({ req, res, body, upstream, account, secret, accountM
     onResponse(upstreamRes) {
       accountManager.updateQuota(account.id, upstreamRes.headers);
 
-      if (upstreamRes.statusCode === 429) {
+      if (!passthroughErrors && upstreamRes.statusCode === 429) {
         const retryAfter = Number.parseInt(upstreamRes.headers['retry-after'], 10) || 60;
         accountManager.markRateLimited(account.id, retryAfter);
         upstreamRes.resume();
         return false;
       }
 
-      if (upstreamRes.statusCode === 401 && canRefreshSecret(account, secret)) {
+      if (!passthroughErrors && upstreamRes.statusCode === 401 && canRefreshSecret(account, secret)) {
         upstreamRes.resume();
         return false;
       }
@@ -220,11 +281,11 @@ async function forwardOnce({ req, res, body, upstream, account, secret, accountM
     },
   });
 
-  if (upstreamResponse.statusCode === 429) {
+  if (!passthroughErrors && upstreamResponse.statusCode === 429) {
     return { retryNextAccount: true };
   }
 
-  if (upstreamResponse.statusCode === 401 && canRefreshSecret(account, secret)) {
+  if (!passthroughErrors && upstreamResponse.statusCode === 401 && canRefreshSecret(account, secret)) {
     return { retryAfterRefresh: true };
   }
 
@@ -328,4 +389,11 @@ async function readBody(req) {
 function sendJson(res, status, body) {
   res.writeHead(status, { 'Content-Type': 'application/json' });
   res.end(JSON.stringify(body));
+}
+
+function sendUnavailableAccounts(res) {
+  sendJson(res, 429, {
+    type: 'error',
+    error: { type: 'rate_limit_error', message: 'All configured accounts are unavailable.' },
+  });
 }

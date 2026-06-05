@@ -134,4 +134,65 @@ describe('AccountManager', () => {
 
     assert.equal(manager.getActiveAccount().id, 'acct_1');
   });
+
+  it('reports precise unavailable reasons for quota, throttling, and errors', () => {
+    const manager = new AccountManager({
+      accounts: [
+        { id: 'acct_1', name: 'a@example.com', type: 'oauth' },
+        { id: 'acct_2', name: 'b@example.com', type: 'oauth' },
+        { id: 'acct_3', name: 'c@example.com', type: 'oauth' },
+      ],
+      switchThreshold: 0.99,
+      now: () => 1000,
+    });
+
+    manager.updateQuota('acct_1', {
+      'anthropic-ratelimit-unified-5h-utilization': '1',
+      'anthropic-ratelimit-unified-5h-reset': '10',
+    });
+    manager.markRateLimited('acct_2', 30);
+    manager.markError('acct_3', 'authentication_error', 'OAuth token rejected');
+
+    const status = manager.getStatus();
+
+    assert.deepEqual(status.accounts[0].unavailableReason, {
+      type: 'quota_exhausted',
+      window: '5h',
+      utilization: 1,
+      resetAt: '1970-01-01T00:00:10.000Z',
+    });
+    assert.deepEqual(status.accounts[1].unavailableReason, {
+      type: 'temporary_throttle',
+      retryAt: '1970-01-01T00:00:31.000Z',
+    });
+    assert.deepEqual(status.accounts[2].unavailableReason, {
+      type: 'authentication_error',
+      message: 'OAuth token rejected',
+    });
+  });
+
+  it('records quota exhaustion events once per quota window', () => {
+    const manager = new AccountManager({
+      accounts: [{ id: 'acct_1', name: 'a@example.com', type: 'oauth' }],
+      switchThreshold: 0.99,
+      now: () => 1000,
+    });
+
+    const headers = {
+      'anthropic-ratelimit-unified-5h-utilization': '1',
+      'anthropic-ratelimit-unified-5h-reset': '10',
+    };
+    manager.updateQuota('acct_1', headers);
+    manager.getStatus();
+    manager.updateQuota('acct_1', headers);
+
+    const events = manager.getStatus().events.filter(event => event.type === 'quota-exhausted');
+    assert.equal(events.length, 1);
+    assert.deepEqual(events[0].reason, {
+      type: 'quota_exhausted',
+      window: '5h',
+      utilization: 1,
+      resetAt: '1970-01-01T00:00:10.000Z',
+    });
+  });
 });

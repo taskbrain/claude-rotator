@@ -210,6 +210,56 @@ describe('createProxyServer', () => {
     assert.equal(accountManager.getStatus().currentAccount, 'acct_2');
   });
 
+  it('passes through the upstream usage-limit response when the only account is exhausted', async t => {
+    const upstreamSeen = [];
+    const upstreamBody = {
+      type: 'error',
+      error: {
+        type: 'rate_limit_error',
+        message: "You've hit your session limit · resets 1:20am",
+      },
+    };
+    const upstream = await listen(http.createServer(async (req, res) => {
+      upstreamSeen.push(req.headers.authorization);
+      res.writeHead(429, {
+        'Content-Type': 'application/json',
+        'anthropic-ratelimit-unified-5h-utilization': '1',
+        'anthropic-ratelimit-unified-5h-reset': '10',
+      });
+      res.end(JSON.stringify(upstreamBody));
+    }));
+
+    const secretStore = new MemorySecretStore();
+    await secretStore.set('acct_1', { accessToken: 'access-token-1' });
+    const accountManager = new AccountManager({
+      accounts: [{ id: 'acct_1', name: 'a@example.com', type: 'oauth' }],
+      now: () => 1000,
+    });
+    accountManager.updateQuota('acct_1', {
+      'anthropic-ratelimit-unified-5h-utilization': '1',
+      'anthropic-ratelimit-unified-5h-reset': '10',
+    });
+    const proxy = await listen(createProxyServer({
+      accountManager,
+      secretStore,
+      config: { upstream: upstream.url },
+    }));
+    t.after(async () => {
+      await close(proxy.server);
+      await close(upstream.server);
+    });
+
+    const response = await requestJson(`${proxy.url}/v1/messages`, {
+      method: 'POST',
+      body: JSON.stringify({ model: 'sonnet' }),
+    });
+
+    assert.equal(response.status, 429);
+    assert.deepEqual(upstreamSeen, ['Bearer access-token-1']);
+    assert.deepEqual(response.body, upstreamBody);
+    assert.notEqual(response.body.error.message, 'All configured accounts are unavailable.');
+  });
+
   it('exposes health and status without secrets', async () => {
     const secretStore = new MemorySecretStore();
     await secretStore.set('acct_1', { accessToken: 'access-token-1' });
