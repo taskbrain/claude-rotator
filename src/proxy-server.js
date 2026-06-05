@@ -258,8 +258,11 @@ async function forwardOnce({
       accountManager.updateQuota(account.id, upstreamRes.headers);
 
       if (!passthroughErrors && upstreamRes.statusCode === 429) {
-        const retryAfter = Number.parseInt(upstreamRes.headers['retry-after'], 10) || 60;
-        accountManager.markRateLimited(account.id, retryAfter);
+        const unavailableReason = accountManager.unavailableReason(account);
+        if (unavailableReason?.type !== 'quota_exhausted') {
+          const retryAfter = Number.parseInt(upstreamRes.headers['retry-after'], 10) || 60;
+          accountManager.markRateLimited(account.id, retryAfter);
+        }
         upstreamRes.resume();
         return false;
       }

@@ -195,4 +195,23 @@ describe('AccountManager', () => {
       resetAt: '1970-01-01T00:00:10.000Z',
     });
   });
+
+  it('reports quota exhaustion ahead of retry-after throttling', () => {
+    const manager = new AccountManager({
+      accounts: [{ id: 'acct_1', name: 'a@example.com', type: 'oauth' }],
+      switchThreshold: 0.99,
+      now: () => 1000,
+    });
+
+    manager.markRateLimited('acct_1', 60);
+    manager.updateQuota('acct_1', {
+      'anthropic-ratelimit-unified-5h-utilization': '1',
+      'anthropic-ratelimit-unified-5h-reset': '10',
+    });
+
+    const account = manager.getStatus().accounts[0];
+    assert.equal(account.status, 'exhausted');
+    assert.equal(account.unavailableReason.type, 'quota_exhausted');
+    assert.equal(account.unavailableReason.window, '5h');
+  });
 });

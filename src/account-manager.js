@@ -193,10 +193,6 @@ export class AccountManager {
       account.status = 'ready';
     }
 
-    if (account.rateLimitedUntil && now < account.rateLimitedUntil) {
-      account.status = 'throttled';
-      return;
-    }
     const quotaReason = quotaUnavailableReason(q, this.switchThreshold);
     if (quotaReason) {
       account.status = 'exhausted';
@@ -204,6 +200,10 @@ export class AccountManager {
       return;
     }
     account.quotaExhaustionEventKey = null;
+    if (account.rateLimitedUntil && now < account.rateLimitedUntil) {
+      account.status = 'throttled';
+      return;
+    }
     if (account.status === 'exhausted' || account.status === 'throttled') account.status = 'ready';
   }
 
