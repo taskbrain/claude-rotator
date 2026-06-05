@@ -104,6 +104,7 @@ async function forwardWithRotation({
         accountManager,
         secretStore,
         tokenRefresher,
+        currentCredentialReader,
       })) return;
       sendUnavailableAccounts(res);
       return;
@@ -194,7 +195,7 @@ async function forwardCurrentUnavailableAccount({
   tokenRefresher,
   currentCredentialReader,
 }) {
-  const account = accountManager.getCurrentAccount();
+  const account = accountManager.getFallbackAccount();
   if (!account) return false;
 
   const secret = await resolveSecretForAccount({ account, secretStore, currentCredentialReader });

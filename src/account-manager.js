@@ -28,6 +28,11 @@ export class AccountManager {
     return this.accounts[this.currentIndex] || null;
   }
 
+  getFallbackAccount() {
+    return this.accounts.find(account => this.unavailableReason(account)?.type === 'quota_exhausted')
+      || this.getCurrentAccount();
+  }
+
   switchTo(accountId) {
     const index = this.accounts.findIndex(account => account.id === accountId || account.name === accountId);
     if (index < 0) throw new Error(`Unknown account: ${accountId}`);

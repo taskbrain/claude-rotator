@@ -302,6 +302,73 @@ describe('createProxyServer', () => {
     assert.notEqual(response.body.error.message, 'All configured accounts are unavailable.');
   });
 
+  it('prefers passing through a quota-exhausted account over an errored account', async t => {
+    const upstreamSeen = [];
+    const upstream = await listen(http.createServer(async (req, res) => {
+      upstreamSeen.push(req.headers.authorization);
+      if (req.headers.authorization === 'Bearer live-current-token') {
+        res.writeHead(429, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({
+          type: 'error',
+          error: {
+            type: 'rate_limit_error',
+            message: "You've hit your session limit · resets 1:20am",
+          },
+        }));
+        return;
+      }
+
+      res.writeHead(401, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({
+        type: 'error',
+        error: { type: 'authentication_error', message: 'Invalid authentication credentials' },
+      }));
+    }));
+
+    const secretStore = new MemorySecretStore();
+    await secretStore.set('other', {
+      accessToken: 'stale-other-token',
+      refreshToken: 'stale-other-refresh',
+      expiresAt: Date.now() + 60 * 60 * 1000,
+    });
+    const accountManager = new AccountManager({
+      accounts: [
+        { id: 'current', name: 'current', type: 'oauth' },
+        { id: 'other', name: 'other@example.com', type: 'oauth' },
+      ],
+      now: () => 1000,
+    });
+    accountManager.updateQuota('current', {
+      'anthropic-ratelimit-unified-5h-utilization': '1',
+      'anthropic-ratelimit-unified-5h-reset': '10',
+    });
+    accountManager.switchTo('other');
+    accountManager.markError('other', 'oauth_refresh_failed', 'OAuth token refresh failed');
+    const proxy = await listen(createProxyServer({
+      accountManager,
+      secretStore,
+      config: { upstream: upstream.url },
+      currentCredentialReader: async () => ({
+        accessToken: 'live-current-token',
+        refreshToken: 'live-current-refresh',
+        expiresAt: Date.now() + 60 * 60 * 1000,
+      }),
+    }));
+    t.after(async () => {
+      await close(proxy.server);
+      await close(upstream.server);
+    });
+
+    const response = await requestJson(`${proxy.url}/v1/messages`, {
+      method: 'POST',
+      body: JSON.stringify({ model: 'sonnet' }),
+    });
+
+    assert.equal(response.status, 429);
+    assert.deepEqual(upstreamSeen, ['Bearer live-current-token']);
+    assert.match(response.body.error.message, /session limit/);
+  });
+
   it('exposes health and status without secrets', async () => {
     const secretStore = new MemorySecretStore();
     await secretStore.set('acct_1', { accessToken: 'access-token-1' });
