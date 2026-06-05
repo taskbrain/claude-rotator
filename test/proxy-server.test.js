@@ -105,6 +105,48 @@ describe('createProxyServer', () => {
     await close(upstream.server);
   });
 
+  it('uses live Claude Code credentials for the current account', async t => {
+    const upstreamSeen = [];
+    const upstream = await listen(http.createServer(async (req, res) => {
+      upstreamSeen.push(req.headers.authorization);
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ ok: true }));
+    }));
+
+    const secretStore = new MemorySecretStore();
+    await secretStore.set('current', {
+      accessToken: 'stale-stored-token',
+      refreshToken: 'stale-stored-refresh',
+      expiresAt: Date.now() + 60 * 60 * 1000,
+    });
+    const accountManager = new AccountManager({
+      accounts: [{ id: 'current', name: 'current', type: 'oauth' }],
+      now: () => 1000,
+    });
+    const proxy = await listen(createProxyServer({
+      accountManager,
+      secretStore,
+      config: { upstream: upstream.url },
+      currentCredentialReader: async () => ({
+        accessToken: 'live-claude-code-token',
+        refreshToken: 'live-claude-code-refresh',
+        expiresAt: Date.now() + 60 * 60 * 1000,
+      }),
+    }));
+    t.after(async () => {
+      await close(proxy.server);
+      await close(upstream.server);
+    });
+
+    const response = await requestJson(`${proxy.url}/v1/messages`, {
+      method: 'POST',
+      body: JSON.stringify({ model: 'sonnet' }),
+    });
+
+    assert.equal(response.status, 200);
+    assert.deepEqual(upstreamSeen, ['Bearer live-claude-code-token']);
+  });
+
   it('refreshes and retries once when upstream rejects the OAuth token', async t => {
     const upstreamSeen = [];
     const upstream = await listen(http.createServer(async (req, res) => {

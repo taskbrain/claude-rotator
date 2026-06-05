@@ -1,6 +1,7 @@
 import http from 'node:http';
 import https from 'node:https';
 
+import { readCurrentClaudeCredentials } from './claude-credentials.js';
 import { isTokenExpiringSoon, refreshAccessToken } from './oauth.js';
 
 const HOP_HEADERS = new Set([
@@ -21,6 +22,7 @@ export function createProxyServer({
   config,
   reloadAccounts = null,
   tokenRefresher = refreshAccessToken,
+  currentCredentialReader = readCurrentClaudeCredentials,
 }) {
   const upstream = config.upstream || 'https://api.anthropic.com';
 
@@ -64,6 +66,7 @@ export function createProxyServer({
         accountManager,
         secretStore,
         tokenRefresher,
+        currentCredentialReader,
       });
     } catch (error) {
       if (!res.headersSent) {
@@ -86,6 +89,7 @@ async function forwardWithRotation({
   accountManager,
   secretStore,
   tokenRefresher,
+  currentCredentialReader,
 }) {
   const maxAttempts = Math.max(1, accountManager.accounts.length);
 
@@ -105,7 +109,7 @@ async function forwardWithRotation({
       return;
     }
 
-    const secret = await secretStore.get(account.id);
+    const secret = await resolveSecretForAccount({ account, secretStore, currentCredentialReader });
     if (!secret) {
       accountManager.markError(account.id, 'credential_missing', 'No stored credential for account');
       continue;
@@ -174,6 +178,7 @@ async function forwardWithRotation({
       accountManager,
       secretStore,
       tokenRefresher,
+      currentCredentialReader,
     })) return;
     sendUnavailableAccounts(res);
   }
@@ -187,11 +192,12 @@ async function forwardCurrentUnavailableAccount({
   accountManager,
   secretStore,
   tokenRefresher,
+  currentCredentialReader,
 }) {
   const account = accountManager.getCurrentAccount();
   if (!account) return false;
 
-  const secret = await secretStore.get(account.id);
+  const secret = await resolveSecretForAccount({ account, secretStore, currentCredentialReader });
   if (!secret) return false;
 
   let freshSecret;
@@ -233,7 +239,18 @@ async function refreshAndStoreSecret({ account, secret, secretStore, tokenRefres
 }
 
 function canRefreshSecret(account, secret) {
+  if (secret.liveClaudeCodeCredential) return false;
   return account.type !== 'apikey' && !secret.apiKey && Boolean(secret.refreshToken);
+}
+
+async function resolveSecretForAccount({ account, secretStore, currentCredentialReader }) {
+  if (account.id === 'current' && account.type !== 'apikey') {
+    return {
+      ...(await currentCredentialReader()),
+      liveClaudeCodeCredential: true,
+    };
+  }
+  return secretStore.get(account.id);
 }
 
 async function forwardOnce({
