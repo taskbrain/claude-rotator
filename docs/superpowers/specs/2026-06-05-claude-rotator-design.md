@@ -59,7 +59,7 @@ The dashboard shows active account, per-account status, 5h usage, 7d usage, rese
 
 ## Usage Refresh
 
-Rate-limit headers are the primary source of quota state. Accounts that have not routed traffic yet start as `unknown`. The server also supports low-frequency OAuth usage polling, default 5 minutes, to fill dashboard state for inactive accounts. Manual refresh is available through `claude-rotator refresh-usage` and the `r` key in `monitor`.
+Rate-limit headers and OAuth Usage API responses are the primary sources of quota state. The server refreshes OAuth usage on startup, account reload, first status read, and a low-frequency polling interval, default 5 minutes, so inactive accounts can still show 5h and 7d state before receiving routed traffic. Accounts remain `unknown` only when Usage API data is unavailable. Manual refresh is available through `claude-rotator refresh-usage`.
 
 ## Logging
 

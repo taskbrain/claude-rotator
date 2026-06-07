@@ -249,6 +249,25 @@ describe('AccountManager', () => {
     });
   });
 
+  it('clears stale reset times from OAuth usage refresh payloads', () => {
+    const manager = new AccountManager({
+      accounts: [{ id: 'acct_1', name: 'a@example.com', type: 'oauth' }],
+      now: () => 1000,
+    });
+
+    manager.updateQuota('acct_1', {
+      'anthropic-ratelimit-unified-5h-utilization': '0.9',
+      'anthropic-ratelimit-unified-5h-reset': '10',
+    });
+    manager.applyUsage('acct_1', {
+      five_hour: { utilization: 0, resets_at: null },
+    });
+
+    const status = manager.getStatus();
+    assert.equal(status.accounts[0].quota.unified5h, 0);
+    assert.equal(status.accounts[0].quota.unified5hReset, null);
+  });
+
   it('reports quota exhaustion ahead of retry-after throttling', () => {
     const manager = new AccountManager({
       accounts: [{ id: 'acct_1', name: 'a@example.com', type: 'oauth' }],

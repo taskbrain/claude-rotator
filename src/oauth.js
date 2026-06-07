@@ -102,19 +102,26 @@ export function parseUsageResponse(data) {
   return {
     five_hour: data.five_hour
       ? {
-          utilization: data.five_hour.utilization,
+          utilization: normalizeUsageUtilization(data.five_hour.utilization),
           resets_at: data.five_hour.resets_at,
         }
       : null,
     seven_day: data.seven_day
       ? {
-          utilization: data.seven_day.utilization,
+          utilization: normalizeUsageUtilization(data.seven_day.utilization),
           resets_at: data.seven_day.resets_at,
         }
       : null,
     seven_day_sonnet: data.seven_day_sonnet || null,
     extra_usage: data.extra_usage || null,
   };
+}
+
+function normalizeUsageUtilization(value) {
+  if (value == null) return value;
+  const number = Number(value);
+  if (!Number.isFinite(number)) return value;
+  return number > 1 ? number / 100 : number;
 }
 
 export function createPkcePair() {

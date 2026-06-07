@@ -78,6 +78,17 @@ export async function runCli(argv = [], deps = {}) {
       return 0;
     }
 
+    if (command === 'refresh-usage') {
+      const result = await postJson('/internal/refresh-usage', {});
+      const total = result.accounts?.length || 0;
+      const ok = (result.accounts || []).filter(account => account.ok).length;
+      write(`Refreshed usage for ${ok}/${total} accounts\n`);
+      for (const account of result.accounts || []) {
+        if (!account.ok) write(`warning: ${account.account}: ${account.error}\n`);
+      }
+      return result.ok ? 0 : 1;
+    }
+
     if (command === 'doctor') {
       return doctorCommand({ write, deps });
     }
@@ -119,6 +130,7 @@ export function helpText() {
   claude-rotator status
   claude-rotator monitor
   claude-rotator switch <account>
+  claude-rotator refresh-usage
   claude-rotator accounts
   claude-rotator login [--id <id>] [--name <email>]
   claude-rotator login --id <id> --name <email> --json <token-json>

@@ -64,7 +64,7 @@ describe('token refresh', () => {
 describe('usage response parsing', () => {
   it('normalizes OAuth usage payloads', () => {
     const parsed = parseUsageResponse({
-      five_hour: { utilization: 0.76, resets_at: '2026-06-04T09:00:00Z' },
+      five_hour: { utilization: 76, resets_at: '2026-06-04T09:00:00Z' },
       seven_day: { utilization: 0.51, resets_at: '2026-06-06T10:00:00Z' },
     });
 

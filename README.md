@@ -167,7 +167,7 @@ account1@example.com        active
 7d ███████░░░  76%  reset in 1d9h -> 06/06 19:00
 ```
 
-未使用のアカウントは、proxy が rate-limit header や usage data を取得するまで `unknown` と表示されます。`unknown` のアカウントは空いている確認が取れていないため、自動切り替え先には使いません。
+未使用のアカウントでも、server 起動時・アカウント reload 時・初回 status 表示時・定期ポーリングで OAuth Usage API から 5時間枠 / 7日枠の状態を取得します。Usage API が取得できない場合だけ `unknown` と表示されます。`unknown` のアカウントは空いている確認が取れていないため、自動切り替え先には使いません。
 
 ## ログと切り替え診断
 
@@ -190,6 +190,13 @@ tail -f ~/.config/claude-rotator/server.err
 自動切り替えは、現在のアカウントの 5時間枠または 7日枠が 100% に達した場合だけ行います。切り替え候補は 5時間枠 / 7日枠の既知使用率から `max(5h, 7d)` が最も低いアカウントを選びます。空き状況が分かっている候補がない場合は切り替えず、現在のアカウントの上流レスポンスをそのまま返します。
 
 retryable な上流 5xx / 529 / `x-should-retry` 付きレスポンス、または上流アイドルタイムアウトが起きた場合も、アカウント切り替えは行いません。上流の error body または proxy の timeout error を可能な限りそのまま返します。
+
+Usage API の状態を手動で即時反映する場合:
+
+```bash
+claude-rotator refresh-usage
+claude-rotator status
+```
 
 `claude-rotator doctor` は server の疎通に加えて、次の問題を secret を出さずに警告します。
 
@@ -220,6 +227,7 @@ claude-rotator accounts
 claude-rotator status
 claude-rotator monitor
 claude-rotator switch <account>
+claude-rotator refresh-usage
 claude-rotator doctor
 ```
 

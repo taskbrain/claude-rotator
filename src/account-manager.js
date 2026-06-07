@@ -64,11 +64,15 @@ export class AccountManager {
     const account = this.find(accountId);
     if (payload?.five_hour) {
       if (typeof payload.five_hour.utilization === 'number') account.quota.unified5h = payload.five_hour.utilization;
-      if (payload.five_hour.resets_at) account.quota.unified5hReset = Date.parse(payload.five_hour.resets_at);
+      if (Object.prototype.hasOwnProperty.call(payload.five_hour, 'resets_at')) {
+        account.quota.unified5hReset = parseUsageReset(payload.five_hour.resets_at);
+      }
     }
     if (payload?.seven_day) {
       if (typeof payload.seven_day.utilization === 'number') account.quota.unified7d = payload.seven_day.utilization;
-      if (payload.seven_day.resets_at) account.quota.unified7dReset = Date.parse(payload.seven_day.resets_at);
+      if (Object.prototype.hasOwnProperty.call(payload.seven_day, 'resets_at')) {
+        account.quota.unified7dReset = parseUsageReset(payload.seven_day.resets_at);
+      }
     }
     this.refreshQuotaState(account);
   }
@@ -393,6 +397,12 @@ function compareSwitchTargetScores(left, right) {
     return left.score.priority - right.score.priority;
   }
   return left.index - right.index;
+}
+
+function parseUsageReset(value) {
+  if (!value) return null;
+  const parsed = Date.parse(value);
+  return Number.isFinite(parsed) ? parsed : null;
 }
 
 export function isNearQuota(quota, threshold) {

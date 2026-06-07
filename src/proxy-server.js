@@ -3,7 +3,7 @@ import https from 'node:https';
 
 import { isUnifiedQuotaExhaustion } from './account-manager.js';
 import { readCurrentClaudeCredentials } from './claude-credentials.js';
-import { isTokenExpiringSoon, refreshAccessToken } from './oauth.js';
+import { fetchUsage, isTokenExpiringSoon, refreshAccessToken } from './oauth.js';
 
 const HOP_HEADERS = new Set([
   'host',
@@ -26,6 +26,7 @@ export function createProxyServer({
   reloadAccounts = null,
   tokenRefresher = refreshAccessToken,
   currentCredentialReader = readCurrentClaudeCredentials,
+  usageFetcher = fetchUsage,
   logger = null,
 }) {
   const upstream = config.upstream || 'https://api.anthropic.com';
@@ -33,7 +34,15 @@ export function createProxyServer({
     ?? config.upstreamIdleTimeoutMs
     ?? DEFAULT_UPSTREAM_IDLE_TIMEOUT_MS;
 
-  return http.createServer(async (req, res) => {
+  const usageRefresher = createUsageRefresher({
+    accountManager,
+    secretStore,
+    tokenRefresher,
+    currentCredentialReader,
+    usageFetcher,
+  });
+
+  const server = http.createServer(async (req, res) => {
     try {
       if (req.method === 'GET' && req.url === '/internal/health') {
         sendJson(res, 200, {
@@ -44,6 +53,9 @@ export function createProxyServer({
       }
 
       if (req.method === 'GET' && req.url === '/internal/status') {
+        if (usagePollingEnabled(config) && !usageRefresher.hasAttempted()) {
+          await usageRefresher.refreshAll();
+        }
         sendJson(res, 200, accountManager.getStatus());
         return;
       }
@@ -60,7 +72,13 @@ export function createProxyServer({
           const accounts = await reloadAccounts();
           accountManager.replaceAccounts(accounts);
         }
+        if (usagePollingEnabled(config)) await usageRefresher.refreshAll();
         sendJson(res, 200, accountManager.getStatus());
+        return;
+      }
+
+      if (req.method === 'POST' && req.url === '/internal/refresh-usage') {
+        sendJson(res, 200, await usageRefresher.refreshAll());
         return;
       }
 
@@ -88,6 +106,95 @@ export function createProxyServer({
       }
     }
   });
+
+  startUsagePolling({ server, config, usageRefresher });
+  return server;
+}
+
+function startUsagePolling({ server, config, usageRefresher }) {
+  if (!usagePollingEnabled(config)) return;
+  usageRefresher.refreshAll().catch(() => {});
+  const intervalMs = Number(config.usagePolling?.intervalMs) || 5 * 60 * 1000;
+  const timer = setInterval(() => {
+    usageRefresher.refreshAll().catch(() => {});
+  }, intervalMs);
+  timer.unref?.();
+  server.on('close', () => clearInterval(timer));
+}
+
+function usagePollingEnabled(config) {
+  return config.usagePolling?.enabled === true;
+}
+
+function createUsageRefresher({
+  accountManager,
+  secretStore,
+  tokenRefresher,
+  currentCredentialReader,
+  usageFetcher,
+}) {
+  let inFlight = null;
+  let attempted = false;
+  const refreshAll = async () => {
+    if (inFlight) return inFlight;
+    inFlight = refreshAllOnce({
+      accountManager,
+      secretStore,
+      tokenRefresher,
+      currentCredentialReader,
+      usageFetcher,
+    }).finally(() => {
+      attempted = true;
+      inFlight = null;
+    });
+    return inFlight;
+  };
+  return {
+    refreshAll,
+    hasAttempted: () => attempted,
+  };
+}
+
+async function refreshAllOnce({
+  accountManager,
+  secretStore,
+  tokenRefresher,
+  currentCredentialReader,
+  usageFetcher,
+}) {
+  const results = [];
+  for (const account of accountManager.accounts) {
+    if (account.type === 'apikey') {
+      results.push({ account: account.id, ok: true, skipped: 'apikey' });
+      continue;
+    }
+
+    try {
+      const secret = await resolveSecretForAccount({ account, secretStore, currentCredentialReader });
+      if (!secret?.accessToken) throw new Error('OAuth access token is missing');
+      const freshSecret = await refreshSecretIfExpiring({
+        account,
+        secret,
+        secretStore,
+        tokenRefresher,
+      });
+      const usage = await usageFetcher(freshSecret.accessToken);
+      accountManager.applyUsage(account.id, usage);
+      results.push({ account: account.id, ok: true });
+    } catch (caught) {
+      results.push({
+        account: account.id,
+        ok: false,
+        error: shortErrorMessage(caught),
+      });
+    }
+  }
+  return {
+    ok: results.every(result => result.ok),
+    refreshedAt: new Date().toISOString(),
+    accounts: results,
+    status: accountManager.getStatus(),
+  };
 }
 
 async function forwardWithRotation({
@@ -605,4 +712,8 @@ function sendUnavailableAccounts(res) {
     type: 'error',
     error: { type: 'rate_limit_error', message: 'All configured accounts are unavailable.' },
   });
+}
+
+function shortErrorMessage(error) {
+  return String(error?.message || error || 'unknown error').replace(/\s+/g, ' ').slice(0, 240);
 }

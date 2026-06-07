@@ -660,6 +660,86 @@ describe('createProxyServer', () => {
     assert.match(response.body.error.message, /session limit/);
   });
 
+  it('refreshes OAuth usage into status for inactive accounts', async t => {
+    const secretStore = new MemorySecretStore();
+    await secretStore.set('dev', { accessToken: 'dev-token' });
+    await secretStore.set('aragosta', { accessToken: 'aragosta-token' });
+    const accountManager = new AccountManager({
+      accounts: [
+        { id: 'dev', name: 'dev@example.com', type: 'oauth' },
+        { id: 'aragosta', name: 'aragosta@example.com', type: 'oauth' },
+      ],
+      switchThreshold: 1,
+      now: () => Date.parse('2026-06-07T11:00:00Z'),
+    });
+    const proxy = await listen(createProxyServer({
+      accountManager,
+      secretStore,
+      config: { upstream: 'http://127.0.0.1:1', usagePolling: { enabled: false } },
+      usageFetcher: async token => {
+        if (token === 'dev-token') {
+          return {
+            five_hour: { utilization: 1, resets_at: '2026-06-07T13:20:00Z' },
+            seven_day: { utilization: 0.41, resets_at: '2026-06-13T10:00:00Z' },
+          };
+        }
+        return {
+          five_hour: { utilization: 0, resets_at: null },
+          seven_day: { utilization: 1, resets_at: '2026-06-11T12:00:00Z' },
+        };
+      },
+    }));
+    t.after(async () => {
+      await close(proxy.server);
+    });
+
+    const refresh = await requestJson(`${proxy.url}/internal/refresh-usage`, { method: 'POST' });
+    const status = refresh.body.status;
+
+    assert.equal(refresh.status, 200);
+    assert.equal(status.accounts[0].quota.unified5h, 1);
+    assert.equal(status.accounts[0].quota.unified7d, 0.41);
+    assert.equal(status.accounts[0].status, 'exhausted');
+    assert.equal(status.accounts[0].unavailableReason.window, '5h');
+    assert.equal(status.accounts[1].quota.unified5h, 0);
+    assert.equal(status.accounts[1].quota.unified7d, 1);
+    assert.equal(status.accounts[1].status, 'exhausted');
+    assert.equal(status.accounts[1].unavailableReason.window, '7d');
+    assert.equal(JSON.stringify(refresh.body).includes('dev-token'), false);
+    assert.equal(JSON.stringify(refresh.body).includes('aragosta-token'), false);
+  });
+
+  it('waits for the initial OAuth usage refresh before returning status', async t => {
+    const secretStore = new MemorySecretStore();
+    await secretStore.set('acct_1', { accessToken: 'access-token-1' });
+    const accountManager = new AccountManager({
+      accounts: [{ id: 'acct_1', name: 'a@example.com', type: 'oauth' }],
+      now: () => Date.parse('2026-06-07T11:00:00Z'),
+    });
+    const proxy = await listen(createProxyServer({
+      accountManager,
+      secretStore,
+      config: {
+        upstream: 'http://127.0.0.1:1',
+        usagePolling: { enabled: true, intervalMs: 60 * 60 * 1000 },
+      },
+      usageFetcher: async () => ({
+        five_hour: { utilization: 0.25, resets_at: '2026-06-07T13:20:00Z' },
+        seven_day: { utilization: 0.5, resets_at: '2026-06-13T10:00:00Z' },
+      }),
+    }));
+    t.after(async () => {
+      await close(proxy.server);
+    });
+
+    const response = await requestJson(`${proxy.url}/internal/status`);
+
+    assert.equal(response.status, 200);
+    assert.equal(response.body.accounts[0].quota.unified5h, 0.25);
+    assert.equal(response.body.accounts[0].quota.unified7d, 0.5);
+    assert.equal(response.body.accounts[0].status, 'ready');
+  });
+
   it('exposes health and status without secrets', async () => {
     const secretStore = new MemorySecretStore();
     await secretStore.set('acct_1', { accessToken: 'access-token-1' });
