@@ -1,0 +1,17 @@
+node_modules/
+coverage/
+.DS_Store
+*.log
+tmp/
+
+# Local runtime state and credentials. The app normally writes these outside
+# the repository, but keep them ignored if a local test config is copied here.
+.claude/
+.config/
+.local/
+accounts/
+config.json
+install-state.json
+*.credentials.json
+*.secret.json
+server.err
