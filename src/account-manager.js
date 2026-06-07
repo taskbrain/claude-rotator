@@ -29,8 +29,12 @@ export class AccountManager {
   }
 
   getFallbackAccount() {
+    const current = this.getCurrentAccount();
+    if (current && this.unavailableReason(current)?.type !== 'account_error' && current.status !== 'error') {
+      return current;
+    }
     return this.accounts.find(account => this.unavailableReason(account)?.type === 'quota_exhausted')
-      || this.getCurrentAccount();
+      || current;
   }
 
   switchTo(accountId) {

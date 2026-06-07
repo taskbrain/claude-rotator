@@ -100,6 +100,24 @@ describe('AccountManager', () => {
     assert.equal(manager.getActiveAccount().id, 'acct_1');
   });
 
+  it('falls back to the current throttled account before an exhausted alternate', () => {
+    const manager = new AccountManager({
+      accounts: [
+        { id: 'throttled', name: 'a@example.com', type: 'oauth' },
+        { id: 'exhausted', name: 'b@example.com', type: 'oauth' },
+      ],
+      now: () => 1000,
+    });
+    manager.markRateLimited('throttled', 60);
+    manager.updateQuota('exhausted', {
+      'anthropic-ratelimit-unified-7d-utilization': '1',
+      'anthropic-ratelimit-unified-7d-reset': '10',
+    });
+
+    assert.equal(manager.getActiveAccount(), null);
+    assert.equal(manager.getFallbackAccount().id, 'throttled');
+  });
+
   it('replaces account metadata for server reload', () => {
     const manager = new AccountManager({
       accounts: [{ id: 'acct_1', name: 'a@example.com', type: 'oauth' }],
