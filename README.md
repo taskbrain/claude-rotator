@@ -127,6 +127,7 @@ claude-rotator login --id account1 --name your-email-1@example.com
 ```bash
 claude-rotator accounts
 claude-rotator status
+claude-rotator doctor
 ```
 
 `claude-rotator login --json ...` は、token JSON を直接渡す上級者向けコマンドです。通常運用では `claude-rotator login` を使ってください。
@@ -137,6 +138,18 @@ claude-rotator status
 - Ubuntu/Linux: `~/.local/share/claude-rotator/accounts/*.json`、ディレクトリ `0700`、ファイル `0600`
 
 `login` は保存後に常駐 server へ reload を通知します。server が起動していない場合だけ、OS 別のサービス再起動コマンドを実行してください。
+
+不要になったアカウントや、`doctor` で壊れていると表示された保存済みアカウントは削除できます。デフォルトでは保存済み認証情報も削除します。
+
+```bash
+claude-rotator remove old-account-id
+```
+
+設定だけ削除し、保存済み認証情報を残す場合:
+
+```bash
+claude-rotator remove old-account-id --keep-secret
+```
 
 ## モニター
 
@@ -176,6 +189,12 @@ tail -f ~/.config/claude-rotator/server.err
 
 retryable な上流 5xx / 529 / `x-should-retry` 付きレスポンス、または上流アイドルタイムアウトが起きた場合、まだ Claude Code へレスポンスを書き始めていなければ次のアカウントへ自動で再送します。代替アカウントがない場合は、上流の error body を可能な限りそのまま返します。
 
+`claude-rotator doctor` は server の疎通に加えて、次の問題を secret を出さずに警告します。
+
+- 同じ Claude account UUID が複数登録されている
+- `current` の表示名や UUID が現在の Claude Code ログインとずれている
+- 保存済み OAuth 認証情報がない、または profile 取得で 401 などになる
+
 必要に応じて `~/.config/claude-rotator/config.json` で調整できます。
 
 ```json
@@ -194,6 +213,7 @@ claude-rotator install [--no-start] [--force]
 claude-rotator uninstall
 claude-rotator login
 claude-rotator use-current [--name your-email@example.com] [--only]
+claude-rotator remove <account> [--keep-secret]
 claude-rotator import-current --id account1 --name your-email@example.com
 claude-rotator accounts
 claude-rotator status

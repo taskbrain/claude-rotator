@@ -79,9 +79,7 @@ export async function runCli(argv = [], deps = {}) {
     }
 
     if (command === 'doctor') {
-      const status = await readHealth();
-      write(`server: ${status.ok ? 'ok' : 'error'}\n`);
-      return status.ok ? 0 : 1;
+      return doctorCommand({ write, deps });
     }
 
     if (command === 'login') {
@@ -92,6 +90,11 @@ export async function runCli(argv = [], deps = {}) {
 
     if (command === 'use-current') {
       await useCurrentCommand({ argv, write, deps });
+      return 0;
+    }
+
+    if (command === 'remove') {
+      await removeCommand({ argv, write, deps });
       return 0;
     }
 
@@ -120,6 +123,7 @@ export function helpText() {
   claude-rotator login [--id <id>] [--name <email>]
   claude-rotator login --id <id> --name <email> --json <token-json>
   claude-rotator use-current [--name <email>] [--only]
+  claude-rotator remove <account> [--keep-secret]
   claude-rotator import-current --id <id> --name <email>
   claude-rotator doctor
 `;
@@ -282,6 +286,27 @@ async function useCurrentCommand({ argv, write, deps }) {
   write(`Using live Claude Code login as ${name}\n`);
 }
 
+async function removeCommand({ argv, write, deps }) {
+  const accountRef = argv[1];
+  if (!accountRef) throw new Error('Usage: claude-rotator remove <account> [--keep-secret]');
+
+  const keepSecret = argv.includes('--keep-secret');
+  const config = deps.loadConfig ? await deps.loadConfig() : await loadOrCreateConfig();
+  const account = resolveAccount(config.accounts || [], accountRef);
+  config.accounts = (config.accounts || []).filter(item => item.id !== account.id);
+
+  if (deps.saveConfig) await deps.saveConfig(config);
+  else await saveConfig(config);
+
+  if (!keepSecret) {
+    if (deps.deleteSecret) await deps.deleteSecret(account.id);
+    else await createSecretStore().delete(account.id);
+  }
+
+  await notifyReload({ deps, write });
+  write(`Removed ${account.id} (${account.name || account.id})\n`);
+}
+
 async function saveImportedAccount({ id, name, accountUuid = null, secret }) {
   const config = await loadOrCreateConfig();
   const store = createSecretStore();
@@ -300,6 +325,90 @@ async function readProfileForLogin(secret, deps) {
   } catch {
     return null;
   }
+}
+
+async function doctorCommand({ write, deps }) {
+  const status = deps.readHealth ? await deps.readHealth() : await readHealth();
+  write(`server: ${status.ok ? 'ok' : 'error'}\n`);
+
+  const warnings = await inspectDoctorWarnings(deps);
+  if (warnings.length === 0) {
+    write('accounts: ok\n');
+  } else {
+    for (const warning of warnings) write(`warning: ${warning}\n`);
+  }
+
+  return status.ok ? 0 : 1;
+}
+
+async function inspectDoctorWarnings(deps = {}) {
+  const config = deps.loadConfig ? await deps.loadConfig() : await loadOrCreateConfig();
+  const accounts = config.accounts || [];
+  const warnings = duplicateAccountUuidWarnings(accounts);
+  const store = deps.secretStore || createSecretStore();
+  const readCurrent = deps.readCurrentCredentials || readCurrentClaudeCredentials;
+  const profileFetcher = deps.fetchProfile || fetchProfile;
+
+  for (const account of accounts) {
+    if (account.type === 'apikey') continue;
+
+    try {
+      const secret = account.id === 'current'
+        ? await readCurrent()
+        : await store.get(account.id);
+
+      if (!secret) {
+        warnings.push(`${account.id}: stored credential is missing`);
+        continue;
+      }
+      if (!secret.accessToken) {
+        warnings.push(`${account.id}: OAuth access token is missing`);
+        continue;
+      }
+
+      const profile = await profileFetcher(secret.accessToken);
+      if (profile?.email && account.name && profile.email !== account.name) {
+        warnings.push(`${account.id}: config name ${account.name} differs from live login ${profile.email}`);
+      }
+      if (profile?.accountUuid && account.accountUuid && profile.accountUuid !== account.accountUuid) {
+        warnings.push(`${account.id}: config accountUuid differs from live login`);
+      }
+    } catch (caught) {
+      warnings.push(`${account.id}: credential profile check failed: ${shortErrorMessage(caught)}`);
+    }
+  }
+
+  return warnings;
+}
+
+function duplicateAccountUuidWarnings(accounts) {
+  const byUuid = new Map();
+  for (const account of accounts) {
+    if (!account.accountUuid) continue;
+    const existing = byUuid.get(account.accountUuid) || [];
+    existing.push(account.id);
+    byUuid.set(account.accountUuid, existing);
+  }
+
+  return [...byUuid.values()]
+    .filter(ids => ids.length > 1)
+    .map(ids => `duplicate accountUuid for ${ids.join(', ')}`);
+}
+
+function resolveAccount(accounts, accountRef) {
+  const byId = accounts.find(account => account.id === accountRef);
+  if (byId) return byId;
+
+  const byName = accounts.filter(account => account.name === accountRef);
+  if (byName.length === 1) return byName[0];
+  if (byName.length > 1) {
+    throw new Error(`Account name matches multiple ids: ${byName.map(account => account.id).join(', ')}`);
+  }
+  throw new Error(`Unknown account: ${accountRef}`);
+}
+
+function shortErrorMessage(error) {
+  return String(error?.message || error || 'unknown error').replace(/\s+/g, ' ').slice(0, 240);
 }
 
 async function notifyReload({ deps, write }) {
