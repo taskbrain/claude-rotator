@@ -85,6 +85,7 @@ export function renderLaunchAgentPlist({ nodePath, cliPath, configPath }) {
 }
 
 export function renderSystemdUserService({ nodePath, cliPath, configPath }) {
+  const configDir = dirname(configPath);
   return `[Unit]
 Description=Claude Rotator proxy
 After=network-online.target
@@ -95,10 +96,42 @@ Environment=CLAUDE_ROTATOR_CONFIG=${systemdEscape(configPath)}
 ExecStart=${systemdEscape(nodePath)} ${systemdEscape(cliPath)} server
 Restart=always
 RestartSec=3
+StandardOutput=append:${systemdEscape(join(configDir, 'server.log'))}
+StandardError=append:${systemdEscape(join(configDir, 'server.err'))}
 
 [Install]
 WantedBy=default.target
 `;
+}
+
+export function renderServiceStartFailureMessage({
+  platform = process.platform,
+  uid = typeof process.getuid === 'function' ? process.getuid() : null,
+  error,
+} = {}) {
+  const reason = error?.message || String(error || 'unknown error');
+  if (platform === 'darwin') {
+    const domain = uid == null ? 'gui/$(id -u)' : `gui/${uid}`;
+    return [
+      `Service start failed: ${reason}`,
+      'Try:',
+      `  launchctl bootstrap ${domain} ~/Library/LaunchAgents/com.cirkit.claude-rotator.plist`,
+      `  launchctl kickstart -k ${domain}/com.cirkit.claude-rotator`,
+      `  launchctl print ${domain}/com.cirkit.claude-rotator`,
+    ].join('\n');
+  }
+
+  return [
+    `Service start failed: ${reason}`,
+    'Try:',
+    '  systemctl --user daemon-reload',
+    '  systemctl --user enable --now claude-rotator.service',
+    '  systemctl --user status claude-rotator.service',
+    '  journalctl --user -u claude-rotator.service -f',
+    'If this Ubuntu session has no user systemd bus:',
+    '  loginctl enable-linger $USER',
+    '  log out and back in, then rerun the systemctl --user commands above',
+  ].join('\n');
 }
 
 function timestampForFile(date) {

@@ -9,6 +9,7 @@ import {
   uninstallSettings,
   renderLaunchAgentPlist,
   renderSystemdUserService,
+  renderServiceStartFailureMessage,
 } from '../src/install.js';
 import { readJsonFile, writeJsonFile } from '../src/json-file.js';
 
@@ -89,5 +90,34 @@ describe('service file rendering', () => {
 
     assert.match(service, /ExecStart=\/usr\/bin\/node \/repo\/bin\/claude-rotator\.js server/);
     assert.match(service, /Environment=CLAUDE_ROTATOR_CONFIG=\/home\/alice\/.config\/claude-rotator\/config.json/);
+    assert.match(service, /StandardOutput=append:\/home\/alice\/.config\/claude-rotator\/server\.log/);
+    assert.match(service, /StandardError=append:\/home\/alice\/.config\/claude-rotator\/server\.err/);
+  });
+
+  it('renders Ubuntu recovery commands when systemd user service start fails', () => {
+    const message = renderServiceStartFailureMessage({
+      platform: 'linux',
+      error: new Error('Failed to connect to bus'),
+    });
+
+    assert.match(message, /Service start failed: Failed to connect to bus/);
+    assert.match(message, /systemctl --user daemon-reload/);
+    assert.match(message, /systemctl --user enable --now claude-rotator\.service/);
+    assert.match(message, /journalctl --user -u claude-rotator\.service -f/);
+    assert.match(message, /loginctl enable-linger \$USER/);
+    assert.doesNotMatch(message, /launchctl/);
+  });
+
+  it('renders macOS recovery commands when LaunchAgent start fails', () => {
+    const message = renderServiceStartFailureMessage({
+      platform: 'darwin',
+      uid: 501,
+      error: new Error('service already bootstrapped'),
+    });
+
+    assert.match(message, /Service start failed: service already bootstrapped/);
+    assert.match(message, /launchctl bootstrap gui\/501/);
+    assert.match(message, /launchctl kickstart -k gui\/501\/com\.cirkit\.claude-rotator/);
+    assert.doesNotMatch(message, /systemctl/);
   });
 });

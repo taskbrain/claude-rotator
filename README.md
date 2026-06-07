@@ -12,26 +12,85 @@ Claude Code の複数アカウントをローカル proxy 経由で切り替え�
 - macOS では Keychain、Linux では private permission のファイルに認証情報を保存する
 - `claude-rotator uninstall` で `~/.claude/settings.json` を元に戻す
 
-## インストール
+## 動作環境
+
+- Node.js 18 以上
+- Claude Code がインストール済み
+- macOS: LaunchAgent を使用
+- Ubuntu: systemd user service を使用
+
+認証情報は PC ごとのローカル保存です。別の Mac / Ubuntu PC で使う場合、その PC でも各アカウントの `claude auth login` と `claude-rotator login` を実行してください。
+
+## macOS用セットアップ
 
 このリポジトリ内で実行します。
 
 ```bash
 npm install -g .
 claude-rotator install
+claude-rotator doctor
 ```
 
 `install` は `~/.claude/settings.json` の `env.ANTHROPIC_BASE_URL` だけを更新し、変更前の状態を `~/.config/claude-rotator/install-state.json` に保存します。
 
-常駐サービスは以下に作られます。
+macOS では次の LaunchAgent が作られます。
 
-- macOS: `~/Library/LaunchAgents/com.cirkit.claude-rotator.plist`
-- Linux: `~/.config/systemd/user/claude-rotator.service`
+```text
+~/Library/LaunchAgents/com.cirkit.claude-rotator.plist
+```
 
-サービス起動に失敗する場合は、手動で server を起動できます。
+サービス操作:
 
 ```bash
-claude-rotator server
+launchctl print gui/$(id -u)/com.cirkit.claude-rotator
+launchctl kickstart -k gui/$(id -u)/com.cirkit.claude-rotator
+```
+
+ログ:
+
+```bash
+tail -f ~/.config/claude-rotator/server.log
+tail -f ~/.config/claude-rotator/server.err
+```
+
+## Ubuntu用セットアップ
+
+Ubuntu PC 上でこのリポジトリを clone し、そのディレクトリ内で実行します。
+
+```bash
+node --version
+npm install -g .
+claude-rotator install
+claude-rotator doctor
+```
+
+`node --version` は `v18` 以上が必要です。Ubuntu では次の systemd user service が作られます。
+
+```text
+~/.config/systemd/user/claude-rotator.service
+```
+
+サービス操作:
+
+```bash
+systemctl --user status claude-rotator.service
+systemctl --user restart claude-rotator.service
+journalctl --user -u claude-rotator.service -f
+```
+
+`claude-rotator install` が `systemctl --user` の起動に失敗した場合は、表示されたコマンドを実行してください。headless / SSH セッションで user systemd bus がない場合は、次が必要になることがあります。
+
+```bash
+loginctl enable-linger $USER
+systemctl --user daemon-reload
+systemctl --user enable --now claude-rotator.service
+```
+
+Ubuntu でも file log は次に出ます。
+
+```bash
+tail -f ~/.config/claude-rotator/server.log
+tail -f ~/.config/claude-rotator/server.err
 ```
 
 ## アカウント追加
@@ -52,26 +111,6 @@ claude-rotator login
 claude-rotator login --id account1 --name your-email-1@example.com
 ```
 
-既存の current import コマンドも残しています。
-
-```bash
-claude-rotator import-current --id account1 --name your-email-1@example.com
-```
-
-`login` / `import-current` は保存後に常駐 server へ reload を通知します。server が起動していない場合だけ、手動で再起動してください。
-
-macOS:
-
-```bash
-launchctl kickstart -k gui/$(id -u)/com.cirkit.claude-rotator
-```
-
-Linux:
-
-```bash
-systemctl --user restart claude-rotator.service
-```
-
 登録確認:
 
 ```bash
@@ -80,6 +119,13 @@ claude-rotator status
 ```
 
 `claude-rotator login --json ...` は、token JSON を直接渡す上級者向けコマンドです。通常運用では `claude-rotator login` を使ってください。
+
+認証情報の保存先:
+
+- macOS: Keychain
+- Ubuntu/Linux: `~/.local/share/claude-rotator/accounts/*.json`、ディレクトリ `0700`、ファイル `0600`
+
+`login` は保存後に常駐 server へ reload を通知します。server が起動していない場合だけ、OS 別のサービス再起動コマンドを実行してください。
 
 ## モニター
 
@@ -108,7 +154,7 @@ account1@example.com        active
 2026-06-07T03:43:23.000Z switched dev-taskbrain-co-jp -> current reason=temporary_upstream_error
 ```
 
-macOS の常駐 server ログは次で確認できます。
+常駐 server の file log は macOS / Ubuntu ともに次で確認できます。
 
 ```bash
 tail -f ~/.config/claude-rotator/server.log
@@ -133,7 +179,7 @@ retryable な上流 5xx / 529 / `x-should-retry` 付きレスポンス、また�
 ## 主なコマンド
 
 ```bash
-claude-rotator install
+claude-rotator install [--no-start] [--force]
 claude-rotator uninstall
 claude-rotator login
 claude-rotator import-current --id account1 --name your-email@example.com
@@ -198,7 +244,20 @@ claude-rotator install
 `install` updates only `env.ANTHROPIC_BASE_URL` in `~/.claude/settings.json`, records the previous value in `~/.config/claude-rotator/install-state.json`, and writes a service definition:
 
 - macOS: `~/Library/LaunchAgents/com.cirkit.claude-rotator.plist`
-- Linux: `~/.config/systemd/user/claude-rotator.service`
+- Ubuntu/Linux: `~/.config/systemd/user/claude-rotator.service`
+
+Ubuntu uses a systemd user service:
+
+```bash
+systemctl --user status claude-rotator.service
+journalctl --user -u claude-rotator.service -f
+```
+
+If `systemctl --user` is unavailable in a headless session, enable linger and log in again:
+
+```bash
+loginctl enable-linger $USER
+```
 
 ### Add Accounts
 
@@ -208,6 +267,8 @@ The easiest workflow is to reuse the currently logged-in Claude Code account:
 claude auth login
 claude-rotator login
 ```
+
+Credentials are machine-local. Run `claude auth login` and `claude-rotator login` on each macOS or Ubuntu machine that should use the rotator.
 
 You can still provide an explicit id/name:
 

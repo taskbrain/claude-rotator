@@ -15,6 +15,7 @@ import { fetchProfile } from './oauth.js';
 import {
   installSettings,
   renderLaunchAgentPlist,
+  renderServiceStartFailureMessage,
   renderSystemdUserService,
   removeInstallState,
   uninstallSettings,
@@ -104,7 +105,7 @@ export async function runCli(argv = [], deps = {}) {
 
 export function helpText() {
   return `Usage:
-  claude-rotator install
+  claude-rotator install [--no-start] [--force]
   claude-rotator uninstall [--purge-secrets] [--force]
   claude-rotator server
   claude-rotator status
@@ -160,8 +161,21 @@ async function installCommand({ argv, write }) {
     force,
   });
   await installServiceFile({ configPath });
-  if (!noStart) await startService().catch(() => {});
   write(`Installed claude-rotator at ${proxyBaseUrl(config)}\n`);
+  if (noStart) {
+    write('Service start skipped because --no-start was set.\n');
+    return;
+  }
+  try {
+    await startService();
+    write('Service started\n');
+  } catch (caught) {
+    write(`${renderServiceStartFailureMessage({
+      platform: process.platform,
+      uid: typeof process.getuid === 'function' ? process.getuid() : null,
+      error: caught,
+    })}\n`);
+  }
 }
 
 async function uninstallCommand({ argv, write }) {
