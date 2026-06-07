@@ -7,7 +7,7 @@ Claude Code の複数アカウントをローカル proxy 経由で切り替え�
 ## できること
 
 - 通常の `claude` コマンドを変えずに、裏側で `claude-rotator` proxy を使う
-- 5時間枠 / 7日枠の使用率を見て、閾値到達時に次アカウントへ切り替える
+- 5時間枠 / 7日枠の使用率を見て、100% 到達時に最も空いている既知のアカウントへ切り替える
 - `claude-rotator monitor` で各アカウントの使用率を一覧表示する
 - macOS では Keychain、Linux では private permission のファイルに認証情報を保存する
 - `claude-rotator uninstall` で `~/.claude/settings.json` を元に戻す
@@ -167,15 +167,15 @@ account1@example.com        active
 7d ███████░░░  76%  reset in 1d9h -> 06/06 19:00
 ```
 
-未使用のアカウントは、proxy が rate-limit header や usage data を取得するまで `unknown` と表示されます。
+未使用のアカウントは、proxy が rate-limit header や usage data を取得するまで `unknown` と表示されます。`unknown` のアカウントは空いている確認が取れていないため、自動切り替え先には使いません。
 
 ## ログと切り替え診断
 
 `status` / `monitor` の Events には、直近の proxy request が表示されます。
 
 ```text
-2026-06-07T03:43:23.000Z request dev-taskbrain-co-jp POST /v1/messages -> 500 1203ms outcome=upstream-retry req=req_xxx
-2026-06-07T03:43:23.000Z switched dev-taskbrain-co-jp -> current reason=temporary_upstream_error
+2026-06-07T03:43:23.000Z request dev-taskbrain-co-jp POST /v1/messages -> 429 1203ms outcome=quota-retry req=req_xxx
+2026-06-07T03:43:23.000Z switched dev-taskbrain-co-jp -> current reason=quota-threshold
 ```
 
 常駐 server の file log は macOS / Ubuntu ともに次で確認できます。
@@ -187,7 +187,9 @@ tail -f ~/.config/claude-rotator/server.err
 
 ログに出るのは `account`、`method`、`path`、`status`、`durationMs`、`outcome`、`requestId`、timeout/network error 時の `errorType` だけです。token / Authorization header / API key / request body / response body は出しません。
 
-retryable な上流 5xx / 529 / `x-should-retry` 付きレスポンス、または上流アイドルタイムアウトが起きた場合、まだ Claude Code へレスポンスを書き始めていなければ次のアカウントへ自動で再送します。代替アカウントがない場合は、上流の error body を可能な限りそのまま返します。
+自動切り替えは、現在のアカウントの 5時間枠または 7日枠が 100% に達した場合だけ行います。切り替え候補は 5時間枠 / 7日枠の既知使用率から `max(5h, 7d)` が最も低いアカウントを選びます。空き状況が分かっている候補がない場合は切り替えず、現在のアカウントの上流レスポンスをそのまま返します。
+
+retryable な上流 5xx / 529 / `x-should-retry` 付きレスポンス、または上流アイドルタイムアウトが起きた場合も、アカウント切り替えは行いません。上流の error body または proxy の timeout error を可能な限りそのまま返します。
 
 `claude-rotator doctor` は server の疎通に加えて、次の問題を secret を出さずに警告します。
 
@@ -200,8 +202,7 @@ retryable な上流 5xx / 529 / `x-should-retry` 付きレスポンス、また�
 ```json
 {
   "proxy": {
-    "upstreamIdleTimeoutMs": 180000,
-    "retryableUpstreamHoldSeconds": 30
+    "upstreamIdleTimeoutMs": 180000
   }
 }
 ```
@@ -316,7 +317,7 @@ claude-rotator monitor
 
 ### Diagnostics
 
-Recent proxy requests are shown in `claude-rotator status` / `claude-rotator monitor`, and the service writes metadata-only request logs to `~/.config/claude-rotator/server.log`. Retryable upstream 5xx / 529 / `x-should-retry` responses and upstream idle timeouts rotate to the next account before a response is sent to Claude Code.
+Recent proxy requests are shown in `claude-rotator status` / `claude-rotator monitor`, and the service writes metadata-only request logs to `~/.config/claude-rotator/server.log`. Automatic rotation only happens when the current account reaches 100% usage in the 5h or 7d window and a known available account exists.
 
 ### Restore
 

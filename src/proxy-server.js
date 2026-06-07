@@ -1,6 +1,7 @@
 import http from 'node:http';
 import https from 'node:https';
 
+import { isUnifiedQuotaExhaustion } from './account-manager.js';
 import { readCurrentClaudeCredentials } from './claude-credentials.js';
 import { isTokenExpiringSoon, refreshAccessToken } from './oauth.js';
 
@@ -17,7 +18,6 @@ const HOP_HEADERS = new Set([
 ]);
 
 const DEFAULT_UPSTREAM_IDLE_TIMEOUT_MS = 180000;
-const DEFAULT_RETRYABLE_UPSTREAM_HOLD_SECONDS = 30;
 
 export function createProxyServer({
   accountManager,
@@ -32,9 +32,6 @@ export function createProxyServer({
   const upstreamIdleTimeoutMs = config.proxy?.upstreamIdleTimeoutMs
     ?? config.upstreamIdleTimeoutMs
     ?? DEFAULT_UPSTREAM_IDLE_TIMEOUT_MS;
-  const retryableUpstreamHoldSeconds = config.proxy?.retryableUpstreamHoldSeconds
-    ?? config.retryableUpstreamHoldSeconds
-    ?? DEFAULT_RETRYABLE_UPSTREAM_HOLD_SECONDS;
 
   return http.createServer(async (req, res) => {
     try {
@@ -79,7 +76,6 @@ export function createProxyServer({
         currentCredentialReader,
         logger,
         upstreamIdleTimeoutMs,
-        retryableUpstreamHoldSeconds,
       });
     } catch (error) {
       if (!res.headersSent) {
@@ -105,7 +101,6 @@ async function forwardWithRotation({
   currentCredentialReader,
   logger,
   upstreamIdleTimeoutMs,
-  retryableUpstreamHoldSeconds,
 }) {
   const maxAttempts = Math.max(1, accountManager.accounts.length);
   let lastRetryableResponse = null;
@@ -113,6 +108,10 @@ async function forwardWithRotation({
   for (let attempt = 0; attempt < maxAttempts; attempt++) {
     const account = accountManager.getActiveAccount();
     if (!account) {
+      if (lastRetryableResponse) {
+        sendBufferedResponse(res, lastRetryableResponse);
+        return;
+      }
       if (await forwardCurrentUnavailableAccount({
         req,
         res,
@@ -124,7 +123,6 @@ async function forwardWithRotation({
         currentCredentialReader,
         logger,
         upstreamIdleTimeoutMs,
-        retryableUpstreamHoldSeconds,
       })) return;
       sendUnavailableAccounts(res);
       return;
@@ -159,7 +157,6 @@ async function forwardWithRotation({
       accountManager,
       logger,
       upstreamIdleTimeoutMs,
-      retryableUpstreamHoldSeconds,
     });
     if (result.retryAfterRefresh) {
       let refreshedSecret;
@@ -184,7 +181,6 @@ async function forwardWithRotation({
         accountManager,
         logger,
         upstreamIdleTimeoutMs,
-        retryableUpstreamHoldSeconds,
       });
       if (retryResult.retryAfterRefresh) {
         accountManager.markError(account.id, 'authentication_error', 'OAuth token rejected');
@@ -219,7 +215,6 @@ async function forwardWithRotation({
       currentCredentialReader,
       logger,
       upstreamIdleTimeoutMs,
-      retryableUpstreamHoldSeconds,
     })) return;
     sendUnavailableAccounts(res);
   }
@@ -236,7 +231,6 @@ async function forwardCurrentUnavailableAccount({
   currentCredentialReader,
   logger,
   upstreamIdleTimeoutMs,
-  retryableUpstreamHoldSeconds,
 }) {
   const account = accountManager.getFallbackAccount();
   if (!account) return false;
@@ -267,7 +261,6 @@ async function forwardCurrentUnavailableAccount({
     passthroughErrors: true,
     logger,
     upstreamIdleTimeoutMs,
-    retryableUpstreamHoldSeconds,
   });
   return true;
 }
@@ -311,7 +304,6 @@ async function forwardOnce({
   passthroughErrors = false,
   logger = null,
   upstreamIdleTimeoutMs,
-  retryableUpstreamHoldSeconds,
 }) {
   const target = new URL(req.url, upstream);
   const headers = buildUpstreamHeaders(req.headers, account, secret);
@@ -330,30 +322,19 @@ async function forwardOnce({
         accountManager.updateQuota(account.id, upstreamRes.headers);
 
         if (!passthroughErrors && upstreamRes.statusCode === 429) {
-          outcome = 'rate-limit-retry';
           const unavailableReason = accountManager.unavailableReason(account);
-          if (unavailableReason?.type !== 'quota_exhausted') {
+          if (isUnifiedQuotaExhaustion(unavailableReason)) {
+            outcome = 'quota-retry';
+            return false;
+          }
+          outcome = 'rate-limit-passthrough';
+          if (!unavailableReason) {
             accountManager.markRateLimited(account.id, retryAfterSeconds(upstreamRes.headers, 60));
           }
-          return false;
         }
 
         if (!passthroughErrors && upstreamRes.statusCode === 401 && canRefreshSecret(account, secret)) {
           outcome = 'auth-refresh-retry';
-          return false;
-        }
-
-        if (!passthroughErrors && isRetryableServerError(upstreamRes.statusCode, upstreamRes.headers)) {
-          outcome = 'upstream-retry';
-          accountManager.markTemporaryUnavailable(
-            account.id,
-            retryAfterSeconds(upstreamRes.headers, retryableUpstreamHoldSeconds),
-            {
-              type: 'temporary_upstream_error',
-              statusCode: upstreamRes.statusCode,
-              message: 'Retryable upstream server error',
-            },
-          );
           return false;
         }
 
@@ -382,21 +363,8 @@ async function forwardOnce({
     });
 
     if (!passthroughErrors && !res.headersSent) {
-      const reasonType = isUpstreamTimeout(error)
-        ? 'temporary_upstream_timeout'
-        : 'temporary_upstream_error';
-      accountManager.markTemporaryUnavailable(
-        account.id,
-        retryableUpstreamHoldSeconds,
-        {
-          type: reasonType,
-          message: error.message,
-        },
-      );
-      return {
-        retryNextAccount: true,
-        syntheticResponse: syntheticUpstreamErrorResponse(error),
-      };
+      sendBufferedResponse(res, syntheticUpstreamErrorResponse(error));
+      return { retryNextAccount: false };
     }
     throw error;
   }
@@ -414,16 +382,12 @@ async function forwardOnce({
     durationMs: Date.now() - startedAt,
   });
 
-  if (!passthroughErrors && upstreamResponse.statusCode === 429) {
+  if (!passthroughErrors && outcome === 'quota-retry') {
     return { retryNextAccount: true, passthroughResponse: upstreamResponse };
   }
 
   if (!passthroughErrors && upstreamResponse.statusCode === 401 && canRefreshSecret(account, secret)) {
     return { retryAfterRefresh: true };
-  }
-
-  if (!passthroughErrors && outcome === 'upstream-retry') {
-    return { retryNextAccount: true, passthroughResponse: upstreamResponse };
   }
 
   if (upstreamResponse.body.length > 0) {
@@ -502,11 +466,6 @@ function requestUpstream({ target, method, headers, body, idleTimeoutMs, onRespo
   });
 }
 
-function isRetryableServerError(statusCode, headers = {}) {
-  if (truthyHeader(headers['x-should-retry'])) return true;
-  return [500, 502, 503, 504, 529].includes(statusCode);
-}
-
 function retryAfterSeconds(headers = {}, fallbackSeconds) {
   const parsed = Number.parseInt(headerValue(headers['retry-after']), 10);
   if (Number.isFinite(parsed) && parsed > 0) return parsed;
@@ -516,11 +475,6 @@ function retryAfterSeconds(headers = {}, fallbackSeconds) {
 function headerValue(value) {
   if (Array.isArray(value)) return value[0];
   return value == null ? null : String(value);
-}
-
-function truthyHeader(value) {
-  const normalized = headerValue(value)?.toLowerCase();
-  return normalized === 'true' || normalized === '1' || normalized === 'yes';
 }
 
 function isUpstreamTimeout(error) {

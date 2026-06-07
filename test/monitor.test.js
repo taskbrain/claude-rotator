@@ -34,7 +34,7 @@ function sampleStatus() {
   return {
     currentAccount: 'acct_2',
     currentAccountName: 'b@example.com',
-    switchThreshold: 0.99,
+    switchThreshold: 1,
     accounts: [
       {
         id: 'acct_1',

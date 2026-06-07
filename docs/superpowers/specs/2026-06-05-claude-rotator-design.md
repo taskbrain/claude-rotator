@@ -8,7 +8,7 @@ Create a standalone `claude-rotator` project under `/Users/cirkit/develop/projec
 
 `claude-rotator server` listens on `127.0.0.1:<port>` and forwards Anthropic API requests upstream. `claude-rotator install` updates the user-level Claude Code settings at `~/.claude/settings.json` by setting `env.ANTHROPIC_BASE_URL` to the local proxy URL. Once installed, the user keeps launching Claude Code with `claude`; all sessions using that user setting route through the proxy.
 
-The proxy owns account selection. Each upstream request is sent with the active account's OAuth bearer token. Response headers such as `anthropic-ratelimit-unified-5h-utilization`, `anthropic-ratelimit-unified-7d-utilization`, and reset headers update per-account quota state. When 5h or 7d utilization reaches the configured threshold, default `0.99`, the account is marked unavailable until the relevant reset time and the next available account is selected.
+The proxy owns account selection. Each upstream request is sent with the active account's OAuth bearer token. Response headers such as `anthropic-ratelimit-unified-5h-utilization`, `anthropic-ratelimit-unified-7d-utilization`, and reset headers update per-account quota state. Automatic rotation only happens when the current account's 5h or 7d utilization reaches the configured threshold, default `1.0`. Before switching, the proxy filters for accounts whose quota state is known and still below threshold, then selects the emptiest account by the lowest `max(5h, 7d)` utilization. If no known available target exists, the current account remains selected and the upstream response is passed through.
 
 ## Install And Uninstall
 

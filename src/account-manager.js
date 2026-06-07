@@ -1,7 +1,7 @@
 import { emptyQuota, parseRateLimitHeaders } from './quota.js';
 
 export class AccountManager {
-  constructor({ accounts = [], switchThreshold = 0.99, now = () => Date.now() } = {}) {
+  constructor({ accounts = [], switchThreshold = 1, now = () => Date.now() } = {}) {
     this.now = now;
     this.switchThreshold = switchThreshold;
     this.events = [];
@@ -16,7 +16,10 @@ export class AccountManager {
       return current;
     }
 
-    const next = this.selectNextAvailable();
+    const reason = this.unavailableReason(current);
+    if (!isUnifiedQuotaExhaustion(reason)) return null;
+
+    const next = this.selectBestAvailableSwitchTarget();
     if (next) {
       next.status = 'active';
       return next;
@@ -30,11 +33,11 @@ export class AccountManager {
 
   getFallbackAccount() {
     const current = this.getCurrentAccount();
-    if (current && this.unavailableReason(current)?.type !== 'account_error' && current.status !== 'error') {
+    if (!current) return null;
+    if (current.status !== 'error') {
       return current;
     }
-    return this.accounts.find(account => this.unavailableReason(account)?.type === 'quota_exhausted')
-      || current;
+    return this.accounts.find(account => isUnifiedQuotaExhaustion(this.unavailableReason(account))) || null;
   }
 
   switchTo(accountId) {
@@ -179,27 +182,42 @@ export class AccountManager {
     };
   }
 
-  selectNextAvailable() {
-    const start = this.currentIndex;
-    for (let offset = 1; offset <= this.accounts.length; offset++) {
-      const index = (start + offset) % this.accounts.length;
-      const candidate = this.accounts[index];
-      if (this.isAvailable(candidate)) {
-        const previous = this.accounts[this.currentIndex];
-        const reason = this.autoSwitchReason(previous);
-        if (previous) previous.status = this.displayStatus(previous);
-        this.currentIndex = index;
-        this.events.unshift({
-          at: new Date(this.now()).toISOString(),
-          type: 'auto-switch',
-          from: previous?.id || null,
-          to: candidate.id,
-          reason,
-        });
-        return candidate;
-      }
-    }
-    return null;
+  selectBestAvailableSwitchTarget() {
+    const candidates = this.accounts
+      .map((account, index) => ({ account, index, score: this.switchTargetScore(account) }))
+      .filter(candidate => candidate.index !== this.currentIndex && candidate.score);
+
+    candidates.sort((left, right) => compareSwitchTargetScores(left, right));
+    const selected = candidates[0];
+    if (!selected) return null;
+
+    const previous = this.accounts[this.currentIndex];
+    const reason = this.autoSwitchReason(previous);
+    if (previous) previous.status = this.displayStatus(previous);
+    this.currentIndex = selected.index;
+    this.events.unshift({
+      at: new Date(this.now()).toISOString(),
+      type: 'auto-switch',
+      from: previous?.id || null,
+      to: selected.account.id,
+      reason,
+      targetScore: selected.score,
+    });
+    return selected.account;
+  }
+
+  switchTargetScore(account) {
+    if (!this.isAvailable(account)) return null;
+    const quota = account.quota || {};
+    const utilizations = [quota.unified5h, quota.unified7d]
+      .filter(value => typeof value === 'number' && Number.isFinite(value));
+    if (utilizations.length === 0) return null;
+    return {
+      maxUtilization: Math.max(...utilizations),
+      totalUtilization: utilizations.reduce((total, value) => total + value, 0),
+      knownWindows: utilizations.length,
+      priority: account.priority ?? Number.MAX_SAFE_INTEGER,
+    };
   }
 
   isAvailable(account) {
@@ -275,7 +293,7 @@ export class AccountManager {
   autoSwitchReason(account) {
     const reason = this.unavailableReason(account);
     if (!reason) return 'account-unavailable';
-    if (reason.type === 'quota_exhausted') return 'quota-threshold';
+    if (isUnifiedQuotaExhaustion(reason)) return 'quota-threshold';
     return reason.type;
   }
 
@@ -355,6 +373,26 @@ export function quotaUnavailableReason(quota, threshold) {
     }
   }
   return null;
+}
+
+export function isUnifiedQuotaExhaustion(reason) {
+  return reason?.type === 'quota_exhausted' && ['5h', '7d'].includes(reason.window);
+}
+
+function compareSwitchTargetScores(left, right) {
+  if (left.score.maxUtilization !== right.score.maxUtilization) {
+    return left.score.maxUtilization - right.score.maxUtilization;
+  }
+  if (left.score.totalUtilization !== right.score.totalUtilization) {
+    return left.score.totalUtilization - right.score.totalUtilization;
+  }
+  if (left.score.knownWindows !== right.score.knownWindows) {
+    return right.score.knownWindows - left.score.knownWindows;
+  }
+  if (left.score.priority !== right.score.priority) {
+    return left.score.priority - right.score.priority;
+  }
+  return left.index - right.index;
 }
 
 export function isNearQuota(quota, threshold) {

@@ -23,22 +23,51 @@ describe('parseRateLimitHeaders', () => {
 });
 
 describe('AccountManager', () => {
-  it('switches away from an account whose 5h quota reaches threshold', () => {
+  it('switches to the emptiest known account when 5h quota reaches threshold', () => {
+    const manager = new AccountManager({
+      accounts: [
+        { id: 'acct_1', name: 'a@example.com', type: 'oauth' },
+        { id: 'acct_2', name: 'b@example.com', type: 'oauth' },
+        { id: 'acct_3', name: 'c@example.com', type: 'oauth' },
+      ],
+      switchThreshold: 1,
+      now: () => 1000,
+    });
+    manager.updateQuota('acct_2', {
+      'anthropic-ratelimit-unified-5h-utilization': '0.72',
+      'anthropic-ratelimit-unified-7d-utilization': '0.61',
+    });
+    manager.updateQuota('acct_3', {
+      'anthropic-ratelimit-unified-5h-utilization': '0.23',
+      'anthropic-ratelimit-unified-7d-utilization': '0.34',
+    });
+
+    manager.updateQuota('acct_1', {
+      'anthropic-ratelimit-unified-5h-utilization': '1',
+      'anthropic-ratelimit-unified-5h-reset': '10',
+    });
+
+    assert.equal(manager.getActiveAccount().id, 'acct_3');
+  });
+
+  it('does not switch when quota is exhausted but no known available target exists', () => {
     const manager = new AccountManager({
       accounts: [
         { id: 'acct_1', name: 'a@example.com', type: 'oauth' },
         { id: 'acct_2', name: 'b@example.com', type: 'oauth' },
       ],
-      switchThreshold: 0.99,
+      switchThreshold: 1,
       now: () => 1000,
     });
 
     manager.updateQuota('acct_1', {
-      'anthropic-ratelimit-unified-5h-utilization': '0.991',
-      'anthropic-ratelimit-unified-5h-reset': '10',
+      'anthropic-ratelimit-unified-7d-utilization': '1',
+      'anthropic-ratelimit-unified-7d-reset': '10',
     });
 
-    assert.equal(manager.getActiveAccount().id, 'acct_2');
+    assert.equal(manager.getActiveAccount(), null);
+    assert.equal(manager.getCurrentAccount().id, 'acct_1');
+    assert.equal(manager.getFallbackAccount().id, 'acct_1');
   });
 
   it('makes quota-limited accounts available after reset time passes', () => {
@@ -48,8 +77,12 @@ describe('AccountManager', () => {
         { id: 'acct_1', name: 'a@example.com', type: 'oauth' },
         { id: 'acct_2', name: 'b@example.com', type: 'oauth' },
       ],
-      switchThreshold: 0.99,
+      switchThreshold: 1,
       now: () => now,
+    });
+    manager.updateQuota('acct_2', {
+      'anthropic-ratelimit-unified-5h-utilization': '0.5',
+      'anthropic-ratelimit-unified-7d-utilization': '0.5',
     });
 
     manager.updateQuota('acct_1', {
@@ -82,7 +115,7 @@ describe('AccountManager', () => {
     assert.equal(JSON.stringify(status).includes('secret'), false);
   });
 
-  it('marks retry-after throttled accounts unavailable', () => {
+  it('does not switch accounts for retry-after throttling', () => {
     let now = 1000;
     const manager = new AccountManager({
       accounts: [
@@ -94,7 +127,9 @@ describe('AccountManager', () => {
 
     manager.markRateLimited('acct_1', 10);
 
-    assert.equal(manager.getActiveAccount().id, 'acct_2');
+    assert.equal(manager.getActiveAccount(), null);
+    assert.equal(manager.getCurrentAccount().id, 'acct_1');
+    assert.equal(manager.getFallbackAccount().id, 'acct_1');
     now = 12000;
     manager.switchTo('acct_1');
     assert.equal(manager.getActiveAccount().id, 'acct_1');
@@ -160,7 +195,7 @@ describe('AccountManager', () => {
         { id: 'acct_2', name: 'b@example.com', type: 'oauth' },
         { id: 'acct_3', name: 'c@example.com', type: 'oauth' },
       ],
-      switchThreshold: 0.99,
+      switchThreshold: 1,
       now: () => 1000,
     });
 
@@ -192,7 +227,7 @@ describe('AccountManager', () => {
   it('records quota exhaustion events once per quota window', () => {
     const manager = new AccountManager({
       accounts: [{ id: 'acct_1', name: 'a@example.com', type: 'oauth' }],
-      switchThreshold: 0.99,
+      switchThreshold: 1,
       now: () => 1000,
     });
 
@@ -217,7 +252,7 @@ describe('AccountManager', () => {
   it('reports quota exhaustion ahead of retry-after throttling', () => {
     const manager = new AccountManager({
       accounts: [{ id: 'acct_1', name: 'a@example.com', type: 'oauth' }],
-      switchThreshold: 0.99,
+      switchThreshold: 1,
       now: () => 1000,
     });
 

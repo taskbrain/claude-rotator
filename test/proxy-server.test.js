@@ -253,25 +253,82 @@ describe('createProxyServer', () => {
     });
   });
 
-  it('switches to the next account when upstream returns a retryable server error', async t => {
+  it('switches to the emptiest known account when the current account reaches quota', async t => {
     const upstreamSeen = [];
     const upstream = await listen(http.createServer(async (req, res) => {
       upstreamSeen.push(req.headers.authorization);
       if (req.headers.authorization === 'Bearer access-token-1') {
-        res.writeHead(500, {
+        res.writeHead(429, {
           'Content-Type': 'application/json',
-          'request-id': 'req_retryable_500',
-          'x-should-retry': 'true',
+          'request-id': 'req_quota_1',
+          'anthropic-ratelimit-unified-5h-utilization': '1',
+          'anthropic-ratelimit-unified-5h-reset': '10',
         });
         res.end(JSON.stringify({
           type: 'error',
-          error: { type: 'api_error', message: 'temporary upstream failure' },
+          error: { type: 'rate_limit_error', message: '5h quota exhausted' },
         }));
         return;
       }
 
-      res.writeHead(200, { 'Content-Type': 'application/json', 'request-id': 'req_ok_2' });
+      res.writeHead(200, { 'Content-Type': 'application/json', 'request-id': 'req_ok_3' });
       res.end(JSON.stringify({ ok: true }));
+    }));
+
+    const secretStore = new MemorySecretStore();
+    await secretStore.set('acct_1', { accessToken: 'access-token-1' });
+    await secretStore.set('acct_2', { accessToken: 'access-token-2' });
+    await secretStore.set('acct_3', { accessToken: 'access-token-3' });
+    const accountManager = new AccountManager({
+      accounts: [
+        { id: 'acct_1', name: 'a@example.com', type: 'oauth' },
+        { id: 'acct_2', name: 'b@example.com', type: 'oauth' },
+        { id: 'acct_3', name: 'c@example.com', type: 'oauth' },
+      ],
+      switchThreshold: 1,
+      now: () => 1000,
+    });
+    accountManager.updateQuota('acct_2', {
+      'anthropic-ratelimit-unified-5h-utilization': '0.9',
+      'anthropic-ratelimit-unified-7d-utilization': '0.4',
+    });
+    accountManager.updateQuota('acct_3', {
+      'anthropic-ratelimit-unified-5h-utilization': '0.2',
+      'anthropic-ratelimit-unified-7d-utilization': '0.3',
+    });
+    const proxy = await listen(createProxyServer({
+      accountManager,
+      secretStore,
+      config: { upstream: upstream.url },
+    }));
+    t.after(async () => {
+      await close(proxy.server);
+      await close(upstream.server);
+    });
+
+    const response = await requestJson(`${proxy.url}/v1/messages`, {
+      method: 'POST',
+      body: JSON.stringify({ model: 'sonnet' }),
+    });
+
+    assert.equal(response.status, 200);
+    assert.deepEqual(upstreamSeen, ['Bearer access-token-1', 'Bearer access-token-3']);
+    assert.equal(accountManager.getStatus().currentAccount, 'acct_3');
+  });
+
+  it('passes through retryable server errors without switching accounts', async t => {
+    const upstreamSeen = [];
+    const upstream = await listen(http.createServer(async (req, res) => {
+      upstreamSeen.push(req.headers.authorization);
+      res.writeHead(500, {
+        'Content-Type': 'application/json',
+        'request-id': 'req_retryable_500',
+        'x-should-retry': 'true',
+      });
+      res.end(JSON.stringify({
+        type: 'error',
+        error: { type: 'api_error', message: 'temporary upstream failure' },
+      }));
     }));
 
     const secretStore = new MemorySecretStore();
@@ -299,10 +356,10 @@ describe('createProxyServer', () => {
       body: JSON.stringify({ model: 'sonnet' }),
     });
 
-    assert.equal(response.status, 200);
-    assert.deepEqual(upstreamSeen, ['Bearer access-token-1', 'Bearer access-token-2']);
-    assert.equal(accountManager.getStatus().currentAccount, 'acct_2');
-    assert.equal(accountManager.getStatus().accounts[0].unavailableReason.type, 'temporary_upstream_error');
+    assert.equal(response.status, 500);
+    assert.deepEqual(upstreamSeen, ['Bearer access-token-1']);
+    assert.equal(accountManager.getStatus().currentAccount, 'acct_1');
+    assert.match(response.body.error.message, /temporary upstream failure/);
   });
 
   it('passes through a retryable server error when no alternate account is available', async t => {
@@ -346,20 +403,14 @@ describe('createProxyServer', () => {
     assert.notEqual(response.body.error.message, 'All configured accounts are unavailable.');
   });
 
-  it('switches to the next account when an upstream request idles past the configured timeout', async t => {
+  it('returns an upstream timeout without switching accounts', async t => {
     const upstreamSeen = [];
     const upstream = await listen(http.createServer(async (req, res) => {
       upstreamSeen.push(req.headers.authorization);
-      if (req.headers.authorization === 'Bearer access-token-1') {
-        setTimeout(() => {
-          res.writeHead(200, { 'Content-Type': 'application/json' });
-          res.end(JSON.stringify({ tooLate: true }));
-        }, 250);
-        return;
-      }
-
-      res.writeHead(200, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify({ ok: true }));
+      setTimeout(() => {
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ tooLate: true }));
+      }, 250);
     }));
 
     const secretStore = new MemorySecretStore();
@@ -391,10 +442,10 @@ describe('createProxyServer', () => {
       timeoutMs: 500,
     });
 
-    assert.equal(response.status, 200);
-    assert.deepEqual(upstreamSeen, ['Bearer access-token-1', 'Bearer access-token-2']);
-    assert.equal(accountManager.getStatus().currentAccount, 'acct_2');
-    assert.equal(accountManager.getStatus().accounts[0].unavailableReason.type, 'temporary_upstream_timeout');
+    assert.equal(response.status, 504);
+    assert.deepEqual(upstreamSeen, ['Bearer access-token-1']);
+    assert.equal(accountManager.getStatus().currentAccount, 'acct_1');
+    assert.equal(response.body.error.type, 'upstream_timeout');
   });
 
   it('does not rotate after a streaming response has already started', async t => {
@@ -442,7 +493,7 @@ describe('createProxyServer', () => {
     assert.equal(accountManager.getStatus().currentAccount, 'acct_1');
   });
 
-  it('skips to the next account when refreshing an expired token fails', async t => {
+  it('does not switch accounts when refreshing an expired token fails', async t => {
     const upstreamSeen = [];
     const upstream = await listen(http.createServer(async (req, res) => {
       upstreamSeen.push(req.headers.authorization);
@@ -486,9 +537,10 @@ describe('createProxyServer', () => {
       body: JSON.stringify({ model: 'sonnet' }),
     });
 
-    assert.equal(response.status, 200);
-    assert.deepEqual(upstreamSeen, ['Bearer access-token-2']);
-    assert.equal(accountManager.getStatus().currentAccount, 'acct_2');
+    assert.equal(response.status, 429);
+    assert.deepEqual(upstreamSeen, []);
+    assert.equal(accountManager.getStatus().currentAccount, 'acct_1');
+    assert.equal(response.body.error.message, 'All configured accounts are unavailable.');
   });
 
   it('passes through the upstream usage-limit response when the only account is exhausted', async t => {

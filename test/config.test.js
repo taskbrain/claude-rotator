@@ -41,7 +41,7 @@ describe('config defaults', () => {
     const config = createDefaultConfig();
 
     assert.equal(config.proxy.host, '127.0.0.1');
-    assert.equal(config.switchThreshold, 0.99);
+    assert.equal(config.switchThreshold, 1);
     assert.deepEqual(config.accounts, []);
     assert.equal(config.usagePolling.intervalMs, 300000);
   });

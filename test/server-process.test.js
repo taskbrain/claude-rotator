@@ -15,7 +15,7 @@ it('keeps the server process alive after listening', async () => {
   await writeJsonFile(configPath, {
     proxy: { host: '127.0.0.1', port },
     upstream: 'https://api.anthropic.com',
-    switchThreshold: 0.99,
+    switchThreshold: 1,
     usagePolling: { enabled: false, intervalMs: 300000 },
     accounts: [],
   });
