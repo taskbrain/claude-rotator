@@ -338,8 +338,13 @@ async function forwardOnce({
           return false;
         }
 
-        if (!passthroughErrors && upstreamRes.statusCode === 401 && canRefreshSecret(account, secret)) {
-          outcome = 'auth-refresh-retry';
+        if (!passthroughErrors && upstreamRes.statusCode === 401) {
+          if (canRefreshSecret(account, secret)) {
+            outcome = 'auth-refresh-retry';
+          } else {
+            outcome = 'auth-account-retry';
+            accountManager.markError(account.id, 'authentication_error', 'OAuth token rejected');
+          }
           return false;
         }
 
@@ -418,8 +423,9 @@ async function forwardOnce({
     return { retryNextAccount: true, passthroughResponse: upstreamResponse };
   }
 
-  if (!passthroughErrors && upstreamResponse.statusCode === 401 && canRefreshSecret(account, secret)) {
-    return { retryAfterRefresh: true };
+  if (!passthroughErrors && upstreamResponse.statusCode === 401) {
+    if (canRefreshSecret(account, secret)) return { retryAfterRefresh: true };
+    return { retryNextAccount: true, passthroughResponse: upstreamResponse };
   }
 
   if (!passthroughErrors && outcome === 'upstream-retry') {

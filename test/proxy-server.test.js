@@ -253,6 +253,62 @@ describe('createProxyServer', () => {
     });
   });
 
+  it('switches to the next account when a non-refreshable OAuth credential is rejected', async t => {
+    const upstreamSeen = [];
+    const upstream = await listen(http.createServer(async (req, res) => {
+      upstreamSeen.push(req.headers.authorization);
+      if (req.headers.authorization === 'Bearer live-current-token') {
+        res.writeHead(401, { 'Content-Type': 'application/json', 'request-id': 'req_current_401' });
+        res.end(JSON.stringify({
+          type: 'error',
+          error: { type: 'authentication_error', message: 'Invalid authentication credentials' },
+        }));
+        return;
+      }
+
+      res.writeHead(200, { 'Content-Type': 'application/json', 'request-id': 'req_next_ok' });
+      res.end(JSON.stringify({ ok: true }));
+    }));
+
+    const secretStore = new MemorySecretStore();
+    await secretStore.set('acct_2', {
+      accessToken: 'access-token-2',
+      refreshToken: 'refresh-token-2',
+      expiresAt: Date.now() + 60 * 60 * 1000,
+    });
+    const accountManager = new AccountManager({
+      accounts: [
+        { id: 'current', name: 'current', type: 'oauth' },
+        { id: 'acct_2', name: 'b@example.com', type: 'oauth' },
+      ],
+      now: () => 1000,
+    });
+    const proxy = await listen(createProxyServer({
+      accountManager,
+      secretStore,
+      config: { upstream: upstream.url },
+      currentCredentialReader: async () => ({
+        accessToken: 'live-current-token',
+        refreshToken: 'live-current-refresh',
+        expiresAt: Date.now() + 60 * 60 * 1000,
+      }),
+    }));
+    t.after(async () => {
+      await close(proxy.server);
+      await close(upstream.server);
+    });
+
+    const response = await requestJson(`${proxy.url}/api/oauth/profile`);
+
+    assert.equal(response.status, 200);
+    assert.deepEqual(upstreamSeen, ['Bearer live-current-token', 'Bearer access-token-2']);
+    assert.equal(accountManager.getStatus().currentAccount, 'acct_2');
+    assert.deepEqual(accountManager.getStatus().accounts[0].unavailableReason, {
+      type: 'authentication_error',
+      message: 'OAuth token rejected',
+    });
+  });
+
   it('switches to the next account when upstream returns a retryable server error', async t => {
     const upstreamSeen = [];
     const upstream = await listen(http.createServer(async (req, res) => {
