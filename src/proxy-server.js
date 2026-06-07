@@ -16,6 +16,9 @@ const HOP_HEADERS = new Set([
   'upgrade',
 ]);
 
+const DEFAULT_UPSTREAM_IDLE_TIMEOUT_MS = 180000;
+const DEFAULT_RETRYABLE_UPSTREAM_HOLD_SECONDS = 30;
+
 export function createProxyServer({
   accountManager,
   secretStore,
@@ -23,8 +26,15 @@ export function createProxyServer({
   reloadAccounts = null,
   tokenRefresher = refreshAccessToken,
   currentCredentialReader = readCurrentClaudeCredentials,
+  logger = null,
 }) {
   const upstream = config.upstream || 'https://api.anthropic.com';
+  const upstreamIdleTimeoutMs = config.proxy?.upstreamIdleTimeoutMs
+    ?? config.upstreamIdleTimeoutMs
+    ?? DEFAULT_UPSTREAM_IDLE_TIMEOUT_MS;
+  const retryableUpstreamHoldSeconds = config.proxy?.retryableUpstreamHoldSeconds
+    ?? config.retryableUpstreamHoldSeconds
+    ?? DEFAULT_RETRYABLE_UPSTREAM_HOLD_SECONDS;
 
   return http.createServer(async (req, res) => {
     try {
@@ -67,6 +77,9 @@ export function createProxyServer({
         secretStore,
         tokenRefresher,
         currentCredentialReader,
+        logger,
+        upstreamIdleTimeoutMs,
+        retryableUpstreamHoldSeconds,
       });
     } catch (error) {
       if (!res.headersSent) {
@@ -90,8 +103,12 @@ async function forwardWithRotation({
   secretStore,
   tokenRefresher,
   currentCredentialReader,
+  logger,
+  upstreamIdleTimeoutMs,
+  retryableUpstreamHoldSeconds,
 }) {
   const maxAttempts = Math.max(1, accountManager.accounts.length);
+  let lastRetryableResponse = null;
 
   for (let attempt = 0; attempt < maxAttempts; attempt++) {
     const account = accountManager.getActiveAccount();
@@ -105,6 +122,9 @@ async function forwardWithRotation({
         secretStore,
         tokenRefresher,
         currentCredentialReader,
+        logger,
+        upstreamIdleTimeoutMs,
+        retryableUpstreamHoldSeconds,
       })) return;
       sendUnavailableAccounts(res);
       return;
@@ -137,6 +157,9 @@ async function forwardWithRotation({
       account,
       secret: freshSecret,
       accountManager,
+      logger,
+      upstreamIdleTimeoutMs,
+      retryableUpstreamHoldSeconds,
     });
     if (result.retryAfterRefresh) {
       let refreshedSecret;
@@ -159,18 +182,32 @@ async function forwardWithRotation({
         account,
         secret: refreshedSecret,
         accountManager,
+        logger,
+        upstreamIdleTimeoutMs,
+        retryableUpstreamHoldSeconds,
       });
-      if (retryResult.retryNextAccount || retryResult.retryAfterRefresh) {
+      if (retryResult.retryAfterRefresh) {
         accountManager.markError(account.id, 'authentication_error', 'OAuth token rejected');
+        continue;
+      }
+      if (retryResult.retryNextAccount) {
+        lastRetryableResponse = retryResult.passthroughResponse || retryResult.syntheticResponse || lastRetryableResponse;
         continue;
       }
       return;
     }
-    if (result.retryNextAccount) continue;
+    if (result.retryNextAccount) {
+      lastRetryableResponse = result.passthroughResponse || result.syntheticResponse || lastRetryableResponse;
+      continue;
+    }
     return;
   }
 
   if (!res.headersSent) {
+    if (lastRetryableResponse) {
+      sendBufferedResponse(res, lastRetryableResponse);
+      return;
+    }
     if (await forwardCurrentUnavailableAccount({
       req,
       res,
@@ -180,6 +217,9 @@ async function forwardWithRotation({
       secretStore,
       tokenRefresher,
       currentCredentialReader,
+      logger,
+      upstreamIdleTimeoutMs,
+      retryableUpstreamHoldSeconds,
     })) return;
     sendUnavailableAccounts(res);
   }
@@ -194,6 +234,9 @@ async function forwardCurrentUnavailableAccount({
   secretStore,
   tokenRefresher,
   currentCredentialReader,
+  logger,
+  upstreamIdleTimeoutMs,
+  retryableUpstreamHoldSeconds,
 }) {
   const account = accountManager.getFallbackAccount();
   if (!account) return false;
@@ -222,6 +265,9 @@ async function forwardCurrentUnavailableAccount({
     secret: freshSecret,
     accountManager,
     passthroughErrors: true,
+    logger,
+    upstreamIdleTimeoutMs,
+    retryableUpstreamHoldSeconds,
   });
   return true;
 }
@@ -263,51 +309,121 @@ async function forwardOnce({
   secret,
   accountManager,
   passthroughErrors = false,
+  logger = null,
+  upstreamIdleTimeoutMs,
+  retryableUpstreamHoldSeconds,
 }) {
   const target = new URL(req.url, upstream);
   const headers = buildUpstreamHeaders(req.headers, account, secret);
+  const startedAt = Date.now();
+  let outcome = 'ok';
 
-  const upstreamResponse = await requestUpstream({
-    target,
-    method: req.method,
-    headers,
-    body,
-    onResponse(upstreamRes) {
-      accountManager.updateQuota(account.id, upstreamRes.headers);
+  let upstreamResponse;
+  try {
+    upstreamResponse = await requestUpstream({
+      target,
+      method: req.method,
+      headers,
+      body,
+      idleTimeoutMs: upstreamIdleTimeoutMs,
+      onResponse(upstreamRes) {
+        accountManager.updateQuota(account.id, upstreamRes.headers);
 
-      if (!passthroughErrors && upstreamRes.statusCode === 429) {
-        const unavailableReason = accountManager.unavailableReason(account);
-        if (unavailableReason?.type !== 'quota_exhausted') {
-          const retryAfter = Number.parseInt(upstreamRes.headers['retry-after'], 10) || 60;
-          accountManager.markRateLimited(account.id, retryAfter);
+        if (!passthroughErrors && upstreamRes.statusCode === 429) {
+          outcome = 'rate-limit-retry';
+          const unavailableReason = accountManager.unavailableReason(account);
+          if (unavailableReason?.type !== 'quota_exhausted') {
+            accountManager.markRateLimited(account.id, retryAfterSeconds(upstreamRes.headers, 60));
+          }
+          return false;
         }
-        upstreamRes.resume();
-        return false;
-      }
 
-      if (!passthroughErrors && upstreamRes.statusCode === 401 && canRefreshSecret(account, secret)) {
-        upstreamRes.resume();
-        return false;
-      }
+        if (!passthroughErrors && upstreamRes.statusCode === 401 && canRefreshSecret(account, secret)) {
+          outcome = 'auth-refresh-retry';
+          return false;
+        }
 
-      const responseHeaders = {};
-      for (const [key, value] of Object.entries(upstreamRes.headers)) {
-        if (!HOP_HEADERS.has(key.toLowerCase())) responseHeaders[key] = value;
-      }
-      res.writeHead(upstreamRes.statusCode || 200, responseHeaders);
-      return true;
-    },
-    onChunk(chunk) {
-      if (!res.destroyed) res.write(chunk);
-    },
+        if (!passthroughErrors && isRetryableServerError(upstreamRes.statusCode, upstreamRes.headers)) {
+          outcome = 'upstream-retry';
+          accountManager.markTemporaryUnavailable(
+            account.id,
+            retryAfterSeconds(upstreamRes.headers, retryableUpstreamHoldSeconds),
+            {
+              type: 'temporary_upstream_error',
+              statusCode: upstreamRes.statusCode,
+              message: 'Retryable upstream server error',
+            },
+          );
+          return false;
+        }
+
+        const responseHeaders = {};
+        for (const [key, value] of Object.entries(upstreamRes.headers)) {
+          if (!HOP_HEADERS.has(key.toLowerCase())) responseHeaders[key] = value;
+        }
+        res.writeHead(upstreamRes.statusCode || 200, responseHeaders);
+        return true;
+      },
+      onChunk(chunk) {
+        if (!res.destroyed) res.write(chunk);
+      },
+    });
+  } catch (error) {
+    outcome = isUpstreamTimeout(error) ? 'upstream-timeout' : 'upstream-error';
+    recordProxyRequest({
+      accountManager,
+      logger,
+      account,
+      method: req.method,
+      path: target.pathname,
+      outcome,
+      durationMs: Date.now() - startedAt,
+      errorType: error.code || error.name,
+    });
+
+    if (!passthroughErrors && !res.headersSent) {
+      const reasonType = isUpstreamTimeout(error)
+        ? 'temporary_upstream_timeout'
+        : 'temporary_upstream_error';
+      accountManager.markTemporaryUnavailable(
+        account.id,
+        retryableUpstreamHoldSeconds,
+        {
+          type: reasonType,
+          message: error.message,
+        },
+      );
+      return {
+        retryNextAccount: true,
+        syntheticResponse: syntheticUpstreamErrorResponse(error),
+      };
+    }
+    throw error;
+  }
+
+  recordProxyRequest({
+    accountManager,
+    logger,
+    account,
+    method: req.method,
+    path: target.pathname,
+    statusCode: upstreamResponse.statusCode,
+    requestId: headerValue(upstreamResponse.headers['request-id'])
+      || headerValue(upstreamResponse.headers['x-request-id']),
+    outcome: outcomeForResponse(outcome, upstreamResponse.statusCode),
+    durationMs: Date.now() - startedAt,
   });
 
   if (!passthroughErrors && upstreamResponse.statusCode === 429) {
-    return { retryNextAccount: true };
+    return { retryNextAccount: true, passthroughResponse: upstreamResponse };
   }
 
   if (!passthroughErrors && upstreamResponse.statusCode === 401 && canRefreshSecret(account, secret)) {
     return { retryAfterRefresh: true };
+  }
+
+  if (!passthroughErrors && outcome === 'upstream-retry') {
+    return { retryNextAccount: true, passthroughResponse: upstreamResponse };
   }
 
   if (upstreamResponse.body.length > 0) {
@@ -335,9 +451,16 @@ function buildUpstreamHeaders(inputHeaders, account, secret) {
   return headers;
 }
 
-function requestUpstream({ target, method, headers, body, onResponse, onChunk }) {
+function requestUpstream({ target, method, headers, body, idleTimeoutMs, onResponse, onChunk }) {
   return new Promise((resolve, reject) => {
     const client = target.protocol === 'https:' ? https : http;
+    let settled = false;
+    const settle = (error, result) => {
+      if (settled) return;
+      settled = true;
+      if (error) reject(error);
+      else resolve(result);
+    };
     const req = client.request({
       protocol: target.protocol,
       hostname: target.hostname,
@@ -353,17 +476,128 @@ function requestUpstream({ target, method, headers, body, onResponse, onChunk })
         if (shouldStream) onChunk(chunk);
       });
       upstreamRes.on('end', () => {
-        resolve({
+        settle(null, {
           statusCode: upstreamRes.statusCode,
           headers: upstreamRes.headers,
           body: Buffer.concat(chunks),
         });
       });
+      upstreamRes.on('aborted', () => {
+        const error = new Error('Upstream response aborted');
+        error.code = 'UPSTREAM_RESPONSE_ABORTED';
+        settle(error);
+      });
+      upstreamRes.on('error', settle);
     });
-    req.on('error', reject);
+    if (idleTimeoutMs > 0) {
+      req.setTimeout(idleTimeoutMs, () => {
+        const error = new Error(`Upstream request idle timeout after ${idleTimeoutMs}ms`);
+        error.code = 'UPSTREAM_IDLE_TIMEOUT';
+        req.destroy(error);
+      });
+    }
+    req.on('error', settle);
     if (!['GET', 'HEAD'].includes(method) && body.length > 0) req.write(body);
     req.end();
   });
+}
+
+function isRetryableServerError(statusCode, headers = {}) {
+  if (truthyHeader(headers['x-should-retry'])) return true;
+  return [500, 502, 503, 504, 529].includes(statusCode);
+}
+
+function retryAfterSeconds(headers = {}, fallbackSeconds) {
+  const parsed = Number.parseInt(headerValue(headers['retry-after']), 10);
+  if (Number.isFinite(parsed) && parsed > 0) return parsed;
+  return fallbackSeconds;
+}
+
+function headerValue(value) {
+  if (Array.isArray(value)) return value[0];
+  return value == null ? null : String(value);
+}
+
+function truthyHeader(value) {
+  const normalized = headerValue(value)?.toLowerCase();
+  return normalized === 'true' || normalized === '1' || normalized === 'yes';
+}
+
+function isUpstreamTimeout(error) {
+  return error?.code === 'UPSTREAM_IDLE_TIMEOUT';
+}
+
+function outcomeForResponse(outcome, statusCode) {
+  if (outcome !== 'ok') return outcome;
+  if (statusCode >= 500) return 'upstream-error-passthrough';
+  if (statusCode >= 400) return 'client-error-passthrough';
+  return 'ok';
+}
+
+function recordProxyRequest({
+  accountManager,
+  logger,
+  account,
+  method,
+  path,
+  statusCode = null,
+  requestId = null,
+  outcome,
+  durationMs,
+  errorType = null,
+}) {
+  const event = accountManager.recordProxyRequest({
+    account: account.id,
+    method,
+    path,
+    statusCode,
+    requestId,
+    outcome,
+    durationMs,
+    errorType,
+  });
+  writeProxyLog(logger, event);
+}
+
+function writeProxyLog(logger, event) {
+  if (!logger) return;
+  const fields = [
+    `${event.at} proxy`,
+    `account=${event.account}`,
+    `method=${event.method}`,
+    `path=${event.path}`,
+    `status=${event.statusCode ?? '-'}`,
+    `durationMs=${event.durationMs}`,
+    `outcome=${event.outcome}`,
+  ];
+  if (event.requestId) fields.push(`requestId=${event.requestId}`);
+  if (event.errorType) fields.push(`errorType=${event.errorType}`);
+  logger(fields.join(' '));
+}
+
+function syntheticUpstreamErrorResponse(error) {
+  const statusCode = isUpstreamTimeout(error) ? 504 : 502;
+  const type = isUpstreamTimeout(error) ? 'upstream_timeout' : 'upstream_error';
+  return {
+    statusCode,
+    headers: { 'content-type': 'application/json' },
+    body: Buffer.from(JSON.stringify({
+      type: 'error',
+      error: {
+        type,
+        message: error.message,
+      },
+    })),
+  };
+}
+
+function sendBufferedResponse(res, response) {
+  const headers = {};
+  for (const [key, value] of Object.entries(response.headers || {})) {
+    if (!HOP_HEADERS.has(key.toLowerCase())) headers[key] = value;
+  }
+  res.writeHead(response.statusCode || 502, headers);
+  res.end(response.body || Buffer.alloc(0));
 }
 
 function extractUsage(body, accountId, accountManager) {

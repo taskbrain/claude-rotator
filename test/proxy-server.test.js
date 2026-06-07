@@ -147,6 +147,56 @@ describe('createProxyServer', () => {
     assert.deepEqual(upstreamSeen, ['Bearer live-claude-code-token']);
   });
 
+  it('records proxy request diagnostics without secrets', async t => {
+    const logLines = [];
+    const upstream = await listen(http.createServer(async (req, res) => {
+      res.writeHead(200, {
+        'Content-Type': 'application/json',
+        'request-id': 'req_diagnostic_1',
+      });
+      res.end(JSON.stringify({ ok: true }));
+    }));
+
+    const secretStore = new MemorySecretStore();
+    await secretStore.set('acct_1', { accessToken: 'access-token-1' });
+    const accountManager = new AccountManager({
+      accounts: [{ id: 'acct_1', name: 'a@example.com', type: 'oauth' }],
+      now: () => 1000,
+    });
+    const proxy = await listen(createProxyServer({
+      accountManager,
+      secretStore,
+      config: { upstream: upstream.url },
+      logger: line => logLines.push(line),
+    }));
+    t.after(async () => {
+      await close(proxy.server);
+      await close(upstream.server);
+    });
+
+    const response = await requestJson(`${proxy.url}/v1/messages?beta=true`, {
+      method: 'POST',
+      body: JSON.stringify({ model: 'sonnet' }),
+      headers: { authorization: 'Bearer client-token', 'x-api-key': 'client-key' },
+    });
+
+    assert.equal(response.status, 200);
+    const event = accountManager.getStatus().events.find(item => item.type === 'proxy-request');
+    assert.equal(event.account, 'acct_1');
+    assert.equal(event.method, 'POST');
+    assert.equal(event.path, '/v1/messages');
+    assert.equal(event.statusCode, 200);
+    assert.equal(event.requestId, 'req_diagnostic_1');
+    assert.equal(event.outcome, 'ok');
+    assert.equal(typeof event.durationMs, 'number');
+
+    const serialized = JSON.stringify(accountManager.getStatus()) + logLines.join('\n');
+    assert.equal(serialized.includes('access-token-1'), false);
+    assert.equal(serialized.includes('client-token'), false);
+    assert.equal(serialized.includes('client-key'), false);
+    assert.match(logLines.join('\n'), /proxy account=acct_1 method=POST path=\/v1\/messages status=200/);
+  });
+
   it('refreshes and retries once when upstream rejects the OAuth token', async t => {
     const upstreamSeen = [];
     const upstream = await listen(http.createServer(async (req, res) => {
@@ -201,6 +251,195 @@ describe('createProxyServer', () => {
       refreshToken: 'refresh-token-2',
       expiresAt: 200000,
     });
+  });
+
+  it('switches to the next account when upstream returns a retryable server error', async t => {
+    const upstreamSeen = [];
+    const upstream = await listen(http.createServer(async (req, res) => {
+      upstreamSeen.push(req.headers.authorization);
+      if (req.headers.authorization === 'Bearer access-token-1') {
+        res.writeHead(500, {
+          'Content-Type': 'application/json',
+          'request-id': 'req_retryable_500',
+          'x-should-retry': 'true',
+        });
+        res.end(JSON.stringify({
+          type: 'error',
+          error: { type: 'api_error', message: 'temporary upstream failure' },
+        }));
+        return;
+      }
+
+      res.writeHead(200, { 'Content-Type': 'application/json', 'request-id': 'req_ok_2' });
+      res.end(JSON.stringify({ ok: true }));
+    }));
+
+    const secretStore = new MemorySecretStore();
+    await secretStore.set('acct_1', { accessToken: 'access-token-1' });
+    await secretStore.set('acct_2', { accessToken: 'access-token-2' });
+    const accountManager = new AccountManager({
+      accounts: [
+        { id: 'acct_1', name: 'a@example.com', type: 'oauth' },
+        { id: 'acct_2', name: 'b@example.com', type: 'oauth' },
+      ],
+      now: () => 1000,
+    });
+    const proxy = await listen(createProxyServer({
+      accountManager,
+      secretStore,
+      config: { upstream: upstream.url },
+    }));
+    t.after(async () => {
+      await close(proxy.server);
+      await close(upstream.server);
+    });
+
+    const response = await requestJson(`${proxy.url}/v1/messages`, {
+      method: 'POST',
+      body: JSON.stringify({ model: 'sonnet' }),
+    });
+
+    assert.equal(response.status, 200);
+    assert.deepEqual(upstreamSeen, ['Bearer access-token-1', 'Bearer access-token-2']);
+    assert.equal(accountManager.getStatus().currentAccount, 'acct_2');
+    assert.equal(accountManager.getStatus().accounts[0].unavailableReason.type, 'temporary_upstream_error');
+  });
+
+  it('passes through a retryable server error when no alternate account is available', async t => {
+    const upstreamBody = {
+      type: 'error',
+      error: { type: 'api_error', message: 'temporary upstream failure' },
+    };
+    const upstream = await listen(http.createServer(async (req, res) => {
+      res.writeHead(529, {
+        'Content-Type': 'application/json',
+        'request-id': 'req_only_529',
+        'x-should-retry': 'true',
+      });
+      res.end(JSON.stringify(upstreamBody));
+    }));
+
+    const secretStore = new MemorySecretStore();
+    await secretStore.set('acct_1', { accessToken: 'access-token-1' });
+    const accountManager = new AccountManager({
+      accounts: [{ id: 'acct_1', name: 'a@example.com', type: 'oauth' }],
+      now: () => 1000,
+    });
+    const proxy = await listen(createProxyServer({
+      accountManager,
+      secretStore,
+      config: { upstream: upstream.url },
+    }));
+    t.after(async () => {
+      await close(proxy.server);
+      await close(upstream.server);
+    });
+
+    const response = await requestJson(`${proxy.url}/v1/messages`, {
+      method: 'POST',
+      body: JSON.stringify({ model: 'sonnet' }),
+    });
+
+    assert.equal(response.status, 529);
+    assert.equal(response.headers['request-id'], 'req_only_529');
+    assert.deepEqual(response.body, upstreamBody);
+    assert.notEqual(response.body.error.message, 'All configured accounts are unavailable.');
+  });
+
+  it('switches to the next account when an upstream request idles past the configured timeout', async t => {
+    const upstreamSeen = [];
+    const upstream = await listen(http.createServer(async (req, res) => {
+      upstreamSeen.push(req.headers.authorization);
+      if (req.headers.authorization === 'Bearer access-token-1') {
+        setTimeout(() => {
+          res.writeHead(200, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ tooLate: true }));
+        }, 250);
+        return;
+      }
+
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ ok: true }));
+    }));
+
+    const secretStore = new MemorySecretStore();
+    await secretStore.set('acct_1', { accessToken: 'access-token-1' });
+    await secretStore.set('acct_2', { accessToken: 'access-token-2' });
+    const accountManager = new AccountManager({
+      accounts: [
+        { id: 'acct_1', name: 'a@example.com', type: 'oauth' },
+        { id: 'acct_2', name: 'b@example.com', type: 'oauth' },
+      ],
+      now: () => 1000,
+    });
+    const proxy = await listen(createProxyServer({
+      accountManager,
+      secretStore,
+      config: {
+        upstream: upstream.url,
+        proxy: { upstreamIdleTimeoutMs: 50 },
+      },
+    }));
+    t.after(async () => {
+      await close(proxy.server);
+      await close(upstream.server);
+    });
+
+    const response = await requestJson(`${proxy.url}/v1/messages`, {
+      method: 'POST',
+      body: JSON.stringify({ model: 'sonnet' }),
+      timeoutMs: 500,
+    });
+
+    assert.equal(response.status, 200);
+    assert.deepEqual(upstreamSeen, ['Bearer access-token-1', 'Bearer access-token-2']);
+    assert.equal(accountManager.getStatus().currentAccount, 'acct_2');
+    assert.equal(accountManager.getStatus().accounts[0].unavailableReason.type, 'temporary_upstream_timeout');
+  });
+
+  it('does not rotate after a streaming response has already started', async t => {
+    const upstreamSeen = [];
+    const upstream = await listen(http.createServer(async (req, res) => {
+      upstreamSeen.push(req.headers.authorization);
+      res.writeHead(200, { 'Content-Type': 'text/event-stream' });
+      res.write('data: {"type":"message_start","message":{"usage":{"input_tokens":1}}}\n\n');
+      setTimeout(() => res.destroy(new Error('stream interrupted')), 25);
+    }));
+
+    const secretStore = new MemorySecretStore();
+    await secretStore.set('acct_1', { accessToken: 'access-token-1' });
+    await secretStore.set('acct_2', { accessToken: 'access-token-2' });
+    const accountManager = new AccountManager({
+      accounts: [
+        { id: 'acct_1', name: 'a@example.com', type: 'oauth' },
+        { id: 'acct_2', name: 'b@example.com', type: 'oauth' },
+      ],
+      now: () => 1000,
+    });
+    const proxy = await listen(createProxyServer({
+      accountManager,
+      secretStore,
+      config: {
+        upstream: upstream.url,
+        proxy: { upstreamIdleTimeoutMs: 50 },
+      },
+    }));
+    t.after(async () => {
+      await close(proxy.server);
+      await close(upstream.server);
+    });
+
+    await assert.rejects(
+      requestJson(`${proxy.url}/v1/messages`, {
+        method: 'POST',
+        body: JSON.stringify({ model: 'sonnet' }),
+        timeoutMs: 500,
+      }),
+      /aborted|socket hang up|ECONNRESET|Parse Error|stream interrupted/,
+    );
+
+    assert.deepEqual(upstreamSeen, ['Bearer access-token-1']);
+    assert.equal(accountManager.getStatus().currentAccount, 'acct_1');
   });
 
   it('skips to the next account when refreshing an expired token fails', async t => {
@@ -432,6 +671,7 @@ async function close(server) {
 async function requestJson(url, options = {}) {
   const target = new URL(url);
   const response = await new Promise((resolve, reject) => {
+    let settled = false;
     const req = http.request({
       hostname: target.hostname,
       port: target.port,
@@ -441,13 +681,38 @@ async function requestJson(url, options = {}) {
     }, res => {
       const chunks = [];
       res.on('data', chunk => chunks.push(chunk));
-      res.on('end', () => resolve({
-        status: res.statusCode,
-        headers: res.headers,
-        bodyText: Buffer.concat(chunks).toString('utf8'),
-      }));
+      res.on('end', () => {
+        settled = true;
+        resolve({
+          status: res.statusCode,
+          headers: res.headers,
+          bodyText: Buffer.concat(chunks).toString('utf8'),
+        });
+      });
+      res.on('aborted', () => {
+        if (!settled) {
+          settled = true;
+          reject(new Error('response aborted'));
+        }
+      });
+      res.on('error', error => {
+        if (!settled) {
+          settled = true;
+          reject(error);
+        }
+      });
     });
-    req.on('error', reject);
+    req.on('error', error => {
+      if (!settled) {
+        settled = true;
+        reject(error);
+      }
+    });
+    if (options.timeoutMs) {
+      req.setTimeout(options.timeoutMs, () => {
+        req.destroy(new Error(`test client timeout after ${options.timeoutMs}ms`));
+      });
+    }
     if (options.body) req.write(options.body);
     req.end();
   });

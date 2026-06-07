@@ -127,6 +127,7 @@ async function runServer({ write }) {
     secretStore,
     config,
     reloadAccounts: async () => (await loadOrCreateConfig()).accounts,
+    logger: line => write(`${line}\n`),
   });
   await new Promise(resolve => server.listen(config.proxy.port, config.proxy.host, resolve));
   write(`claude-rotator listening on ${proxyBaseUrl(config)}\n`);

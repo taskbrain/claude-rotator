@@ -52,10 +52,20 @@ function renderQuotaRow(label, ratio, resetAt, now) {
 
 function renderEvent(event) {
   if (event.type === 'auto-switch') {
-    return `${event.at || ''} switched ${event.from || '(none)'} -> ${event.to} reason=quota-threshold`.trim();
+    return `${event.at || ''} switched ${event.from || '(none)'} -> ${event.to} reason=${event.reason || 'quota-threshold'}`.trim();
   }
   if (event.type === 'manual-switch') {
     return `${event.at || ''} manual switch -> ${event.account}`.trim();
+  }
+  if (event.type === 'proxy-request') {
+    const status = event.statusCode ?? '-';
+    const requestId = event.requestId ? ` req=${event.requestId}` : '';
+    const errorType = event.errorType ? ` error=${event.errorType}` : '';
+    return `${event.at || ''} request ${event.account || ''} ${event.method || ''} ${event.path || ''} -> ${status} ${event.durationMs ?? 0}ms outcome=${event.outcome || 'unknown'}${requestId}${errorType}`.trim();
+  }
+  if (event.type === 'upstream-error') {
+    const reason = renderUnavailableReason(event.reason);
+    return `${event.at || ''} upstream error ${event.account || ''}${reason ? ` (${reason})` : ''}`.trim();
   }
   if (event.type === 'quota-exhausted') {
     const reason = renderUnavailableReason(event.reason);
@@ -77,6 +87,11 @@ function renderUnavailableReason(reason) {
   if (reason.type === 'temporary_throttle') {
     const retry = reason.retryAt ? `; retry -> ${formatDate(Date.parse(reason.retryAt))}` : '';
     return `temporary throttle${retry}`;
+  }
+  if (reason.type === 'temporary_upstream_error' || reason.type === 'temporary_upstream_timeout') {
+    const retry = reason.retryAt ? `; retry -> ${formatDate(Date.parse(reason.retryAt))}` : '';
+    const status = reason.statusCode ? ` ${reason.statusCode}` : '';
+    return `${reason.type}${status}${retry}`;
   }
   if (reason.message) return `${reason.type}: ${reason.message}`;
   return reason.type;

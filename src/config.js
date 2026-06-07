@@ -4,12 +4,16 @@ import { readJsonFile, writeJsonFile } from './json-file.js';
 export const DEFAULT_PORT = 37891;
 export const DEFAULT_THRESHOLD = 0.99;
 export const DEFAULT_USAGE_POLL_INTERVAL_MS = 5 * 60 * 1000;
+export const DEFAULT_UPSTREAM_IDLE_TIMEOUT_MS = 3 * 60 * 1000;
+export const DEFAULT_RETRYABLE_UPSTREAM_HOLD_SECONDS = 30;
 
 export function createDefaultConfig() {
   return {
     proxy: {
       host: '127.0.0.1',
       port: DEFAULT_PORT,
+      upstreamIdleTimeoutMs: DEFAULT_UPSTREAM_IDLE_TIMEOUT_MS,
+      retryableUpstreamHoldSeconds: DEFAULT_RETRYABLE_UPSTREAM_HOLD_SECONDS,
     },
     upstream: 'https://api.anthropic.com',
     switchThreshold: DEFAULT_THRESHOLD,

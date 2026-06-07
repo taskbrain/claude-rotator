@@ -75,14 +75,23 @@ export class AccountManager {
   }
 
   markRateLimited(accountId, retryAfterSeconds) {
+    this.markTemporaryUnavailable(accountId, retryAfterSeconds, { type: 'temporary_throttle' }, {
+      eventType: 'throttled',
+      retryAfterSeconds,
+    });
+  }
+
+  markTemporaryUnavailable(accountId, retryAfterSeconds, reason, event = {}) {
     const account = this.find(accountId);
     account.rateLimitedUntil = this.now() + retryAfterSeconds * 1000;
+    account.temporaryUnavailableReason = { ...reason };
     account.status = 'throttled';
     this.events.unshift({
       at: new Date(this.now()).toISOString(),
-      type: 'throttled',
+      type: event.eventType || 'upstream-error',
       account: account.id,
-      retryAfterSeconds,
+      retryAfterSeconds: event.retryAfterSeconds ?? retryAfterSeconds,
+      reason: account.temporaryUnavailableReason,
     });
   }
 
@@ -97,6 +106,23 @@ export class AccountManager {
       account: account.id,
       reason: account.errorReason,
     });
+  }
+
+  recordProxyRequest(meta) {
+    const event = {
+      at: new Date(this.now()).toISOString(),
+      type: 'proxy-request',
+      account: meta.account,
+      method: meta.method,
+      path: meta.path,
+      outcome: meta.outcome,
+      durationMs: Math.max(0, Math.round(meta.durationMs || 0)),
+    };
+    if (meta.statusCode != null) event.statusCode = meta.statusCode;
+    if (meta.requestId) event.requestId = meta.requestId;
+    if (meta.errorType) event.errorType = meta.errorType;
+    this.events.unshift(event);
+    return event;
   }
 
   replaceAccounts(accounts) {
@@ -156,6 +182,7 @@ export class AccountManager {
       const candidate = this.accounts[index];
       if (this.isAvailable(candidate)) {
         const previous = this.accounts[this.currentIndex];
+        const reason = this.autoSwitchReason(previous);
         if (previous) previous.status = this.displayStatus(previous);
         this.currentIndex = index;
         this.events.unshift({
@@ -163,7 +190,7 @@ export class AccountManager {
           type: 'auto-switch',
           from: previous?.id || null,
           to: candidate.id,
-          reason: 'quota-threshold',
+          reason,
         });
         return candidate;
       }
@@ -195,6 +222,7 @@ export class AccountManager {
     }
     if (account.rateLimitedUntil && now >= account.rateLimitedUntil) {
       account.rateLimitedUntil = null;
+      account.temporaryUnavailableReason = null;
       account.status = 'ready';
     }
 
@@ -230,7 +258,7 @@ export class AccountManager {
     if (quotaReason) return quotaReason;
     if (account.rateLimitedUntil && this.now() < account.rateLimitedUntil) {
       return {
-        type: 'temporary_throttle',
+        ...(account.temporaryUnavailableReason || { type: 'temporary_throttle' }),
         retryAt: new Date(account.rateLimitedUntil).toISOString(),
       };
     }
@@ -238,6 +266,13 @@ export class AccountManager {
       return account.errorReason || { type: 'account_error' };
     }
     return null;
+  }
+
+  autoSwitchReason(account) {
+    const reason = this.unavailableReason(account);
+    if (!reason) return 'account-unavailable';
+    if (reason.type === 'quota_exhausted') return 'quota-threshold';
+    return reason.type;
   }
 
   displayStatus(account) {
@@ -271,6 +306,7 @@ export class AccountManager {
         lastUsed: null,
       },
       rateLimitedUntil: null,
+      temporaryUnavailableReason: null,
       errorReason: null,
       quotaExhaustionEventKey: null,
     };

@@ -99,6 +99,37 @@ account1@example.com        active
 
 未使用のアカウントは、proxy が rate-limit header や usage data を取得するまで `unknown` と表示されます。
 
+## ログと切り替え診断
+
+`status` / `monitor` の Events には、直近の proxy request が表示されます。
+
+```text
+2026-06-07T03:43:23.000Z request dev-taskbrain-co-jp POST /v1/messages -> 500 1203ms outcome=upstream-retry req=req_xxx
+2026-06-07T03:43:23.000Z switched dev-taskbrain-co-jp -> current reason=temporary_upstream_error
+```
+
+macOS の常駐 server ログは次で確認できます。
+
+```bash
+tail -f ~/.config/claude-rotator/server.log
+tail -f ~/.config/claude-rotator/server.err
+```
+
+ログに出るのは `account`、`method`、`path`、`status`、`durationMs`、`outcome`、`requestId`、timeout/network error 時の `errorType` だけです。token / Authorization header / API key / request body / response body は出しません。
+
+retryable な上流 5xx / 529 / `x-should-retry` 付きレスポンス、または上流アイドルタイムアウトが起きた場合、まだ Claude Code へレスポンスを書き始めていなければ次のアカウントへ自動で再送します。代替アカウントがない場合は、上流の error body を可能な限りそのまま返します。
+
+必要に応じて `~/.config/claude-rotator/config.json` で調整できます。
+
+```json
+{
+  "proxy": {
+    "upstreamIdleTimeoutMs": 180000,
+    "retryableUpstreamHoldSeconds": 30
+  }
+}
+```
+
 ## 主なコマンド
 
 ```bash
@@ -189,6 +220,10 @@ claude-rotator login --id account1 --name your-email@example.com
 ```bash
 claude-rotator monitor
 ```
+
+### Diagnostics
+
+Recent proxy requests are shown in `claude-rotator status` / `claude-rotator monitor`, and the service writes metadata-only request logs to `~/.config/claude-rotator/server.log`. Retryable upstream 5xx / 529 / `x-should-retry` responses and upstream idle timeouts rotate to the next account before a response is sent to Claude Code.
 
 ### Restore
 
