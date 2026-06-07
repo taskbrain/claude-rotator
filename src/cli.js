@@ -90,6 +90,11 @@ export async function runCli(argv = [], deps = {}) {
       return 0;
     }
 
+    if (command === 'use-current') {
+      await useCurrentCommand({ argv, write, deps });
+      return 0;
+    }
+
     if (command === 'import-current') {
       await importCurrentCommand({ argv, write, deps });
       return 0;
@@ -114,6 +119,7 @@ export function helpText() {
   claude-rotator accounts
   claude-rotator login [--id <id>] [--name <email>]
   claude-rotator login --id <id> --name <email> --json <token-json>
+  claude-rotator use-current [--name <email>] [--only]
   claude-rotator import-current --id <id> --name <email>
   claude-rotator doctor
 `;
@@ -246,6 +252,34 @@ async function importCurrentCommand({ argv, write, deps }) {
   }
   await notifyReload({ deps, write });
   write(`Imported ${name}\n`);
+}
+
+async function useCurrentCommand({ argv, write, deps }) {
+  const secret = deps.readCurrentCredentials
+    ? await deps.readCurrentCredentials()
+    : await readCurrentClaudeCredentials();
+  const profile = await readProfileForLogin(secret, deps);
+  const name = argValue(argv, '--name') || profile?.email || 'current';
+  const account = {
+    id: 'current',
+    name,
+    type: 'oauth',
+    accountUuid: profile?.accountUuid || null,
+  };
+  const config = deps.loadConfig ? await deps.loadConfig() : await loadOrCreateConfig();
+
+  if (argv.includes('--only')) {
+    config.accounts = [account];
+  } else {
+    const existing = config.accounts.findIndex(item => item.id === 'current');
+    if (existing >= 0) config.accounts[existing] = account;
+    else config.accounts.unshift(account);
+  }
+
+  if (deps.saveConfig) await deps.saveConfig(config);
+  else await saveConfig(config);
+  await notifyReload({ deps, write });
+  write(`Using live Claude Code login as ${name}\n`);
 }
 
 async function saveImportedAccount({ id, name, accountUuid = null, secret }) {

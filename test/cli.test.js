@@ -81,6 +81,33 @@ describe('runCli', () => {
     }]);
     assert.match(io.output(), /Imported person@example\.com/);
   });
+
+  it('configures live current Claude Code login without storing a token snapshot', async () => {
+    const io = createIo();
+    let savedConfig = null;
+    let reloaded = false;
+
+    const code = await runCli(['use-current', '--only'], {
+      ...io,
+      readCurrentCredentials: async () => ({ accessToken: 'access', refreshToken: 'refresh' }),
+      fetchProfile: async () => ({ email: 'person@example.com', accountUuid: 'uuid-1' }),
+      loadConfig: async () => ({
+        accounts: [{ id: 'stale-account', name: 'old@example.com', type: 'oauth' }],
+      }),
+      saveConfig: async config => { savedConfig = config; },
+      reloadServer: async () => { reloaded = true; },
+    });
+
+    assert.equal(code, 0);
+    assert.deepEqual(savedConfig.accounts, [{
+      id: 'current',
+      name: 'person@example.com',
+      type: 'oauth',
+      accountUuid: 'uuid-1',
+    }]);
+    assert.equal(reloaded, true);
+    assert.match(io.output(), /Using live Claude Code login as person@example\.com/);
+  });
 });
 
 function createIo() {

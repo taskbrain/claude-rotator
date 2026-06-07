@@ -97,6 +97,17 @@ tail -f ~/.config/claude-rotator/server.err
 
 通常は Claude Code にログインしてから `claude-rotator login` を実行するのが一番簡単です。`login` は現在の Claude Code ログインを読み取り、可能であれば email を自動取得して登録します。
 
+この PC で現在ログイン中の Claude Code アカウントだけを使う場合は、保存済み token snapshot ではなく Claude Code の最新認証情報を毎回読む `current` アカウントとして登録できます。Claude Code 側で token が更新されても proxy が追従するため、Ubuntu の常用 PC ではこの方法が安全です。
+
+```bash
+claude auth login
+claude-rotator use-current --only
+```
+
+`--only` は既存の rotator アカウント一覧を `current` だけに置き換えます。複数アカウント構成に `current` を追加するだけなら `--only` を外してください。
+
+複数アカウントを個別に保存して切り替える場合は、各アカウントで Claude Code にログインしてから `claude-rotator login` を実行します。
+
 ```bash
 claude auth login
 claude-rotator login
@@ -182,6 +193,7 @@ retryable な上流 5xx / 529 / `x-should-retry` 付きレスポンス、また�
 claude-rotator install [--no-start] [--force]
 claude-rotator uninstall
 claude-rotator login
+claude-rotator use-current [--name your-email@example.com] [--only]
 claude-rotator import-current --id account1 --name your-email@example.com
 claude-rotator accounts
 claude-rotator status
