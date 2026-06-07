@@ -721,7 +721,7 @@ describe('createProxyServer', () => {
       secretStore,
       config: {
         upstream: 'http://127.0.0.1:1',
-        usagePolling: { enabled: true, intervalMs: 60 * 60 * 1000 },
+        usagePolling: { enabled: true },
       },
       usageFetcher: async () => ({
         five_hour: { utilization: 0.25, resets_at: '2026-06-07T13:20:00Z' },
@@ -738,6 +738,55 @@ describe('createProxyServer', () => {
     assert.equal(response.body.accounts[0].quota.unified5h, 0.25);
     assert.equal(response.body.accounts[0].quota.unified7d, 0.5);
     assert.equal(response.body.accounts[0].status, 'ready');
+  });
+
+  it('refreshes exhausted usage again at the reported reset time', async t => {
+    const secretStore = new MemorySecretStore();
+    await secretStore.set('acct_1', { accessToken: 'access-token-1' });
+    const accountManager = new AccountManager({
+      accounts: [{ id: 'acct_1', name: 'a@example.com', type: 'oauth' }],
+      switchThreshold: 1,
+      now: () => Date.now(),
+    });
+    let calls = 0;
+    const proxy = await listen(createProxyServer({
+      accountManager,
+      secretStore,
+      config: {
+        upstream: 'http://127.0.0.1:1',
+        usagePolling: { enabled: true, resetCheckDelayMs: 5 },
+      },
+      usageFetcher: async () => {
+        calls += 1;
+        if (calls === 1) {
+          return {
+            five_hour: { utilization: 0.2, resets_at: null },
+            seven_day: {
+              utilization: 1,
+              resets_at: new Date(Date.now() + 25).toISOString(),
+            },
+          };
+        }
+        return {
+          five_hour: { utilization: 0.2, resets_at: null },
+          seven_day: { utilization: 0, resets_at: null },
+        };
+      },
+    }));
+    t.after(async () => {
+      await close(proxy.server);
+    });
+
+    const first = await requestJson(`${proxy.url}/internal/status`);
+    assert.equal(first.body.accounts[0].status, 'exhausted');
+    assert.equal(first.body.accounts[0].unavailableReason.window, '7d');
+
+    await sleep(80);
+    const second = await requestJson(`${proxy.url}/internal/status`);
+
+    assert.ok(calls >= 2);
+    assert.equal(second.body.accounts[0].quota.unified7d, 0);
+    assert.equal(second.body.accounts[0].status, 'ready');
   });
 
   it('exposes health and status without secrets', async () => {
@@ -798,6 +847,10 @@ async function listen(server) {
 
 async function close(server) {
   await new Promise(resolve => server.close(resolve));
+}
+
+async function sleep(ms) {
+  await new Promise(resolve => setTimeout(resolve, ms));
 }
 
 async function requestJson(url, options = {}) {

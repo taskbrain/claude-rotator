@@ -18,6 +18,8 @@ const HOP_HEADERS = new Set([
 ]);
 
 const DEFAULT_UPSTREAM_IDLE_TIMEOUT_MS = 180000;
+const DEFAULT_RESET_CHECK_DELAY_MS = 1000;
+const MAX_TIMER_DELAY_MS = 2_147_483_647;
 
 export function createProxyServer({
   accountManager,
@@ -41,6 +43,10 @@ export function createProxyServer({
     currentCredentialReader,
     usageFetcher,
   });
+  const usageScheduler = createUsageRefreshScheduler({
+    config,
+    usageRefresher,
+  });
 
   const server = http.createServer(async (req, res) => {
     try {
@@ -53,8 +59,8 @@ export function createProxyServer({
       }
 
       if (req.method === 'GET' && req.url === '/internal/status') {
-        if (usagePollingEnabled(config) && !usageRefresher.hasAttempted()) {
-          await usageRefresher.refreshAll();
+        if (usagePollingEnabled(config) && !usageScheduler.hasAttempted()) {
+          await usageScheduler.refreshNow();
         }
         sendJson(res, 200, accountManager.getStatus());
         return;
@@ -72,13 +78,13 @@ export function createProxyServer({
           const accounts = await reloadAccounts();
           accountManager.replaceAccounts(accounts);
         }
-        if (usagePollingEnabled(config)) await usageRefresher.refreshAll();
+        if (usagePollingEnabled(config)) await usageScheduler.refreshNow();
         sendJson(res, 200, accountManager.getStatus());
         return;
       }
 
       if (req.method === 'POST' && req.url === '/internal/refresh-usage') {
-        sendJson(res, 200, await usageRefresher.refreshAll());
+        sendJson(res, 200, await usageScheduler.refreshNow());
         return;
       }
 
@@ -107,23 +113,81 @@ export function createProxyServer({
     }
   });
 
-  startUsagePolling({ server, config, usageRefresher });
+  usageScheduler.start(server);
   return server;
-}
-
-function startUsagePolling({ server, config, usageRefresher }) {
-  if (!usagePollingEnabled(config)) return;
-  usageRefresher.refreshAll().catch(() => {});
-  const intervalMs = Number(config.usagePolling?.intervalMs) || 5 * 60 * 1000;
-  const timer = setInterval(() => {
-    usageRefresher.refreshAll().catch(() => {});
-  }, intervalMs);
-  timer.unref?.();
-  server.on('close', () => clearInterval(timer));
 }
 
 function usagePollingEnabled(config) {
   return config.usagePolling?.enabled === true;
+}
+
+function createUsageRefreshScheduler({ config, usageRefresher, now = () => Date.now() }) {
+  let timer = null;
+
+  const stop = () => {
+    if (timer) clearTimeout(timer);
+    timer = null;
+  };
+
+  const scheduleFromStatus = status => {
+    if (!usagePollingEnabled(config)) return;
+    stop();
+    const delayMs = nextUsageRefreshDelay(status, config, now());
+    if (delayMs == null) return;
+    timer = setTimeout(() => {
+      timer = null;
+      refreshNow().catch(() => {
+        scheduleFromStatus(null);
+      });
+    }, delayMs);
+    timer.unref?.();
+  };
+
+  const refreshNow = async () => {
+    const result = await usageRefresher.refreshAll();
+    scheduleFromStatus(result.status);
+    return result;
+  };
+
+  const start = server => {
+    if (!usagePollingEnabled(config)) return;
+    refreshNow().catch(() => {
+      scheduleFromStatus(null);
+    });
+    server.on('close', stop);
+  };
+
+  return {
+    start,
+    refreshNow,
+    hasAttempted: usageRefresher.hasAttempted,
+  };
+}
+
+function nextUsageRefreshDelay(status, config, nowMs) {
+  const resetCheckDelayMs = Number(config.usagePolling?.resetCheckDelayMs) || DEFAULT_RESET_CHECK_DELAY_MS;
+  const resetAt = nextExhaustedQuotaResetAt(status);
+  if (resetAt != null) {
+    return clampTimerDelay(Math.max(0, resetAt - nowMs) + resetCheckDelayMs);
+  }
+  return null;
+}
+
+function nextExhaustedQuotaResetAt(status) {
+  const resetTimes = [];
+  for (const account of status?.accounts || []) {
+    const reason = account.unavailableReason;
+    if (!isUnifiedQuotaExhaustion(reason) || !reason.resetAt) continue;
+    const resetAt = Date.parse(reason.resetAt);
+    if (Number.isFinite(resetAt)) resetTimes.push(resetAt);
+  }
+  if (resetTimes.length === 0) return null;
+  return Math.min(...resetTimes);
+}
+
+function clampTimerDelay(delayMs) {
+  if (!Number.isFinite(delayMs)) return DEFAULT_RESET_CHECK_DELAY_MS;
+  return Math.max(0, Math.min(delayMs, MAX_TIMER_DELAY_MS));
 }
 
 function createUsageRefresher({

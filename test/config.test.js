@@ -43,7 +43,8 @@ describe('config defaults', () => {
     assert.equal(config.proxy.host, '127.0.0.1');
     assert.equal(config.switchThreshold, 1);
     assert.deepEqual(config.accounts, []);
-    assert.equal(config.usagePolling.intervalMs, 300000);
+    assert.equal(config.usagePolling.enabled, true);
+    assert.equal(Object.hasOwn(config.usagePolling, 'intervalMs'), false);
   });
 });
 

@@ -16,7 +16,7 @@ it('keeps the server process alive after listening', async () => {
     proxy: { host: '127.0.0.1', port },
     upstream: 'https://api.anthropic.com',
     switchThreshold: 1,
-    usagePolling: { enabled: false, intervalMs: 300000 },
+    usagePolling: { enabled: false },
     accounts: [],
   });
 

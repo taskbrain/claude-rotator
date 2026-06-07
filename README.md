@@ -167,7 +167,7 @@ account1@example.com        active
 7d ███████░░░  76%  reset in 1d9h -> 06/06 19:00
 ```
 
-未使用のアカウントでも、server 起動時・アカウント reload 時・初回 status 表示時・定期ポーリングで OAuth Usage API から 5時間枠 / 7日枠の状態を取得します。Usage API が取得できない場合だけ `unknown` と表示されます。`unknown` のアカウントは空いている確認が取れていないため、自動切り替え先には使いません。
+未使用のアカウントでも、server 起動時・アカウント reload 時・初回 status 表示時に OAuth Usage API から 5時間枠 / 7日枠の状態を取得します。100% 到達済みの枠に reset 時刻がある場合は、その reset 時刻の直後に自動で再取得します。Usage API が取得できない場合だけ `unknown` と表示されます。`unknown` のアカウントは空いている確認が取れていないため、自動切り替え先には使いません。
 
 ## ログと切り替え診断
 

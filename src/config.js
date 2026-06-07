@@ -3,7 +3,6 @@ import { readJsonFile, writeJsonFile } from './json-file.js';
 
 export const DEFAULT_PORT = 37891;
 export const DEFAULT_THRESHOLD = 1;
-export const DEFAULT_USAGE_POLL_INTERVAL_MS = 5 * 60 * 1000;
 export const DEFAULT_UPSTREAM_IDLE_TIMEOUT_MS = 3 * 60 * 1000;
 
 export function createDefaultConfig() {
@@ -17,7 +16,6 @@ export function createDefaultConfig() {
     switchThreshold: DEFAULT_THRESHOLD,
     usagePolling: {
       enabled: true,
-      intervalMs: DEFAULT_USAGE_POLL_INTERVAL_MS,
     },
     accounts: [],
   };
