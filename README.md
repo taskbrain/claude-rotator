@@ -97,6 +97,8 @@ tail -f ~/.config/claude-rotator/server.err
 
 通常は Claude Code にログインしてから `claude-rotator login` を実行するのが一番簡単です。`login` は現在の Claude Code ログインを読み取り、可能であれば email を自動取得して登録します。
 
+重要: `claude auth login` や `claude-rotator login` は、Claude Code 側の現在ログインを変更したり、そのログインを rotator の候補一覧へ取り込んだりする操作です。実際に API リクエストで使われるアカウントは `claude-rotator status` の `active` で決まります。別アカウントでログインして `claude-rotator login` しても、それだけでは active は切り替わりません。
+
 この PC で現在ログイン中の Claude Code アカウントだけを使う場合は、保存済み token snapshot ではなく Claude Code の最新認証情報を毎回読む `current` アカウントとして登録できます。Claude Code 側で token が更新されても proxy が追従するため、Ubuntu の常用 PC ではこの方法が安全です。
 
 ```bash
@@ -138,6 +140,15 @@ claude-rotator doctor
 - Ubuntu/Linux: `~/.local/share/claude-rotator/accounts/*.json`、ディレクトリ `0700`、ファイル `0600`
 
 `login` は保存後に常駐 server へ reload を通知します。server が起動していない場合だけ、OS 別のサービス再起動コマンドを実行してください。
+
+アカウントを追加した直後は、Usage API の状態も確認してください。
+
+```bash
+claude-rotator refresh-usage
+claude-rotator status
+```
+
+追加したアカウントの 5時間枠または 7日枠が 100% の場合、そのアカウントは `exhausted` と表示され、自動切り替え先にはなりません。
 
 不要になったアカウントや、`doctor` で壊れていると表示された保存済みアカウントは削除できます。デフォルトでは保存済み認証情報も削除します。
 
@@ -191,12 +202,14 @@ tail -f ~/.config/claude-rotator/server.err
 
 retryable な上流 5xx / 529 / `x-should-retry` 付きレスポンス、または上流アイドルタイムアウトが起きた場合も、アカウント切り替えは行いません。上流の error body または proxy の timeout error を可能な限りそのまま返します。
 
-Usage API の状態を手動で即時反映する場合:
+Usage API の再取得は、固定間隔では実行しません。通常は取得済み Usage API に含まれる reset 時刻を使い、100% 到達済みの枠がリセットされる時刻の直後に自動で再取得します。Claude Code 側の早期リセットや一時的な状態変化を確認したい場合は、次の手動コマンドで全登録アカウントを即時再確認します。
 
 ```bash
 claude-rotator refresh-usage
 claude-rotator status
 ```
+
+`refresh-usage` は active を変更しません。現在の active を確認するには `claude-rotator status` の先頭行を見てください。意図的に active を変更する場合だけ `claude-rotator switch <account>` を使います。
 
 `claude-rotator doctor` は server の疎通に加えて、次の問題を secret を出さずに警告します。
 
@@ -309,6 +322,8 @@ claude auth login
 claude-rotator login
 ```
 
+`claude auth login` and `claude-rotator login` do not automatically switch the rotator's active account. They only change or import the Claude Code login. The account actually used for API requests is the `active` account shown by `claude-rotator status`.
+
 Credentials are machine-local. Run `claude auth login` and `claude-rotator login` on each macOS or Ubuntu machine that should use the rotator.
 
 You can still provide an explicit id/name:
@@ -325,7 +340,7 @@ claude-rotator monitor
 
 ### Diagnostics
 
-Recent proxy requests are shown in `claude-rotator status` / `claude-rotator monitor`, and the service writes metadata-only request logs to `~/.config/claude-rotator/server.log`. Automatic rotation only happens when the current account reaches 100% usage in the 5h or 7d window and a known available account exists.
+Recent proxy requests are shown in `claude-rotator status` / `claude-rotator monitor`, and the service writes metadata-only request logs to `~/.config/claude-rotator/server.log`. Automatic rotation only happens when the current account reaches 100% usage in the 5h or 7d window and a known available account exists. OAuth usage is refreshed at startup, reload, first status read, and at reported reset times for exhausted accounts. Use `claude-rotator refresh-usage` to force an immediate recheck of all registered accounts.
 
 ### Restore
 
