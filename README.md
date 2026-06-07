@@ -208,7 +208,7 @@ tail -f ~/.config/claude-rotator/server.err
 
 ログに出るのは `account`、`method`、`path`、`status`、`durationMs`、`outcome`、`requestId`、timeout/network error 時の `errorType` だけです。token / Authorization header / API key / request body / response body は出しません。
 
-自動切り替えは、現在のアカウントの 5時間枠または 7日枠が 100% に達した場合だけ行います。利用可能な候補がある場合は、5時間枠 / 7日枠の既知使用率から `max(5h, 7d)` が最も低いアカウントを選びます。すべての候補が 100% の場合は、reset 時刻が最も近い exhausted アカウントを選び、Claude Code に上流の limit message をそのまま返せるようにします。
+自動切り替えは、現在のアカウントの 5時間枠または 7日枠が 100% に達した場合だけ行います。利用可能な候補がある場合は、5時間枠 / 7日枠の既知使用率から `max(5h, 7d)` が最も低いアカウントを選びます。現在のアカウント自身が quota exhausted で、すべての候補も 100% の場合だけ、reset 時刻が最も近い exhausted アカウントを選び、Claude Code に上流の limit message をそのまま返せるようにします。OAuth refresh failure、authentication error、一時的な throttle では exhausted アカウントへ切り替えません。
 
 retryable な上流 5xx / 529 / `x-should-retry` 付きレスポンス、または上流アイドルタイムアウトが起きた場合も、アカウント切り替えは行いません。上流の error body または proxy の timeout error を可能な限りそのまま返します。
 
@@ -350,7 +350,7 @@ claude-rotator monitor
 
 ### Diagnostics
 
-Recent proxy requests are shown in `claude-rotator status` / `claude-rotator monitor`, and the service writes metadata-only request logs to `~/.config/claude-rotator/server.log`. Automatic rotation only happens when the current account reaches 100% usage in the 5h or 7d window. If an available account exists, the proxy chooses the lowest known usage; if every account is exhausted, it chooses the account with the shortest reset time and passes through the upstream limit message. OAuth usage is refreshed at startup, reload, first status read, and at reported reset times for exhausted accounts. Use `claude-rotator refresh-usage` to force an immediate recheck of all registered accounts.
+Recent proxy requests are shown in `claude-rotator status` / `claude-rotator monitor`, and the service writes metadata-only request logs to `~/.config/claude-rotator/server.log`. Automatic rotation only happens when the current account reaches 100% usage in the 5h or 7d window. If an available account exists, the proxy chooses the lowest known usage; if the current account itself is quota-exhausted and every candidate is exhausted, it chooses the account with the shortest reset time and passes through the upstream limit message. OAuth refresh failures, authentication errors, and temporary throttles do not rotate to exhausted accounts. OAuth usage is refreshed at startup, reload, first status read, and at reported reset times for exhausted accounts. Use `claude-rotator refresh-usage` to force an immediate recheck of all registered accounts.
 
 ### Restore
 

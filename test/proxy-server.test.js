@@ -547,7 +547,7 @@ describe('createProxyServer', () => {
     assert.equal(accountManager.getStatus().currentAccount, 'acct_1');
   });
 
-  it('does not switch accounts when refreshing an expired token fails', async t => {
+  it('keeps the current account when refreshing an expired token fails', async t => {
     const upstreamSeen = [];
     const upstream = await listen(http.createServer(async (req, res) => {
       upstreamSeen.push(req.headers.authorization);
@@ -591,10 +591,13 @@ describe('createProxyServer', () => {
       body: JSON.stringify({ model: 'sonnet' }),
     });
 
-    assert.equal(response.status, 429);
-    assert.deepEqual(upstreamSeen, []);
+    assert.equal(response.status, 200);
+    assert.deepEqual(upstreamSeen, ['Bearer expired-token']);
     assert.equal(accountManager.getStatus().currentAccount, 'acct_1');
-    assert.equal(response.body.error.message, 'All configured accounts are unavailable.');
+    assert.deepEqual(accountManager.getStatus().accounts[0].unavailableReason, {
+      type: 'oauth_refresh_failed',
+      message: 'OAuth token refresh failed',
+    });
   });
 
   it('passes through the upstream usage-limit response when the only account is exhausted', async t => {
@@ -647,7 +650,7 @@ describe('createProxyServer', () => {
     assert.notEqual(response.body.error.message, 'All configured accounts are unavailable.');
   });
 
-  it('prefers passing through a quota-exhausted account over an errored account', async t => {
+  it('does not fall back to a quota-exhausted account when the current account is errored', async t => {
     const upstreamSeen = [];
     const upstream = await listen(http.createServer(async (req, res) => {
       upstreamSeen.push(req.headers.authorization);
@@ -709,9 +712,10 @@ describe('createProxyServer', () => {
       body: JSON.stringify({ model: 'sonnet' }),
     });
 
-    assert.equal(response.status, 429);
-    assert.deepEqual(upstreamSeen, ['Bearer live-current-token']);
-    assert.match(response.body.error.message, /session limit/);
+    assert.equal(response.status, 401);
+    assert.deepEqual(upstreamSeen, ['Bearer stale-other-token']);
+    assert.equal(response.body.error.type, 'authentication_error');
+    assert.equal(accountManager.getStatus().currentAccount, 'other');
   });
 
   it('passes through the exhausted account with the shortest reset time when all accounts are exhausted', async t => {

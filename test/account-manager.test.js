@@ -183,6 +183,25 @@ describe('AccountManager', () => {
     assert.equal(manager.getFallbackAccount().id, 'throttled');
   });
 
+  it('does not fall back to an exhausted alternate when the current account has an auth error', () => {
+    const manager = new AccountManager({
+      accounts: [
+        { id: 'current', name: 'current@example.com', type: 'oauth' },
+        { id: 'exhausted', name: 'exhausted@example.com', type: 'oauth' },
+      ],
+      now: () => 1000,
+    });
+    manager.markError('current', 'oauth_refresh_failed', 'OAuth token refresh failed');
+    manager.updateQuota('exhausted', {
+      'anthropic-ratelimit-unified-7d-utilization': '1',
+      'anthropic-ratelimit-unified-7d-reset': '10',
+    });
+
+    assert.equal(manager.getActiveAccount(), null);
+    assert.equal(manager.getFallbackAccount().id, 'current');
+    assert.equal(manager.getCurrentAccount().id, 'current');
+  });
+
   it('replaces account metadata for server reload', () => {
     const manager = new AccountManager({
       accounts: [{ id: 'acct_1', name: 'a@example.com', type: 'oauth' }],

@@ -41,7 +41,7 @@ export class AccountManager {
     if (current.status !== 'error') {
       return current;
     }
-    return this.selectBestExhaustedFallback();
+    return current;
   }
 
   switchTo(accountId) {
