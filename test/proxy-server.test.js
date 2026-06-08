@@ -975,7 +975,7 @@ describe('createProxyServer', () => {
     assert.equal(response.status, 200);
     assert.equal(response.body.accounts[0].quota.unified5h, 0.25);
     assert.equal(response.body.accounts[0].quota.unified7d, 0.5);
-    assert.equal(response.body.accounts[0].status, 'ready');
+    assert.equal(response.body.accounts[0].status, 'active');
   });
 
   it('refreshes exhausted usage again at the reported reset time', async t => {
@@ -1024,7 +1024,7 @@ describe('createProxyServer', () => {
 
     assert.ok(calls >= 2);
     assert.equal(second.body.accounts[0].quota.unified7d, 0);
-    assert.equal(second.body.accounts[0].status, 'ready');
+    assert.equal(second.body.accounts[0].status, 'active');
   });
 
   it('exposes health and status without secrets', async () => {

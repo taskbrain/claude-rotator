@@ -358,7 +358,7 @@ export class AccountManager {
   }
 
   displayStatus(account) {
-    if (account.status === 'active' && this.accounts[this.currentIndex]?.id === account.id) return 'active';
+    if (this.accounts[this.currentIndex]?.id === account.id && !this.unavailableReason(account)) return 'active';
     if (account.status === 'exhausted') return 'exhausted';
     if (account.status === 'throttled') return 'throttled';
     if (account.status === 'error') return 'error';

@@ -112,6 +112,19 @@ describe('AccountManager', () => {
     assert.equal(manager.getCurrentAccount().id, 'acct_2');
   });
 
+  it('reports the configured current account as active in status', () => {
+    const manager = new AccountManager({
+      accounts: [
+        { id: 'acct_1', name: 'a@example.com', type: 'oauth' },
+        { id: 'acct_2', name: 'b@example.com', type: 'oauth' },
+      ],
+      currentAccountId: 'acct_2',
+    });
+
+    assert.equal(manager.getStatus().currentAccount, 'acct_2');
+    assert.equal(manager.getStatus().accounts[1].status, 'active');
+  });
+
   it('makes quota-limited accounts available after reset time passes', () => {
     let now = 1000;
     const manager = new AccountManager({
