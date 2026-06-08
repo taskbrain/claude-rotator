@@ -89,6 +89,9 @@ export function createProxyServer({
       }
 
       const body = await readBody(req);
+      if (usagePollingEnabled(config) && !usageScheduler.hasAttempted()) {
+        await usageScheduler.refreshNow();
+      }
       await forwardWithRotation({
         req,
         res,

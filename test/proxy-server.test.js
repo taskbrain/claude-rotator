@@ -846,6 +846,56 @@ describe('createProxyServer', () => {
     assert.equal(accountManager.getStatus().currentAccount, 'weekly-a');
   });
 
+  it('waits for initial usage refresh before forwarding the first API request', async t => {
+    const upstreamSeen = [];
+    const upstream = await listen(http.createServer(async (req, res) => {
+      upstreamSeen.push(req.headers.authorization);
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ ok: true }));
+    }));
+
+    const secretStore = new MemorySecretStore();
+    await secretStore.set('weekly', { accessToken: 'weekly-token' });
+    await secretStore.set('dev', { accessToken: 'dev-token' });
+    const accountManager = new AccountManager({
+      accounts: [
+        { id: 'weekly', name: 'weekly@example.com', type: 'oauth' },
+        { id: 'dev', name: 'dev@example.com', type: 'oauth' },
+      ],
+      switchThreshold: 1,
+      now: () => Date.parse('2026-06-08T06:00:00Z'),
+    });
+    const proxy = await listen(createProxyServer({
+      accountManager,
+      secretStore,
+      config: { upstream: upstream.url, usagePolling: { enabled: true } },
+      usageFetcher: async token => {
+        if (token === 'weekly-token') {
+          return {
+            seven_day: { utilization: 1, resets_at: '2026-06-11T12:00:00Z' },
+          };
+        }
+        return {
+          five_hour: { utilization: 0.11, resets_at: '2026-06-08T10:50:00Z' },
+          seven_day: { utilization: 0.03, resets_at: '2026-06-15T03:00:00Z' },
+        };
+      },
+    }));
+    t.after(async () => {
+      await close(proxy.server);
+      await close(upstream.server);
+    });
+
+    const response = await requestJson(`${proxy.url}/v1/messages`, {
+      method: 'POST',
+      body: JSON.stringify({ model: 'sonnet' }),
+    });
+
+    assert.equal(response.status, 200);
+    assert.deepEqual(upstreamSeen, ['Bearer dev-token']);
+    assert.equal(accountManager.getStatus().currentAccount, 'dev');
+  });
+
   it('refreshes OAuth usage into status for inactive accounts', async t => {
     const secretStore = new MemorySecretStore();
     await secretStore.set('dev', { accessToken: 'dev-token' });
