@@ -773,7 +773,7 @@ describe('createProxyServer', () => {
     assert.equal(accountManager.getStatus().currentAccount, 'other');
   });
 
-  it('passes through the exhausted account with the shortest reset time when all accounts are exhausted', async t => {
+  it('keeps the current exhausted account when all accounts are exhausted', async t => {
     const upstreamSeen = [];
     const upstream = await listen(http.createServer(async (req, res) => {
       upstreamSeen.push(req.headers.authorization);
@@ -841,9 +841,9 @@ describe('createProxyServer', () => {
     });
 
     assert.equal(response.status, 429);
-    assert.deepEqual(upstreamSeen, ['Bearer dev-token']);
-    assert.match(response.body.error.message, /session limit/);
-    assert.equal(accountManager.getStatus().currentAccount, 'dev');
+    assert.deepEqual(upstreamSeen, ['Bearer weekly-a-token']);
+    assert.match(response.body.error.message, /weekly limit/);
+    assert.equal(accountManager.getStatus().currentAccount, 'weekly-a');
   });
 
   it('refreshes OAuth usage into status for inactive accounts', async t => {
@@ -856,6 +856,7 @@ describe('createProxyServer', () => {
         { id: 'dev', name: 'dev@example.com', type: 'oauth' },
       ],
       switchThreshold: 1,
+      currentAccountId: 'dev',
       now: () => Date.parse('2026-06-07T11:00:00Z'),
     });
     const proxy = await listen(createProxyServer({

@@ -1,12 +1,15 @@
 import { emptyQuota, parseRateLimitHeaders } from './quota.js';
 
 export class AccountManager {
-  constructor({ accounts = [], switchThreshold = 1, now = () => Date.now() } = {}) {
+  constructor({ accounts = [], switchThreshold = 1, currentAccountId = null, now = () => Date.now() } = {}) {
     this.now = now;
     this.switchThreshold = switchThreshold;
     this.events = [];
     this.accounts = accounts.map((account, index) => this.createAccount(account, index));
-    this.currentIndex = 0;
+    const configuredIndex = currentAccountId
+      ? this.accounts.findIndex(account => account.id === currentAccountId || account.name === currentAccountId)
+      : -1;
+    this.currentIndex = configuredIndex >= 0 ? configuredIndex : 0;
   }
 
   getActiveAccount() {
@@ -44,7 +47,7 @@ export class AccountManager {
     if (!current) return null;
     const reason = this.unavailableReason(current);
     if (isUnifiedQuotaExhaustion(reason)) {
-      return this.selectBestExhaustedFallback() || current;
+      return current;
     }
     if (current.status !== 'error') {
       return current;

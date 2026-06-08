@@ -84,6 +84,44 @@ describe('runCli', () => {
     assert.match(io.output(), /Imported person@example\.com/);
   });
 
+  it('refuses to import current login when no refresh token is available', async () => {
+    const io = createIo();
+    const imported = [];
+
+    const code = await runCli(['login'], {
+      ...io,
+      readCurrentCredentials: async () => ({ accessToken: 'access', refreshToken: null }),
+      fetchProfile: async () => ({ email: 'person@example.com', accountUuid: 'uuid-1' }),
+      saveImportedAccount: async account => imported.push(account),
+      reloadServer: async () => {},
+    });
+
+    assert.equal(code, 1);
+    assert.deepEqual(imported, []);
+    assert.match(io.output(), /include a refresh token/);
+  });
+
+  it('refuses to create a fallback account when current login cannot be verified', async () => {
+    const io = createIo();
+    const imported = [];
+
+    const code = await runCli(['login'], {
+      ...io,
+      readCurrentCredentials: async () => ({ accessToken: 'access', refreshToken: 'refresh' }),
+      fetchProfile: async () => {
+        throw new Error('Profile fetch failed (401): invalid credentials');
+      },
+      loadConfig: async () => ({ accounts: [] }),
+      saveImportedAccount: async account => imported.push(account),
+      reloadServer: async () => {},
+    });
+
+    assert.equal(code, 1);
+    assert.deepEqual(imported, []);
+    assert.doesNotMatch(io.output(), /Imported account1/);
+    assert.match(io.output(), /Could not verify the current Claude Code login/);
+  });
+
   it('configures live current Claude Code login without storing a token snapshot', async () => {
     const io = createIo();
     let savedConfig = null;

@@ -75,7 +75,10 @@ export async function runCli(argv = [], deps = {}) {
     if (command === 'switch') {
       const account = argv[1];
       if (!account) throw new Error('Usage: claude-rotator switch <account>');
-      await postJson('/internal/switch', { account });
+      const status = await postJson('/internal/switch', { account });
+      const config = await loadOrCreateConfig();
+      config.activeAccount = status.currentAccount || account;
+      await saveConfig(config);
       write(`Switched to ${account}\n`);
       return 0;
     }
@@ -146,7 +149,11 @@ export function helpText() {
 async function runServer({ write }) {
   const config = await loadOrCreateConfig();
   const secretStore = createSecretStore();
-  const accountManager = new AccountManager({ accounts: config.accounts, switchThreshold: config.switchThreshold });
+  const accountManager = new AccountManager({
+    accounts: config.accounts,
+    switchThreshold: config.switchThreshold,
+    currentAccountId: config.activeAccount,
+  });
   const server = createProxyServer({
     accountManager,
     secretStore,
@@ -242,9 +249,22 @@ async function loginCurrentCommand({ argv, write, deps }) {
   const secret = deps.readCurrentCredentials
     ? await deps.readCurrentCredentials()
     : await readCurrentClaudeCredentials();
+  if (!secret.refreshToken) {
+    throw new Error(
+      'Current Claude Code credentials do not include a refresh token. ' +
+      'Run claude auth login, then retry claude-rotator login.'
+    );
+  }
   const profile = await readProfileForLogin(secret, deps);
   const config = deps.loadConfig ? await deps.loadConfig() : await loadOrCreateConfig();
   const explicitId = Boolean(argValue(argv, '--id'));
+  const explicitName = Boolean(argValue(argv, '--name'));
+  if (!profile && !explicitId && !explicitName) {
+    throw new Error(
+      'Could not verify the current Claude Code login. ' +
+      'Run claude auth login and retry, or pass both --id and --name for a known-good credential.'
+    );
+  }
   const name = argValue(argv, '--name') || profile?.email || argValue(argv, '--id') || nextAccountId(config);
   const id = argValue(argv, '--id') || accountIdFromName(name);
   assertSnapshotAccountId(id);
