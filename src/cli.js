@@ -11,7 +11,7 @@ import { createProxyServer } from './proxy-server.js';
 import { createSecretStore } from './secret-store.js';
 import { renderStatus } from './monitor.js';
 import { readCurrentClaudeCredentials } from './claude-credentials.js';
-import { fetchProfile } from './oauth.js';
+import { fetchProfile, isTokenExpiringSoon, refreshAccessToken } from './oauth.js';
 import {
   installSettings,
   MACOS_LAUNCH_AGENT_LABEL,
@@ -410,6 +410,7 @@ async function inspectDoctorWarnings(deps = {}) {
   const store = deps.secretStore || createSecretStore();
   const readCurrent = deps.readCurrentCredentials || readCurrentClaudeCredentials;
   const profileFetcher = deps.fetchProfile || fetchProfile;
+  const tokenRefresher = deps.refreshAccessToken || refreshAccessToken;
   const liveProfiles = [];
 
   for (const account of accounts) {
@@ -429,7 +430,25 @@ async function inspectDoctorWarnings(deps = {}) {
         continue;
       }
 
-      const profile = await profileFetcher(secret.accessToken);
+      const profileSecret = await refreshDoctorSecretIfNeeded({
+        account,
+        secret,
+        store,
+        tokenRefresher,
+      });
+      let profile;
+      try {
+        profile = await profileFetcher(profileSecret.accessToken);
+      } catch (profileError) {
+        if (!secret.refreshToken || profileSecret !== secret) throw profileError;
+        const refreshedSecret = await refreshDoctorSecret({
+          account,
+          secret,
+          store,
+          tokenRefresher,
+        });
+        profile = await profileFetcher(refreshedSecret.accessToken);
+      }
       if (profile?.accountUuid) liveProfiles.push({ id: account.id, accountUuid: profile.accountUuid });
       if (profile?.email && account.name && profile.email !== account.name) {
         warnings.push(`${account.id}: config name ${account.name} differs from live login ${profile.email}`);
@@ -446,6 +465,17 @@ async function inspectDoctorWarnings(deps = {}) {
 
   warnings.push(...duplicateAccountUuidWarnings(liveProfiles).map(warning => `live ${warning}`));
   return warnings;
+}
+
+async function refreshDoctorSecretIfNeeded({ account, secret, store, tokenRefresher }) {
+  if (!secret.refreshToken || !isTokenExpiringSoon(secret.expiresAt)) return secret;
+  return refreshDoctorSecret({ account, secret, store, tokenRefresher });
+}
+
+async function refreshDoctorSecret({ account, secret, store, tokenRefresher }) {
+  const refreshed = { ...secret, ...(await tokenRefresher(secret.refreshToken)) };
+  if (account.id !== CURRENT_ACCOUNT_ID && store.set) await store.set(account.id, refreshed);
+  return refreshed;
 }
 
 function duplicateAccountUuidWarnings(accounts) {

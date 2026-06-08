@@ -19,6 +19,7 @@ const HOP_HEADERS = new Set([
 
 const DEFAULT_UPSTREAM_IDLE_TIMEOUT_MS = 180000;
 const DEFAULT_RESET_CHECK_DELAY_MS = 1000;
+const DEFAULT_USAGE_POLL_INTERVAL_MS = 60_000;
 const MAX_TIMER_DELAY_MS = 2_147_483_647;
 
 export function createProxyServer({
@@ -168,12 +169,25 @@ function createUsageRefreshScheduler({ config, usageRefresher, now = () => Date.
 }
 
 function nextUsageRefreshDelay(status, config, nowMs) {
+  const delays = [];
   const resetCheckDelayMs = Number(config.usagePolling?.resetCheckDelayMs) || DEFAULT_RESET_CHECK_DELAY_MS;
   const resetAt = nextExhaustedQuotaResetAt(status);
   if (resetAt != null) {
-    return clampTimerDelay(Math.max(0, resetAt - nowMs) + resetCheckDelayMs);
+    delays.push(Math.max(0, resetAt - nowMs) + resetCheckDelayMs);
   }
-  return null;
+
+  const intervalMs = usagePollingIntervalMs(config);
+  if (intervalMs != null) delays.push(intervalMs);
+
+  if (delays.length === 0) return null;
+  return clampTimerDelay(Math.min(...delays));
+}
+
+function usagePollingIntervalMs(config) {
+  const raw = config.usagePolling?.intervalMs;
+  const value = raw == null ? DEFAULT_USAGE_POLL_INTERVAL_MS : Number(raw);
+  if (!Number.isFinite(value) || value <= 0) return null;
+  return value;
 }
 
 function nextExhaustedQuotaResetAt(status) {

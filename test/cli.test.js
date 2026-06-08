@@ -286,6 +286,48 @@ describe('runCli', () => {
     assert.match(io.output(), /warning: bad: credential profile check failed: Profile fetch failed \(401\)/);
     assert.match(io.output(), /warning: live duplicate accountUuid for current, duplicate/);
   });
+
+  it('refreshes expired stored credentials before doctor profile checks', async () => {
+    const io = createIo();
+    const stored = {
+      acct_1: {
+        accessToken: 'expired-token',
+        refreshToken: 'refresh-token',
+        expiresAt: 1000,
+      },
+    };
+    const secretStore = {
+      get: async id => stored[id],
+      set: async (id, secret) => { stored[id] = secret; },
+    };
+
+    const code = await runCli(['doctor'], {
+      ...io,
+      readHealth: async () => ({ ok: true }),
+      loadConfig: async () => ({
+        accounts: [
+          { id: 'acct_1', name: 'person@example.com', type: 'oauth', accountUuid: 'uuid-1' },
+        ],
+      }),
+      secretStore,
+      refreshAccessToken: async refreshToken => {
+        assert.equal(refreshToken, 'refresh-token');
+        return {
+          accessToken: 'fresh-token',
+          refreshToken,
+          expiresAt: Date.now() + 60 * 60 * 1000,
+        };
+      },
+      fetchProfile: async token => {
+        assert.equal(token, 'fresh-token');
+        return { email: 'person@example.com', accountUuid: 'uuid-1' };
+      },
+    });
+
+    assert.equal(code, 0);
+    assert.match(io.output(), /accounts: ok/);
+    assert.equal(stored.acct_1.accessToken, 'fresh-token');
+  });
 });
 
 function createIo() {

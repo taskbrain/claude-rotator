@@ -1027,6 +1027,55 @@ describe('createProxyServer', () => {
     assert.equal(second.body.accounts[0].status, 'active');
   });
 
+  it('periodically refreshes usage and switches before the next API request', async t => {
+    const secretStore = new MemorySecretStore();
+    await secretStore.set('acct_1', { accessToken: 'access-token-1' });
+    await secretStore.set('acct_2', { accessToken: 'access-token-2' });
+    const accountManager = new AccountManager({
+      accounts: [
+        { id: 'acct_1', name: 'a@example.com', type: 'oauth' },
+        { id: 'acct_2', name: 'b@example.com', type: 'oauth' },
+      ],
+      switchThreshold: 0.99,
+      now: () => Date.now(),
+    });
+    let refreshes = 0;
+    const proxy = await listen(createProxyServer({
+      accountManager,
+      secretStore,
+      config: {
+        upstream: 'http://127.0.0.1:1',
+        usagePolling: { enabled: true, intervalMs: 5 },
+      },
+      usageFetcher: async token => {
+        if (token === 'access-token-1') {
+          const utilization = refreshes >= 2 ? 1 : 0.5;
+          refreshes += 1;
+          return {
+            five_hour: { utilization, resets_at: '2026-06-09T00:50:00+09:00' },
+            seven_day: { utilization: 0.35, resets_at: '2026-06-15T12:00:00+09:00' },
+          };
+        }
+        refreshes += 1;
+        return {
+          five_hour: { utilization: 0.1, resets_at: '2026-06-09T05:00:00+09:00' },
+          seven_day: { utilization: 0.2, resets_at: '2026-06-15T12:00:00+09:00' },
+        };
+      },
+    }));
+    t.after(async () => {
+      await close(proxy.server);
+    });
+
+    await sleep(80);
+    const status = accountManager.getStatus();
+
+    assert.ok(refreshes >= 4);
+    assert.equal(status.currentAccount, 'acct_2');
+    assert.equal(status.accounts[0].status, 'exhausted');
+    assert.equal(status.accounts[1].status, 'active');
+  });
+
   it('exposes health and status without secrets', async () => {
     const secretStore = new MemorySecretStore();
     await secretStore.set('acct_1', { accessToken: 'access-token-1' });

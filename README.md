@@ -189,7 +189,7 @@ account1@example.com        active
 7d ███████░░░  76%  reset in 1d9h -> 06/06 19:00
 ```
 
-未使用のアカウントでも、server 起動時・アカウント reload 時・初回 status 表示時に OAuth Usage API から 5時間枠 / 7日枠の状態を取得します。100% 到達済みの枠に reset 時刻がある場合は、その reset 時刻の直後に自動で再取得します。Usage API が取得できない場合だけ `unknown` と表示されます。`unknown` のアカウントは空いている確認が取れていないため、自動切り替え先には使いません。
+未使用のアカウントでも、server 起動時・アカウント reload 時・初回 status 表示時・定期 polling で OAuth Usage API から 5時間枠 / 7日枠の状態を取得します。100% 到達済みの枠に reset 時刻がある場合は、その reset 時刻の直後にも自動で再取得します。Usage API が取得できない場合だけ `unknown` と表示されます。`unknown` のアカウントは空いている確認が取れていないため、自動切り替え先には使いません。
 
 ## ログと切り替え診断
 
@@ -213,7 +213,7 @@ tail -f ~/.config/claude-rotator/server.err
 
 retryable な上流 5xx / 529 / `x-should-retry` 付きレスポンス、または上流アイドルタイムアウトが起きた場合も、アカウント切り替えは行いません。上流の error body または proxy の timeout error を可能な限りそのまま返します。
 
-Usage API の再取得は、固定間隔では実行しません。通常は取得済み Usage API に含まれる reset 時刻を使い、100% 到達済みの枠がリセットされる時刻の直後に自動で再取得します。Claude Code 側の早期リセットや一時的な状態変化を確認したい場合は、次の手動コマンドで全登録アカウントを即時再確認します。
+Usage API の再取得は、デフォルトでは 60 秒ごとの定期 polling と、100% 到達済みの枠がリセットされる時刻の直後に実行されます。間隔は `~/.config/claude-rotator/config.json` の `usagePolling.intervalMs` で変更できます。Claude Code 側の早期リセットや一時的な状態変化を確認したい場合は、次の手動コマンドで全登録アカウントを即時再確認します。
 
 ```bash
 claude-rotator refresh-usage
@@ -222,7 +222,7 @@ claude-rotator status
 
 `refresh-usage` 後は `claude-rotator status` で active を確認してください。Usage API の再取得で現在の active が 100% と判明し、別の利用可能アカウントまたは reset が近い exhausted アカウントがある場合は、active が更新されることがあります。意図的に active を変更する場合は `claude-rotator switch <account>` を使います。
 
-`claude-rotator doctor` は server の疎通に加えて、次の問題を secret を出さずに警告します。
+`claude-rotator doctor` は server の疎通に加えて、次の問題を secret を出さずに警告します。保存済み access token が期限切れの場合は refresh token で更新してから profile を確認します。
 
 - 同じ Claude account UUID が複数登録されている
 - `current` の表示名や UUID が現在の Claude Code ログインとずれている
@@ -351,7 +351,7 @@ claude-rotator monitor
 
 ### Diagnostics
 
-Recent proxy requests are shown in `claude-rotator status` / `claude-rotator monitor`, and the service writes metadata-only request logs to `~/.config/claude-rotator/server.log`. Automatic rotation only happens when the current account reaches 100% usage in the 5h or 7d window. If an available account exists, the proxy chooses the lowest known usage. If every candidate is exhausted or otherwise unavailable, the proxy keeps the current account and passes through the upstream limit message instead of switching to another exhausted account. OAuth refresh failures, authentication errors, and temporary throttles do not rotate to exhausted accounts. OAuth usage is refreshed at startup, reload, first status read, and at reported reset times for exhausted accounts. Use `claude-rotator refresh-usage` to force an immediate recheck of all registered accounts.
+Recent proxy requests are shown in `claude-rotator status` / `claude-rotator monitor`, and the service writes metadata-only request logs to `~/.config/claude-rotator/server.log`. Automatic rotation happens when the current account reaches the configured 5h or 7d usage threshold. If an available account exists, the proxy chooses the lowest known usage. If every candidate is exhausted or otherwise unavailable, the proxy keeps the current account and passes through the upstream limit message instead of switching to another exhausted account. OAuth refresh failures, authentication errors, and temporary throttles do not rotate to exhausted accounts. OAuth usage is refreshed at startup, reload, first status read, periodically every 60 seconds by default, and at reported reset times for exhausted accounts. Set `usagePolling.intervalMs` in `~/.config/claude-rotator/config.json` to adjust the interval. Use `claude-rotator refresh-usage` to force an immediate recheck of all registered accounts.
 
 ### Restore
 
