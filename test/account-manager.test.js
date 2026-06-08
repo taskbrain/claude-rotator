@@ -70,7 +70,7 @@ describe('AccountManager', () => {
     assert.equal(manager.getFallbackAccount().id, 'acct_1');
   });
 
-  it('falls back to the quota-exhausted account with the shortest reset time', () => {
+  it('keeps the current quota-exhausted account when no available target exists', () => {
     const manager = new AccountManager({
       accounts: [
         { id: 'weekly-a', name: 'weekly-a@example.com', type: 'oauth' },
@@ -96,8 +96,20 @@ describe('AccountManager', () => {
     });
 
     assert.equal(manager.getActiveAccount(), null);
-    assert.equal(manager.getFallbackAccount().id, 'dev');
-    assert.equal(manager.getCurrentAccount().id, 'dev');
+    assert.equal(manager.getFallbackAccount().id, 'weekly-a');
+    assert.equal(manager.getCurrentAccount().id, 'weekly-a');
+  });
+
+  it('starts on the configured active account', () => {
+    const manager = new AccountManager({
+      accounts: [
+        { id: 'acct_1', name: 'a@example.com', type: 'oauth' },
+        { id: 'acct_2', name: 'b@example.com', type: 'oauth' },
+      ],
+      currentAccountId: 'acct_2',
+    });
+
+    assert.equal(manager.getCurrentAccount().id, 'acct_2');
   });
 
   it('makes quota-limited accounts available after reset time passes', () => {

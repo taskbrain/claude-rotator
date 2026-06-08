@@ -351,7 +351,7 @@ claude-rotator monitor
 
 ### Diagnostics
 
-Recent proxy requests are shown in `claude-rotator status` / `claude-rotator monitor`, and the service writes metadata-only request logs to `~/.config/claude-rotator/server.log`. Automatic rotation only happens when the current account reaches 100% usage in the 5h or 7d window. If an available account exists, the proxy chooses the lowest known usage; if the current account itself is quota-exhausted and every candidate is exhausted, it chooses the account with the shortest reset time and passes through the upstream limit message. OAuth refresh failures, authentication errors, and temporary throttles do not rotate to exhausted accounts. OAuth usage is refreshed at startup, reload, first status read, and at reported reset times for exhausted accounts. Use `claude-rotator refresh-usage` to force an immediate recheck of all registered accounts.
+Recent proxy requests are shown in `claude-rotator status` / `claude-rotator monitor`, and the service writes metadata-only request logs to `~/.config/claude-rotator/server.log`. Automatic rotation only happens when the current account reaches 100% usage in the 5h or 7d window. If an available account exists, the proxy chooses the lowest known usage. If every candidate is exhausted or otherwise unavailable, the proxy keeps the current account and passes through the upstream limit message instead of switching to another exhausted account. OAuth refresh failures, authentication errors, and temporary throttles do not rotate to exhausted accounts. OAuth usage is refreshed at startup, reload, first status read, and at reported reset times for exhausted accounts. Use `claude-rotator refresh-usage` to force an immediate recheck of all registered accounts.
 
 ### Restore
 
