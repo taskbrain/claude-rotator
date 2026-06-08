@@ -202,6 +202,40 @@ describe('AccountManager', () => {
     assert.equal(manager.getCurrentAccount().id, 'current');
   });
 
+  it('switches from an errored current account to a known available alternate', () => {
+    const manager = new AccountManager({
+      accounts: [
+        { id: 'current', name: 'current@example.com', type: 'oauth' },
+        { id: 'available', name: 'available@example.com', type: 'oauth' },
+      ],
+      now: () => 1000,
+    });
+    manager.markError('current', 'oauth_refresh_failed', 'OAuth token refresh failed');
+    manager.updateQuota('available', {
+      'anthropic-ratelimit-unified-5h-utilization': '0.1',
+      'anthropic-ratelimit-unified-7d-utilization': '0.2',
+    });
+
+    assert.equal(manager.getActiveAccount().id, 'available');
+    assert.equal(manager.getCurrentAccount().id, 'available');
+    assert.equal(manager.getStatus().accounts[0].status, 'error');
+  });
+
+  it('keeps an errored previous account marked as error after a manual switch', () => {
+    const manager = new AccountManager({
+      accounts: [
+        { id: 'current', name: 'current@example.com', type: 'oauth' },
+        { id: 'available', name: 'available@example.com', type: 'oauth' },
+      ],
+      now: () => 1000,
+    });
+    manager.markError('current', 'oauth_refresh_failed', 'OAuth token refresh failed');
+    manager.switchTo('available');
+
+    assert.equal(manager.getCurrentAccount().id, 'available');
+    assert.equal(manager.getStatus().accounts[0].status, 'error');
+  });
+
   it('replaces account metadata for server reload', () => {
     const manager = new AccountManager({
       accounts: [{ id: 'acct_1', name: 'a@example.com', type: 'oauth' }],

@@ -17,6 +17,14 @@ export class AccountManager {
     }
 
     const reason = this.unavailableReason(current);
+    if (current?.status === 'error') {
+      const next = this.selectBestAvailableSwitchTarget();
+      if (next) {
+        next.status = 'active';
+        return next;
+      }
+      return null;
+    }
     if (!isUnifiedQuotaExhaustion(reason)) return null;
 
     const next = this.selectBestAvailableSwitchTarget();
@@ -47,7 +55,11 @@ export class AccountManager {
   switchTo(accountId) {
     const index = this.accounts.findIndex(account => account.id === accountId || account.name === accountId);
     if (index < 0) throw new Error(`Unknown account: ${accountId}`);
-    this.accounts[this.currentIndex].status = 'ready';
+    const previous = this.accounts[this.currentIndex];
+    if (previous) {
+      this.refreshQuotaState(previous);
+      if (previous.status === 'active') previous.status = 'ready';
+    }
     this.currentIndex = index;
     this.accounts[index].status = 'active';
     this.events.unshift({
