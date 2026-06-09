@@ -303,6 +303,12 @@ async function forwardWithRotation({
   for (let attempt = 0; attempt < maxAttempts; attempt++) {
     const account = accountManager.getActiveAccount();
     if (!account) {
+      if (sendCurrentQuotaUnavailableResponse({
+        req,
+        res,
+        accountManager,
+        logger,
+      })) return;
       if (lastRetryableResponse) {
         sendBufferedResponse(res, lastRetryableResponse);
         return;
@@ -395,6 +401,12 @@ async function forwardWithRotation({
   }
 
   if (!res.headersSent) {
+    if (sendCurrentQuotaUnavailableResponse({
+      req,
+      res,
+      accountManager,
+      logger,
+    })) return;
     if (lastRetryableResponse) {
       sendBufferedResponse(res, lastRetryableResponse);
       return;
@@ -427,6 +439,13 @@ async function forwardCurrentUnavailableAccount({
   logger,
   upstreamIdleTimeoutMs,
 }) {
+  if (sendCurrentQuotaUnavailableResponse({
+    req,
+    res,
+    accountManager,
+    logger,
+  })) return true;
+
   const account = accountManager.getFallbackAccount();
   if (!account) return false;
 
@@ -740,6 +759,53 @@ function syntheticUpstreamErrorResponse(error) {
       error: {
         type,
         message: error.message,
+      },
+    })),
+  };
+}
+
+function sendCurrentQuotaUnavailableResponse({ req, res, accountManager, logger }) {
+  const account = accountManager.getCurrentAccount();
+  const reason = accountManager.unavailableReason(account);
+  if (!isUnifiedQuotaExhaustion(reason)) return false;
+
+  const response = syntheticQuotaExhaustedResponse(account, reason);
+  recordProxyRequest({
+    accountManager,
+    logger,
+    account,
+    method: req.method,
+    path: new URL(req.url, 'http://claude-rotator.local').pathname,
+    statusCode: response.statusCode,
+    outcome: 'quota-exhausted-local',
+    durationMs: 0,
+  });
+  sendBufferedResponse(res, response);
+  return true;
+}
+
+function syntheticQuotaExhaustedResponse(account, reason) {
+  const reset = reason.resetAt ? ` Resets at ${reason.resetAt}.` : '';
+  return {
+    statusCode: 429,
+    headers: {
+      'content-type': 'application/json',
+      'x-claude-rotator-account': account?.id || '',
+      'x-claude-rotator-quota-window': reason.window || '',
+    },
+    body: Buffer.from(JSON.stringify({
+      type: 'error',
+      error: {
+        type: 'rate_limit_error',
+        message: `Claude ${reason.window} usage limit exhausted for ${account?.name || account?.id || 'current account'}.${reset} No available rotation target.`,
+        details: {
+          source: 'claude-rotator',
+          account: account?.id || null,
+          account_name: account?.name || null,
+          window: reason.window,
+          utilization: reason.utilization,
+          reset_at: reason.resetAt || null,
+        },
       },
     })),
   };

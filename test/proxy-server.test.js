@@ -655,7 +655,7 @@ describe('createProxyServer', () => {
     assert.equal(accountManager.getStatus().accounts[0].status, 'error');
   });
 
-  it('passes through the upstream usage-limit response when the only account is exhausted', async t => {
+  it('returns local quota exhaustion when the only account is exhausted', async t => {
     const upstreamSeen = [];
     const upstreamBody = {
       type: 'error',
@@ -700,9 +700,58 @@ describe('createProxyServer', () => {
     });
 
     assert.equal(response.status, 429);
-    assert.deepEqual(upstreamSeen, ['Bearer access-token-1']);
-    assert.deepEqual(response.body, upstreamBody);
+    assert.deepEqual(upstreamSeen, []);
+    assert.equal(response.body.error.type, 'rate_limit_error');
+    assert.match(response.body.error.message, /Claude 5h usage limit exhausted/);
+    assert.doesNotMatch(response.body.error.message, /monthly spend limit/i);
+    assert.equal(response.body.error.details.window, '5h');
     assert.notEqual(response.body.error.message, 'All configured accounts are unavailable.');
+  });
+
+  it('overrides a misleading upstream monthly limit message when local usage is 5h exhausted', async t => {
+    const upstreamSeen = [];
+    const upstream = await listen(http.createServer(async (req, res) => {
+      upstreamSeen.push(req.headers.authorization);
+      res.writeHead(429, {
+        'Content-Type': 'application/json',
+        'anthropic-ratelimit-unified-5h-utilization': '1',
+        'anthropic-ratelimit-unified-5h-reset': '10',
+      });
+      res.end(JSON.stringify({
+        type: 'error',
+        error: {
+          type: 'rate_limit_error',
+          message: "You've hit your monthly spend limit.",
+        },
+      }));
+    }));
+
+    const secretStore = new MemorySecretStore();
+    await secretStore.set('acct_1', { accessToken: 'access-token-1' });
+    const accountManager = new AccountManager({
+      accounts: [{ id: 'acct_1', name: 'a@example.com', type: 'oauth' }],
+      now: () => 1000,
+    });
+    const proxy = await listen(createProxyServer({
+      accountManager,
+      secretStore,
+      config: { upstream: upstream.url },
+    }));
+    t.after(async () => {
+      await close(proxy.server);
+      await close(upstream.server);
+    });
+
+    const response = await requestJson(`${proxy.url}/v1/messages`, {
+      method: 'POST',
+      body: JSON.stringify({ model: 'sonnet' }),
+    });
+
+    assert.equal(response.status, 429);
+    assert.deepEqual(upstreamSeen, ['Bearer access-token-1']);
+    assert.match(response.body.error.message, /Claude 5h usage limit exhausted/);
+    assert.doesNotMatch(response.body.error.message, /monthly spend limit/i);
+    assert.equal(accountManager.getStatus().accounts[0].unavailableReason.window, '5h');
   });
 
   it('does not fall back to a quota-exhausted account when the current account is errored', async t => {
@@ -773,7 +822,7 @@ describe('createProxyServer', () => {
     assert.equal(accountManager.getStatus().currentAccount, 'other');
   });
 
-  it('keeps the current exhausted account when all accounts are exhausted', async t => {
+  it('returns local quota exhaustion when all accounts are exhausted', async t => {
     const upstreamSeen = [];
     const upstream = await listen(http.createServer(async (req, res) => {
       upstreamSeen.push(req.headers.authorization);
@@ -841,8 +890,9 @@ describe('createProxyServer', () => {
     });
 
     assert.equal(response.status, 429);
-    assert.deepEqual(upstreamSeen, ['Bearer weekly-a-token']);
-    assert.match(response.body.error.message, /weekly limit/);
+    assert.deepEqual(upstreamSeen, []);
+    assert.match(response.body.error.message, /Claude 7d usage limit exhausted/);
+    assert.equal(response.body.error.details.window, '7d');
     assert.equal(accountManager.getStatus().currentAccount, 'weekly-a');
   });
 
