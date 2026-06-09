@@ -785,19 +785,33 @@ function sendCurrentQuotaUnavailableResponse({ req, res, accountManager, logger 
 }
 
 function syntheticQuotaExhaustedResponse(account, reason) {
-  const reset = reason.resetAt ? ` Resets at ${reason.resetAt}.` : '';
+  const windowHeader = quotaWindowHeader(reason.window);
+  const claim = quotaRepresentativeClaim(reason.window);
+  const resetSeconds = quotaResetSeconds(reason.resetAt);
+  const headers = {
+    'content-type': 'application/json',
+    'x-claude-rotator-account': account?.id || '',
+    'x-claude-rotator-quota-window': reason.window || '',
+  };
+  if (claim) {
+    headers['anthropic-ratelimit-unified-status'] = 'rejected';
+    headers['anthropic-ratelimit-unified-representative-claim'] = claim;
+  }
+  if (resetSeconds) headers['anthropic-ratelimit-unified-reset'] = resetSeconds;
+  if (windowHeader) {
+    headers[`anthropic-ratelimit-unified-${windowHeader}-utilization`] = String(reason.utilization ?? 1);
+    if (resetSeconds) headers[`anthropic-ratelimit-unified-${windowHeader}-reset`] = resetSeconds;
+  }
+
+  const rotatorMessage = quotaExhaustedRotatorMessage(account, reason);
   return {
     statusCode: 429,
-    headers: {
-      'content-type': 'application/json',
-      'x-claude-rotator-account': account?.id || '',
-      'x-claude-rotator-quota-window': reason.window || '',
-    },
+    headers,
     body: Buffer.from(JSON.stringify({
       type: 'error',
       error: {
         type: 'rate_limit_error',
-        message: `Claude ${reason.window} usage limit exhausted for ${account?.name || account?.id || 'current account'}.${reset} No available rotation target.`,
+        message: quotaExhaustedOfficialMessage(reason),
         details: {
           source: 'claude-rotator',
           account: account?.id || null,
@@ -805,10 +819,65 @@ function syntheticQuotaExhaustedResponse(account, reason) {
           window: reason.window,
           utilization: reason.utilization,
           reset_at: reason.resetAt || null,
+          rotator_message: rotatorMessage,
         },
       },
     })),
   };
+}
+
+function quotaWindowHeader(window) {
+  if (window === '5h') return '5h';
+  if (window === '7d') return '7d';
+  return null;
+}
+
+function quotaRepresentativeClaim(window) {
+  if (window === '5h') return 'five_hour';
+  if (window === '7d') return 'seven_day';
+  return null;
+}
+
+function quotaResetSeconds(resetAt) {
+  const parsed = Date.parse(resetAt);
+  if (!Number.isFinite(parsed)) return null;
+  return String(Math.floor(parsed / 1000));
+}
+
+function quotaExhaustedOfficialMessage(reason) {
+  const limit = reason.window === '5h'
+    ? 'session limit'
+    : reason.window === '7d'
+      ? 'weekly limit'
+      : 'usage limit';
+  const reset = reason.resetAt ? ` · resets ${formatClaudeResetTime(reason.window, reason.resetAt)}` : '';
+  return `You've hit your ${limit}${reset}`;
+}
+
+function quotaExhaustedRotatorMessage(account, reason) {
+  const reset = reason.resetAt ? ` Resets at ${reason.resetAt}.` : '';
+  return `Claude ${reason.window} usage limit exhausted for ${account?.name || account?.id || 'current account'}.${reset} No available rotation target.`;
+}
+
+function formatClaudeResetTime(window, resetAt) {
+  const parsed = Date.parse(resetAt);
+  if (!Number.isFinite(parsed)) return resetAt;
+  const date = new Date(parsed);
+  const time = formatTwelveHourTime(date);
+  if (window === '7d') {
+    const month = date.toLocaleString('en-US', { month: 'short' });
+    return `${month} ${date.getDate()} at ${time}`;
+  }
+  return time;
+}
+
+function formatTwelveHourTime(date) {
+  const hours = date.getHours();
+  const minutes = date.getMinutes();
+  const hour = hours % 12 || 12;
+  const suffix = hours < 12 ? 'am' : 'pm';
+  if (minutes === 0) return `${hour}${suffix}`;
+  return `${hour}:${String(minutes).padStart(2, '0')}${suffix}`;
 }
 
 function sendBufferedResponse(res, response) {

@@ -19,6 +19,9 @@ export function formatDuration(ms) {
   return restHours ? `${days}d${restHours}h` : `${days}d`;
 }
 
+const JAPAN_TIME_OFFSET_MS = 9 * 60 * 60 * 1000;
+const JAPAN_TIME_LABEL = 'JST';
+
 export function renderStatus(status, options = {}) {
   const now = options.now ?? Date.now();
   const lines = [];
@@ -51,34 +54,35 @@ function renderQuotaRow(label, ratio, resetAt, now) {
 }
 
 function renderEvent(event) {
+  const at = formatEventTime(event.at);
   if (event.type === 'auto-switch') {
-    return `${event.at || ''} switched ${event.from || '(none)'} -> ${event.to} reason=${event.reason || 'quota-threshold'}`.trim();
+    return `${at} switched ${event.from || '(none)'} -> ${event.to} reason=${event.reason || 'quota-threshold'}`.trim();
   }
   if (event.type === 'fallback-switch') {
-    return `${event.at || ''} fallback ${event.from || '(none)'} -> ${event.to} reason=${event.reason || 'shortest-quota-reset'}`.trim();
+    return `${at} fallback ${event.from || '(none)'} -> ${event.to} reason=${event.reason || 'shortest-quota-reset'}`.trim();
   }
   if (event.type === 'manual-switch') {
-    return `${event.at || ''} manual switch -> ${event.account}`.trim();
+    return `${at} manual switch -> ${event.account}`.trim();
   }
   if (event.type === 'proxy-request') {
     const status = event.statusCode ?? '-';
     const requestId = event.requestId ? ` req=${event.requestId}` : '';
     const errorType = event.errorType ? ` error=${event.errorType}` : '';
-    return `${event.at || ''} request ${event.account || ''} ${event.method || ''} ${event.path || ''} -> ${status} ${event.durationMs ?? 0}ms outcome=${event.outcome || 'unknown'}${requestId}${errorType}`.trim();
+    return `${at} request ${event.account || ''} ${event.method || ''} ${event.path || ''} -> ${status} ${event.durationMs ?? 0}ms outcome=${event.outcome || 'unknown'}${requestId}${errorType}`.trim();
   }
   if (event.type === 'upstream-error') {
     const reason = renderUnavailableReason(event.reason);
-    return `${event.at || ''} upstream error ${event.account || ''}${reason ? ` (${reason})` : ''}`.trim();
+    return `${at} upstream error ${event.account || ''}${reason ? ` (${reason})` : ''}`.trim();
   }
   if (event.type === 'quota-exhausted') {
     const reason = renderUnavailableReason(event.reason);
-    return `${event.at || ''} quota exhausted ${event.account || ''}${reason ? ` (${reason})` : ''}`.trim();
+    return `${at} quota exhausted ${event.account || ''}${reason ? ` (${reason})` : ''}`.trim();
   }
   if (event.type === 'account-error') {
     const reason = renderUnavailableReason(event.reason);
-    return `${event.at || ''} account error ${event.account || ''}${reason ? ` (${reason})` : ''}`.trim();
+    return `${at} account error ${event.account || ''}${reason ? ` (${reason})` : ''}`.trim();
   }
-  return `${event.at || ''} ${event.type || 'event'}`.trim();
+  return `${at} ${event.type || 'event'}`.trim();
 }
 
 function renderUnavailableReason(reason) {
@@ -101,10 +105,18 @@ function renderUnavailableReason(reason) {
 }
 
 function formatDate(ts) {
-  const date = new Date(ts);
-  const mm = String(date.getMonth() + 1).padStart(2, '0');
-  const dd = String(date.getDate()).padStart(2, '0');
-  const hh = String(date.getHours()).padStart(2, '0');
-  const mi = String(date.getMinutes()).padStart(2, '0');
-  return `${mm}/${dd} ${hh}:${mi}`;
+  if (!Number.isFinite(ts)) return '';
+  const date = new Date(ts + JAPAN_TIME_OFFSET_MS);
+  const mm = String(date.getUTCMonth() + 1).padStart(2, '0');
+  const dd = String(date.getUTCDate()).padStart(2, '0');
+  const hh = String(date.getUTCHours()).padStart(2, '0');
+  const mi = String(date.getUTCMinutes()).padStart(2, '0');
+  return `${mm}/${dd} ${hh}:${mi} ${JAPAN_TIME_LABEL}`;
+}
+
+function formatEventTime(value) {
+  if (!value) return '';
+  const parsed = Date.parse(value);
+  if (!Number.isFinite(parsed)) return String(value);
+  return formatDate(parsed);
 }

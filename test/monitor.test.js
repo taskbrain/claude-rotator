@@ -22,12 +22,13 @@ describe('monitor rendering', () => {
 
     assert.match(output, /Claude Rotator\s+active: b@example\.com/);
     assert.match(output, /a@example\.com\s+exhausted/);
-    assert.match(output, /reason: 5h quota exhausted; reset -> 06\/04 10:00/);
+    assert.match(output, /reason: 5h quota exhausted; reset -> 06\/04 19:00 JST/);
     assert.match(output, /5h ██████████ 100%/);
+    assert.match(output, /reset in 1h -> 06\/04 19:00 JST/);
     assert.match(output, /7d ███████░░░  76%/);
     assert.match(output, /b@example\.com\s+active/);
     assert.match(output, /Events/);
-    assert.match(output, /fallback acct_1 -> acct_2 reason=shortest-quota-reset/);
+    assert.match(output, /06\/04 18:02 JST fallback acct_1 -> acct_2 reason=shortest-quota-reset/);
   });
 });
 

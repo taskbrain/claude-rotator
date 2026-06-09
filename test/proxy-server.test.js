@@ -702,10 +702,15 @@ describe('createProxyServer', () => {
     assert.equal(response.status, 429);
     assert.deepEqual(upstreamSeen, []);
     assert.equal(response.body.error.type, 'rate_limit_error');
-    assert.match(response.body.error.message, /Claude 5h usage limit exhausted/);
+    assert.match(response.body.error.message, /You've hit your session limit/);
+    assert.equal(response.headers['anthropic-ratelimit-unified-status'], 'rejected');
+    assert.equal(response.headers['anthropic-ratelimit-unified-representative-claim'], 'five_hour');
+    assert.equal(response.headers['anthropic-ratelimit-unified-reset'], '10');
+    assert.equal(response.headers['anthropic-ratelimit-unified-5h-utilization'], '1');
     assert.doesNotMatch(response.body.error.message, /monthly spend limit/i);
     assert.equal(response.body.error.details.window, '5h');
-    assert.notEqual(response.body.error.message, 'All configured accounts are unavailable.');
+    assert.match(response.body.error.details.rotator_message, /Claude 5h usage limit exhausted/);
+    assert.notEqual(response.body.error.details.rotator_message, 'All configured accounts are unavailable.');
   });
 
   it('overrides a misleading upstream monthly limit message when local usage is 5h exhausted', async t => {
@@ -749,8 +754,12 @@ describe('createProxyServer', () => {
 
     assert.equal(response.status, 429);
     assert.deepEqual(upstreamSeen, ['Bearer access-token-1']);
-    assert.match(response.body.error.message, /Claude 5h usage limit exhausted/);
+    assert.match(response.body.error.message, /You've hit your session limit/);
+    assert.equal(response.headers['anthropic-ratelimit-unified-status'], 'rejected');
+    assert.equal(response.headers['anthropic-ratelimit-unified-representative-claim'], 'five_hour');
+    assert.equal(response.headers['anthropic-ratelimit-unified-reset'], '10');
     assert.doesNotMatch(response.body.error.message, /monthly spend limit/i);
+    assert.match(response.body.error.details.rotator_message, /Claude 5h usage limit exhausted/);
     assert.equal(accountManager.getStatus().accounts[0].unavailableReason.window, '5h');
   });
 
@@ -891,8 +900,13 @@ describe('createProxyServer', () => {
 
     assert.equal(response.status, 429);
     assert.deepEqual(upstreamSeen, []);
-    assert.match(response.body.error.message, /Claude 7d usage limit exhausted/);
+    assert.match(response.body.error.message, /You've hit your weekly limit/);
+    assert.equal(response.headers['anthropic-ratelimit-unified-status'], 'rejected');
+    assert.equal(response.headers['anthropic-ratelimit-unified-representative-claim'], 'seven_day');
+    assert.equal(response.headers['anthropic-ratelimit-unified-reset'], '100');
+    assert.equal(response.headers['anthropic-ratelimit-unified-7d-utilization'], '1');
     assert.equal(response.body.error.details.window, '7d');
+    assert.match(response.body.error.details.rotator_message, /Claude 7d usage limit exhausted/);
     assert.equal(accountManager.getStatus().currentAccount, 'weekly-a');
   });
 

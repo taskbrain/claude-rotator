@@ -185,19 +185,19 @@ claude-rotator monitor
 
 ```text
 account1@example.com        active
-5h ███████░░░  76%  reset in 42m -> 06/04 18:00
-7d ███████░░░  76%  reset in 1d9h -> 06/06 19:00
+5h ███████░░░  76%  reset in 42m -> 06/04 18:00 JST
+7d ███████░░░  76%  reset in 1d9h -> 06/06 19:00 JST
 ```
 
-未使用のアカウントでも、server 起動時・アカウント reload 時・初回 status 表示時・定期 polling で OAuth Usage API から 5時間枠 / 7日枠の状態を取得します。100% 到達済みの枠に reset 時刻がある場合は、その reset 時刻の直後にも自動で再取得します。Usage API が取得できない場合だけ `unknown` と表示されます。`unknown` のアカウントは空いている確認が取れていないため、自動切り替え先には使いません。
+`status` / `monitor` の reset 時刻と Events 時刻は、日本時間（JST）で表示します。未使用のアカウントでも、server 起動時・アカウント reload 時・初回 status 表示時・定期 polling で OAuth Usage API から 5時間枠 / 7日枠の状態を取得します。100% 到達済みの枠に reset 時刻がある場合は、その reset 時刻の直後にも自動で再取得します。Usage API が取得できない場合だけ `unknown` と表示されます。`unknown` のアカウントは空いている確認が取れていないため、自動切り替え先には使いません。
 
 ## ログと切り替え診断
 
 `status` / `monitor` の Events には、直近の proxy request が表示されます。
 
 ```text
-2026-06-07T03:43:23.000Z request account-one POST /v1/messages -> 429 1203ms outcome=quota-retry req=req_xxx
-2026-06-07T03:43:23.000Z switched account-one -> account-two reason=quota-threshold
+06/07 12:43 JST request account-one POST /v1/messages -> 429 1203ms outcome=quota-retry req=req_xxx
+06/07 12:43 JST switched account-one -> account-two reason=quota-threshold
 ```
 
 常駐 server の file log は macOS / Ubuntu ともに次で確認できます。
@@ -210,6 +210,8 @@ tail -f ~/.config/claude-rotator/server.err
 ログに出るのは `account`、`method`、`path`、`status`、`durationMs`、`outcome`、`requestId`、timeout/network error 時の `errorType` だけです。token / Authorization header / API key / request body / response body は出しません。
 
 自動切り替えは、現在のアカウントの 5時間枠または 7日枠が 100% に達した場合だけ行います。利用可能な候補がある場合は、5時間枠 / 7日枠の既知使用率から `max(5h, 7d)` が最も低いアカウントを選びます。現在のアカウント自身が quota exhausted で、すべての候補も 100% の場合だけ、reset 時刻が最も近い exhausted アカウントを選び、Claude Code に上流の limit message をそのまま返せるようにします。OAuth refresh failure、authentication error、一時的な throttle では exhausted アカウントへ切り替えません。
+
+切り替え可能なアカウントがなくローカルで 429 を返す場合も、Claude Code が 5時間枠は `session limit`、7日枠は `weekly limit` として扱える unified rate-limit ヘッダーを返します。rotator 独自の補足情報は JSON の `details.rotator_message` に入ります。
 
 retryable な上流 5xx / 529 / `x-should-retry` 付きレスポンス、または上流アイドルタイムアウトが起きた場合も、アカウント切り替えは行いません。上流の error body または proxy の timeout error を可能な限りそのまま返します。
 
