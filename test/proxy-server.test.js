@@ -1145,11 +1145,11 @@ describe('createProxyServer', () => {
 
   it('periodically refreshes usage and proactively switches to an account with a soon weekly reset', async t => {
     const secretStore = new MemorySecretStore();
-    await secretStore.set('current', { accessToken: 'access-token-current' });
+    await secretStore.set('active-account', { accessToken: 'access-token-current' });
     await secretStore.set('soon-weekly', { accessToken: 'access-token-soon' });
     const accountManager = new AccountManager({
       accounts: [
-        { id: 'current', name: 'current@example.com', type: 'oauth' },
+        { id: 'active-account', name: 'current@example.com', type: 'oauth' },
         { id: 'soon-weekly', name: 'soon@example.com', type: 'oauth' },
       ],
       switchThreshold: 1,
