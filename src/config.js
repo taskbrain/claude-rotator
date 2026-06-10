@@ -4,6 +4,7 @@ import { readJsonFile, writeJsonFile } from './json-file.js';
 export const DEFAULT_PORT = 37891;
 export const DEFAULT_THRESHOLD = 1;
 export const DEFAULT_UPSTREAM_IDLE_TIMEOUT_MS = 3 * 60 * 1000;
+export const DEFAULT_WEEKLY_RESET_PRIORITY_WINDOW_MS = 36 * 60 * 60 * 1000;
 
 export function createDefaultConfig() {
   return {
@@ -14,6 +15,10 @@ export function createDefaultConfig() {
     },
     upstream: 'https://api.anthropic.com',
     switchThreshold: DEFAULT_THRESHOLD,
+    rotationPolicy: {
+      mode: 'use-expiring-weekly',
+      weeklyResetPriorityWindowMs: DEFAULT_WEEKLY_RESET_PRIORITY_WINDOW_MS,
+    },
     usagePolling: {
       enabled: true,
     },

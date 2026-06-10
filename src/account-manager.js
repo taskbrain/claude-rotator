@@ -1,9 +1,18 @@
 import { emptyQuota, parseRateLimitHeaders } from './quota.js';
 
+export const DEFAULT_WEEKLY_RESET_PRIORITY_WINDOW_MS = 36 * 60 * 60 * 1000;
+
 export class AccountManager {
-  constructor({ accounts = [], switchThreshold = 1, currentAccountId = null, now = () => Date.now() } = {}) {
+  constructor({
+    accounts = [],
+    switchThreshold = 1,
+    currentAccountId = null,
+    now = () => Date.now(),
+    rotationPolicy = null,
+  } = {}) {
     this.now = now;
     this.switchThreshold = switchThreshold;
+    this.rotationPolicy = normalizeRotationPolicy(rotationPolicy);
     this.events = [];
     this.accounts = accounts.map((account, index) => this.createAccount(account, index));
     const configuredIndex = currentAccountId
@@ -206,18 +215,56 @@ export class AccountManager {
   }
 
   selectBestAvailableSwitchTarget() {
-    const candidates = this.accounts
-      .map((account, index) => ({ account, index, score: this.switchTargetScore(account) }))
-      .filter(candidate => candidate.index !== this.currentIndex && candidate.score);
-
-    candidates.sort((left, right) => compareSwitchTargetScores(left, right));
-    const selected = candidates[0];
+    const selected = this.bestAvailableSwitchCandidate({ excludeCurrent: true });
     if (!selected) return null;
 
     const previous = this.accounts[this.currentIndex];
     const reason = this.autoSwitchReason(previous);
-    if (previous) previous.status = this.displayStatus(previous);
+    return this.switchToCandidate(selected, reason);
+  }
+
+  rebalanceActiveAccount() {
+    const current = this.getCurrentAccount();
+    if (!current) return null;
+
+    if (!this.isAvailable(current)) {
+      if (!this.getActiveAccount()) return this.getFallbackAccount();
+      return this.getCurrentAccount();
+    }
+
+    const selected = this.bestAvailableSwitchCandidate({ excludeCurrent: false });
+    if (!selected || selected.index === this.currentIndex) return current;
+    if (!selected.score.weeklyResetPriority) return current;
+
+    const currentScore = this.switchTargetScore(current);
+    if (currentScore && compareSwitchTargetScores(selected, {
+      account: current,
+      index: this.currentIndex,
+      score: currentScore,
+    }) >= 0) {
+      return current;
+    }
+
+    return this.switchToCandidate(selected, 'weekly-reset-priority');
+  }
+
+  bestAvailableSwitchCandidate({ excludeCurrent } = {}) {
+    const candidates = this.accounts
+      .map((account, index) => ({ account, index, score: this.switchTargetScore(account) }))
+      .filter(candidate => (!excludeCurrent || candidate.index !== this.currentIndex) && candidate.score);
+
+    candidates.sort((left, right) => compareSwitchTargetScores(left, right));
+    return candidates[0] || null;
+  }
+
+  switchToCandidate(selected, reason) {
+    const previous = this.accounts[this.currentIndex];
+    if (previous) {
+      this.refreshQuotaState(previous);
+      previous.status = this.unavailableReason(previous) ? this.displayStatus(previous) : 'ready';
+    }
     this.currentIndex = selected.index;
+    selected.account.status = 'active';
     this.events.unshift({
       at: new Date(this.now()).toISOString(),
       type: 'auto-switch',
@@ -260,7 +307,21 @@ export class AccountManager {
     const utilizations = [quota.unified5h, quota.unified7d]
       .filter(value => typeof value === 'number' && Number.isFinite(value));
     if (utilizations.length === 0) return null;
+    const now = this.now();
+    const fiveHourUtilization = finiteNumberOrNull(quota.unified5h);
+    const weeklyUtilization = finiteNumberOrNull(quota.unified7d);
+    const weeklyResetAt = finiteNumberOrNull(quota.unified7dReset);
+    const weeklyResetPriority = this.rotationPolicy.mode === 'use-expiring-weekly'
+      && weeklyUtilization != null
+      && weeklyResetAt != null
+      && weeklyResetAt > now
+      && weeklyResetAt - now <= this.rotationPolicy.weeklyResetPriorityWindowMs;
     return {
+      weeklyResetPriority,
+      weeklyResetAt: weeklyResetPriority ? weeklyResetAt : Number.MAX_SAFE_INTEGER,
+      weeklyHeadroom: weeklyUtilization != null ? Math.max(0, 1 - weeklyUtilization) : -1,
+      weeklyUtilization: weeklyUtilization ?? Number.MAX_SAFE_INTEGER,
+      fiveHourUtilization: fiveHourUtilization ?? Number.MAX_SAFE_INTEGER,
       maxUtilization: Math.max(...utilizations),
       totalUtilization: utilizations.reduce((total, value) => total + value, 0),
       knownWindows: utilizations.length,
@@ -440,6 +501,20 @@ export function isUnifiedQuotaExhaustion(reason) {
 }
 
 function compareSwitchTargetScores(left, right) {
+  if (left.score.weeklyResetPriority !== right.score.weeklyResetPriority) {
+    return left.score.weeklyResetPriority ? -1 : 1;
+  }
+  if (left.score.weeklyResetPriority && right.score.weeklyResetPriority) {
+    if (left.score.weeklyResetAt !== right.score.weeklyResetAt) {
+      return left.score.weeklyResetAt - right.score.weeklyResetAt;
+    }
+    if (left.score.weeklyHeadroom !== right.score.weeklyHeadroom) {
+      return right.score.weeklyHeadroom - left.score.weeklyHeadroom;
+    }
+    if (left.score.fiveHourUtilization !== right.score.fiveHourUtilization) {
+      return left.score.fiveHourUtilization - right.score.fiveHourUtilization;
+    }
+  }
   if (left.score.maxUtilization !== right.score.maxUtilization) {
     return left.score.maxUtilization - right.score.maxUtilization;
   }
@@ -475,6 +550,20 @@ function parseUsageReset(value) {
   if (!value) return null;
   const parsed = Date.parse(value);
   return Number.isFinite(parsed) ? parsed : null;
+}
+
+function normalizeRotationPolicy(policy) {
+  const weeklyResetPriorityWindowMs = Number(policy?.weeklyResetPriorityWindowMs);
+  return {
+    mode: policy?.mode || 'use-expiring-weekly',
+    weeklyResetPriorityWindowMs: Number.isFinite(weeklyResetPriorityWindowMs) && weeklyResetPriorityWindowMs > 0
+      ? weeklyResetPriorityWindowMs
+      : DEFAULT_WEEKLY_RESET_PRIORITY_WINDOW_MS,
+  };
+}
+
+function finiteNumberOrNull(value) {
+  return typeof value === 'number' && Number.isFinite(value) ? value : null;
 }
 
 export function isNearQuota(quota, threshold) {

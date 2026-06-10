@@ -209,7 +209,9 @@ tail -f ~/.config/claude-rotator/server.err
 
 ログに出るのは `account`、`method`、`path`、`status`、`durationMs`、`outcome`、`requestId`、timeout/network error 時の `errorType` だけです。token / Authorization header / API key / request body / response body は出しません。
 
-自動切り替えは、現在のアカウントの 5時間枠または 7日枠が 100% に達した場合だけ行います。利用可能な候補がある場合は、5時間枠 / 7日枠の既知使用率から `max(5h, 7d)` が最も低いアカウントを選びます。現在のアカウント自身が quota exhausted で、すべての候補も 100% の場合だけ、reset 時刻が最も近い exhausted アカウントを選び、Claude Code に上流の limit message をそのまま返せるようにします。OAuth refresh failure、authentication error、一時的な throttle では exhausted アカウントへ切り替えません。
+自動切り替えは、現在のアカウントの 5時間枠または 7日枠が 100% に達した場合に行います。利用可能な候補がある場合は、通常は 5時間枠 / 7日枠の既知使用率から `max(5h, 7d)` が最も低いアカウントを選びます。ただし、7日枠の reset が近いアカウントがある場合は、reset 前に週次枠を使い切れるように、そのアカウントを優先します。この週次 reset 優先は、現在の active がまだ 100% ではない場合でも、Usage API の再取得後に proactive に active を更新できます。現在のアカウント自身が quota exhausted で、すべての候補も 100% の場合だけ、reset 時刻が最も近い exhausted アカウントを選び、Claude Code に上流の limit message をそのまま返せるようにします。OAuth refresh failure、authentication error、一時的な throttle では exhausted アカウントへ切り替えません。
+
+週次 reset 優先の対象期間は、デフォルトで reset まで 36 時間以内です。必要に応じて `~/.config/claude-rotator/config.json` の `rotationPolicy.weeklyResetPriorityWindowMs` で変更できます。
 
 切り替え可能なアカウントがなくローカルで 429 を返す場合も、Claude Code が 5時間枠は `session limit`、7日枠は `weekly limit` として扱える unified rate-limit ヘッダーを返します。rotator 独自の補足情報は JSON の `details.rotator_message` に入ります。
 
@@ -222,7 +224,7 @@ claude-rotator refresh-usage
 claude-rotator status
 ```
 
-`refresh-usage` 後は `claude-rotator status` で active を確認してください。Usage API の再取得で現在の active が 100% と判明し、別の利用可能アカウントまたは reset が近い exhausted アカウントがある場合は、active が更新されることがあります。意図的に active を変更する場合は `claude-rotator switch <account>` を使います。
+`refresh-usage` 後は `claude-rotator status` で active を確認してください。Usage API の再取得で現在の active が 100% と判明した場合、または 7日枠の reset が近く週次枠を優先消化したい利用可能アカウントがある場合は、active が更新されることがあります。意図的に active を変更する場合は `claude-rotator switch <account>` を使います。
 
 `claude-rotator doctor` は server の疎通に加えて、次の問題を secret を出さずに警告します。保存済み access token が期限切れの場合は refresh token で更新してから profile を確認します。
 
@@ -353,7 +355,7 @@ claude-rotator monitor
 
 ### Diagnostics
 
-Recent proxy requests are shown in `claude-rotator status` / `claude-rotator monitor`, and the service writes metadata-only request logs to `~/.config/claude-rotator/server.log`. Automatic rotation happens when the current account reaches the configured 5h or 7d usage threshold. If an available account exists, the proxy chooses the lowest known usage. If every candidate is exhausted or otherwise unavailable, the proxy keeps the current account and returns a local 429 based on the known 5h/7d Usage API state instead of forwarding a possibly misleading upstream limit message. OAuth refresh failures, authentication errors, and temporary throttles do not rotate to exhausted accounts. OAuth usage is refreshed at startup, reload, first status read, periodically every 60 seconds by default, and at reported reset times for exhausted accounts. Set `usagePolling.intervalMs` in `~/.config/claude-rotator/config.json` to adjust the interval. Use `claude-rotator refresh-usage` to force an immediate recheck of all registered accounts.
+Recent proxy requests are shown in `claude-rotator status` / `claude-rotator monitor`, and the service writes metadata-only request logs to `~/.config/claude-rotator/server.log`. Automatic rotation happens when the current account reaches the configured 5h or 7d usage threshold. If an available account exists, the proxy usually chooses the lowest known `max(5h, 7d)` usage. When an available account has a 7d reset within the weekly priority window, the proxy prefers that account so expiring weekly quota can be consumed before reset; usage refresh can proactively move the active account even when the current account is not yet exhausted. The weekly priority window defaults to 36 hours and can be adjusted with `rotationPolicy.weeklyResetPriorityWindowMs` in `~/.config/claude-rotator/config.json`. If every candidate is exhausted or otherwise unavailable, the proxy keeps the current account and returns a local 429 based on the known 5h/7d Usage API state instead of forwarding a possibly misleading upstream limit message. OAuth refresh failures, authentication errors, and temporary throttles do not rotate to exhausted accounts. OAuth usage is refreshed at startup, reload, first status read, periodically every 60 seconds by default, and at reported reset times for exhausted accounts. Set `usagePolling.intervalMs` in `~/.config/claude-rotator/config.json` to adjust the interval. Use `claude-rotator refresh-usage` to force an immediate recheck of all registered accounts.
 
 ### Restore
 

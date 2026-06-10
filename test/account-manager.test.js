@@ -50,6 +50,83 @@ describe('AccountManager', () => {
     assert.equal(manager.getActiveAccount().id, 'acct_3');
   });
 
+  it('prefers a ready account with a soon weekly reset over a lower-usage account', () => {
+    const manager = new AccountManager({
+      accounts: [
+        { id: 'current', name: 'current@example.com', type: 'oauth' },
+        { id: 'soon-weekly', name: 'soon@example.com', type: 'oauth' },
+        { id: 'later-low-usage', name: 'later@example.com', type: 'oauth' },
+      ],
+      switchThreshold: 1,
+      now: () => 1000,
+    });
+    manager.updateQuota('soon-weekly', {
+      'anthropic-ratelimit-unified-5h-utilization': '0.33',
+      'anthropic-ratelimit-unified-7d-utilization': '0.08',
+      'anthropic-ratelimit-unified-7d-reset': '100',
+    });
+    manager.updateQuota('later-low-usage', {
+      'anthropic-ratelimit-unified-5h-utilization': '0.05',
+      'anthropic-ratelimit-unified-7d-utilization': '0.02',
+      'anthropic-ratelimit-unified-7d-reset': '500000',
+    });
+    manager.updateQuota('current', {
+      'anthropic-ratelimit-unified-5h-utilization': '1',
+      'anthropic-ratelimit-unified-5h-reset': '20',
+    });
+
+    assert.equal(manager.getActiveAccount().id, 'soon-weekly');
+  });
+
+  it('proactively rebalances to a ready account with a soon weekly reset after usage refresh', () => {
+    const manager = new AccountManager({
+      accounts: [
+        { id: 'current', name: 'current@example.com', type: 'oauth' },
+        { id: 'soon-weekly', name: 'soon@example.com', type: 'oauth' },
+      ],
+      currentAccountId: 'current',
+      switchThreshold: 1,
+      now: () => 1000,
+    });
+    manager.updateQuota('current', {
+      'anthropic-ratelimit-unified-5h-utilization': '0.12',
+      'anthropic-ratelimit-unified-7d-utilization': '0.30',
+      'anthropic-ratelimit-unified-7d-reset': '500000',
+    });
+    manager.updateQuota('soon-weekly', {
+      'anthropic-ratelimit-unified-5h-utilization': '0.33',
+      'anthropic-ratelimit-unified-7d-utilization': '0.07',
+      'anthropic-ratelimit-unified-7d-reset': '100',
+    });
+
+    assert.equal(manager.rebalanceActiveAccount().id, 'soon-weekly');
+    assert.equal(manager.getCurrentAccount().id, 'soon-weekly');
+    assert.equal(manager.getStatus().events[0].reason, 'weekly-reset-priority');
+  });
+
+  it('does not proactively rebalance ordinary available accounts without a soon weekly reset', () => {
+    const manager = new AccountManager({
+      accounts: [
+        { id: 'current', name: 'current@example.com', type: 'oauth' },
+        { id: 'lower-usage', name: 'lower@example.com', type: 'oauth' },
+      ],
+      currentAccountId: 'current',
+      switchThreshold: 1,
+      now: () => 1000,
+    });
+    manager.updateQuota('current', {
+      'anthropic-ratelimit-unified-5h-utilization': '0.40',
+      'anthropic-ratelimit-unified-7d-utilization': '0.45',
+    });
+    manager.updateQuota('lower-usage', {
+      'anthropic-ratelimit-unified-5h-utilization': '0.05',
+      'anthropic-ratelimit-unified-7d-utilization': '0.02',
+    });
+
+    assert.equal(manager.rebalanceActiveAccount().id, 'current');
+    assert.equal(manager.getCurrentAccount().id, 'current');
+  });
+
   it('does not switch when quota is exhausted but no known available target exists', () => {
     const manager = new AccountManager({
       accounts: [

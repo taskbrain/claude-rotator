@@ -153,6 +153,7 @@ async function runServer({ write }) {
     accounts: config.accounts,
     switchThreshold: config.switchThreshold,
     currentAccountId: config.activeAccount,
+    rotationPolicy: config.rotationPolicy,
   });
   const server = createProxyServer({
     accountManager,

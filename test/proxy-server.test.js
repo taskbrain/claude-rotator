@@ -1143,6 +1143,53 @@ describe('createProxyServer', () => {
     assert.equal(status.accounts[1].status, 'active');
   });
 
+  it('periodically refreshes usage and proactively switches to an account with a soon weekly reset', async t => {
+    const secretStore = new MemorySecretStore();
+    await secretStore.set('current', { accessToken: 'access-token-current' });
+    await secretStore.set('soon-weekly', { accessToken: 'access-token-soon' });
+    const accountManager = new AccountManager({
+      accounts: [
+        { id: 'current', name: 'current@example.com', type: 'oauth' },
+        { id: 'soon-weekly', name: 'soon@example.com', type: 'oauth' },
+      ],
+      switchThreshold: 1,
+      now: () => Date.now(),
+    });
+    const soonResetAt = new Date(Date.now() + 60 * 60 * 1000).toISOString();
+    const laterResetAt = new Date(Date.now() + 5 * 24 * 60 * 60 * 1000).toISOString();
+    const proxy = await listen(createProxyServer({
+      accountManager,
+      secretStore,
+      config: {
+        upstream: 'http://127.0.0.1:1',
+        usagePolling: { enabled: true, intervalMs: 5 },
+      },
+      usageFetcher: async token => {
+        if (token === 'access-token-current') {
+          return {
+            five_hour: { utilization: 0.12, resets_at: soonResetAt },
+            seven_day: { utilization: 0.30, resets_at: laterResetAt },
+          };
+        }
+        return {
+          five_hour: { utilization: 0.33, resets_at: soonResetAt },
+          seven_day: { utilization: 0.07, resets_at: soonResetAt },
+        };
+      },
+    }));
+    t.after(async () => {
+      await close(proxy.server);
+    });
+
+    const status = await waitForStatus(
+      () => accountManager.getStatus(),
+      value => value.currentAccount === 'soon-weekly'
+    );
+
+    assert.equal(status.currentAccount, 'soon-weekly');
+    assert.equal(status.events[0].reason, 'weekly-reset-priority');
+  });
+
   it('exposes health and status without secrets', async () => {
     const secretStore = new MemorySecretStore();
     await secretStore.set('acct_1', { accessToken: 'access-token-1' });

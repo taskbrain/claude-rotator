@@ -280,9 +280,7 @@ async function refreshAllOnce({
 }
 
 function rebalanceAfterUsageRefresh(accountManager) {
-  const current = accountManager.getCurrentAccount();
-  if (!isUnifiedQuotaExhaustion(accountManager.unavailableReason(current))) return;
-  if (!accountManager.getActiveAccount()) accountManager.getFallbackAccount();
+  accountManager.rebalanceActiveAccount();
 }
 
 async function forwardWithRotation({
