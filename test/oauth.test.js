@@ -65,12 +65,12 @@ describe('usage response parsing', () => {
   it('normalizes OAuth usage payloads', () => {
     const parsed = parseUsageResponse({
       five_hour: { utilization: 76, resets_at: '2026-06-04T09:00:00Z' },
-      seven_day: { utilization: 0.51, resets_at: '2026-06-06T10:00:00Z' },
+      seven_day: { utilization: 1, resets_at: '2026-06-06T10:00:00Z' },
     });
 
     assert.equal(parsed.five_hour.utilization, 0.76);
     assert.equal(parsed.five_hour.resets_at, '2026-06-04T09:00:00Z');
-    assert.equal(parsed.seven_day.utilization, 0.51);
+    assert.equal(parsed.seven_day.utilization, 0.01);
   });
 });
 

@@ -121,7 +121,7 @@ function normalizeUsageUtilization(value) {
   if (value == null) return value;
   const number = Number(value);
   if (!Number.isFinite(number)) return value;
-  return number > 1 ? number / 100 : number;
+  return Math.max(0, Math.min(1, number / 100));
 }
 
 export function createPkcePair() {
