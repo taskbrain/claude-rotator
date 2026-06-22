@@ -6,6 +6,9 @@ if (major < 18) {
   process.exit(1);
 }
 
+const { setDefaultResultOrder } = await import('node:dns');
+setDefaultResultOrder('ipv4first');
+
 const { runCli } = await import('../src/cli.js');
 
 const code = await runCli(process.argv.slice(2));
