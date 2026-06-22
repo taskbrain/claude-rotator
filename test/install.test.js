@@ -79,6 +79,8 @@ describe('service file rendering', () => {
     assert.match(plist, /<string>server<\/string>/);
     assert.match(plist, /<key>CLAUDE_ROTATOR_CONFIG<\/key>/);
     assert.match(plist, /<string>\/home\/alice\/.config\/claude-rotator\/config.json<\/string>/);
+    assert.match(plist, /<key>NODE_OPTIONS<\/key>/);
+    assert.match(plist, /<string>--dns-result-order=ipv4first<\/string>/);
   });
 
   it('renders a Linux systemd user service', () => {
@@ -90,6 +92,7 @@ describe('service file rendering', () => {
 
     assert.match(service, /ExecStart=\/usr\/bin\/node \/repo\/bin\/claude-rotator\.js server/);
     assert.match(service, /Environment=CLAUDE_ROTATOR_CONFIG=\/home\/alice\/.config\/claude-rotator\/config.json/);
+    assert.match(service, /Environment=NODE_OPTIONS=--dns-result-order=ipv4first/);
     assert.match(service, /StandardOutput=append:\/home\/alice\/.config\/claude-rotator\/server\.log/);
     assert.match(service, /StandardError=append:\/home\/alice\/.config\/claude-rotator\/server\.err/);
   });

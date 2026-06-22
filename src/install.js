@@ -5,6 +5,7 @@ import { mergeClaudeSettings, restoreClaudeSettings } from './config.js';
 import { fileSha256, readJsonFile, writeJsonFile } from './json-file.js';
 
 export const MACOS_LAUNCH_AGENT_LABEL = 'io.github.claude-rotator';
+export const SERVICE_NODE_OPTIONS = '--dns-result-order=ipv4first';
 
 export async function installSettings({
   settingsPath,
@@ -72,6 +73,8 @@ export function renderLaunchAgentPlist({ nodePath, cliPath, configPath }) {
   <dict>
     <key>CLAUDE_ROTATOR_CONFIG</key>
     <string>${xmlEscape(configPath)}</string>
+    <key>NODE_OPTIONS</key>
+    <string>${xmlEscape(SERVICE_NODE_OPTIONS)}</string>
   </dict>
   <key>RunAtLoad</key>
   <true/>
@@ -95,6 +98,7 @@ After=network-online.target
 [Service]
 Type=simple
 Environment=CLAUDE_ROTATOR_CONFIG=${systemdEscape(configPath)}
+Environment=NODE_OPTIONS=${systemdEscape(SERVICE_NODE_OPTIONS)}
 ExecStart=${systemdEscape(nodePath)} ${systemdEscape(cliPath)} server
 Restart=always
 RestartSec=3
