@@ -1,10 +1,21 @@
-import { describe, it } from 'node:test';
+import { afterEach, describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 import http from 'node:http';
 
 import { AccountManager } from '../src/account-manager.js';
 import { MemorySecretStore } from '../src/secret-store.js';
 import { createProxyServer } from '../src/proxy-server.js';
+
+const cleanupCallbacks = [];
+
+afterEach(async () => {
+  const callbacks = cleanupCallbacks.splice(0).reverse();
+  for (const callback of callbacks) await callback();
+});
+
+function cleanupAfterTest(callback) {
+  cleanupCallbacks.push(callback);
+}
 
 describe('createProxyServer', () => {
   it('forwards requests with the selected OAuth token and records quota headers', async () => {
@@ -105,7 +116,7 @@ describe('createProxyServer', () => {
     await close(upstream.server);
   });
 
-  it('uses live Claude Code credentials for the current account', async t => {
+  it('uses live Claude Code credentials for the current account', async () => {
     const upstreamSeen = [];
     const upstream = await listen(http.createServer(async (req, res) => {
       upstreamSeen.push(req.headers.authorization);
@@ -133,7 +144,7 @@ describe('createProxyServer', () => {
         expiresAt: Date.now() + 60 * 60 * 1000,
       }),
     }));
-    t.after(async () => {
+    cleanupAfterTest(async () => {
       await close(proxy.server);
       await close(upstream.server);
     });
@@ -147,7 +158,7 @@ describe('createProxyServer', () => {
     assert.deepEqual(upstreamSeen, ['Bearer live-claude-code-token']);
   });
 
-  it('records proxy request diagnostics without secrets', async t => {
+  it('records proxy request diagnostics without secrets', async () => {
     const logLines = [];
     const upstream = await listen(http.createServer(async (req, res) => {
       res.writeHead(200, {
@@ -169,7 +180,7 @@ describe('createProxyServer', () => {
       config: { upstream: upstream.url },
       logger: line => logLines.push(line),
     }));
-    t.after(async () => {
+    cleanupAfterTest(async () => {
       await close(proxy.server);
       await close(upstream.server);
     });
@@ -197,7 +208,7 @@ describe('createProxyServer', () => {
     assert.match(logLines.join('\n'), /proxy account=acct_1 method=POST path=\/v1\/messages status=200/);
   });
 
-  it('refreshes and retries once when upstream rejects the OAuth token', async t => {
+  it('refreshes and retries once when upstream rejects the OAuth token', async () => {
     const upstreamSeen = [];
     const upstream = await listen(http.createServer(async (req, res) => {
       upstreamSeen.push(req.headers.authorization);
@@ -234,7 +245,7 @@ describe('createProxyServer', () => {
         };
       },
     }));
-    t.after(async () => {
+    cleanupAfterTest(async () => {
       await close(proxy.server);
       await close(upstream.server);
     });
@@ -253,7 +264,7 @@ describe('createProxyServer', () => {
     });
   });
 
-  it('passes through a non-refreshable OAuth rejection without switching accounts', async t => {
+  it('passes through a non-refreshable OAuth rejection without switching accounts', async () => {
     const upstreamSeen = [];
     const upstream = await listen(http.createServer(async (req, res) => {
       upstreamSeen.push(req.headers.authorization);
@@ -287,7 +298,7 @@ describe('createProxyServer', () => {
         expiresAt: Date.now() + 60 * 60 * 1000,
       }),
     }));
-    t.after(async () => {
+    cleanupAfterTest(async () => {
       await close(proxy.server);
       await close(upstream.server);
     });
@@ -307,7 +318,7 @@ describe('createProxyServer', () => {
     });
   });
 
-  it('switches to the emptiest known account when the current account reaches quota', async t => {
+  it('switches to the emptiest known account when the current account reaches quota', async () => {
     const upstreamSeen = [];
     const upstream = await listen(http.createServer(async (req, res) => {
       upstreamSeen.push(req.headers.authorization);
@@ -355,7 +366,7 @@ describe('createProxyServer', () => {
       secretStore,
       config: { upstream: upstream.url },
     }));
-    t.after(async () => {
+    cleanupAfterTest(async () => {
       await close(proxy.server);
       await close(upstream.server);
     });
@@ -370,7 +381,7 @@ describe('createProxyServer', () => {
     assert.equal(accountManager.getStatus().currentAccount, 'acct_3');
   });
 
-  it('passes through retryable server errors without switching accounts', async t => {
+  it('passes through retryable server errors without switching accounts', async () => {
     const upstreamSeen = [];
     const upstream = await listen(http.createServer(async (req, res) => {
       upstreamSeen.push(req.headers.authorization);
@@ -400,7 +411,7 @@ describe('createProxyServer', () => {
       secretStore,
       config: { upstream: upstream.url },
     }));
-    t.after(async () => {
+    cleanupAfterTest(async () => {
       await close(proxy.server);
       await close(upstream.server);
     });
@@ -416,7 +427,7 @@ describe('createProxyServer', () => {
     assert.match(response.body.error.message, /temporary upstream failure/);
   });
 
-  it('passes through a retryable server error when no alternate account is available', async t => {
+  it('passes through a retryable server error when no alternate account is available', async () => {
     const upstreamBody = {
       type: 'error',
       error: { type: 'api_error', message: 'temporary upstream failure' },
@@ -441,7 +452,7 @@ describe('createProxyServer', () => {
       secretStore,
       config: { upstream: upstream.url },
     }));
-    t.after(async () => {
+    cleanupAfterTest(async () => {
       await close(proxy.server);
       await close(upstream.server);
     });
@@ -457,7 +468,7 @@ describe('createProxyServer', () => {
     assert.notEqual(response.body.error.message, 'All configured accounts are unavailable.');
   });
 
-  it('returns an upstream timeout without switching accounts', async t => {
+  it('returns an upstream timeout without switching accounts', async () => {
     const upstreamSeen = [];
     const upstream = await listen(http.createServer(async (req, res) => {
       upstreamSeen.push(req.headers.authorization);
@@ -485,7 +496,7 @@ describe('createProxyServer', () => {
         proxy: { upstreamIdleTimeoutMs: 50 },
       },
     }));
-    t.after(async () => {
+    cleanupAfterTest(async () => {
       await close(proxy.server);
       await close(upstream.server);
     });
@@ -502,7 +513,7 @@ describe('createProxyServer', () => {
     assert.equal(response.body.error.type, 'upstream_timeout');
   });
 
-  it('does not rotate after a streaming response has already started', async t => {
+  it('does not rotate after a streaming response has already started', async () => {
     const upstreamSeen = [];
     const upstream = await listen(http.createServer(async (req, res) => {
       upstreamSeen.push(req.headers.authorization);
@@ -529,7 +540,7 @@ describe('createProxyServer', () => {
         proxy: { upstreamIdleTimeoutMs: 50 },
       },
     }));
-    t.after(async () => {
+    cleanupAfterTest(async () => {
       await close(proxy.server);
       await close(upstream.server);
     });
@@ -547,7 +558,7 @@ describe('createProxyServer', () => {
     assert.equal(accountManager.getStatus().currentAccount, 'acct_1');
   });
 
-  it('keeps the current account when refreshing an expired token fails', async t => {
+  it('keeps the current account when refreshing an expired token fails', async () => {
     const upstreamSeen = [];
     const upstream = await listen(http.createServer(async (req, res) => {
       upstreamSeen.push(req.headers.authorization);
@@ -581,7 +592,7 @@ describe('createProxyServer', () => {
         throw new Error('refresh token revoked');
       },
     }));
-    t.after(async () => {
+    cleanupAfterTest(async () => {
       await close(proxy.server);
       await close(upstream.server);
     });
@@ -600,7 +611,7 @@ describe('createProxyServer', () => {
     });
   });
 
-  it('switches to a known available account when the current OAuth refresh fails', async t => {
+  it('switches to a known available account when the current OAuth refresh fails', async () => {
     const upstreamSeen = [];
     const upstream = await listen(http.createServer(async (req, res) => {
       upstreamSeen.push(req.headers.authorization);
@@ -639,7 +650,7 @@ describe('createProxyServer', () => {
         return { accessToken: 'fresh-token-2', refreshToken };
       },
     }));
-    t.after(async () => {
+    cleanupAfterTest(async () => {
       await close(proxy.server);
       await close(upstream.server);
     });
@@ -655,7 +666,7 @@ describe('createProxyServer', () => {
     assert.equal(accountManager.getStatus().accounts[0].status, 'error');
   });
 
-  it('returns local quota exhaustion when the only account is exhausted', async t => {
+  it('returns local quota exhaustion when the only account is exhausted', async () => {
     const upstreamSeen = [];
     const upstreamBody = {
       type: 'error',
@@ -689,7 +700,7 @@ describe('createProxyServer', () => {
       secretStore,
       config: { upstream: upstream.url },
     }));
-    t.after(async () => {
+    cleanupAfterTest(async () => {
       await close(proxy.server);
       await close(upstream.server);
     });
@@ -713,7 +724,7 @@ describe('createProxyServer', () => {
     assert.notEqual(response.body.error.details.rotator_message, 'All configured accounts are unavailable.');
   });
 
-  it('overrides a misleading upstream monthly limit message when local usage is 5h exhausted', async t => {
+  it('overrides a misleading upstream monthly limit message when local usage is 5h exhausted', async () => {
     const upstreamSeen = [];
     const upstream = await listen(http.createServer(async (req, res) => {
       upstreamSeen.push(req.headers.authorization);
@@ -742,7 +753,7 @@ describe('createProxyServer', () => {
       secretStore,
       config: { upstream: upstream.url },
     }));
-    t.after(async () => {
+    cleanupAfterTest(async () => {
       await close(proxy.server);
       await close(upstream.server);
     });
@@ -763,7 +774,7 @@ describe('createProxyServer', () => {
     assert.equal(accountManager.getStatus().accounts[0].unavailableReason.window, '5h');
   });
 
-  it('does not fall back to a quota-exhausted account when the current account is errored', async t => {
+  it('does not fall back to a quota-exhausted account when the current account is errored', async () => {
     const upstreamSeen = [];
     const upstream = await listen(http.createServer(async (req, res) => {
       upstreamSeen.push(req.headers.authorization);
@@ -815,7 +826,7 @@ describe('createProxyServer', () => {
         expiresAt: Date.now() + 60 * 60 * 1000,
       }),
     }));
-    t.after(async () => {
+    cleanupAfterTest(async () => {
       await close(proxy.server);
       await close(upstream.server);
     });
@@ -831,7 +842,7 @@ describe('createProxyServer', () => {
     assert.equal(accountManager.getStatus().currentAccount, 'other');
   });
 
-  it('returns local quota exhaustion when all accounts are exhausted', async t => {
+  it('returns local quota exhaustion when all accounts are exhausted', async () => {
     const upstreamSeen = [];
     const upstream = await listen(http.createServer(async (req, res) => {
       upstreamSeen.push(req.headers.authorization);
@@ -888,7 +899,7 @@ describe('createProxyServer', () => {
       secretStore,
       config: { upstream: upstream.url },
     }));
-    t.after(async () => {
+    cleanupAfterTest(async () => {
       await close(proxy.server);
       await close(upstream.server);
     });
@@ -910,7 +921,7 @@ describe('createProxyServer', () => {
     assert.equal(accountManager.getStatus().currentAccount, 'dev');
   });
 
-  it('prepares a resume target through the internal API', async t => {
+  it('prepares a resume target through the internal API', async () => {
     const secretStore = new MemorySecretStore();
     await secretStore.set('weekly-a', { accessToken: 'weekly-a-token' });
     await secretStore.set('dev', { accessToken: 'dev-token' });
@@ -935,7 +946,7 @@ describe('createProxyServer', () => {
       secretStore,
       config: { upstream: 'http://127.0.0.1:1' },
     }));
-    t.after(async () => {
+    cleanupAfterTest(async () => {
       await close(proxy.server);
     });
 
@@ -951,7 +962,7 @@ describe('createProxyServer', () => {
     assert.equal(JSON.stringify(response.body).includes('dev-token'), false);
   });
 
-  it('refreshes usage for prepare-resume even when polling is disabled', async t => {
+  it('refreshes usage for prepare-resume even when polling is disabled', async () => {
     const secretStore = new MemorySecretStore();
     await secretStore.set('weekly', { accessToken: 'weekly-token' });
     await secretStore.set('dev', { accessToken: 'dev-token' });
@@ -984,7 +995,7 @@ describe('createProxyServer', () => {
         };
       },
     }));
-    t.after(async () => {
+    cleanupAfterTest(async () => {
       await close(proxy.server);
     });
 
@@ -1000,7 +1011,7 @@ describe('createProxyServer', () => {
     assert.equal(response.body.resumeAtEpoch, Date.parse('2026-06-08T10:50:00Z') / 1000);
   });
 
-  it('waits for initial usage refresh before forwarding the first API request', async t => {
+  it('waits for initial usage refresh before forwarding the first API request', async () => {
     const upstreamSeen = [];
     const upstream = await listen(http.createServer(async (req, res) => {
       upstreamSeen.push(req.headers.authorization);
@@ -1035,7 +1046,7 @@ describe('createProxyServer', () => {
         };
       },
     }));
-    t.after(async () => {
+    cleanupAfterTest(async () => {
       await close(proxy.server);
       await close(upstream.server);
     });
@@ -1050,7 +1061,7 @@ describe('createProxyServer', () => {
     assert.equal(accountManager.getStatus().currentAccount, 'dev');
   });
 
-  it('refreshes OAuth usage into status for inactive accounts', async t => {
+  it('refreshes OAuth usage into status for inactive accounts', async () => {
     const secretStore = new MemorySecretStore();
     await secretStore.set('dev', { accessToken: 'dev-token' });
     await secretStore.set('account-two', { accessToken: 'account-two-token' });
@@ -1080,7 +1091,7 @@ describe('createProxyServer', () => {
         };
       },
     }));
-    t.after(async () => {
+    cleanupAfterTest(async () => {
       await close(proxy.server);
     });
 
@@ -1101,7 +1112,7 @@ describe('createProxyServer', () => {
     assert.equal(JSON.stringify(refresh.body).includes('account-two-token'), false);
   });
 
-  it('waits for the initial OAuth usage refresh before returning status', async t => {
+  it('waits for the initial OAuth usage refresh before returning status', async () => {
     const secretStore = new MemorySecretStore();
     await secretStore.set('acct_1', { accessToken: 'access-token-1' });
     const accountManager = new AccountManager({
@@ -1120,7 +1131,7 @@ describe('createProxyServer', () => {
         seven_day: { utilization: 0.5, resets_at: '2026-06-13T10:00:00Z' },
       }),
     }));
-    t.after(async () => {
+    cleanupAfterTest(async () => {
       await close(proxy.server);
     });
 
@@ -1132,7 +1143,7 @@ describe('createProxyServer', () => {
     assert.equal(response.body.accounts[0].status, 'active');
   });
 
-  it('refreshes exhausted usage again at the reported reset time', async t => {
+  it('refreshes exhausted usage again at the reported reset time', async () => {
     const secretStore = new MemorySecretStore();
     await secretStore.set('acct_1', { accessToken: 'access-token-1' });
     const accountManager = new AccountManager({
@@ -1165,7 +1176,7 @@ describe('createProxyServer', () => {
         };
       },
     }));
-    t.after(async () => {
+    cleanupAfterTest(async () => {
       await close(proxy.server);
     });
 
@@ -1181,7 +1192,7 @@ describe('createProxyServer', () => {
     assert.equal(second.body.accounts[0].status, 'active');
   });
 
-  it('periodically refreshes usage and switches before the next API request', async t => {
+  it('periodically refreshes usage and switches before the next API request', async () => {
     const secretStore = new MemorySecretStore();
     await secretStore.set('acct_1', { accessToken: 'access-token-1' });
     await secretStore.set('acct_2', { accessToken: 'access-token-2' });
@@ -1218,7 +1229,7 @@ describe('createProxyServer', () => {
         };
       },
     }));
-    t.after(async () => {
+    cleanupAfterTest(async () => {
       await close(proxy.server);
     });
 
@@ -1233,7 +1244,7 @@ describe('createProxyServer', () => {
     assert.equal(status.accounts[1].status, 'active');
   });
 
-  it('periodically refreshes usage and proactively switches to an account with a soon weekly reset', async t => {
+  it('periodically refreshes usage and proactively switches to an account with a soon weekly reset', async () => {
     const secretStore = new MemorySecretStore();
     await secretStore.set('active-account', { accessToken: 'access-token-current' });
     await secretStore.set('soon-weekly', { accessToken: 'access-token-soon' });
@@ -1267,7 +1278,7 @@ describe('createProxyServer', () => {
         };
       },
     }));
-    t.after(async () => {
+    cleanupAfterTest(async () => {
       await close(proxy.server);
     });
 
@@ -1332,6 +1343,7 @@ describe('createProxyServer', () => {
 
 async function listen(server) {
   await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
+  server.unref?.();
   const { port } = server.address();
   return { server, url: `http://127.0.0.1:${port}` };
 }
