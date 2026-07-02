@@ -1,7 +1,7 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 
-import { runCli } from '../src/cli.js';
+import { runCli, startService } from '../src/cli.js';
 
 describe('runCli', () => {
   it('prints help', async () => {
@@ -353,6 +353,50 @@ describe('runCli', () => {
     assert.equal(code, 0);
     assert.match(io.output(), /accounts: ok/);
     assert.equal(stored.acct_1.accessToken, 'fresh-token');
+  });
+});
+
+describe('startService', () => {
+  it('restarts a macOS LaunchAgent before kickstart', async () => {
+    const calls = [];
+
+    await startService({
+      platform: 'darwin',
+      uid: 501,
+      plistPath: '/Users/alice/Library/LaunchAgents/io.github.claude-rotator.plist',
+      execFileImpl: async (cmd, args) => {
+        calls.push([cmd, args]);
+      },
+    });
+
+    assert.deepEqual(calls, [
+      ['launchctl', ['bootout', 'gui/501/io.github.claude-rotator']],
+      ['launchctl', ['bootstrap', 'gui/501', '/Users/alice/Library/LaunchAgents/io.github.claude-rotator.plist']],
+      ['launchctl', ['enable', 'gui/501/io.github.claude-rotator']],
+      ['launchctl', ['kickstart', '-k', 'gui/501/io.github.claude-rotator']],
+    ]);
+  });
+
+  it('falls back to launchctl load when macOS bootstrap fails', async () => {
+    const calls = [];
+
+    await startService({
+      platform: 'darwin',
+      uid: 501,
+      plistPath: '/Users/alice/Library/LaunchAgents/io.github.claude-rotator.plist',
+      execFileImpl: async (cmd, args) => {
+        calls.push([cmd, args]);
+        if (args[0] === 'bootstrap') throw new Error('Bootstrap failed: 5');
+      },
+    });
+
+    assert.deepEqual(calls, [
+      ['launchctl', ['bootout', 'gui/501/io.github.claude-rotator']],
+      ['launchctl', ['bootstrap', 'gui/501', '/Users/alice/Library/LaunchAgents/io.github.claude-rotator.plist']],
+      ['launchctl', ['load', '-w', '/Users/alice/Library/LaunchAgents/io.github.claude-rotator.plist']],
+      ['launchctl', ['enable', 'gui/501/io.github.claude-rotator']],
+      ['launchctl', ['kickstart', '-k', 'gui/501/io.github.claude-rotator']],
+    ]);
   });
 });
 
