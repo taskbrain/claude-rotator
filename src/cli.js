@@ -94,6 +94,18 @@ export async function runCli(argv = [], deps = {}) {
       return result.ok ? 0 : 1;
     }
 
+    if (command === 'prepare-resume') {
+      const result = await (deps.postJson || postJson)('/internal/prepare-resume', {
+        refreshUsage: argv.includes('--refresh'),
+      });
+      if (argv.includes('--json')) {
+        write(`${JSON.stringify(result)}\n`);
+      } else {
+        write(renderPrepareResume(result));
+      }
+      return result.ok ? 0 : 1;
+    }
+
     if (command === 'doctor') {
       return doctorCommand({ write, deps });
     }
@@ -136,6 +148,7 @@ export function helpText() {
   claude-rotator monitor
   claude-rotator switch <account>
   claude-rotator refresh-usage
+  claude-rotator prepare-resume [--json] [--refresh]
   claude-rotator accounts
   claude-rotator login [--id <id>] [--name <email>]
   claude-rotator login --id <id> --name <email> --json <token-json>
@@ -144,6 +157,20 @@ export function helpText() {
   claude-rotator import-current --id <id> --name <email>
   claude-rotator doctor
 `;
+}
+
+function renderPrepareResume(result) {
+  const account = result.accountName || result.account || '(none)';
+  if (result.action === 'ready') {
+    const switched = result.switched ? ' (switched)' : '';
+    return `Resume target ready: ${account}${switched}\n`;
+  }
+  if (result.action === 'wait') {
+    const wait = result.waitMs == null ? '' : ` in ${Math.ceil(result.waitMs / 60000)}m`;
+    const switched = result.switched ? ' (switched)' : '';
+    return `Resume target: ${account}${switched}; wait until ${result.resumeAt}${wait}\n`;
+  }
+  return `No resume target available: ${result.reason || 'unknown'}\n`;
 }
 
 async function runServer({ write }) {

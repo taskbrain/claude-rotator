@@ -38,6 +38,32 @@ describe('runCli', () => {
     assert.match(io.output(), /5h ███████░░░  76%/);
   });
 
+  it('prints prepare-resume JSON using the internal API', async () => {
+    const io = createIo();
+
+    const code = await runCli(['prepare-resume', '--json'], {
+      ...io,
+      postJson: async (path, body) => {
+        assert.equal(path, '/internal/prepare-resume');
+        assert.deepEqual(body, { refreshUsage: false });
+        return {
+          ok: true,
+          action: 'wait',
+          account: 'dev',
+          resumeAtEpoch: 1780614000,
+        };
+      },
+    });
+
+    assert.equal(code, 0);
+    assert.deepEqual(JSON.parse(io.output()), {
+      ok: true,
+      action: 'wait',
+      account: 'dev',
+      resumeAtEpoch: 1780614000,
+    });
+  });
+
   it('imports current Claude Code credentials through injected reader', async () => {
     const io = createIo();
     const imported = [];

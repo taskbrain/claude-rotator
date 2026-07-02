@@ -223,6 +223,50 @@ export class AccountManager {
     return this.switchToCandidate(selected, reason);
   }
 
+  prepareResumeTarget() {
+    const previousId = this.getCurrentAccount()?.id || null;
+    const available = this.bestAvailableSwitchCandidate({ excludeCurrent: false });
+    if (available) {
+      const account = available.index === this.currentIndex
+        ? available.account
+        : this.switchToCandidate(available, 'resume-ready');
+      return this.resumeTarget({
+        account,
+        action: 'ready',
+        reason: 'available',
+        resumeAt: this.now(),
+        switched: previousId !== account.id,
+      });
+    }
+
+    const selected = this.bestExhaustedFallbackCandidate();
+    if (!selected) {
+      return this.emptyResumeTarget('no-resume-target');
+    }
+
+    const account = this.switchToExhaustedFallbackCandidate(selected);
+    const resetAt = finiteResetAt(selected.score.resetAt);
+    if (resetAt == null) {
+      return this.resumeTarget({
+        account,
+        action: 'unavailable',
+        reason: 'quota-reset-unknown',
+        resumeAt: null,
+        switched: previousId !== account.id,
+        unavailableReason: this.unavailableReason(account),
+      });
+    }
+
+    return this.resumeTarget({
+      account,
+      action: resetAt <= this.now() ? 'ready' : 'wait',
+      reason: 'shortest-quota-reset',
+      resumeAt: resetAt,
+      switched: previousId !== account.id,
+      unavailableReason: this.unavailableReason(account),
+    });
+  }
+
   rebalanceActiveAccount() {
     const current = this.getCurrentAccount();
     if (!current) return null;
@@ -277,14 +321,21 @@ export class AccountManager {
   }
 
   selectBestExhaustedFallback() {
+    const selected = this.bestExhaustedFallbackCandidate();
+    if (!selected) return null;
+    return this.switchToExhaustedFallbackCandidate(selected);
+  }
+
+  bestExhaustedFallbackCandidate() {
     const candidates = this.accounts
       .map((account, index) => ({ account, index, score: this.exhaustedFallbackScore(account) }))
       .filter(candidate => candidate.score);
 
     candidates.sort((left, right) => compareExhaustedFallbackScores(left, right));
-    const selected = candidates[0];
-    if (!selected) return null;
+    return candidates[0] || null;
+  }
 
+  switchToExhaustedFallbackCandidate(selected) {
     if (selected.index !== this.currentIndex) {
       const previous = this.accounts[this.currentIndex];
       if (previous) previous.status = this.displayStatus(previous);
@@ -299,6 +350,48 @@ export class AccountManager {
       });
     }
     return selected.account;
+  }
+
+  resumeTarget({
+    account,
+    action,
+    reason,
+    resumeAt,
+    switched,
+    unavailableReason = null,
+  }) {
+    const resumeAtMs = finiteResetAt(resumeAt);
+    const waitMs = resumeAtMs == null ? null : Math.max(0, resumeAtMs - this.now());
+    const reasonDetails = unavailableReason || this.unavailableReason(account);
+    return {
+      ok: action !== 'unavailable',
+      action,
+      reason,
+      account: account?.id || null,
+      accountName: account?.name || null,
+      switched: Boolean(switched),
+      window: reasonDetails?.window || null,
+      unavailableReason: reasonDetails,
+      resumeAt: resumeAtMs == null ? null : new Date(resumeAtMs).toISOString(),
+      resumeAtEpoch: resumeAtMs == null ? null : Math.floor(resumeAtMs / 1000),
+      waitMs,
+    };
+  }
+
+  emptyResumeTarget(reason) {
+    return {
+      ok: false,
+      action: 'unavailable',
+      reason,
+      account: null,
+      accountName: null,
+      switched: false,
+      window: null,
+      unavailableReason: null,
+      resumeAt: null,
+      resumeAtEpoch: null,
+      waitMs: null,
+    };
   }
 
   switchTargetScore(account) {
@@ -564,6 +657,10 @@ function normalizeRotationPolicy(policy) {
 
 function finiteNumberOrNull(value) {
   return typeof value === 'number' && Number.isFinite(value) ? value : null;
+}
+
+function finiteResetAt(value) {
+  return typeof value === 'number' && Number.isFinite(value) && value !== Number.MAX_SAFE_INTEGER ? value : null;
 }
 
 export function isNearQuota(quota, threshold) {
