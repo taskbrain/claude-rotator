@@ -19,7 +19,7 @@ Claude Code の複数アカウントをローカル proxy 経由で切り替え�
 
 ## 動作環境
 
-- Node.js 18 以上
+- Node.js 18.10 以上
 - Claude Code がインストール済み
 - macOS: LaunchAgent を使用
 - Ubuntu: systemd user service を使用
@@ -69,7 +69,7 @@ claude-rotator install
 claude-rotator doctor
 ```
 
-`node --version` は `v18` 以上が必要です。Ubuntu では次の systemd user service が作られます。
+`node --version` は `v18.10` 以上が必要です。Ubuntu では次の systemd user service が作られます。
 
 ```text
 ~/.config/systemd/user/claude-rotator.service
@@ -311,6 +311,8 @@ claude-rotator uninstall --purge-secrets
 npm test
 npm run lint
 ```
+
+ローカル Node は `v18.10` 以上で動作します。開発時に macOS / Ubuntu の差分を避けて確認したい場合は、下の Docker コマンドで Node 22 の検証も実行してください。
 
 Docker での検証:
 

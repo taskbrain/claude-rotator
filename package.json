@@ -12,7 +12,7 @@
     "check": "npm run lint && npm test"
   },
   "engines": {
-    "node": ">=18.0.0"
+    "node": ">=18.10.0"
   },
   "license": "MIT"
 }
