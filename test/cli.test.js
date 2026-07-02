@@ -364,6 +364,7 @@ describe('startService', () => {
       platform: 'darwin',
       uid: 501,
       plistPath: '/Users/alice/Library/LaunchAgents/io.github.claude-rotator.plist',
+      sleepImpl: async () => {},
       execFileImpl: async (cmd, args) => {
         calls.push([cmd, args]);
       },
@@ -372,6 +373,7 @@ describe('startService', () => {
     assert.deepEqual(calls, [
       ['launchctl', ['bootout', 'gui/501/io.github.claude-rotator']],
       ['launchctl', ['bootstrap', 'gui/501', '/Users/alice/Library/LaunchAgents/io.github.claude-rotator.plist']],
+      ['launchctl', ['print', 'gui/501/io.github.claude-rotator']],
       ['launchctl', ['enable', 'gui/501/io.github.claude-rotator']],
       ['launchctl', ['kickstart', '-k', 'gui/501/io.github.claude-rotator']],
     ]);
@@ -384,6 +386,7 @@ describe('startService', () => {
       platform: 'darwin',
       uid: 501,
       plistPath: '/Users/alice/Library/LaunchAgents/io.github.claude-rotator.plist',
+      sleepImpl: async () => {},
       execFileImpl: async (cmd, args) => {
         calls.push([cmd, args]);
         if (args[0] === 'bootstrap') throw new Error('Bootstrap failed: 5');
@@ -393,7 +396,46 @@ describe('startService', () => {
     assert.deepEqual(calls, [
       ['launchctl', ['bootout', 'gui/501/io.github.claude-rotator']],
       ['launchctl', ['bootstrap', 'gui/501', '/Users/alice/Library/LaunchAgents/io.github.claude-rotator.plist']],
+      ['launchctl', ['bootstrap', 'gui/501', '/Users/alice/Library/LaunchAgents/io.github.claude-rotator.plist']],
       ['launchctl', ['load', '-w', '/Users/alice/Library/LaunchAgents/io.github.claude-rotator.plist']],
+      ['launchctl', ['print', 'gui/501/io.github.claude-rotator']],
+      ['launchctl', ['enable', 'gui/501/io.github.claude-rotator']],
+      ['launchctl', ['kickstart', '-k', 'gui/501/io.github.claude-rotator']],
+    ]);
+  });
+
+  it('retries bootstrap when load exits before registering the macOS service', async () => {
+    const calls = [];
+    let bootstrapCalls = 0;
+    let printCalls = 0;
+
+    await startService({
+      platform: 'darwin',
+      uid: 501,
+      plistPath: '/Users/alice/Library/LaunchAgents/io.github.claude-rotator.plist',
+      sleepImpl: async () => {},
+      execFileImpl: async (cmd, args) => {
+        calls.push([cmd, args]);
+        if (args[0] === 'bootstrap') {
+          bootstrapCalls += 1;
+          if (bootstrapCalls < 3) throw new Error('Bootstrap failed: 5');
+        }
+        if (args[0] === 'print') {
+          printCalls += 1;
+          if (printCalls < 3) throw new Error('service not found');
+        }
+      },
+    });
+
+    assert.deepEqual(calls, [
+      ['launchctl', ['bootout', 'gui/501/io.github.claude-rotator']],
+      ['launchctl', ['bootstrap', 'gui/501', '/Users/alice/Library/LaunchAgents/io.github.claude-rotator.plist']],
+      ['launchctl', ['bootstrap', 'gui/501', '/Users/alice/Library/LaunchAgents/io.github.claude-rotator.plist']],
+      ['launchctl', ['load', '-w', '/Users/alice/Library/LaunchAgents/io.github.claude-rotator.plist']],
+      ['launchctl', ['print', 'gui/501/io.github.claude-rotator']],
+      ['launchctl', ['print', 'gui/501/io.github.claude-rotator']],
+      ['launchctl', ['bootstrap', 'gui/501', '/Users/alice/Library/LaunchAgents/io.github.claude-rotator.plist']],
+      ['launchctl', ['print', 'gui/501/io.github.claude-rotator']],
       ['launchctl', ['enable', 'gui/501/io.github.claude-rotator']],
       ['launchctl', ['kickstart', '-k', 'gui/501/io.github.claude-rotator']],
     ]);
