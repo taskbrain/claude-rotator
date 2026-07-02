@@ -177,6 +177,87 @@ describe('AccountManager', () => {
     assert.equal(manager.getCurrentAccount().id, 'weekly-a');
   });
 
+  it('prepares resume on the available account immediately when one exists', () => {
+    const manager = new AccountManager({
+      accounts: [
+        { id: 'current', name: 'current@example.com', type: 'oauth' },
+        { id: 'available', name: 'available@example.com', type: 'oauth' },
+      ],
+      switchThreshold: 1,
+      now: () => 1000,
+    });
+    manager.updateQuota('current', {
+      'anthropic-ratelimit-unified-5h-utilization': '1',
+      'anthropic-ratelimit-unified-5h-reset': '20',
+    });
+    manager.updateQuota('available', {
+      'anthropic-ratelimit-unified-5h-utilization': '0.1',
+      'anthropic-ratelimit-unified-7d-utilization': '0.2',
+    });
+
+    const target = manager.prepareResumeTarget();
+
+    assert.equal(target.ok, true);
+    assert.equal(target.action, 'ready');
+    assert.equal(target.account, 'available');
+    assert.equal(target.switched, true);
+    assert.equal(target.resumeAtEpoch, 1);
+    assert.equal(manager.getCurrentAccount().id, 'available');
+  });
+
+  it('prepares resume on the exhausted account with the shortest reset', () => {
+    const manager = new AccountManager({
+      accounts: [
+        { id: 'weekly-a', name: 'weekly-a@example.com', type: 'oauth' },
+        { id: 'dev', name: 'dev@example.com', type: 'oauth' },
+        { id: 'weekly-b', name: 'weekly-b@example.com', type: 'oauth' },
+      ],
+      switchThreshold: 1,
+      now: () => 1000,
+    });
+    manager.updateQuota('weekly-a', {
+      'anthropic-ratelimit-unified-7d-utilization': '1',
+      'anthropic-ratelimit-unified-7d-reset': '100',
+    });
+    manager.updateQuota('dev', {
+      'anthropic-ratelimit-unified-5h-utilization': '1',
+      'anthropic-ratelimit-unified-5h-reset': '10',
+    });
+    manager.updateQuota('weekly-b', {
+      'anthropic-ratelimit-unified-7d-utilization': '1',
+      'anthropic-ratelimit-unified-7d-reset': '50',
+    });
+
+    const target = manager.prepareResumeTarget();
+
+    assert.equal(target.ok, true);
+    assert.equal(target.action, 'wait');
+    assert.equal(target.account, 'dev');
+    assert.equal(target.window, '5h');
+    assert.equal(target.resumeAt, '1970-01-01T00:00:10.000Z');
+    assert.equal(target.resumeAtEpoch, 10);
+    assert.equal(target.waitMs, 9000);
+    assert.equal(target.switched, true);
+    assert.equal(manager.getCurrentAccount().id, 'dev');
+    assert.equal(manager.getStatus().events[0].type, 'fallback-switch');
+  });
+
+  it('does not prepare an unknown-usage account as immediately ready', () => {
+    const manager = new AccountManager({
+      accounts: [
+        { id: 'unknown', name: 'unknown@example.com', type: 'oauth' },
+      ],
+      switchThreshold: 1,
+      now: () => 1000,
+    });
+
+    const target = manager.prepareResumeTarget();
+
+    assert.equal(target.ok, false);
+    assert.equal(target.action, 'unavailable');
+    assert.equal(target.reason, 'no-resume-target');
+  });
+
   it('starts on the configured active account', () => {
     const manager = new AccountManager({
       accounts: [

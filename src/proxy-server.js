@@ -89,6 +89,16 @@ export function createProxyServer({
         return;
       }
 
+      if (req.method === 'POST' && req.url === '/internal/prepare-resume') {
+        const body = JSON.parse((await readBody(req)).toString('utf8') || '{}');
+        if (body.refreshUsage) await usageScheduler.refreshNow();
+        sendJson(res, 200, {
+          ...accountManager.prepareResumeTarget(),
+          status: accountManager.getStatus(),
+        });
+        return;
+      }
+
       const body = await readBody(req);
       if (usagePollingEnabled(config) && !usageScheduler.hasAttempted()) {
         await usageScheduler.refreshNow();
@@ -763,9 +773,16 @@ function syntheticUpstreamErrorResponse(error) {
 }
 
 function sendCurrentQuotaUnavailableResponse({ req, res, accountManager, logger }) {
-  const account = accountManager.getCurrentAccount();
-  const reason = accountManager.unavailableReason(account);
+  let account = accountManager.getCurrentAccount();
+  let reason = accountManager.unavailableReason(account);
   if (!isUnifiedQuotaExhaustion(reason)) return false;
+
+  const shortestResetAccount = accountManager.selectBestExhaustedFallback();
+  if (shortestResetAccount) {
+    account = shortestResetAccount;
+    reason = accountManager.unavailableReason(account);
+    if (!isUnifiedQuotaExhaustion(reason)) return false;
+  }
 
   const response = syntheticQuotaExhaustedResponse(account, reason);
   recordProxyRequest({

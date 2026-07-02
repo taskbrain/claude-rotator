@@ -900,14 +900,104 @@ describe('createProxyServer', () => {
 
     assert.equal(response.status, 429);
     assert.deepEqual(upstreamSeen, []);
-    assert.match(response.body.error.message, /You've hit your weekly limit/);
+    assert.match(response.body.error.message, /You've hit your session limit/);
     assert.equal(response.headers['anthropic-ratelimit-unified-status'], 'rejected');
-    assert.equal(response.headers['anthropic-ratelimit-unified-representative-claim'], 'seven_day');
-    assert.equal(response.headers['anthropic-ratelimit-unified-reset'], '100');
-    assert.equal(response.headers['anthropic-ratelimit-unified-7d-utilization'], '1');
-    assert.equal(response.body.error.details.window, '7d');
-    assert.match(response.body.error.details.rotator_message, /Claude 7d usage limit exhausted/);
-    assert.equal(accountManager.getStatus().currentAccount, 'weekly-a');
+    assert.equal(response.headers['anthropic-ratelimit-unified-representative-claim'], 'five_hour');
+    assert.equal(response.headers['anthropic-ratelimit-unified-reset'], '10');
+    assert.equal(response.headers['anthropic-ratelimit-unified-5h-utilization'], '1');
+    assert.equal(response.body.error.details.window, '5h');
+    assert.match(response.body.error.details.rotator_message, /Claude 5h usage limit exhausted/);
+    assert.equal(accountManager.getStatus().currentAccount, 'dev');
+  });
+
+  it('prepares a resume target through the internal API', async t => {
+    const secretStore = new MemorySecretStore();
+    await secretStore.set('weekly-a', { accessToken: 'weekly-a-token' });
+    await secretStore.set('dev', { accessToken: 'dev-token' });
+    const accountManager = new AccountManager({
+      accounts: [
+        { id: 'weekly-a', name: 'weekly-a@example.com', type: 'oauth' },
+        { id: 'dev', name: 'dev@example.com', type: 'oauth' },
+      ],
+      switchThreshold: 1,
+      now: () => 1000,
+    });
+    accountManager.updateQuota('weekly-a', {
+      'anthropic-ratelimit-unified-7d-utilization': '1',
+      'anthropic-ratelimit-unified-7d-reset': '100',
+    });
+    accountManager.updateQuota('dev', {
+      'anthropic-ratelimit-unified-5h-utilization': '1',
+      'anthropic-ratelimit-unified-5h-reset': '10',
+    });
+    const proxy = await listen(createProxyServer({
+      accountManager,
+      secretStore,
+      config: { upstream: 'http://127.0.0.1:1' },
+    }));
+    t.after(async () => {
+      await close(proxy.server);
+    });
+
+    const response = await requestJson(`${proxy.url}/internal/prepare-resume`, { method: 'POST' });
+
+    assert.equal(response.status, 200);
+    assert.equal(response.body.ok, true);
+    assert.equal(response.body.action, 'wait');
+    assert.equal(response.body.account, 'dev');
+    assert.equal(response.body.window, '5h');
+    assert.equal(response.body.resumeAtEpoch, 10);
+    assert.equal(response.body.status.currentAccount, 'dev');
+    assert.equal(JSON.stringify(response.body).includes('dev-token'), false);
+  });
+
+  it('refreshes usage for prepare-resume even when polling is disabled', async t => {
+    const secretStore = new MemorySecretStore();
+    await secretStore.set('weekly', { accessToken: 'weekly-token' });
+    await secretStore.set('dev', { accessToken: 'dev-token' });
+    const accountManager = new AccountManager({
+      accounts: [
+        { id: 'weekly', name: 'weekly@example.com', type: 'oauth' },
+        { id: 'dev', name: 'dev@example.com', type: 'oauth' },
+      ],
+      switchThreshold: 1,
+      now: () => Date.parse('2026-06-08T06:00:00Z'),
+    });
+    let calls = 0;
+    const proxy = await listen(createProxyServer({
+      accountManager,
+      secretStore,
+      config: {
+        upstream: 'http://127.0.0.1:1',
+        usagePolling: { enabled: false },
+      },
+      usageFetcher: async token => {
+        calls += 1;
+        if (token === 'weekly-token') {
+          return {
+            seven_day: { utilization: 1, resets_at: '2026-06-11T12:00:00Z' },
+          };
+        }
+        return {
+          five_hour: { utilization: 1, resets_at: '2026-06-08T10:50:00Z' },
+          seven_day: { utilization: 0.2, resets_at: '2026-06-15T03:00:00Z' },
+        };
+      },
+    }));
+    t.after(async () => {
+      await close(proxy.server);
+    });
+
+    const response = await requestJson(`${proxy.url}/internal/prepare-resume`, {
+      method: 'POST',
+      body: JSON.stringify({ refreshUsage: true }),
+    });
+
+    assert.equal(response.status, 200);
+    assert.equal(calls, 2);
+    assert.equal(response.body.action, 'wait');
+    assert.equal(response.body.account, 'dev');
+    assert.equal(response.body.resumeAtEpoch, Date.parse('2026-06-08T10:50:00Z') / 1000);
   });
 
   it('waits for initial usage refresh before forwarding the first API request', async t => {
