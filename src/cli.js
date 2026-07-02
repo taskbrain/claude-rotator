@@ -601,15 +601,30 @@ export async function startService({
   uid = typeof process.getuid === 'function' ? process.getuid() : null,
   execFileImpl = execFileAsync,
   plistPath = macosLaunchAgentPath(MACOS_LAUNCH_AGENT_LABEL),
+  sleepImpl = sleep,
 } = {}) {
   if (platform === 'darwin') {
     const domain = uid == null ? 'gui/$(id -u)' : `gui/${uid}`;
     const label = `${domain}/${MACOS_LAUNCH_AGENT_LABEL}`;
     await execFileImpl('launchctl', ['bootout', label]).catch(() => {});
+    await sleepImpl(300);
     try {
       await execFileImpl('launchctl', ['bootstrap', domain, plistPath]);
-    } catch (error) {
-      await execFileImpl('launchctl', ['load', '-w', plistPath]);
+    } catch {
+      await sleepImpl(300);
+      try {
+        await execFileImpl('launchctl', ['bootstrap', domain, plistPath]);
+      } catch {
+        await execFileImpl('launchctl', ['load', '-w', plistPath]);
+      }
+    }
+    if (!(await isLaunchAgentRegistered(execFileImpl, label))) {
+      await sleepImpl(300);
+      if (!(await isLaunchAgentRegistered(execFileImpl, label))) {
+        await execFileImpl('launchctl', ['bootstrap', domain, plistPath]).catch(() => {});
+        await sleepImpl(300);
+      }
+      await execFileImpl('launchctl', ['print', label]);
     }
     await execFileImpl('launchctl', ['enable', label]).catch(() => {});
     await execFileImpl('launchctl', ['kickstart', '-k', label]).catch(() => {});
@@ -617,6 +632,19 @@ export async function startService({
   }
   await execFileImpl('systemctl', ['--user', 'daemon-reload']);
   await execFileImpl('systemctl', ['--user', 'enable', '--now', 'claude-rotator.service']);
+}
+
+async function sleep(ms) {
+  await new Promise(resolve => setTimeout(resolve, ms));
+}
+
+async function isLaunchAgentRegistered(execFileImpl, label) {
+  try {
+    await execFileImpl('launchctl', ['print', label]);
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 async function stopService() {
