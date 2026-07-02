@@ -121,7 +121,9 @@ export function renderServiceStartFailureMessage({
     return [
       `Service start failed: ${reason}`,
       'Try:',
+      `  launchctl bootout ${domain}/${MACOS_LAUNCH_AGENT_LABEL} 2>/dev/null || true`,
       `  launchctl bootstrap ${domain} ~/Library/LaunchAgents/${MACOS_LAUNCH_AGENT_LABEL}.plist`,
+      `  launchctl load -w ~/Library/LaunchAgents/${MACOS_LAUNCH_AGENT_LABEL}.plist`,
       `  launchctl kickstart -k ${domain}/${MACOS_LAUNCH_AGENT_LABEL}`,
       `  launchctl print ${domain}/${MACOS_LAUNCH_AGENT_LABEL}`,
     ].join('\n');

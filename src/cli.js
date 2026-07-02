@@ -596,14 +596,27 @@ async function removeServiceFile() {
   await rm(join(homedir(), '.config', 'systemd', 'user', 'claude-rotator.service'), { force: true });
 }
 
-async function startService() {
-  if (process.platform === 'darwin') {
-    const plist = macosLaunchAgentPath(MACOS_LAUNCH_AGENT_LABEL);
-    await execFileAsync('launchctl', ['bootstrap', `gui/${process.getuid()}`, plist]);
+export async function startService({
+  platform = process.platform,
+  uid = typeof process.getuid === 'function' ? process.getuid() : null,
+  execFileImpl = execFileAsync,
+  plistPath = macosLaunchAgentPath(MACOS_LAUNCH_AGENT_LABEL),
+} = {}) {
+  if (platform === 'darwin') {
+    const domain = uid == null ? 'gui/$(id -u)' : `gui/${uid}`;
+    const label = `${domain}/${MACOS_LAUNCH_AGENT_LABEL}`;
+    await execFileImpl('launchctl', ['bootout', label]).catch(() => {});
+    try {
+      await execFileImpl('launchctl', ['bootstrap', domain, plistPath]);
+    } catch (error) {
+      await execFileImpl('launchctl', ['load', '-w', plistPath]);
+    }
+    await execFileImpl('launchctl', ['enable', label]).catch(() => {});
+    await execFileImpl('launchctl', ['kickstart', '-k', label]).catch(() => {});
     return;
   }
-  await execFileAsync('systemctl', ['--user', 'daemon-reload']);
-  await execFileAsync('systemctl', ['--user', 'enable', '--now', 'claude-rotator.service']);
+  await execFileImpl('systemctl', ['--user', 'daemon-reload']);
+  await execFileImpl('systemctl', ['--user', 'enable', '--now', 'claude-rotator.service']);
 }
 
 async function stopService() {

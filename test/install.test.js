@@ -119,7 +119,9 @@ describe('service file rendering', () => {
     });
 
     assert.match(message, /Service start failed: service already bootstrapped/);
+    assert.match(message, /launchctl bootout gui\/501\/io\.github\.claude-rotator/);
     assert.match(message, /launchctl bootstrap gui\/501/);
+    assert.match(message, /launchctl load -w ~\/Library\/LaunchAgents\/io\.github\.claude-rotator\.plist/);
     assert.match(message, /launchctl kickstart -k gui\/501\/io\.github\.claude-rotator/);
     assert.doesNotMatch(message, /systemctl/);
   });
