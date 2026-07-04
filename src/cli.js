@@ -636,6 +636,12 @@ export async function startService({
     }
     await execFileImpl('launchctl', ['enable', label]).catch(() => {});
     await execFileImpl('launchctl', ['kickstart', '-k', label]).catch(() => {});
+    await sleepImpl(5000);
+    if (!(await isLaunchAgentRegistered(execFileImpl, label))) {
+      await execFileImpl('launchctl', ['bootstrap', domain, plistPath]).catch(() => {});
+      await sleepImpl(300);
+      await execFileImpl('launchctl', ['print', label]);
+    }
     return;
   }
   await execFileImpl('systemctl', ['--user', 'daemon-reload']);
