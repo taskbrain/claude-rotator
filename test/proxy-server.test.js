@@ -1112,6 +1112,43 @@ describe('createProxyServer', () => {
     assert.equal(JSON.stringify(refresh.body).includes('account-two-token'), false);
   });
 
+  it('surfaces usage refresh network causes without leaking tokens', async () => {
+    const secretStore = new MemorySecretStore();
+    await secretStore.set('acct_1', { accessToken: 'access-token-1' });
+    const accountManager = new AccountManager({
+      accounts: [{ id: 'acct_1', name: 'a@example.com', type: 'oauth' }],
+      now: () => Date.parse('2026-06-07T11:00:00Z'),
+    });
+    const fetchError = new TypeError('fetch failed');
+    fetchError.cause = Object.assign(new Error('Connect Timeout Error'), {
+      name: 'ConnectTimeoutError',
+      code: 'UND_ERR_CONNECT_TIMEOUT',
+      syscall: 'connect',
+      address: '160.79.104.10',
+      port: 443,
+    });
+    const proxy = await listen(createProxyServer({
+      accountManager,
+      secretStore,
+      config: { upstream: 'http://127.0.0.1:1', usagePolling: { enabled: false } },
+      usageFetcher: async () => {
+        throw fetchError;
+      },
+    }));
+    cleanupAfterTest(async () => {
+      await close(proxy.server);
+    });
+
+    const refresh = await requestJson(`${proxy.url}/internal/refresh-usage`, { method: 'POST' });
+
+    assert.equal(refresh.status, 200);
+    assert.equal(refresh.body.ok, false);
+    assert.match(refresh.body.accounts[0].error, /fetch failed/);
+    assert.match(refresh.body.accounts[0].error, /UND_ERR_CONNECT_TIMEOUT/);
+    assert.match(refresh.body.accounts[0].error, /160\.79\.104\.10:443/);
+    assert.equal(JSON.stringify(refresh.body).includes('access-token-1'), false);
+  });
+
   it('waits for the initial OAuth usage refresh before returning status', async () => {
     const secretStore = new MemorySecretStore();
     await secretStore.set('acct_1', { accessToken: 'access-token-1' });
