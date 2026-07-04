@@ -18,6 +18,9 @@ const HOP_HEADERS = new Set([
 ]);
 
 const DEFAULT_UPSTREAM_IDLE_TIMEOUT_MS = 180000;
+const DEFAULT_UPSTREAM_CONNECT_TIMEOUT_MS = 10_000;
+const DEFAULT_UPSTREAM_CONNECT_RETRIES = 3;
+const DEFAULT_UPSTREAM_CONNECT_RETRY_DELAY_MS = 250;
 const DEFAULT_RESET_CHECK_DELAY_MS = 1000;
 const DEFAULT_USAGE_POLL_INTERVAL_MS = 60_000;
 const MAX_TIMER_DELAY_MS = 2_147_483_647;
@@ -37,6 +40,15 @@ export function createProxyServer({
   const upstreamIdleTimeoutMs = config.proxy?.upstreamIdleTimeoutMs
     ?? config.upstreamIdleTimeoutMs
     ?? DEFAULT_UPSTREAM_IDLE_TIMEOUT_MS;
+  const upstreamConnectTimeoutMs = config.proxy?.upstreamConnectTimeoutMs
+    ?? config.upstreamConnectTimeoutMs
+    ?? DEFAULT_UPSTREAM_CONNECT_TIMEOUT_MS;
+  const upstreamConnectRetries = config.proxy?.upstreamConnectRetries
+    ?? config.upstreamConnectRetries
+    ?? DEFAULT_UPSTREAM_CONNECT_RETRIES;
+  const upstreamConnectRetryDelayMs = config.proxy?.upstreamConnectRetryDelayMs
+    ?? config.upstreamConnectRetryDelayMs
+    ?? DEFAULT_UPSTREAM_CONNECT_RETRY_DELAY_MS;
 
   const usageRefresher = createUsageRefresher({
     accountManager,
@@ -127,6 +139,9 @@ export function createProxyServer({
         currentCredentialReader,
         logger,
         upstreamIdleTimeoutMs,
+        upstreamConnectTimeoutMs,
+        upstreamConnectRetries,
+        upstreamConnectRetryDelayMs,
       });
       await persistState();
     } catch (error) {
@@ -338,6 +353,9 @@ async function forwardWithRotation({
   currentCredentialReader,
   logger,
   upstreamIdleTimeoutMs,
+  upstreamConnectTimeoutMs,
+  upstreamConnectRetries,
+  upstreamConnectRetryDelayMs,
 }) {
   const maxAttempts = Math.max(1, accountManager.accounts.length);
   let lastRetryableResponse = null;
@@ -366,6 +384,9 @@ async function forwardWithRotation({
         currentCredentialReader,
         logger,
         upstreamIdleTimeoutMs,
+        upstreamConnectTimeoutMs,
+        upstreamConnectRetries,
+        upstreamConnectRetryDelayMs,
       })) return;
       sendUnavailableAccounts(res);
       return;
@@ -400,6 +421,9 @@ async function forwardWithRotation({
       accountManager,
       logger,
       upstreamIdleTimeoutMs,
+      upstreamConnectTimeoutMs,
+      upstreamConnectRetries,
+      upstreamConnectRetryDelayMs,
     });
     if (result.retryAfterRefresh) {
       let refreshedSecret;
@@ -424,6 +448,9 @@ async function forwardWithRotation({
         accountManager,
         logger,
         upstreamIdleTimeoutMs,
+        upstreamConnectTimeoutMs,
+        upstreamConnectRetries,
+        upstreamConnectRetryDelayMs,
       });
       if (retryResult.retryAfterRefresh) {
         accountManager.markError(account.id, 'authentication_error', 'OAuth token rejected');
@@ -464,6 +491,9 @@ async function forwardWithRotation({
       currentCredentialReader,
       logger,
       upstreamIdleTimeoutMs,
+      upstreamConnectTimeoutMs,
+      upstreamConnectRetries,
+      upstreamConnectRetryDelayMs,
     })) return;
     sendUnavailableAccounts(res);
   }
@@ -480,6 +510,9 @@ async function forwardCurrentUnavailableAccount({
   currentCredentialReader,
   logger,
   upstreamIdleTimeoutMs,
+  upstreamConnectTimeoutMs,
+  upstreamConnectRetries,
+  upstreamConnectRetryDelayMs,
 }) {
   if (sendCurrentQuotaUnavailableResponse({
     req,
@@ -517,6 +550,9 @@ async function forwardCurrentUnavailableAccount({
     passthroughErrors: true,
     logger,
     upstreamIdleTimeoutMs,
+    upstreamConnectTimeoutMs,
+    upstreamConnectRetries,
+    upstreamConnectRetryDelayMs,
   });
   return true;
 }
@@ -560,6 +596,9 @@ async function forwardOnce({
   passthroughErrors = false,
   logger = null,
   upstreamIdleTimeoutMs,
+  upstreamConnectTimeoutMs,
+  upstreamConnectRetries,
+  upstreamConnectRetryDelayMs,
 }) {
   const target = new URL(req.url, upstream);
   const headers = buildUpstreamHeaders(req.headers, account, secret);
@@ -568,12 +607,18 @@ async function forwardOnce({
 
   let upstreamResponse;
   try {
-    upstreamResponse = await requestUpstream({
+    upstreamResponse = await requestUpstreamWithConnectRetries({
       target,
       method: req.method,
       headers,
       body,
       idleTimeoutMs: upstreamIdleTimeoutMs,
+      connectTimeoutMs: upstreamConnectTimeoutMs,
+      connectRetries: upstreamConnectRetries,
+      connectRetryDelayMs: upstreamConnectRetryDelayMs,
+      onRetry(error, attempt, maxAttempts) {
+        logger?.(`${new Date().toISOString()} upstream-connect-retry account=${account.id} method=${req.method} path=${target.pathname} attempt=${attempt}/${maxAttempts} errorType=${error.code || error.name}`);
+      },
       onResponse(upstreamRes) {
         accountManager.updateQuota(account.id, upstreamRes.headers);
 
@@ -676,18 +721,62 @@ function buildUpstreamHeaders(inputHeaders, account, secret) {
   return headers;
 }
 
-function requestUpstream({ target, method, headers, body, idleTimeoutMs, onResponse, onChunk }) {
+async function requestUpstreamWithConnectRetries(options) {
+  const retryCount = Math.max(0, Number(options.connectRetries) || 0);
+  const maxAttempts = retryCount + 1;
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    try {
+      return await requestUpstream(options);
+    } catch (error) {
+      if (attempt >= maxAttempts || !isRetryableConnectError(error)) throw error;
+      options.onRetry?.(error, attempt, maxAttempts);
+      await sleep(Math.max(0, Number(options.connectRetryDelayMs) || 0));
+    }
+  }
+  throw new Error('unreachable upstream retry state');
+}
+
+function requestUpstream({
+  target,
+  method,
+  headers,
+  body,
+  idleTimeoutMs,
+  connectTimeoutMs,
+  onResponse,
+  onChunk,
+}) {
   return new Promise((resolve, reject) => {
     const client = target.protocol === 'https:' ? https : http;
     let settled = false;
     let idleTimer = null;
+    let connectTimer = null;
+    let connected = false;
+    let responseStarted = false;
     let req = null;
     const settle = (error, result) => {
       if (settled) return;
       settled = true;
       if (idleTimer) clearTimeout(idleTimer);
+      if (connectTimer) clearTimeout(connectTimer);
       if (error) reject(error);
       else resolve(result);
+    };
+    const markConnected = () => {
+      connected = true;
+      if (connectTimer) clearTimeout(connectTimer);
+      connectTimer = null;
+    };
+    const startConnectTimer = () => {
+      if (!connectTimeoutMs || connectTimeoutMs <= 0 || settled) return;
+      connectTimer = setTimeout(() => {
+        const error = new Error(`Upstream connection timeout after ${connectTimeoutMs}ms`);
+        error.code = 'UPSTREAM_CONNECT_TIMEOUT';
+        error.connectPhase = true;
+        req?.destroy(error);
+        settle(error);
+      }, connectTimeoutMs);
+      connectTimer.unref?.();
     };
     const resetIdleTimer = () => {
       if (!idleTimeoutMs || idleTimeoutMs <= 0 || settled) return;
@@ -708,6 +797,8 @@ function requestUpstream({ target, method, headers, body, idleTimeoutMs, onRespo
       method,
       headers,
     }, upstreamRes => {
+      responseStarted = true;
+      markConnected();
       resetIdleTimer();
       const shouldStream = onResponse(upstreamRes);
       const chunks = [];
@@ -730,11 +821,45 @@ function requestUpstream({ target, method, headers, body, idleTimeoutMs, onRespo
       });
       upstreamRes.on('error', settle);
     });
-    req.on('error', settle);
+    req.on('socket', socket => {
+      if (!socket.connecting) {
+        markConnected();
+        return;
+      }
+      if (target.protocol === 'https:') socket.once('secureConnect', markConnected);
+      else socket.once('connect', markConnected);
+    });
+    req.on('error', error => {
+      if (!connected && !responseStarted && isConnectNetworkError(error)) {
+        error.connectPhase = true;
+      }
+      settle(error);
+    });
     if (!['GET', 'HEAD'].includes(method) && body.length > 0) req.write(body);
+    startConnectTimer();
     resetIdleTimer();
     req.end();
   });
+}
+
+function isRetryableConnectError(error) {
+  return Boolean(error?.connectPhase) && isConnectNetworkError(error);
+}
+
+function isConnectNetworkError(error) {
+  return [
+    'ETIMEDOUT',
+    'ENETUNREACH',
+    'EHOSTUNREACH',
+    'ECONNREFUSED',
+    'ECONNRESET',
+    'UPSTREAM_CONNECT_TIMEOUT',
+  ].includes(error?.code);
+}
+
+async function sleep(ms) {
+  if (ms <= 0) return;
+  await new Promise(resolve => setTimeout(resolve, ms));
 }
 
 function retryAfterSeconds(headers = {}, fallbackSeconds) {
@@ -749,7 +874,8 @@ function headerValue(value) {
 }
 
 function isUpstreamTimeout(error) {
-  return error?.code === 'UPSTREAM_IDLE_TIMEOUT';
+  return error?.code === 'UPSTREAM_IDLE_TIMEOUT'
+    || error?.code === 'UPSTREAM_CONNECT_TIMEOUT';
 }
 
 function outcomeForResponse(outcome, statusCode) {

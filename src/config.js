@@ -4,6 +4,9 @@ import { readJsonFile, writeJsonFile } from './json-file.js';
 export const DEFAULT_PORT = 37891;
 export const DEFAULT_THRESHOLD = 1;
 export const DEFAULT_UPSTREAM_IDLE_TIMEOUT_MS = 3 * 60 * 1000;
+export const DEFAULT_UPSTREAM_CONNECT_TIMEOUT_MS = 10 * 1000;
+export const DEFAULT_UPSTREAM_CONNECT_RETRIES = 3;
+export const DEFAULT_UPSTREAM_CONNECT_RETRY_DELAY_MS = 250;
 export const DEFAULT_WEEKLY_RESET_PRIORITY_WINDOW_MS = 36 * 60 * 60 * 1000;
 
 export function createDefaultConfig() {
@@ -12,6 +15,9 @@ export function createDefaultConfig() {
       host: '127.0.0.1',
       port: DEFAULT_PORT,
       upstreamIdleTimeoutMs: DEFAULT_UPSTREAM_IDLE_TIMEOUT_MS,
+      upstreamConnectTimeoutMs: DEFAULT_UPSTREAM_CONNECT_TIMEOUT_MS,
+      upstreamConnectRetries: DEFAULT_UPSTREAM_CONNECT_RETRIES,
+      upstreamConnectRetryDelayMs: DEFAULT_UPSTREAM_CONNECT_RETRY_DELAY_MS,
     },
     upstream: 'https://api.anthropic.com',
     switchThreshold: DEFAULT_THRESHOLD,

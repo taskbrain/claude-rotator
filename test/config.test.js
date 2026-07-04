@@ -41,6 +41,9 @@ describe('config defaults', () => {
     const config = createDefaultConfig();
 
     assert.equal(config.proxy.host, '127.0.0.1');
+    assert.equal(config.proxy.upstreamConnectTimeoutMs, 10 * 1000);
+    assert.equal(config.proxy.upstreamConnectRetries, 3);
+    assert.equal(config.proxy.upstreamConnectRetryDelayMs, 250);
     assert.equal(config.switchThreshold, 1);
     assert.deepEqual(config.accounts, []);
     assert.deepEqual(config.rotationPolicy, {
