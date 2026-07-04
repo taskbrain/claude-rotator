@@ -214,6 +214,49 @@ export class AccountManager {
     };
   }
 
+  exportState() {
+    const active = this.accounts[this.currentIndex];
+    return {
+      version: 1,
+      savedAt: new Date(this.now()).toISOString(),
+      currentAccount: active?.id || null,
+      accounts: this.accounts.map(account => ({
+        id: account.id,
+        status: account.status,
+        quota: { ...account.quota },
+        usage: { ...account.usage },
+        rateLimitedUntil: account.rateLimitedUntil ? new Date(account.rateLimitedUntil).toISOString() : null,
+        temporaryUnavailableReason: clonePlainObject(account.temporaryUnavailableReason),
+        errorReason: clonePlainObject(account.errorReason),
+      })),
+    };
+  }
+
+  restoreState(state) {
+    if (!state || typeof state !== 'object') return;
+    const savedById = new Map((Array.isArray(state.accounts) ? state.accounts : [])
+      .filter(account => account && typeof account.id === 'string')
+      .map(account => [account.id, account]));
+
+    for (const account of this.accounts) {
+      const saved = savedById.get(account.id);
+      if (!saved) continue;
+      account.status = restoreStatus(saved.status);
+      account.quota = restoreQuota(saved.quota);
+      account.usage = restoreUsage(saved.usage);
+      account.rateLimitedUntil = restoreTimestamp(saved.rateLimitedUntil);
+      account.temporaryUnavailableReason = clonePlainObject(saved.temporaryUnavailableReason);
+      account.errorReason = clonePlainObject(saved.errorReason);
+      account.quotaExhaustionEventKey = null;
+      this.refreshQuotaState(account);
+    }
+
+    if (state.currentAccount) {
+      const index = this.accounts.findIndex(account => account.id === state.currentAccount);
+      if (index >= 0) this.currentIndex = index;
+    }
+  }
+
   selectBestAvailableSwitchTarget() {
     const selected = this.bestAvailableSwitchCandidate({ excludeCurrent: true });
     if (!selected) return null;
@@ -643,6 +686,50 @@ function parseUsageReset(value) {
   if (!value) return null;
   const parsed = Date.parse(value);
   return Number.isFinite(parsed) ? parsed : null;
+}
+
+function restoreQuota(value) {
+  const quota = emptyQuota();
+  if (!value || typeof value !== 'object') return quota;
+  for (const key of Object.keys(quota)) {
+    quota[key] = restoreNumberOrNull(value[key]);
+  }
+  if (typeof value.unifiedStatus === 'string') quota.unifiedStatus = value.unifiedStatus;
+  if (typeof value.resetsAt === 'string') quota.resetsAt = value.resetsAt;
+  return quota;
+}
+
+function restoreUsage(value) {
+  return {
+    totalInputTokens: restoreNumber(value?.totalInputTokens),
+    totalOutputTokens: restoreNumber(value?.totalOutputTokens),
+    totalRequests: restoreNumber(value?.totalRequests),
+    lastUsed: typeof value?.lastUsed === 'string' ? value.lastUsed : null,
+  };
+}
+
+function restoreTimestamp(value) {
+  if (typeof value === 'number' && Number.isFinite(value)) return value;
+  if (typeof value !== 'string') return null;
+  const parsed = Date.parse(value);
+  return Number.isFinite(parsed) ? parsed : null;
+}
+
+function restoreNumber(value) {
+  return typeof value === 'number' && Number.isFinite(value) ? value : 0;
+}
+
+function restoreNumberOrNull(value) {
+  return typeof value === 'number' && Number.isFinite(value) ? value : null;
+}
+
+function restoreStatus(value) {
+  return ['ready', 'active', 'exhausted', 'throttled', 'error'].includes(value) ? value : 'ready';
+}
+
+function clonePlainObject(value) {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return null;
+  return { ...value };
 }
 
 function normalizeRotationPolicy(policy) {

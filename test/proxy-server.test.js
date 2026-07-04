@@ -1112,6 +1112,38 @@ describe('createProxyServer', () => {
     assert.equal(JSON.stringify(refresh.body).includes('account-two-token'), false);
   });
 
+  it('persists account state after usage refresh', async () => {
+    const secretStore = new MemorySecretStore();
+    await secretStore.set('acct_1', { accessToken: 'access-token-1' });
+    const persisted = [];
+    const accountManager = new AccountManager({
+      accounts: [{ id: 'acct_1', name: 'a@example.com', type: 'oauth' }],
+      now: () => Date.parse('2026-06-07T11:00:00Z'),
+    });
+    const proxy = await listen(createProxyServer({
+      accountManager,
+      secretStore,
+      config: { upstream: 'http://127.0.0.1:1', usagePolling: { enabled: false } },
+      usageFetcher: async () => ({
+        five_hour: { utilization: 0.25, resets_at: '2026-06-07T13:00:00Z' },
+        seven_day: { utilization: 0.5, resets_at: '2026-06-10T11:00:00Z' },
+      }),
+      stateWriter: async state => {
+        persisted.push(state);
+      },
+    }));
+    cleanupAfterTest(async () => {
+      await close(proxy.server);
+    });
+
+    const refresh = await requestJson(`${proxy.url}/internal/refresh-usage`, { method: 'POST' });
+
+    assert.equal(refresh.status, 200);
+    assert.equal(persisted.length, 1);
+    assert.equal(persisted[0].accounts[0].quota.unified5h, 0.25);
+    assert.equal(persisted[0].accounts[0].quota.unified7d, 0.5);
+  });
+
   it('surfaces usage refresh network causes without leaking tokens', async () => {
     const secretStore = new MemorySecretStore();
     await secretStore.set('acct_1', { accessToken: 'access-token-1' });
