@@ -1,4 +1,6 @@
 import { createHash, randomBytes } from 'node:crypto';
+import http from 'node:http';
+import https from 'node:https';
 
 export const OAUTH_CLIENT_ID = '9d1c250a-e61b-44d9-88ed-5944d1962f5e';
 export const OAUTH_AUTHORIZE_URL = 'https://claude.ai/oauth/authorize';
@@ -6,6 +8,7 @@ export const OAUTH_TOKEN_URL = 'https://platform.claude.com/v1/oauth/token';
 export const OAUTH_PROFILE_URL = 'https://api.anthropic.com/api/oauth/profile';
 export const OAUTH_USAGE_URL = 'https://api.anthropic.com/api/oauth/usage';
 export const OAUTH_BETA_HEADER = 'oauth-2025-04-20';
+export const DEFAULT_OAUTH_REQUEST_TIMEOUT_MS = 60_000;
 export const OAUTH_SCOPES = [
   'org:create_api_key',
   'user:profile',
@@ -35,9 +38,8 @@ export function parseTokenResponse(data, previousRefreshToken, now = Date.now())
 
 export async function refreshAccessToken(refreshToken, options = {}) {
   const endpoint = options.endpoint || OAUTH_TOKEN_URL;
-  const fetchImpl = options.fetchImpl || globalThis.fetch;
   const now = options.now || Date.now;
-  const response = await fetchImpl(endpoint, {
+  const response = await requestEndpoint(endpoint, {
     method: 'POST',
     headers: {
       'Content-Type': 'application/json',
@@ -48,7 +50,7 @@ export async function refreshAccessToken(refreshToken, options = {}) {
       refresh_token: refreshToken,
       client_id: OAUTH_CLIENT_ID,
     }),
-  });
+  }, options);
 
   if (!response.ok) {
     throw new Error(`Token refresh failed (${response.status}): ${await response.text()}`);
@@ -58,12 +60,11 @@ export async function refreshAccessToken(refreshToken, options = {}) {
 }
 
 export async function fetchProfile(accessToken, options = {}) {
-  const fetchImpl = options.fetchImpl || globalThis.fetch;
-  const response = await fetchImpl(options.endpoint || OAUTH_PROFILE_URL, {
+  const response = await requestEndpoint(options.endpoint || OAUTH_PROFILE_URL, {
     headers: {
       Authorization: `Bearer ${accessToken}`,
     },
-  });
+  }, options);
 
   if (!response.ok) {
     throw new Error(`Profile fetch failed (${response.status}): ${await response.text()}`);
@@ -82,14 +83,13 @@ export async function fetchProfile(accessToken, options = {}) {
 }
 
 export async function fetchUsage(accessToken, options = {}) {
-  const fetchImpl = options.fetchImpl || globalThis.fetch;
-  const response = await fetchImpl(options.endpoint || OAUTH_USAGE_URL, {
+  const response = await requestEndpoint(options.endpoint || OAUTH_USAGE_URL, {
     headers: {
       Authorization: `Bearer ${accessToken}`,
       'anthropic-beta': OAUTH_BETA_HEADER,
       Accept: 'application/json',
     },
-  });
+  }, options);
 
   if (!response.ok) {
     throw new Error(`Usage fetch failed (${response.status}): ${await response.text()}`);
@@ -153,9 +153,11 @@ export async function exchangeAuthorizationCode({
   state,
   redirectUri,
   codeVerifier,
-  fetchImpl = globalThis.fetch,
+  fetchImpl = null,
+  requestImpl = null,
+  timeoutMs = DEFAULT_OAUTH_REQUEST_TIMEOUT_MS,
 }) {
-  const response = await fetchImpl(OAUTH_TOKEN_URL, {
+  const response = await requestEndpoint(OAUTH_TOKEN_URL, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({
@@ -166,11 +168,85 @@ export async function exchangeAuthorizationCode({
       redirect_uri: redirectUri,
       code_verifier: codeVerifier,
     }),
-  });
+  }, { fetchImpl, requestImpl, timeoutMs });
 
   if (!response.ok) {
     throw new Error(`Token exchange failed (${response.status}): ${await response.text()}`);
   }
 
   return parseTokenResponse(await response.json(), null);
+}
+
+async function requestEndpoint(endpoint, init, options = {}) {
+  if (options.fetchImpl) return options.fetchImpl(endpoint, init);
+  const requestImpl = options.requestImpl || requestHttp;
+  return requestImpl(endpoint, {
+    method: init.method || 'GET',
+    headers: init.headers || {},
+    body: init.body || null,
+    timeoutMs: options.timeoutMs ?? DEFAULT_OAUTH_REQUEST_TIMEOUT_MS,
+  });
+}
+
+function requestHttp(endpoint, {
+  method = 'GET',
+  headers = {},
+  body = null,
+  timeoutMs = DEFAULT_OAUTH_REQUEST_TIMEOUT_MS,
+} = {}) {
+  return new Promise((resolve, reject) => {
+    const target = new URL(endpoint);
+    const client = target.protocol === 'http:' ? http : https;
+    const chunks = [];
+    let settled = false;
+    const settle = (error, result) => {
+      if (settled) return;
+      settled = true;
+      if (error) reject(error);
+      else resolve(result);
+    };
+    const req = client.request({
+      protocol: target.protocol,
+      hostname: target.hostname,
+      port: target.port,
+      path: `${target.pathname}${target.search}`,
+      method,
+      headers,
+    }, res => {
+      res.on('data', chunk => {
+        chunks.push(chunk);
+      });
+      res.on('end', () => {
+        const buffer = Buffer.concat(chunks);
+        settle(null, {
+          ok: res.statusCode >= 200 && res.statusCode < 300,
+          status: res.statusCode,
+          headers: res.headers,
+          async text() {
+            return buffer.toString('utf8');
+          },
+          async json() {
+            return JSON.parse(buffer.toString('utf8'));
+          },
+        });
+      });
+      res.on('aborted', () => {
+        const error = new Error('OAuth response aborted');
+        error.code = 'OAUTH_RESPONSE_ABORTED';
+        settle(error);
+      });
+      res.on('error', settle);
+    });
+
+    if (timeoutMs > 0) {
+      req.setTimeout(timeoutMs, () => {
+        const error = new Error(`OAuth request timeout after ${timeoutMs}ms`);
+        error.code = 'OAUTH_REQUEST_TIMEOUT';
+        req.destroy(error);
+      });
+    }
+    req.on('error', settle);
+    if (body) req.write(body);
+    req.end();
+  });
 }

@@ -6,6 +6,8 @@ import {
   isTokenExpiringSoon,
   parseTokenResponse,
   refreshAccessToken,
+  fetchUsage,
+  DEFAULT_OAUTH_REQUEST_TIMEOUT_MS,
   parseUsageResponse,
   createAuthorizationUrl,
 } from '../src/oauth.js';
@@ -62,6 +64,27 @@ describe('token refresh', () => {
 });
 
 describe('usage response parsing', () => {
+  it('fetches OAuth usage through the native request helper by default', async () => {
+    const calls = [];
+    const usage = await fetchUsage('access1', {
+      endpoint: 'https://example.test/api/oauth/usage',
+      requestImpl: async (url, options) => {
+        calls.push({ url, options });
+        return jsonResponse(200, {
+          five_hour: { utilization: 25, resets_at: '2026-06-04T09:00:00Z' },
+          seven_day: { utilization: 50, resets_at: '2026-06-06T10:00:00Z' },
+        });
+      },
+    });
+
+    assert.equal(calls.length, 1);
+    assert.equal(calls[0].url, 'https://example.test/api/oauth/usage');
+    assert.equal(calls[0].options.timeoutMs, DEFAULT_OAUTH_REQUEST_TIMEOUT_MS);
+    assert.equal(calls[0].options.headers.Authorization, 'Bearer access1');
+    assert.equal(usage.five_hour.utilization, 0.25);
+    assert.equal(usage.seven_day.utilization, 0.5);
+  });
+
   it('normalizes OAuth usage payloads', () => {
     const parsed = parseUsageResponse({
       five_hour: { utilization: 76, resets_at: '2026-06-04T09:00:00Z' },

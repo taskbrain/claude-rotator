@@ -273,33 +273,14 @@ async function refreshAllOnce({
   currentCredentialReader,
   usageFetcher,
 }) {
-  const results = [];
-  for (const account of accountManager.accounts) {
-    if (account.type === 'apikey') {
-      results.push({ account: account.id, ok: true, skipped: 'apikey' });
-      continue;
-    }
-
-    try {
-      const secret = await resolveSecretForAccount({ account, secretStore, currentCredentialReader });
-      if (!secret?.accessToken) throw new Error('OAuth access token is missing');
-      const freshSecret = await refreshSecretIfExpiring({
-        account,
-        secret,
-        secretStore,
-        tokenRefresher,
-      });
-      const usage = await usageFetcher(freshSecret.accessToken);
-      accountManager.applyUsage(account.id, usage);
-      results.push({ account: account.id, ok: true });
-    } catch (caught) {
-      results.push({
-        account: account.id,
-        ok: false,
-        error: shortErrorMessage(caught),
-      });
-    }
-  }
+  const results = await Promise.all(accountManager.accounts.map(account => refreshAccountUsage({
+    account,
+    accountManager,
+    secretStore,
+    tokenRefresher,
+    currentCredentialReader,
+    usageFetcher,
+  })));
   rebalanceAfterUsageRefresh(accountManager);
   return {
     ok: results.every(result => result.ok),
@@ -307,6 +288,37 @@ async function refreshAllOnce({
     accounts: results,
     status: accountManager.getStatus(),
   };
+}
+
+async function refreshAccountUsage({
+  account,
+  accountManager,
+  secretStore,
+  tokenRefresher,
+  currentCredentialReader,
+  usageFetcher,
+}) {
+  if (account.type === 'apikey') return { account: account.id, ok: true, skipped: 'apikey' };
+
+  try {
+    const secret = await resolveSecretForAccount({ account, secretStore, currentCredentialReader });
+    if (!secret?.accessToken) throw new Error('OAuth access token is missing');
+    const freshSecret = await refreshSecretIfExpiring({
+      account,
+      secret,
+      secretStore,
+      tokenRefresher,
+    });
+    const usage = await usageFetcher(freshSecret.accessToken);
+    accountManager.applyUsage(account.id, usage);
+    return { account: account.id, ok: true };
+  } catch (caught) {
+    return {
+      account: account.id,
+      ok: false,
+      error: shortErrorMessage(caught),
+    };
+  }
 }
 
 function rebalanceAfterUsageRefresh(accountManager) {
