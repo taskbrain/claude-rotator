@@ -958,5 +958,17 @@ function sendUnavailableAccounts(res) {
 }
 
 function shortErrorMessage(error) {
-  return String(error?.message || error || 'unknown error').replace(/\s+/g, ' ').slice(0, 240);
+  const parts = [error?.message || error || 'unknown error'];
+  const cause = error?.cause;
+  if (cause) {
+    const causeParts = [
+      cause.name,
+      cause.code,
+      cause.message,
+      cause.syscall,
+      cause.address && cause.port ? `${cause.address}:${cause.port}` : cause.address,
+    ].filter(Boolean);
+    if (causeParts.length > 0) parts.push(`cause: ${causeParts.join(' ')}`);
+  }
+  return String(parts.join(' · ')).replace(/\s+/g, ' ').slice(0, 360);
 }
