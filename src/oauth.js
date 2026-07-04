@@ -9,6 +9,9 @@ export const OAUTH_PROFILE_URL = 'https://api.anthropic.com/api/oauth/profile';
 export const OAUTH_USAGE_URL = 'https://api.anthropic.com/api/oauth/usage';
 export const OAUTH_BETA_HEADER = 'oauth-2025-04-20';
 export const DEFAULT_OAUTH_REQUEST_TIMEOUT_MS = 60_000;
+export const DEFAULT_OAUTH_CONNECT_TIMEOUT_MS = 10_000;
+export const DEFAULT_OAUTH_CONNECT_RETRIES = 3;
+export const DEFAULT_OAUTH_CONNECT_RETRY_DELAY_MS = 250;
 export const OAUTH_SCOPES = [
   'org:create_api_key',
   'user:profile',
@@ -179,13 +182,30 @@ export async function exchangeAuthorizationCode({
 
 async function requestEndpoint(endpoint, init, options = {}) {
   if (options.fetchImpl) return options.fetchImpl(endpoint, init);
-  const requestImpl = options.requestImpl || requestHttp;
+  const requestImpl = options.requestImpl || requestHttpWithConnectRetries;
   return requestImpl(endpoint, {
     method: init.method || 'GET',
     headers: init.headers || {},
     body: init.body || null,
     timeoutMs: options.timeoutMs ?? DEFAULT_OAUTH_REQUEST_TIMEOUT_MS,
+    connectTimeoutMs: options.connectTimeoutMs ?? DEFAULT_OAUTH_CONNECT_TIMEOUT_MS,
+    connectRetries: options.connectRetries ?? DEFAULT_OAUTH_CONNECT_RETRIES,
+    connectRetryDelayMs: options.connectRetryDelayMs ?? DEFAULT_OAUTH_CONNECT_RETRY_DELAY_MS,
   });
+}
+
+async function requestHttpWithConnectRetries(endpoint, options = {}) {
+  const retryCount = Math.max(0, Number(options.connectRetries) || 0);
+  const maxAttempts = retryCount + 1;
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    try {
+      return await requestHttp(endpoint, options);
+    } catch (error) {
+      if (attempt >= maxAttempts || !isRetryableConnectError(error)) throw error;
+      await sleep(Math.max(0, Number(options.connectRetryDelayMs) || 0));
+    }
+  }
+  throw new Error('unreachable OAuth retry state');
 }
 
 function requestHttp(endpoint, {
@@ -193,17 +213,38 @@ function requestHttp(endpoint, {
   headers = {},
   body = null,
   timeoutMs = DEFAULT_OAUTH_REQUEST_TIMEOUT_MS,
+  connectTimeoutMs = DEFAULT_OAUTH_CONNECT_TIMEOUT_MS,
 } = {}) {
   return new Promise((resolve, reject) => {
     const target = new URL(endpoint);
     const client = target.protocol === 'http:' ? http : https;
     const chunks = [];
     let settled = false;
+    let connected = false;
+    let responseStarted = false;
+    let connectTimer = null;
     const settle = (error, result) => {
       if (settled) return;
       settled = true;
+      if (connectTimer) clearTimeout(connectTimer);
       if (error) reject(error);
       else resolve(result);
+    };
+    const markConnected = () => {
+      connected = true;
+      if (connectTimer) clearTimeout(connectTimer);
+      connectTimer = null;
+    };
+    const startConnectTimer = req => {
+      if (!connectTimeoutMs || connectTimeoutMs <= 0 || settled) return;
+      connectTimer = setTimeout(() => {
+        const error = new Error(`OAuth connection timeout after ${connectTimeoutMs}ms`);
+        error.code = 'OAUTH_CONNECT_TIMEOUT';
+        error.connectPhase = true;
+        req.destroy(error);
+        settle(error);
+      }, connectTimeoutMs);
+      connectTimer.unref?.();
     };
     const req = client.request({
       protocol: target.protocol,
@@ -213,6 +254,8 @@ function requestHttp(endpoint, {
       method,
       headers,
     }, res => {
+      responseStarted = true;
+      markConnected();
       res.on('data', chunk => {
         chunks.push(chunk);
       });
@@ -242,11 +285,48 @@ function requestHttp(endpoint, {
       req.setTimeout(timeoutMs, () => {
         const error = new Error(`OAuth request timeout after ${timeoutMs}ms`);
         error.code = 'OAUTH_REQUEST_TIMEOUT';
+        if (!connected && !responseStarted) error.connectPhase = true;
         req.destroy(error);
       });
     }
-    req.on('error', settle);
+    req.on('socket', socket => {
+      if (!socket.connecting) {
+        markConnected();
+        return;
+      }
+      if (target.protocol === 'https:') socket.once('secureConnect', markConnected);
+      else socket.once('connect', markConnected);
+    });
+    req.on('error', error => {
+      if (!connected && !responseStarted && isConnectNetworkError(error)) {
+        error.connectPhase = true;
+      }
+      settle(error);
+    });
     if (body) req.write(body);
+    startConnectTimer(req);
     req.end();
   });
+}
+
+function isRetryableConnectError(error) {
+  return Boolean(error?.connectPhase) && isConnectNetworkError(error);
+}
+
+function isConnectNetworkError(error) {
+  return [
+    'ETIMEDOUT',
+    'ENETUNREACH',
+    'EHOSTUNREACH',
+    'ECONNREFUSED',
+    'ECONNRESET',
+    'UND_ERR_CONNECT_TIMEOUT',
+    'OAUTH_CONNECT_TIMEOUT',
+    'OAUTH_REQUEST_TIMEOUT',
+  ].includes(error?.code);
+}
+
+async function sleep(ms) {
+  if (ms <= 0) return;
+  await new Promise(resolve => setTimeout(resolve, ms));
 }

@@ -56,6 +56,11 @@ export function createProxyServer({
     tokenRefresher,
     currentCredentialReader,
     usageFetcher,
+    usageRequestOptions: {
+      connectTimeoutMs: upstreamConnectTimeoutMs,
+      connectRetries: upstreamConnectRetries,
+      connectRetryDelayMs: upstreamConnectRetryDelayMs,
+    },
   });
   const usageScheduler = createUsageRefreshScheduler({
     config,
@@ -260,6 +265,7 @@ function createUsageRefresher({
   tokenRefresher,
   currentCredentialReader,
   usageFetcher,
+  usageRequestOptions,
 }) {
   let inFlight = null;
   let attempted = false;
@@ -271,6 +277,7 @@ function createUsageRefresher({
       tokenRefresher,
       currentCredentialReader,
       usageFetcher,
+      usageRequestOptions,
     }).finally(() => {
       attempted = true;
       inFlight = null;
@@ -289,6 +296,7 @@ async function refreshAllOnce({
   tokenRefresher,
   currentCredentialReader,
   usageFetcher,
+  usageRequestOptions,
 }) {
   const results = await Promise.all(accountManager.accounts.map(account => refreshAccountUsage({
     account,
@@ -297,6 +305,7 @@ async function refreshAllOnce({
     tokenRefresher,
     currentCredentialReader,
     usageFetcher,
+    usageRequestOptions,
   })));
   rebalanceAfterUsageRefresh(accountManager);
   return {
@@ -314,6 +323,7 @@ async function refreshAccountUsage({
   tokenRefresher,
   currentCredentialReader,
   usageFetcher,
+  usageRequestOptions,
 }) {
   if (account.type === 'apikey') return { account: account.id, ok: true, skipped: 'apikey' };
 
@@ -326,7 +336,7 @@ async function refreshAccountUsage({
       secretStore,
       tokenRefresher,
     });
-    const usage = await usageFetcher(freshSecret.accessToken);
+    const usage = await usageFetcher(freshSecret.accessToken, usageRequestOptions);
     accountManager.applyUsage(account.id, usage);
     return { account: account.id, ok: true };
   } catch (caught) {
