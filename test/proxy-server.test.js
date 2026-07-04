@@ -1287,6 +1287,47 @@ describe('createProxyServer', () => {
     assert.equal(JSON.stringify(refresh.body).includes('account-two-token'), false);
   });
 
+  it('passes upstream connect retry settings to OAuth usage refreshes', async () => {
+    const secretStore = new MemorySecretStore();
+    await secretStore.set('dev', { accessToken: 'dev-token' });
+    const accountManager = new AccountManager({
+      accounts: [{ id: 'dev', name: 'dev@example.com', type: 'oauth' }],
+      currentAccountId: 'dev',
+    });
+    let seenOptions = null;
+    const proxy = await listen(createProxyServer({
+      accountManager,
+      secretStore,
+      config: {
+        upstream: 'http://127.0.0.1:1',
+        proxy: {
+          upstreamConnectTimeoutMs: 3210,
+          upstreamConnectRetries: 7,
+          upstreamConnectRetryDelayMs: 123,
+        },
+        usagePolling: { enabled: false },
+      },
+      usageFetcher: async (token, options) => {
+        assert.equal(token, 'dev-token');
+        seenOptions = options;
+        return {
+          five_hour: { utilization: 0.2, resets_at: null },
+          seven_day: { utilization: 0.3, resets_at: null },
+        };
+      },
+    }));
+    cleanupAfterTest(async () => {
+      await close(proxy.server);
+    });
+
+    const refresh = await requestJson(`${proxy.url}/internal/refresh-usage`, { method: 'POST' });
+
+    assert.equal(refresh.status, 200);
+    assert.equal(seenOptions.connectTimeoutMs, 3210);
+    assert.equal(seenOptions.connectRetries, 7);
+    assert.equal(seenOptions.connectRetryDelayMs, 123);
+  });
+
   it('refreshes OAuth usage accounts concurrently', async () => {
     const secretStore = new MemorySecretStore();
     await secretStore.set('acct_1', { accessToken: 'access-token-1' });

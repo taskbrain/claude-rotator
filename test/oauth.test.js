@@ -1,5 +1,7 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
+import { EventEmitter } from 'node:events';
+import https from 'node:https';
 
 import {
   normalizeExpiresAt,
@@ -7,6 +9,9 @@ import {
   parseTokenResponse,
   refreshAccessToken,
   fetchUsage,
+  DEFAULT_OAUTH_CONNECT_RETRIES,
+  DEFAULT_OAUTH_CONNECT_RETRY_DELAY_MS,
+  DEFAULT_OAUTH_CONNECT_TIMEOUT_MS,
   DEFAULT_OAUTH_REQUEST_TIMEOUT_MS,
   parseUsageResponse,
   createAuthorizationUrl,
@@ -80,9 +85,63 @@ describe('usage response parsing', () => {
     assert.equal(calls.length, 1);
     assert.equal(calls[0].url, 'https://example.test/api/oauth/usage');
     assert.equal(calls[0].options.timeoutMs, DEFAULT_OAUTH_REQUEST_TIMEOUT_MS);
+    assert.equal(calls[0].options.connectTimeoutMs, DEFAULT_OAUTH_CONNECT_TIMEOUT_MS);
+    assert.equal(calls[0].options.connectRetries, DEFAULT_OAUTH_CONNECT_RETRIES);
+    assert.equal(calls[0].options.connectRetryDelayMs, DEFAULT_OAUTH_CONNECT_RETRY_DELAY_MS);
     assert.equal(calls[0].options.headers.Authorization, 'Bearer access1');
     assert.equal(usage.five_hour.utilization, 0.25);
     assert.equal(usage.seven_day.utilization, 0.5);
+  });
+
+  it('retries OAuth usage requests that fail before a connection is established', async () => {
+    const originalRequest = https.request;
+    let requests = 0;
+    https.request = function patchedRequest(options, callback) {
+      requests++;
+      const requestNumber = requests;
+      const fakeRequest = new EventEmitter();
+      fakeRequest.setTimeout = () => fakeRequest;
+      fakeRequest.write = () => {};
+      fakeRequest.destroy = error => {
+        if (error) setTimeout(() => fakeRequest.emit('error', error), 0);
+      };
+      fakeRequest.end = () => {
+        if (requestNumber === 1) {
+          setTimeout(() => {
+            const error = new Error('connect ETIMEDOUT');
+            error.code = 'ETIMEDOUT';
+            fakeRequest.emit('error', error);
+          }, 1);
+          return;
+        }
+        const response = new EventEmitter();
+        response.statusCode = 200;
+        response.headers = {};
+        callback(response);
+        setTimeout(() => {
+          response.emit('data', Buffer.from(JSON.stringify({
+            five_hour: { utilization: 25, resets_at: '2026-06-04T09:00:00Z' },
+            seven_day: { utilization: 50, resets_at: '2026-06-06T10:00:00Z' },
+          })));
+          response.emit('end');
+        }, 1);
+      };
+      return fakeRequest;
+    };
+
+    try {
+      const usage = await fetchUsage('access1', {
+        endpoint: 'https://api.anthropic.test/api/oauth/usage',
+        connectRetries: 1,
+        connectRetryDelayMs: 1,
+      });
+
+      assert.equal(requests, 2);
+      assert.equal(usage.five_hour.utilization, 0.25);
+      assert.equal(usage.seven_day.utilization, 0.5);
+    } finally {
+      https.request = originalRequest;
+    }
   });
 
   it('normalizes OAuth usage payloads', () => {
