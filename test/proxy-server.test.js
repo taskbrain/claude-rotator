@@ -1112,6 +1112,58 @@ describe('createProxyServer', () => {
     assert.equal(JSON.stringify(refresh.body).includes('account-two-token'), false);
   });
 
+  it('refreshes OAuth usage accounts concurrently', async () => {
+    const secretStore = new MemorySecretStore();
+    await secretStore.set('acct_1', { accessToken: 'access-token-1' });
+    await secretStore.set('acct_2', { accessToken: 'access-token-2' });
+    const accountManager = new AccountManager({
+      accounts: [
+        { id: 'acct_1', name: 'a@example.com', type: 'oauth' },
+        { id: 'acct_2', name: 'b@example.com', type: 'oauth' },
+      ],
+      now: () => Date.parse('2026-06-07T11:00:00Z'),
+    });
+    let resolveBothCalled;
+    let releaseUsage;
+    const bothCalled = new Promise(resolve => {
+      resolveBothCalled = resolve;
+    });
+    const release = new Promise(resolve => {
+      releaseUsage = resolve;
+    });
+    const calls = [];
+    const proxy = await listen(createProxyServer({
+      accountManager,
+      secretStore,
+      config: { upstream: 'http://127.0.0.1:1', usagePolling: { enabled: false } },
+      usageFetcher: async token => {
+        calls.push(token);
+        if (calls.length === 2) resolveBothCalled();
+        await release;
+        return {
+          five_hour: { utilization: 0.25, resets_at: '2026-06-07T13:00:00Z' },
+          seven_day: { utilization: 0.5, resets_at: '2026-06-10T11:00:00Z' },
+        };
+      },
+    }));
+    cleanupAfterTest(async () => {
+      await close(proxy.server);
+    });
+
+    const refreshPromise = requestJson(`${proxy.url}/internal/refresh-usage`, { method: 'POST' });
+    const startedConcurrently = await Promise.race([
+      bothCalled.then(() => true),
+      sleep(100).then(() => false),
+    ]);
+    releaseUsage();
+    const refresh = await refreshPromise;
+
+    assert.equal(startedConcurrently, true, 'usage refresh did not start both account fetches concurrently');
+    assert.equal(refresh.status, 200);
+    assert.deepEqual(calls.sort(), ['access-token-1', 'access-token-2']);
+    assert.equal(refresh.body.accounts.filter(account => account.ok).length, 2);
+  });
+
   it('persists account state after usage refresh', async () => {
     const secretStore = new MemorySecretStore();
     await secretStore.set('acct_1', { accessToken: 'access-token-1' });
