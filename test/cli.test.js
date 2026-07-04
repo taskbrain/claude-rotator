@@ -376,6 +376,7 @@ describe('startService', () => {
       ['launchctl', ['print', 'gui/501/io.github.claude-rotator']],
       ['launchctl', ['enable', 'gui/501/io.github.claude-rotator']],
       ['launchctl', ['kickstart', '-k', 'gui/501/io.github.claude-rotator']],
+      ['launchctl', ['print', 'gui/501/io.github.claude-rotator']],
     ]);
   });
 
@@ -401,6 +402,7 @@ describe('startService', () => {
       ['launchctl', ['print', 'gui/501/io.github.claude-rotator']],
       ['launchctl', ['enable', 'gui/501/io.github.claude-rotator']],
       ['launchctl', ['kickstart', '-k', 'gui/501/io.github.claude-rotator']],
+      ['launchctl', ['print', 'gui/501/io.github.claude-rotator']],
     ]);
   });
 
@@ -438,6 +440,37 @@ describe('startService', () => {
       ['launchctl', ['print', 'gui/501/io.github.claude-rotator']],
       ['launchctl', ['enable', 'gui/501/io.github.claude-rotator']],
       ['launchctl', ['kickstart', '-k', 'gui/501/io.github.claude-rotator']],
+      ['launchctl', ['print', 'gui/501/io.github.claude-rotator']],
+    ]);
+  });
+
+  it('retries bootstrap when the macOS service disappears after kickstart', async () => {
+    const calls = [];
+    let printCalls = 0;
+
+    await startService({
+      platform: 'darwin',
+      uid: 501,
+      plistPath: '/Users/alice/Library/LaunchAgents/io.github.claude-rotator.plist',
+      sleepImpl: async () => {},
+      execFileImpl: async (cmd, args) => {
+        calls.push([cmd, args]);
+        if (args[0] === 'print') {
+          printCalls += 1;
+          if (printCalls === 2) throw new Error('service not found');
+        }
+      },
+    });
+
+    assert.deepEqual(calls, [
+      ['launchctl', ['bootout', 'gui/501/io.github.claude-rotator']],
+      ['launchctl', ['bootstrap', 'gui/501', '/Users/alice/Library/LaunchAgents/io.github.claude-rotator.plist']],
+      ['launchctl', ['print', 'gui/501/io.github.claude-rotator']],
+      ['launchctl', ['enable', 'gui/501/io.github.claude-rotator']],
+      ['launchctl', ['kickstart', '-k', 'gui/501/io.github.claude-rotator']],
+      ['launchctl', ['print', 'gui/501/io.github.claude-rotator']],
+      ['launchctl', ['bootstrap', 'gui/501', '/Users/alice/Library/LaunchAgents/io.github.claude-rotator.plist']],
+      ['launchctl', ['print', 'gui/501/io.github.claude-rotator']],
     ]);
   });
 });
