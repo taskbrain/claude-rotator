@@ -1,6 +1,7 @@
 import { afterEach, describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 import http from 'node:http';
+import { EventEmitter } from 'node:events';
 
 import { AccountManager } from '../src/account-manager.js';
 import { MemorySecretStore } from '../src/secret-store.js';
@@ -557,6 +558,131 @@ describe('createProxyServer', () => {
 
       assert.equal(response.status, 200);
       assert.deepEqual(response.body, { ok: true });
+    } finally {
+      http.request = originalRequest;
+    }
+  });
+
+  it('retries upstream connect timeouts before sending an error to Claude Code', async () => {
+    const upstreamSeen = [];
+    const upstream = await listen(http.createServer(async (req, res) => {
+      upstreamSeen.push(req.headers.authorization);
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ ok: true }));
+    }));
+    const secretStore = new MemorySecretStore();
+    await secretStore.set('acct_1', { accessToken: 'access-token-1' });
+    const accountManager = new AccountManager({
+      accounts: [{ id: 'acct_1', name: 'a@example.com', type: 'oauth' }],
+    });
+    const proxy = await listen(createProxyServer({
+      accountManager,
+      secretStore,
+      config: {
+        upstream: upstream.url,
+        proxy: {
+          upstreamConnectRetries: 1,
+          upstreamConnectTimeoutMs: 10,
+          upstreamIdleTimeoutMs: 1000,
+        },
+        usagePolling: { enabled: false },
+      },
+    }));
+    cleanupAfterTest(async () => {
+      await close(proxy.server);
+      await close(upstream.server);
+    });
+
+    const upstreamPort = new URL(upstream.url).port;
+    const originalRequest = http.request;
+    let upstreamRequests = 0;
+    http.request = function patchedRequest(options, ...args) {
+      if (String(options?.port) === upstreamPort && upstreamRequests++ === 0) {
+        const fakeRequest = new EventEmitter();
+        fakeRequest.write = () => {};
+        fakeRequest.end = () => {
+          setTimeout(() => {
+            const error = new Error('connect ETIMEDOUT');
+            error.code = 'ETIMEDOUT';
+            fakeRequest.emit('error', error);
+          }, 1);
+        };
+        fakeRequest.destroy = error => {
+          if (error) setTimeout(() => fakeRequest.emit('error', error), 0);
+        };
+        return fakeRequest;
+      }
+      return originalRequest.call(this, options, ...args);
+    };
+
+    try {
+      const response = await requestJson(`${proxy.url}/v1/messages`, {
+        method: 'POST',
+        body: JSON.stringify({ model: 'sonnet' }),
+      });
+
+      assert.equal(response.status, 200);
+      assert.deepEqual(response.body, { ok: true });
+      assert.deepEqual(upstreamSeen, ['Bearer access-token-1']);
+      assert.equal(upstreamRequests, 2);
+    } finally {
+      http.request = originalRequest;
+    }
+  });
+
+  it('returns an upstream timeout when connect retries are exhausted', async () => {
+    const upstream = await listen(http.createServer(async (req, res) => {
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ ok: true }));
+    }));
+    const secretStore = new MemorySecretStore();
+    await secretStore.set('acct_1', { accessToken: 'access-token-1' });
+    const accountManager = new AccountManager({
+      accounts: [{ id: 'acct_1', name: 'a@example.com', type: 'oauth' }],
+    });
+    const proxy = await listen(createProxyServer({
+      accountManager,
+      secretStore,
+      config: {
+        upstream: upstream.url,
+        proxy: {
+          upstreamConnectRetries: 1,
+          upstreamConnectTimeoutMs: 5,
+          upstreamConnectRetryDelayMs: 1,
+          upstreamIdleTimeoutMs: 1000,
+        },
+        usagePolling: { enabled: false },
+      },
+    }));
+    cleanupAfterTest(async () => {
+      await close(proxy.server);
+      await close(upstream.server);
+    });
+
+    const upstreamPort = new URL(upstream.url).port;
+    const originalRequest = http.request;
+    let upstreamRequests = 0;
+    http.request = function patchedRequest(options, ...args) {
+      if (String(options?.port) === upstreamPort) {
+        upstreamRequests++;
+        const fakeRequest = new EventEmitter();
+        fakeRequest.write = () => {};
+        fakeRequest.end = () => {};
+        fakeRequest.destroy = () => {};
+        return fakeRequest;
+      }
+      return originalRequest.call(this, options, ...args);
+    };
+
+    try {
+      const response = await requestJson(`${proxy.url}/v1/messages`, {
+        method: 'POST',
+        body: JSON.stringify({ model: 'sonnet' }),
+      });
+
+      assert.equal(response.status, 504);
+      assert.equal(response.body.error.type, 'upstream_timeout');
+      assert.equal(upstreamRequests, 2);
     } finally {
       http.request = originalRequest;
     }
