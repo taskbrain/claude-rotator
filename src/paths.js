@@ -33,6 +33,10 @@ export function installStatePath(env = process.env, home = homedir()) {
   return join(appConfigDir(env, home), 'install-state.json');
 }
 
+export function runtimeStatePath(env = process.env, home = homedir()) {
+  return join(appConfigDir(env, home), 'runtime-state.json');
+}
+
 export function backupDir(env = process.env, home = homedir()) {
   return join(appConfigDir(env, home), 'backups');
 }

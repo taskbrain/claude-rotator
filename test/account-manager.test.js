@@ -552,4 +552,41 @@ describe('AccountManager', () => {
     assert.equal(account.unavailableReason.type, 'quota_exhausted');
     assert.equal(account.unavailableReason.window, '5h');
   });
+
+  it('restores persisted quota state for resume target selection after restart', () => {
+    const now = Date.parse('2026-06-07T11:00:00Z');
+    const accounts = [
+      { id: 'current', name: 'current@example.com', type: 'oauth' },
+      { id: 'ready', name: 'ready@example.com', type: 'oauth' },
+    ];
+    const manager = new AccountManager({
+      accounts,
+      currentAccountId: 'current',
+      now: () => now,
+    });
+    manager.applyUsage('current', {
+      five_hour: { utilization: 1, resets_at: '2026-06-07T14:00:00Z' },
+      seven_day: { utilization: 0.2, resets_at: '2026-06-10T11:00:00Z' },
+    });
+    manager.applyUsage('ready', {
+      five_hour: { utilization: 0.1, resets_at: '2026-06-07T13:00:00Z' },
+      seven_day: { utilization: 0.3, resets_at: '2026-06-10T11:00:00Z' },
+    });
+
+    const restarted = new AccountManager({
+      accounts,
+      currentAccountId: 'current',
+      now: () => now,
+    });
+    restarted.restoreState(manager.exportState());
+
+    const target = restarted.prepareResumeTarget();
+
+    assert.equal(target.action, 'ready');
+    assert.equal(target.account, 'ready');
+    assert.equal(target.switched, true);
+    const status = restarted.getStatus();
+    assert.equal(status.accounts[0].status, 'exhausted');
+    assert.equal(status.accounts[1].status, 'active');
+  });
 });

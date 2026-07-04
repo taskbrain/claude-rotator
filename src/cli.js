@@ -21,7 +21,8 @@ import {
   removeInstallState,
   uninstallSettings,
 } from './install.js';
-import { appConfigDir, backupDir, claudeSettingsPath, installStatePath } from './paths.js';
+import { appConfigDir, backupDir, claudeSettingsPath, installStatePath, runtimeStatePath } from './paths.js';
+import { readJsonFile, writeJsonFile } from './json-file.js';
 
 const execFileAsync = promisify(execFile);
 const CURRENT_ACCOUNT_ID = 'current';
@@ -182,12 +183,19 @@ async function runServer({ write }) {
     currentAccountId: config.activeAccount,
     rotationPolicy: config.rotationPolicy,
   });
+  const statePath = runtimeStatePath();
+  const savedState = await readJsonFile(statePath, null).catch(error => {
+    write(`runtime state restore skipped: ${shortErrorMessage(error)}\n`);
+    return null;
+  });
+  if (savedState) accountManager.restoreState(savedState);
   const server = createProxyServer({
     accountManager,
     secretStore,
     config,
     reloadAccounts: async () => (await loadOrCreateConfig()).accounts,
     logger: line => write(`${line}\n`),
+    stateWriter: state => writeJsonFile(statePath, state),
   });
   await new Promise(resolve => server.listen(config.proxy.port, config.proxy.host, resolve));
   write(`claude-rotator listening on ${proxyBaseUrl(config)}\n`);

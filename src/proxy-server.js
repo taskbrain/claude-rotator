@@ -31,6 +31,7 @@ export function createProxyServer({
   currentCredentialReader = readCurrentClaudeCredentials,
   usageFetcher = fetchUsage,
   logger = null,
+  stateWriter = null,
 }) {
   const upstream = config.upstream || 'https://api.anthropic.com';
   const upstreamIdleTimeoutMs = config.proxy?.upstreamIdleTimeoutMs
@@ -47,7 +48,16 @@ export function createProxyServer({
   const usageScheduler = createUsageRefreshScheduler({
     config,
     usageRefresher,
+    persistState,
   });
+  async function persistState() {
+    if (!stateWriter) return;
+    try {
+      await stateWriter(accountManager.exportState());
+    } catch (error) {
+      logger?.(`state persist failed: ${shortErrorMessage(error)}`);
+    }
+  }
 
   const server = http.createServer(async (req, res) => {
     try {
@@ -70,6 +80,7 @@ export function createProxyServer({
       if (req.method === 'POST' && req.url === '/internal/switch') {
         const body = JSON.parse((await readBody(req)).toString('utf8') || '{}');
         accountManager.switchTo(body.account);
+        await persistState();
         sendJson(res, 200, accountManager.getStatus());
         return;
       }
@@ -92,8 +103,10 @@ export function createProxyServer({
       if (req.method === 'POST' && req.url === '/internal/prepare-resume') {
         const body = JSON.parse((await readBody(req)).toString('utf8') || '{}');
         if (body.refreshUsage) await usageScheduler.refreshNow();
+        const result = accountManager.prepareResumeTarget();
+        await persistState();
         sendJson(res, 200, {
-          ...accountManager.prepareResumeTarget(),
+          ...result,
           status: accountManager.getStatus(),
         });
         return;
@@ -115,6 +128,7 @@ export function createProxyServer({
         logger,
         upstreamIdleTimeoutMs,
       });
+      await persistState();
     } catch (error) {
       if (!res.headersSent) {
         sendJson(res, 502, {
@@ -135,7 +149,12 @@ function usagePollingEnabled(config) {
   return config.usagePolling?.enabled === true;
 }
 
-function createUsageRefreshScheduler({ config, usageRefresher, now = () => Date.now() }) {
+function createUsageRefreshScheduler({
+  config,
+  usageRefresher,
+  now = () => Date.now(),
+  persistState = async () => {},
+}) {
   let timer = null;
 
   const stop = () => {
@@ -159,6 +178,7 @@ function createUsageRefreshScheduler({ config, usageRefresher, now = () => Date.
 
   const refreshNow = async () => {
     const result = await usageRefresher.refreshAll();
+    await persistState();
     scheduleFromStatus(result.status);
     return result;
   };
