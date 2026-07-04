@@ -130,10 +130,12 @@ export function createProxyServer({
       });
       await persistState();
     } catch (error) {
+      const message = shortErrorMessage(error);
+      logger?.(`${new Date().toISOString()} proxy-error method=${req.method} path=${new URL(req.url, 'http://claude-rotator.local').pathname} error=${message}`);
       if (!res.headersSent) {
         sendJson(res, 502, {
           type: 'error',
-          error: { type: 'proxy_error', message: error.message },
+          error: { type: 'proxy_error', message },
         });
       } else {
         res.destroy(error);
@@ -678,13 +680,27 @@ function requestUpstream({ target, method, headers, body, idleTimeoutMs, onRespo
   return new Promise((resolve, reject) => {
     const client = target.protocol === 'https:' ? https : http;
     let settled = false;
+    let idleTimer = null;
+    let req = null;
     const settle = (error, result) => {
       if (settled) return;
       settled = true;
+      if (idleTimer) clearTimeout(idleTimer);
       if (error) reject(error);
       else resolve(result);
     };
-    const req = client.request({
+    const resetIdleTimer = () => {
+      if (!idleTimeoutMs || idleTimeoutMs <= 0 || settled) return;
+      if (idleTimer) clearTimeout(idleTimer);
+      idleTimer = setTimeout(() => {
+        const error = new Error(`Upstream request idle timeout after ${idleTimeoutMs}ms`);
+        error.code = 'UPSTREAM_IDLE_TIMEOUT';
+        req?.destroy(error);
+        settle(error);
+      }, idleTimeoutMs);
+      idleTimer.unref?.();
+    };
+    req = client.request({
       protocol: target.protocol,
       hostname: target.hostname,
       port: target.port,
@@ -692,9 +708,11 @@ function requestUpstream({ target, method, headers, body, idleTimeoutMs, onRespo
       method,
       headers,
     }, upstreamRes => {
+      resetIdleTimer();
       const shouldStream = onResponse(upstreamRes);
       const chunks = [];
       upstreamRes.on('data', chunk => {
+        resetIdleTimer();
         chunks.push(chunk);
         if (shouldStream) onChunk(chunk);
       });
@@ -712,15 +730,9 @@ function requestUpstream({ target, method, headers, body, idleTimeoutMs, onRespo
       });
       upstreamRes.on('error', settle);
     });
-    if (idleTimeoutMs > 0) {
-      req.setTimeout(idleTimeoutMs, () => {
-        const error = new Error(`Upstream request idle timeout after ${idleTimeoutMs}ms`);
-        error.code = 'UPSTREAM_IDLE_TIMEOUT';
-        req.destroy(error);
-      });
-    }
     req.on('error', settle);
     if (!['GET', 'HEAD'].includes(method) && body.length > 0) req.write(body);
+    resetIdleTimer();
     req.end();
   });
 }

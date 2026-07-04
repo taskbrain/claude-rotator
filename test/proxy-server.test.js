@@ -513,6 +513,55 @@ describe('createProxyServer', () => {
     assert.equal(response.body.error.type, 'upstream_timeout');
   });
 
+  it('does not treat an unrelated socket timeout event as the configured upstream idle timeout', async () => {
+    const originalRequest = http.request;
+    http.request = function patchedRequest(...args) {
+      const clientRequest = originalRequest.apply(this, args);
+      const originalSetTimeout = clientRequest.setTimeout;
+      clientRequest.setTimeout = function patchedSetTimeout(timeoutMs, callback) {
+        if (typeof callback === 'function') setTimeout(callback, 5);
+        return originalSetTimeout.call(this, timeoutMs, callback);
+      };
+      return clientRequest;
+    };
+
+    try {
+      const upstream = await listen(http.createServer(async (req, res) => {
+        await sleep(30);
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ ok: true }));
+      }));
+      const secretStore = new MemorySecretStore();
+      await secretStore.set('acct_1', { accessToken: 'access-token-1' });
+      const accountManager = new AccountManager({
+        accounts: [{ id: 'acct_1', name: 'a@example.com', type: 'oauth' }],
+      });
+      const proxy = await listen(createProxyServer({
+        accountManager,
+        secretStore,
+        config: {
+          upstream: upstream.url,
+          proxy: { upstreamIdleTimeoutMs: 1000 },
+          usagePolling: { enabled: false },
+        },
+      }));
+      cleanupAfterTest(async () => {
+        await close(proxy.server);
+        await close(upstream.server);
+      });
+
+      const response = await requestJson(`${proxy.url}/v1/messages`, {
+        method: 'POST',
+        body: JSON.stringify({ model: 'sonnet' }),
+      });
+
+      assert.equal(response.status, 200);
+      assert.deepEqual(response.body, { ok: true });
+    } finally {
+      http.request = originalRequest;
+    }
+  });
+
   it('does not rotate after a streaming response has already started', async () => {
     const upstreamSeen = [];
     const upstream = await listen(http.createServer(async (req, res) => {
@@ -1435,6 +1484,33 @@ describe('createProxyServer', () => {
     await close(proxy.server);
   });
 
+  it('returns a non-empty proxy error message for empty internal errors', async () => {
+    const accountManager = new AccountManager({
+      accounts: [{ id: 'acct_1', name: 'a@example.com', type: 'oauth' }],
+    });
+    const proxy = await listen(createProxyServer({
+      accountManager,
+      secretStore: {
+        async get() {
+          throw new Error('');
+        },
+      },
+      config: { upstream: 'http://127.0.0.1:1', usagePolling: { enabled: false } },
+    }));
+    cleanupAfterTest(async () => {
+      await close(proxy.server);
+    });
+
+    const response = await requestJson(`${proxy.url}/v1/messages`, {
+      method: 'POST',
+      body: JSON.stringify({ model: 'sonnet' }),
+    });
+
+    assert.equal(response.status, 502);
+    assert.equal(response.body.error.type, 'proxy_error');
+    assert.notEqual(response.body.error.message, '');
+  });
+
   it('reloads accounts from the current config without restarting the server', async () => {
     const secretStore = new MemorySecretStore();
     const accountManager = new AccountManager({
@@ -1518,6 +1594,12 @@ async function requestJson(url, options = {}) {
         if (!settled) {
           settled = true;
           reject(error);
+        }
+      });
+      res.on('close', () => {
+        if (!settled) {
+          settled = true;
+          reject(new Error('response aborted before end'));
         }
       });
     });
