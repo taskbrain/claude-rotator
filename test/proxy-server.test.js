@@ -1380,6 +1380,53 @@ describe('createProxyServer', () => {
     assert.equal(refresh.body.accounts.filter(account => account.ok).length, 2);
   });
 
+  it('limits OAuth usage refresh concurrency from config', async () => {
+    const secretStore = new MemorySecretStore();
+    await secretStore.set('acct_1', { accessToken: 'access-token-1' });
+    await secretStore.set('acct_2', { accessToken: 'access-token-2' });
+    await secretStore.set('acct_3', { accessToken: 'access-token-3' });
+    const accountManager = new AccountManager({
+      accounts: [
+        { id: 'acct_1', name: 'a@example.com', type: 'oauth' },
+        { id: 'acct_2', name: 'b@example.com', type: 'oauth' },
+        { id: 'acct_3', name: 'c@example.com', type: 'oauth' },
+      ],
+      now: () => Date.parse('2026-06-07T11:00:00Z'),
+    });
+    let active = 0;
+    let maxActive = 0;
+    const calls = [];
+    const proxy = await listen(createProxyServer({
+      accountManager,
+      secretStore,
+      config: {
+        upstream: 'http://127.0.0.1:1',
+        usagePolling: { enabled: false, concurrency: 1 },
+      },
+      usageFetcher: async token => {
+        active++;
+        maxActive = Math.max(maxActive, active);
+        calls.push(token);
+        await sleep(5);
+        active--;
+        return {
+          five_hour: { utilization: 0.25, resets_at: '2026-06-07T13:00:00Z' },
+          seven_day: { utilization: 0.5, resets_at: '2026-06-10T11:00:00Z' },
+        };
+      },
+    }));
+    cleanupAfterTest(async () => {
+      await close(proxy.server);
+    });
+
+    const refresh = await requestJson(`${proxy.url}/internal/refresh-usage`, { method: 'POST' });
+
+    assert.equal(refresh.status, 200);
+    assert.equal(maxActive, 1);
+    assert.deepEqual(calls, ['access-token-1', 'access-token-2', 'access-token-3']);
+    assert.equal(refresh.body.accounts.filter(account => account.ok).length, 3);
+  });
+
   it('persists account state after usage refresh', async () => {
     const secretStore = new MemorySecretStore();
     await secretStore.set('acct_1', { accessToken: 'access-token-1' });

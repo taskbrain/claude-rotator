@@ -61,6 +61,7 @@ export function createProxyServer({
       connectRetries: upstreamConnectRetries,
       connectRetryDelayMs: upstreamConnectRetryDelayMs,
     },
+    usageRefreshConcurrency: usagePollingConcurrency(config, accountManager.accounts.length),
   });
   const usageScheduler = createUsageRefreshScheduler({
     config,
@@ -242,6 +243,12 @@ function usagePollingIntervalMs(config) {
   return value;
 }
 
+function usagePollingConcurrency(config, accountCount) {
+  const parsed = Number(config.usagePolling?.concurrency);
+  if (!Number.isFinite(parsed) || parsed <= 0) return Math.max(1, accountCount);
+  return Math.max(1, Math.min(accountCount || 1, Math.floor(parsed)));
+}
+
 function nextExhaustedQuotaResetAt(status) {
   const resetTimes = [];
   for (const account of status?.accounts || []) {
@@ -266,6 +273,7 @@ function createUsageRefresher({
   currentCredentialReader,
   usageFetcher,
   usageRequestOptions,
+  usageRefreshConcurrency,
 }) {
   let inFlight = null;
   let attempted = false;
@@ -278,6 +286,7 @@ function createUsageRefresher({
       currentCredentialReader,
       usageFetcher,
       usageRequestOptions,
+      usageRefreshConcurrency,
     }).finally(() => {
       attempted = true;
       inFlight = null;
@@ -297,16 +306,21 @@ async function refreshAllOnce({
   currentCredentialReader,
   usageFetcher,
   usageRequestOptions,
+  usageRefreshConcurrency,
 }) {
-  const results = await Promise.all(accountManager.accounts.map(account => refreshAccountUsage({
-    account,
-    accountManager,
-    secretStore,
-    tokenRefresher,
-    currentCredentialReader,
-    usageFetcher,
-    usageRequestOptions,
-  })));
+  const results = await mapWithConcurrency(
+    accountManager.accounts,
+    usageRefreshConcurrency,
+    account => refreshAccountUsage({
+      account,
+      accountManager,
+      secretStore,
+      tokenRefresher,
+      currentCredentialReader,
+      usageFetcher,
+      usageRequestOptions,
+    }),
+  );
   rebalanceAfterUsageRefresh(accountManager);
   return {
     ok: results.every(result => result.ok),
@@ -314,6 +328,23 @@ async function refreshAllOnce({
     accounts: results,
     status: accountManager.getStatus(),
   };
+}
+
+async function mapWithConcurrency(items, concurrency, mapper) {
+  if (items.length === 0) return [];
+  const limit = Math.max(1, Math.min(items.length, Math.floor(Number(concurrency) || items.length)));
+  const results = new Array(items.length);
+  let nextIndex = 0;
+
+  async function worker() {
+    while (nextIndex < items.length) {
+      const index = nextIndex++;
+      results[index] = await mapper(items[index], index);
+    }
+  }
+
+  await Promise.all(Array.from({ length: limit }, () => worker()));
+  return results;
 }
 
 async function refreshAccountUsage({
