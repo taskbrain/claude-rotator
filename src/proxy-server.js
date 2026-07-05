@@ -1012,7 +1012,7 @@ function sendCurrentQuotaUnavailableResponse({ req, res, accountManager, logger 
 
 function syntheticQuotaExhaustedResponse(account, reason) {
   const windowHeader = quotaWindowHeader(reason.window);
-  const claim = quotaRepresentativeClaim(reason.window);
+  const claim = reason.claim || quotaRepresentativeClaim(reason.window);
   const resetSeconds = quotaResetSeconds(reason.resetAt);
   const headers = {
     'content-type': 'application/json',
@@ -1075,7 +1075,9 @@ function quotaExhaustedOfficialMessage(reason) {
     ? 'session limit'
     : reason.window === '7d'
       ? 'weekly limit'
-      : 'usage limit';
+      : String(reason.window || '').startsWith('7d ')
+        ? `${reason.window.slice(3)} weekly limit`
+        : 'usage limit';
   const reset = reason.resetAt ? ` · resets ${formatClaudeResetTime(reason.window, reason.resetAt)}` : '';
   return `You've hit your ${limit}${reset}`;
 }
@@ -1090,7 +1092,7 @@ function formatClaudeResetTime(window, resetAt) {
   if (!Number.isFinite(parsed)) return resetAt;
   const date = new Date(parsed);
   const time = formatTwelveHourTime(date);
-  if (window === '7d') {
+  if (window === '7d' || String(window || '').startsWith('7d ')) {
     const month = date.toLocaleString('en-US', { month: 'short' });
     return `${month} ${date.getDate()} at ${time}`;
   }

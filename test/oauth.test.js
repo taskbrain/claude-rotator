@@ -154,6 +154,54 @@ describe('usage response parsing', () => {
     assert.equal(parsed.five_hour.resets_at, '2026-06-04T09:00:00Z');
     assert.equal(parsed.seven_day.utilization, 0.01);
   });
+
+  it('normalizes structured scoped weekly limits from OAuth usage payloads', () => {
+    const parsed = parseUsageResponse({
+      limits: [
+        { kind: 'session', percent: 76, resets_at: '2026-06-04T09:00:00Z' },
+        { kind: 'weekly_all', percent: 41, resets_at: '2026-06-08T09:00:00Z' },
+        {
+          kind: 'weekly_scoped',
+          percent: 12,
+          resets_at: '2026-06-08T09:00:00Z',
+          scope: { model: { display_name: 'Fable', id: 'claude-fable-5' } },
+        },
+      ],
+    });
+
+    assert.equal(parsed.five_hour.utilization, 0.76);
+    assert.equal(parsed.seven_day.utilization, 0.41);
+    assert.deepEqual(parsed.scoped_weekly, [
+      {
+        key: 'fable',
+        label: 'Fable',
+        utilization: 0.12,
+        resets_at: '2026-06-08T09:00:00Z',
+      },
+    ]);
+  });
+
+  it('normalizes legacy flat model-specific weekly usage payloads', () => {
+    const parsed = parseUsageResponse({
+      seven_day_fable: { utilization: 50, resets_at: '2026-07-07T00:00:00Z' },
+      seven_day_sonnet: { utilization: 25, resets_at: '2026-07-06T00:00:00Z' },
+    });
+
+    assert.deepEqual(parsed.scoped_weekly, [
+      {
+        key: 'fable',
+        label: 'Fable',
+        utilization: 0.5,
+        resets_at: '2026-07-07T00:00:00Z',
+      },
+      {
+        key: 'sonnet',
+        label: 'Sonnet',
+        utilization: 0.25,
+        resets_at: '2026-07-06T00:00:00Z',
+      },
+    ]);
+  });
 });
 
 describe('authorization URL', () => {

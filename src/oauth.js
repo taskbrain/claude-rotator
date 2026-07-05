@@ -102,22 +102,85 @@ export async function fetchUsage(accessToken, options = {}) {
 }
 
 export function parseUsageResponse(data) {
+  const limits = Array.isArray(data.limits) ? data.limits : [];
+  const sessionLimit = limits.find(limit => limit?.kind === 'session');
+  const weeklyAllLimit = limits.find(limit => limit?.kind === 'weekly_all');
+
   return {
-    five_hour: data.five_hour
-      ? {
-          utilization: normalizeUsageUtilization(data.five_hour.utilization),
-          resets_at: data.five_hour.resets_at,
-        }
-      : null,
-    seven_day: data.seven_day
-      ? {
-          utilization: normalizeUsageUtilization(data.seven_day.utilization),
-          resets_at: data.seven_day.resets_at,
-        }
-      : null,
+    five_hour: normalizeUsageBucket(data.five_hour) || normalizeUsageBucket(sessionLimit),
+    seven_day: normalizeUsageBucket(data.seven_day) || normalizeUsageBucket(weeklyAllLimit),
+    scoped_weekly: normalizeScopedWeeklyUsage(data, limits),
     seven_day_sonnet: data.seven_day_sonnet || null,
     extra_usage: data.extra_usage || null,
   };
+}
+
+function normalizeUsageBucket(bucket) {
+  if (!bucket || typeof bucket !== 'object') return null;
+  const rawUtilization = bucket.utilization ?? bucket.percent;
+  if (rawUtilization == null && !bucket.resets_at) return null;
+  return {
+    utilization: normalizeUsageUtilization(rawUtilization),
+    resets_at: bucket.resets_at || null,
+  };
+}
+
+function normalizeScopedWeeklyUsage(data, limits) {
+  const scoped = [];
+  const seen = new Set();
+
+  for (const limit of limits) {
+    if (!limit || limit.kind !== 'weekly_scoped') continue;
+    const model = limit.scope?.model || {};
+    const label = normalizeScopedLabel(model.display_name || model.name || model.id || 'Scoped');
+    appendScopedWeeklyUsage(scoped, seen, label, limit);
+  }
+
+  for (const key of Object.keys(data || {})) {
+    if (!key.startsWith('seven_day_') || key === 'seven_day') continue;
+    const bucket = data[key];
+    if (!bucket || typeof bucket !== 'object') continue;
+    const label = labelFromLegacyScopedKey(key.slice('seven_day_'.length));
+    appendScopedWeeklyUsage(scoped, seen, label, bucket);
+  }
+
+  return scoped;
+}
+
+function appendScopedWeeklyUsage(scoped, seen, label, bucket) {
+  const normalized = normalizeUsageBucket(bucket);
+  if (!normalized || typeof normalized.utilization !== 'number') return;
+  const key = normalizeScopedKey(label);
+  if (seen.has(key)) return;
+  seen.add(key);
+  scoped.push({
+    key,
+    label,
+    utilization: normalized.utilization,
+    resets_at: normalized.resets_at,
+  });
+}
+
+function labelFromLegacyScopedKey(value) {
+  return normalizeScopedLabel(String(value || '')
+    .split('_')
+    .filter(Boolean)
+    .map(part => `${part.charAt(0).toUpperCase()}${part.slice(1)}`)
+    .join(' '));
+}
+
+function normalizeScopedLabel(value) {
+  const label = String(value || '').trim();
+  return label || 'Scoped';
+}
+
+function normalizeScopedKey(value) {
+  const key = String(value || '')
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, '_')
+    .replace(/^_+|_+$/g, '');
+  return key || 'scoped';
 }
 
 function normalizeUsageUtilization(value) {

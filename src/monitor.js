@@ -35,6 +35,9 @@ export function renderStatus(status, options = {}) {
     if (reason) lines.push(`reason: ${reason}`);
     lines.push(renderQuotaRow('5h', account.quota?.unified5h, account.quota?.unified5hReset, now));
     lines.push(renderQuotaRow('7d', account.quota?.unified7d, account.quota?.unified7dReset, now));
+    for (const limit of account.quota?.weeklyScoped || []) {
+      lines.push(renderQuotaRow(`7d ${limit.label || limit.key || 'scoped'}`, limit.utilization, limit.resetAt, now));
+    }
     lines.push(`requests: ${account.usage?.totalRequests ?? 0}`);
     lines.push('');
   }
