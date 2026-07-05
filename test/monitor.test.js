@@ -30,6 +30,38 @@ describe('monitor rendering', () => {
     assert.match(output, /Events/);
     assert.match(output, /06\/04 18:02 JST fallback acct_1 -> acct_2 reason=shortest-quota-reset/);
   });
+
+  it('renders model-scoped weekly quota rows when present', () => {
+    const output = renderStatus({
+      currentAccount: 'acct_1',
+      currentAccountName: 'a@example.com',
+      accounts: [
+        {
+          id: 'acct_1',
+          name: 'a@example.com',
+          status: 'active',
+          quota: {
+            unified5h: 0.2,
+            unified7d: 0.3,
+            weeklyScoped: [
+              {
+                key: 'fable',
+                label: 'Fable',
+                utilization: 0.5,
+                resetAt: Date.parse('2026-07-07T00:00:00Z'),
+              },
+            ],
+          },
+          usage: { totalRequests: 1 },
+        },
+      ],
+      events: [],
+    }, {
+      now: Date.parse('2026-07-05T00:00:00Z'),
+    });
+
+    assert.match(output, /7d Fable █████░░░░░  50%  reset in 2d -> 07\/07 09:00 JST/);
+  });
 });
 
 function sampleStatus() {

@@ -1,4 +1,4 @@
-import { emptyQuota, parseRateLimitHeaders } from './quota.js';
+import { emptyQuota, normalizeWeeklyScopedUsage, parseRateLimitHeaders } from './quota.js';
 
 export const DEFAULT_WEEKLY_RESET_PRIORITY_WINDOW_MS = 36 * 60 * 60 * 1000;
 
@@ -101,6 +101,9 @@ export class AccountManager {
       if (Object.prototype.hasOwnProperty.call(payload.seven_day, 'resets_at')) {
         account.quota.unified7dReset = parseUsageReset(payload.seven_day.resets_at);
       }
+    }
+    if (Array.isArray(payload?.scoped_weekly)) {
+      account.quota.weeklyScoped = normalizeWeeklyScopedUsage(payload.scoped_weekly);
     }
     this.refreshQuotaState(account);
   }
@@ -499,6 +502,11 @@ export class AccountManager {
       q.unified7dReset = null;
       q.unifiedStatus = null;
     }
+    if (Array.isArray(q.weeklyScoped)) {
+      q.weeklyScoped = q.weeklyScoped.filter(limit => !limit.resetAt || now < limit.resetAt);
+    } else {
+      q.weeklyScoped = [];
+    }
     if (account.rateLimitedUntil && now >= account.rateLimitedUntil) {
       account.rateLimitedUntil = null;
       account.temporaryUnavailableReason = null;
@@ -609,6 +617,8 @@ export function quotaUnavailableReason(quota, threshold) {
       resetAt: quota.unified7dReset ? new Date(quota.unified7dReset).toISOString() : null,
     };
   }
+  const scopedReason = scopedWeeklyQuotaUnavailableReason(quota.weeklyScoped, threshold);
+  if (scopedReason) return scopedReason;
   if (quota.tokensLimit != null && quota.tokensRemaining != null) {
     const utilization = 1 - quota.tokensRemaining / quota.tokensLimit;
     if (utilization >= threshold) {
@@ -633,7 +643,8 @@ export function quotaUnavailableReason(quota, threshold) {
 }
 
 export function isUnifiedQuotaExhaustion(reason) {
-  return reason?.type === 'quota_exhausted' && ['5h', '7d'].includes(reason.window);
+  return reason?.type === 'quota_exhausted'
+    && (['5h', '7d'].includes(reason.window) || String(reason.window || '').startsWith('7d '));
 }
 
 function compareSwitchTargetScores(left, right) {
@@ -692,8 +703,10 @@ function restoreQuota(value) {
   const quota = emptyQuota();
   if (!value || typeof value !== 'object') return quota;
   for (const key of Object.keys(quota)) {
+    if (key === 'weeklyScoped') continue;
     quota[key] = restoreNumberOrNull(value[key]);
   }
+  quota.weeklyScoped = normalizeWeeklyScopedUsage(value.weeklyScoped);
   if (typeof value.unifiedStatus === 'string') quota.unifiedStatus = value.unifiedStatus;
   if (typeof value.resetsAt === 'string') quota.resetsAt = value.resetsAt;
   return quota;
@@ -750,9 +763,25 @@ function finiteResetAt(value) {
   return typeof value === 'number' && Number.isFinite(value) && value !== Number.MAX_SAFE_INTEGER ? value : null;
 }
 
+function scopedWeeklyQuotaUnavailableReason(value, threshold) {
+  if (!Array.isArray(value)) return null;
+  for (const limit of value) {
+    if (!limit || typeof limit.utilization !== 'number' || limit.utilization < threshold) continue;
+    return {
+      type: 'quota_exhausted',
+      window: `7d ${limit.label || limit.key || 'scoped'}`,
+      claim: `seven_day_${limit.key || 'scoped'}`,
+      utilization: limit.utilization,
+      resetAt: limit.resetAt ? new Date(limit.resetAt).toISOString() : null,
+    };
+  }
+  return null;
+}
+
 export function isNearQuota(quota, threshold) {
   if (quota.unified5h != null && quota.unified5h >= threshold) return true;
   if (quota.unified7d != null && quota.unified7d >= threshold) return true;
+  if (Array.isArray(quota.weeklyScoped) && quota.weeklyScoped.some(limit => limit.utilization >= threshold)) return true;
   if (quota.tokensLimit != null && quota.tokensRemaining != null) {
     if (1 - quota.tokensRemaining / quota.tokensLimit >= threshold) return true;
   }

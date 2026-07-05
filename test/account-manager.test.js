@@ -534,6 +534,73 @@ describe('AccountManager', () => {
     assert.equal(status.accounts[0].quota.unified5hReset, null);
   });
 
+  it('stores model-scoped weekly usage from OAuth usage refresh payloads', () => {
+    const manager = new AccountManager({
+      accounts: [{ id: 'acct_1', name: 'a@example.com', type: 'oauth' }],
+      now: () => 1000,
+    });
+
+    manager.applyUsage('acct_1', {
+      scoped_weekly: [
+        {
+          key: 'fable',
+          label: 'Fable',
+          utilization: 0.5,
+          resets_at: '2026-07-07T00:00:00Z',
+        },
+      ],
+    });
+
+    const status = manager.getStatus();
+    assert.deepEqual(status.accounts[0].quota.weeklyScoped, [
+      {
+        key: 'fable',
+        label: 'Fable',
+        utilization: 0.5,
+        resetAt: Date.parse('2026-07-07T00:00:00Z'),
+      },
+    ]);
+  });
+
+  it('switches away from accounts with exhausted model-scoped weekly usage', () => {
+    const manager = new AccountManager({
+      accounts: [
+        { id: 'acct_1', name: 'a@example.com', type: 'oauth' },
+        { id: 'acct_2', name: 'b@example.com', type: 'oauth' },
+      ],
+      switchThreshold: 1,
+      now: () => 1000,
+    });
+
+    manager.applyUsage('acct_1', {
+      five_hour: { utilization: 0.2, resets_at: '2026-07-05T05:00:00Z' },
+      seven_day: { utilization: 0.2, resets_at: '2026-07-07T00:00:00Z' },
+      scoped_weekly: [
+        {
+          key: 'fable',
+          label: 'Fable',
+          utilization: 1,
+          resets_at: '2026-07-07T00:00:00Z',
+        },
+      ],
+    });
+    manager.applyUsage('acct_2', {
+      five_hour: { utilization: 0.4, resets_at: '2026-07-05T05:00:00Z' },
+      seven_day: { utilization: 0.4, resets_at: '2026-07-07T00:00:00Z' },
+    });
+
+    assert.equal(manager.getActiveAccount().id, 'acct_2');
+    const exhausted = manager.getStatus().accounts[0];
+    assert.equal(exhausted.status, 'exhausted');
+    assert.deepEqual(exhausted.unavailableReason, {
+      type: 'quota_exhausted',
+      window: '7d Fable',
+      claim: 'seven_day_fable',
+      utilization: 1,
+      resetAt: '2026-07-07T00:00:00.000Z',
+    });
+  });
+
   it('reports quota exhaustion ahead of retry-after throttling', () => {
     const manager = new AccountManager({
       accounts: [{ id: 'acct_1', name: 'a@example.com', type: 'oauth' }],
