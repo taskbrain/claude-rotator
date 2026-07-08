@@ -51,7 +51,9 @@ describe('config defaults', () => {
       weeklyResetPriorityWindowMs: 36 * 60 * 60 * 1000,
     });
     assert.equal(config.usagePolling.enabled, true);
-    assert.equal(Object.hasOwn(config.usagePolling, 'intervalMs'), false);
+    assert.equal(config.usagePolling.intervalMs, 15 * 60 * 1000);
+    assert.equal(config.usagePolling.concurrency, 1);
+    assert.equal(config.usagePolling.requestSpacingMs, 1500);
   });
 });
 

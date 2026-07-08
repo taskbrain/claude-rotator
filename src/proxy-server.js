@@ -3,7 +3,12 @@ import https from 'node:https';
 
 import { isUnifiedQuotaExhaustion } from './account-manager.js';
 import { readCurrentClaudeCredentials } from './claude-credentials.js';
-import { fetchUsage, isTokenExpiringSoon, refreshAccessToken } from './oauth.js';
+import {
+  DEFAULT_USAGE_POLL_INTERVAL_MS,
+  DEFAULT_USAGE_REFRESH_CONCURRENCY,
+  DEFAULT_USAGE_REFRESH_REQUEST_SPACING_MS,
+} from './config.js';
+import { fetchProfile, fetchUsage, isTokenExpiringSoon, refreshAccessToken } from './oauth.js';
 
 const HOP_HEADERS = new Set([
   'host',
@@ -22,7 +27,6 @@ const DEFAULT_UPSTREAM_CONNECT_TIMEOUT_MS = 10_000;
 const DEFAULT_UPSTREAM_CONNECT_RETRIES = 3;
 const DEFAULT_UPSTREAM_CONNECT_RETRY_DELAY_MS = 250;
 const DEFAULT_RESET_CHECK_DELAY_MS = 1000;
-const DEFAULT_USAGE_POLL_INTERVAL_MS = 60_000;
 const MAX_TIMER_DELAY_MS = 2_147_483_647;
 
 export function createProxyServer({
@@ -32,6 +36,7 @@ export function createProxyServer({
   reloadAccounts = null,
   tokenRefresher = refreshAccessToken,
   currentCredentialReader = readCurrentClaudeCredentials,
+  currentProfileFetcher = fetchProfile,
   usageFetcher = fetchUsage,
   logger = null,
   stateWriter = null,
@@ -55,6 +60,7 @@ export function createProxyServer({
     secretStore,
     tokenRefresher,
     currentCredentialReader,
+    currentProfileFetcher,
     usageFetcher,
     usageRequestOptions: {
       connectTimeoutMs: upstreamConnectTimeoutMs,
@@ -62,6 +68,7 @@ export function createProxyServer({
       connectRetryDelayMs: upstreamConnectRetryDelayMs,
     },
     usageRefreshConcurrency: usagePollingConcurrency(config, accountManager.accounts.length),
+    usageRefreshRequestSpacingMs: usagePollingRequestSpacingMs(config),
   });
   const usageScheduler = createUsageRefreshScheduler({
     config,
@@ -143,6 +150,7 @@ export function createProxyServer({
         secretStore,
         tokenRefresher,
         currentCredentialReader,
+        currentProfileFetcher,
         logger,
         upstreamIdleTimeoutMs,
         upstreamConnectTimeoutMs,
@@ -245,8 +253,15 @@ function usagePollingIntervalMs(config) {
 
 function usagePollingConcurrency(config, accountCount) {
   const parsed = Number(config.usagePolling?.concurrency);
-  if (!Number.isFinite(parsed) || parsed <= 0) return Math.max(1, accountCount);
+  if (!Number.isFinite(parsed) || parsed <= 0) return Math.max(1, Math.min(accountCount || 1, DEFAULT_USAGE_REFRESH_CONCURRENCY));
   return Math.max(1, Math.min(accountCount || 1, Math.floor(parsed)));
+}
+
+function usagePollingRequestSpacingMs(config) {
+  const raw = config.usagePolling?.requestSpacingMs;
+  const value = raw == null ? DEFAULT_USAGE_REFRESH_REQUEST_SPACING_MS : Number(raw);
+  if (!Number.isFinite(value) || value <= 0) return 0;
+  return Math.floor(value);
 }
 
 function nextExhaustedQuotaResetAt(status) {
@@ -271,9 +286,11 @@ function createUsageRefresher({
   secretStore,
   tokenRefresher,
   currentCredentialReader,
+  currentProfileFetcher,
   usageFetcher,
   usageRequestOptions,
   usageRefreshConcurrency,
+  usageRefreshRequestSpacingMs,
 }) {
   let inFlight = null;
   let attempted = false;
@@ -284,9 +301,11 @@ function createUsageRefresher({
       secretStore,
       tokenRefresher,
       currentCredentialReader,
+      currentProfileFetcher,
       usageFetcher,
       usageRequestOptions,
       usageRefreshConcurrency,
+      usageRefreshRequestSpacingMs,
     }).finally(() => {
       attempted = true;
       inFlight = null;
@@ -304,19 +323,23 @@ async function refreshAllOnce({
   secretStore,
   tokenRefresher,
   currentCredentialReader,
+  currentProfileFetcher,
   usageFetcher,
   usageRequestOptions,
   usageRefreshConcurrency,
+  usageRefreshRequestSpacingMs,
 }) {
   const results = await mapWithConcurrency(
     accountManager.accounts,
     usageRefreshConcurrency,
+    usageRefreshRequestSpacingMs,
     account => refreshAccountUsage({
       account,
       accountManager,
       secretStore,
       tokenRefresher,
       currentCredentialReader,
+      currentProfileFetcher,
       usageFetcher,
       usageRequestOptions,
     }),
@@ -330,15 +353,25 @@ async function refreshAllOnce({
   };
 }
 
-async function mapWithConcurrency(items, concurrency, mapper) {
+async function mapWithConcurrency(items, concurrency, requestSpacingMs, mapper) {
   if (items.length === 0) return [];
   const limit = Math.max(1, Math.min(items.length, Math.floor(Number(concurrency) || items.length)));
   const results = new Array(items.length);
   let nextIndex = 0;
+  let lastStartedAt = 0;
+  let spacingTail = Promise.resolve();
 
   async function worker() {
     while (nextIndex < items.length) {
       const index = nextIndex++;
+      if (requestSpacingMs > 0) {
+        spacingTail = spacingTail.then(async () => {
+          const waitMs = Math.max(0, lastStartedAt + requestSpacingMs - Date.now());
+          if (waitMs > 0) await sleep(waitMs);
+          lastStartedAt = Date.now();
+        });
+        await spacingTail;
+      }
       results[index] = await mapper(items[index], index);
     }
   }
@@ -353,13 +386,19 @@ async function refreshAccountUsage({
   secretStore,
   tokenRefresher,
   currentCredentialReader,
+  currentProfileFetcher,
   usageFetcher,
   usageRequestOptions,
 }) {
   if (account.type === 'apikey') return { account: account.id, ok: true, skipped: 'apikey' };
 
   try {
-    const secret = await resolveSecretForAccount({ account, secretStore, currentCredentialReader });
+    const secret = await resolveSecretForAccount({
+      account,
+      secretStore,
+      currentCredentialReader,
+      currentProfileFetcher,
+    });
     if (!secret?.accessToken) throw new Error('OAuth access token is missing');
     const freshSecret = await refreshSecretIfExpiring({
       account,
@@ -371,16 +410,24 @@ async function refreshAccountUsage({
     accountManager.applyUsage(account.id, usage);
     return { account: account.id, ok: true };
   } catch (caught) {
+    const message = shortErrorMessage(caught);
+    if (isOAuthCredentialError(message)) {
+      accountManager.markError(account.id, 'oauth_refresh_failed', 'OAuth token refresh failed');
+    }
     return {
       account: account.id,
       ok: false,
-      error: shortErrorMessage(caught),
+      error: message,
     };
   }
 }
 
 function rebalanceAfterUsageRefresh(accountManager) {
   accountManager.rebalanceActiveAccount();
+}
+
+function isOAuthCredentialError(message) {
+  return /OAuth access token is missing|Token refresh failed|Usage fetch failed \(401\)/.test(String(message || ''));
 }
 
 async function forwardWithRotation({
@@ -392,6 +439,7 @@ async function forwardWithRotation({
   secretStore,
   tokenRefresher,
   currentCredentialReader,
+  currentProfileFetcher,
   logger,
   upstreamIdleTimeoutMs,
   upstreamConnectTimeoutMs,
@@ -423,6 +471,7 @@ async function forwardWithRotation({
         secretStore,
         tokenRefresher,
         currentCredentialReader,
+        currentProfileFetcher,
         logger,
         upstreamIdleTimeoutMs,
         upstreamConnectTimeoutMs,
@@ -433,7 +482,12 @@ async function forwardWithRotation({
       return;
     }
 
-    const secret = await resolveSecretForAccount({ account, secretStore, currentCredentialReader });
+    const secret = await resolveSecretForAccount({
+      account,
+      secretStore,
+      currentCredentialReader,
+      currentProfileFetcher,
+    });
     if (!secret) {
       accountManager.markError(account.id, 'credential_missing', 'No stored credential for account');
       continue;
@@ -530,6 +584,7 @@ async function forwardWithRotation({
       secretStore,
       tokenRefresher,
       currentCredentialReader,
+      currentProfileFetcher,
       logger,
       upstreamIdleTimeoutMs,
       upstreamConnectTimeoutMs,
@@ -549,6 +604,7 @@ async function forwardCurrentUnavailableAccount({
   secretStore,
   tokenRefresher,
   currentCredentialReader,
+  currentProfileFetcher,
   logger,
   upstreamIdleTimeoutMs,
   upstreamConnectTimeoutMs,
@@ -565,7 +621,12 @@ async function forwardCurrentUnavailableAccount({
   const account = accountManager.getFallbackAccount();
   if (!account) return false;
 
-  const secret = await resolveSecretForAccount({ account, secretStore, currentCredentialReader });
+  const secret = await resolveSecretForAccount({
+    account,
+    secretStore,
+    currentCredentialReader,
+    currentProfileFetcher,
+  });
   if (!secret) return false;
 
   let freshSecret;
@@ -616,14 +677,62 @@ function canRefreshSecret(account, secret) {
   return account.type !== 'apikey' && !secret.apiKey && Boolean(secret.refreshToken);
 }
 
-async function resolveSecretForAccount({ account, secretStore, currentCredentialReader }) {
-  if (account.id === 'current' && account.type !== 'apikey') {
-    return {
-      ...(await currentCredentialReader()),
-      liveClaudeCodeCredential: true,
-    };
+async function resolveSecretForAccount({
+  account,
+  secretStore,
+  currentCredentialReader,
+  currentProfileFetcher,
+}) {
+  if (account.type === 'apikey') return secretStore.get(account.id);
+  if (account.id === 'current' || account.credentialSource === 'claude-code-current') {
+    return liveClaudeCodeSecret(currentCredentialReader);
   }
-  return secretStore.get(account.id);
+
+  const stored = await secretStore.get(account.id);
+  if (!account.accountUuid) return stored;
+
+  const current = await liveClaudeCodeCredentialWithProfile({
+    currentCredentialReader,
+    currentProfileFetcher,
+  }).catch(() => null);
+  if (current?.profile?.accountUuid !== account.accountUuid) return stored;
+  return current.secret;
+}
+
+async function liveClaudeCodeSecret(currentCredentialReader) {
+  return {
+    ...(await currentCredentialReader()),
+    liveClaudeCodeCredential: true,
+  };
+}
+
+const LIVE_CLAUDE_CODE_CACHE_TTL_MS = 60_000;
+let liveClaudeCodeCache = null;
+
+async function liveClaudeCodeCredentialWithProfile({
+  currentCredentialReader,
+  currentProfileFetcher,
+}) {
+  const now = Date.now();
+  if (
+    liveClaudeCodeCache
+    && liveClaudeCodeCache.currentCredentialReader === currentCredentialReader
+    && liveClaudeCodeCache.currentProfileFetcher === currentProfileFetcher
+    && liveClaudeCodeCache.expiresAt > now
+  ) {
+    return liveClaudeCodeCache.value;
+  }
+
+  const secret = await liveClaudeCodeSecret(currentCredentialReader);
+  const profile = secret.accessToken ? await currentProfileFetcher(secret.accessToken) : null;
+  const value = { secret, profile };
+  liveClaudeCodeCache = {
+    currentCredentialReader,
+    currentProfileFetcher,
+    expiresAt: now + LIVE_CLAUDE_CODE_CACHE_TTL_MS,
+    value,
+  };
+  return value;
 }
 
 async function forwardOnce({

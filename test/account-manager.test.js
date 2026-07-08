@@ -419,6 +419,26 @@ describe('AccountManager', () => {
     assert.equal(manager.getStatus().accounts[0].status, 'error');
   });
 
+  it('keeps authentication errors ahead of stale quota exhaustion', () => {
+    const manager = new AccountManager({
+      accounts: [{ id: 'acct_1', name: 'a@example.com', type: 'oauth' }],
+      now: () => 1000,
+    });
+    manager.markError('acct_1', 'oauth_refresh_failed', 'OAuth token refresh failed');
+    manager.updateQuota('acct_1', {
+      'anthropic-ratelimit-unified-7d-utilization': '1',
+      'anthropic-ratelimit-unified-7d-reset': '10',
+    });
+
+    const account = manager.getStatus().accounts[0];
+    assert.equal(account.status, 'error');
+    assert.deepEqual(account.unavailableReason, {
+      type: 'oauth_refresh_failed',
+      message: 'OAuth token refresh failed',
+    });
+    assert.equal(manager.selectBestExhaustedFallback(), null);
+  });
+
   it('replaces account metadata for server reload', () => {
     const manager = new AccountManager({
       accounts: [{ id: 'acct_1', name: 'a@example.com', type: 'oauth' }],

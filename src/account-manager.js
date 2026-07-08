@@ -512,6 +512,7 @@ export class AccountManager {
       account.temporaryUnavailableReason = null;
       account.status = 'ready';
     }
+    if (account.status === 'error') return;
 
     const quotaReason = quotaUnavailableReason(q, this.switchThreshold);
     if (quotaReason) {
@@ -541,6 +542,9 @@ export class AccountManager {
 
   unavailableReason(account) {
     if (!account) return null;
+    if (account.status === 'error') {
+      return account.errorReason || { type: 'account_error' };
+    }
     const quotaReason = quotaUnavailableReason(account.quota, this.switchThreshold);
     if (quotaReason) return quotaReason;
     if (account.rateLimitedUntil && this.now() < account.rateLimitedUntil) {
@@ -548,9 +552,6 @@ export class AccountManager {
         ...(account.temporaryUnavailableReason || { type: 'temporary_throttle' }),
         retryAt: new Date(account.rateLimitedUntil).toISOString(),
       };
-    }
-    if (account.status === 'error') {
-      return account.errorReason || { type: 'account_error' };
     }
     return null;
   }

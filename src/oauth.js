@@ -8,6 +8,7 @@ export const OAUTH_TOKEN_URL = 'https://platform.claude.com/v1/oauth/token';
 export const OAUTH_PROFILE_URL = 'https://api.anthropic.com/api/oauth/profile';
 export const OAUTH_USAGE_URL = 'https://api.anthropic.com/api/oauth/usage';
 export const OAUTH_BETA_HEADER = 'oauth-2025-04-20';
+export const OAUTH_USER_AGENT = 'claude-code/2.1.201 (cli)';
 export const DEFAULT_OAUTH_REQUEST_TIMEOUT_MS = 60_000;
 export const DEFAULT_OAUTH_CONNECT_TIMEOUT_MS = 10_000;
 export const DEFAULT_OAUTH_CONNECT_RETRIES = 3;
@@ -45,6 +46,7 @@ export async function refreshAccessToken(refreshToken, options = {}) {
   const response = await requestEndpoint(endpoint, {
     method: 'POST',
     headers: {
+      ...oauthClientHeaders(),
       'Content-Type': 'application/json',
       'Accept': 'application/json, text/plain, */*',
     },
@@ -65,6 +67,7 @@ export async function refreshAccessToken(refreshToken, options = {}) {
 export async function fetchProfile(accessToken, options = {}) {
   const response = await requestEndpoint(options.endpoint || OAUTH_PROFILE_URL, {
     headers: {
+      ...oauthClientHeaders(),
       Authorization: `Bearer ${accessToken}`,
     },
   }, options);
@@ -88,6 +91,7 @@ export async function fetchProfile(accessToken, options = {}) {
 export async function fetchUsage(accessToken, options = {}) {
   const response = await requestEndpoint(options.endpoint || OAUTH_USAGE_URL, {
     headers: {
+      ...oauthClientHeaders(),
       Authorization: `Bearer ${accessToken}`,
       'anthropic-beta': OAUTH_BETA_HEADER,
       Accept: 'application/json',
@@ -214,6 +218,13 @@ export function createAuthorizationUrl({
   return url;
 }
 
+function oauthClientHeaders() {
+  return {
+    'User-Agent': OAUTH_USER_AGENT,
+    'Accept-Encoding': 'identity',
+  };
+}
+
 export async function exchangeAuthorizationCode({
   code,
   state,
@@ -225,7 +236,7 @@ export async function exchangeAuthorizationCode({
 }) {
   const response = await requestEndpoint(OAUTH_TOKEN_URL, {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
+    headers: { ...oauthClientHeaders(), 'Content-Type': 'application/json' },
     body: JSON.stringify({
       code,
       state,

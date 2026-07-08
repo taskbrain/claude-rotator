@@ -159,6 +159,55 @@ describe('createProxyServer', () => {
     assert.deepEqual(upstreamSeen, ['Bearer live-claude-code-token']);
   });
 
+  it('uses live Claude Code credentials for an expired saved account with the same accountUuid', async () => {
+    const upstreamSeen = [];
+    const upstream = await listen(http.createServer(async (req, res) => {
+      upstreamSeen.push(req.headers.authorization);
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ ok: true }));
+    }));
+
+    const secretStore = new MemorySecretStore();
+    await secretStore.set('acct_1', {
+      accessToken: 'expired-saved-token',
+      refreshToken: 'saved-refresh-token',
+      expiresAt: 900,
+    });
+    const accountManager = new AccountManager({
+      accounts: [{ id: 'acct_1', name: 'a@example.com', type: 'oauth', accountUuid: 'uuid-live' }],
+      now: () => 1000,
+    });
+    const proxy = await listen(createProxyServer({
+      accountManager,
+      secretStore,
+      config: { upstream: upstream.url },
+      tokenRefresher: async () => {
+        throw new Error('token refresh should not be called');
+      },
+      currentCredentialReader: async () => ({
+        accessToken: 'live-claude-code-token',
+        refreshToken: 'live-claude-code-refresh',
+        expiresAt: Date.now() + 60 * 60 * 1000,
+      }),
+      currentProfileFetcher: async accessToken => {
+        assert.equal(accessToken, 'live-claude-code-token');
+        return { accountUuid: 'uuid-live' };
+      },
+    }));
+    cleanupAfterTest(async () => {
+      await close(proxy.server);
+      await close(upstream.server);
+    });
+
+    const response = await requestJson(`${proxy.url}/v1/messages`, {
+      method: 'POST',
+      body: JSON.stringify({ model: 'sonnet' }),
+    });
+
+    assert.equal(response.status, 200);
+    assert.deepEqual(upstreamSeen, ['Bearer live-claude-code-token']);
+  });
+
   it('records proxy request diagnostics without secrets', async () => {
     const logLines = [];
     const upstream = await listen(http.createServer(async (req, res) => {
@@ -1155,7 +1204,7 @@ describe('createProxyServer', () => {
       secretStore,
       config: {
         upstream: 'http://127.0.0.1:1',
-        usagePolling: { enabled: false },
+        usagePolling: { enabled: false, requestSpacingMs: 0 },
       },
       usageFetcher: async token => {
         calls += 1;
@@ -1208,7 +1257,7 @@ describe('createProxyServer', () => {
     const proxy = await listen(createProxyServer({
       accountManager,
       secretStore,
-      config: { upstream: upstream.url, usagePolling: { enabled: true } },
+      config: { upstream: upstream.url, usagePolling: { enabled: true, requestSpacingMs: 0 } },
       usageFetcher: async token => {
         if (token === 'weekly-token') {
           return {
@@ -1252,7 +1301,10 @@ describe('createProxyServer', () => {
     const proxy = await listen(createProxyServer({
       accountManager,
       secretStore,
-      config: { upstream: 'http://127.0.0.1:1', usagePolling: { enabled: false } },
+      config: {
+        upstream: 'http://127.0.0.1:1',
+        usagePolling: { enabled: false, requestSpacingMs: 0 },
+      },
       usageFetcher: async token => {
         if (token === 'dev-token') {
           return {
@@ -1328,7 +1380,54 @@ describe('createProxyServer', () => {
     assert.equal(seenOptions.connectRetryDelayMs, 123);
   });
 
-  it('refreshes OAuth usage accounts concurrently', async () => {
+  it('refreshes OAuth usage with live Claude Code credentials for a matching expired saved account', async () => {
+    const secretStore = new MemorySecretStore();
+    await secretStore.set('acct_1', {
+      accessToken: 'expired-saved-token',
+      refreshToken: 'saved-refresh-token',
+      expiresAt: 900,
+    });
+    const accountManager = new AccountManager({
+      accounts: [{ id: 'acct_1', name: 'a@example.com', type: 'oauth', accountUuid: 'uuid-live' }],
+      now: () => 1000,
+    });
+    const seenTokens = [];
+    const proxy = await listen(createProxyServer({
+      accountManager,
+      secretStore,
+      config: { upstream: 'http://127.0.0.1:1', usagePolling: { enabled: false } },
+      tokenRefresher: async () => {
+        throw new Error('token refresh should not be called');
+      },
+      currentCredentialReader: async () => ({
+        accessToken: 'live-claude-code-token',
+        refreshToken: 'live-claude-code-refresh',
+        expiresAt: Date.now() + 60 * 60 * 1000,
+      }),
+      currentProfileFetcher: async accessToken => {
+        assert.equal(accessToken, 'live-claude-code-token');
+        return { accountUuid: 'uuid-live' };
+      },
+      usageFetcher: async token => {
+        seenTokens.push(token);
+        return {
+          five_hour: { utilization: 0.2, resets_at: null },
+          seven_day: { utilization: 0.3, resets_at: null },
+        };
+      },
+    }));
+    cleanupAfterTest(async () => {
+      await close(proxy.server);
+    });
+
+    const refresh = await requestJson(`${proxy.url}/internal/refresh-usage`, { method: 'POST' });
+
+    assert.equal(refresh.status, 200);
+    assert.equal(refresh.body.ok, true);
+    assert.deepEqual(seenTokens, ['live-claude-code-token']);
+  });
+
+  it('refreshes OAuth usage accounts concurrently when configured', async () => {
     const secretStore = new MemorySecretStore();
     await secretStore.set('acct_1', { accessToken: 'access-token-1' });
     await secretStore.set('acct_2', { accessToken: 'access-token-2' });
@@ -1351,7 +1450,10 @@ describe('createProxyServer', () => {
     const proxy = await listen(createProxyServer({
       accountManager,
       secretStore,
-      config: { upstream: 'http://127.0.0.1:1', usagePolling: { enabled: false } },
+      config: {
+        upstream: 'http://127.0.0.1:1',
+        usagePolling: { enabled: false, concurrency: 2, requestSpacingMs: 0 },
+      },
       usageFetcher: async token => {
         calls.push(token);
         if (calls.length === 2) resolveBothCalled();
@@ -1380,6 +1482,86 @@ describe('createProxyServer', () => {
     assert.equal(refresh.body.accounts.filter(account => account.ok).length, 2);
   });
 
+  it('refreshes OAuth usage accounts serially by default', async () => {
+    const secretStore = new MemorySecretStore();
+    await secretStore.set('acct_1', { accessToken: 'access-token-1' });
+    await secretStore.set('acct_2', { accessToken: 'access-token-2' });
+    const accountManager = new AccountManager({
+      accounts: [
+        { id: 'acct_1', name: 'a@example.com', type: 'oauth' },
+        { id: 'acct_2', name: 'b@example.com', type: 'oauth' },
+      ],
+      now: () => Date.parse('2026-06-07T11:00:00Z'),
+    });
+    let active = 0;
+    let maxActive = 0;
+    const calls = [];
+    const proxy = await listen(createProxyServer({
+      accountManager,
+      secretStore,
+      config: {
+        upstream: 'http://127.0.0.1:1',
+        usagePolling: { enabled: false, requestSpacingMs: 0 },
+      },
+      usageFetcher: async token => {
+        active++;
+        maxActive = Math.max(maxActive, active);
+        calls.push(token);
+        await sleep(5);
+        active--;
+        return {
+          five_hour: { utilization: 0.25, resets_at: '2026-06-07T13:00:00Z' },
+          seven_day: { utilization: 0.5, resets_at: '2026-06-10T11:00:00Z' },
+        };
+      },
+    }));
+    cleanupAfterTest(async () => {
+      await close(proxy.server);
+    });
+
+    const refresh = await requestJson(`${proxy.url}/internal/refresh-usage`, { method: 'POST' });
+
+    assert.equal(refresh.status, 200);
+    assert.equal(maxActive, 1);
+    assert.deepEqual(calls, ['access-token-1', 'access-token-2']);
+    assert.equal(refresh.body.accounts.filter(account => account.ok).length, 2);
+  });
+
+  it('spaces OAuth usage refresh requests by default', async () => {
+    const secretStore = new MemorySecretStore();
+    await secretStore.set('acct_1', { accessToken: 'access-token-1' });
+    await secretStore.set('acct_2', { accessToken: 'access-token-2' });
+    const accountManager = new AccountManager({
+      accounts: [
+        { id: 'acct_1', name: 'a@example.com', type: 'oauth' },
+        { id: 'acct_2', name: 'b@example.com', type: 'oauth' },
+      ],
+      now: () => Date.parse('2026-06-07T11:00:00Z'),
+    });
+    const startedAt = [];
+    const proxy = await listen(createProxyServer({
+      accountManager,
+      secretStore,
+      config: { upstream: 'http://127.0.0.1:1', usagePolling: { enabled: false } },
+      usageFetcher: async () => {
+        startedAt.push(Date.now());
+        return {
+          five_hour: { utilization: 0.25, resets_at: '2026-06-07T13:00:00Z' },
+          seven_day: { utilization: 0.5, resets_at: '2026-06-10T11:00:00Z' },
+        };
+      },
+    }));
+    cleanupAfterTest(async () => {
+      await close(proxy.server);
+    });
+
+    const refresh = await requestJson(`${proxy.url}/internal/refresh-usage`, { method: 'POST' });
+
+    assert.equal(refresh.status, 200);
+    assert.equal(startedAt.length, 2);
+    assert.ok(startedAt[1] - startedAt[0] >= 1400);
+  });
+
   it('limits OAuth usage refresh concurrency from config', async () => {
     const secretStore = new MemorySecretStore();
     await secretStore.set('acct_1', { accessToken: 'access-token-1' });
@@ -1401,7 +1583,7 @@ describe('createProxyServer', () => {
       secretStore,
       config: {
         upstream: 'http://127.0.0.1:1',
-        usagePolling: { enabled: false, concurrency: 1 },
+        usagePolling: { enabled: false, concurrency: 1, requestSpacingMs: 0 },
       },
       usageFetcher: async token => {
         active++;
@@ -1541,7 +1723,7 @@ describe('createProxyServer', () => {
       secretStore,
       config: {
         upstream: 'http://127.0.0.1:1',
-        usagePolling: { enabled: true, resetCheckDelayMs: 5 },
+        usagePolling: { enabled: true, resetCheckDelayMs: 5, requestSpacingMs: 0 },
       },
       usageFetcher: async () => {
         calls += 1;
@@ -1596,7 +1778,7 @@ describe('createProxyServer', () => {
       secretStore,
       config: {
         upstream: 'http://127.0.0.1:1',
-        usagePolling: { enabled: true, intervalMs: 5 },
+        usagePolling: { enabled: true, intervalMs: 5, requestSpacingMs: 0 },
       },
       usageFetcher: async token => {
         if (token === 'access-token-1') {
@@ -1647,7 +1829,7 @@ describe('createProxyServer', () => {
       secretStore,
       config: {
         upstream: 'http://127.0.0.1:1',
-        usagePolling: { enabled: true, intervalMs: 5 },
+        usagePolling: { enabled: true, intervalMs: 5, requestSpacingMs: 0 },
       },
       usageFetcher: async token => {
         if (token === 'access-token-current') {

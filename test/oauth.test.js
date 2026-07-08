@@ -13,6 +13,7 @@ import {
   DEFAULT_OAUTH_CONNECT_RETRY_DELAY_MS,
   DEFAULT_OAUTH_CONNECT_TIMEOUT_MS,
   DEFAULT_OAUTH_REQUEST_TIMEOUT_MS,
+  OAUTH_USER_AGENT,
   parseUsageResponse,
   createAuthorizationUrl,
 } from '../src/oauth.js';
@@ -65,6 +66,8 @@ describe('token refresh', () => {
     assert.equal(result.refreshToken, 'refresh1');
     assert.equal(result.expiresAt, 3601000);
     assert.equal(JSON.parse(calls[0].options.body).refresh_token, 'refresh1');
+    assert.equal(calls[0].options.headers['User-Agent'], OAUTH_USER_AGENT);
+    assert.equal(calls[0].options.headers['Accept-Encoding'], 'identity');
   });
 });
 
@@ -89,6 +92,8 @@ describe('usage response parsing', () => {
     assert.equal(calls[0].options.connectRetries, DEFAULT_OAUTH_CONNECT_RETRIES);
     assert.equal(calls[0].options.connectRetryDelayMs, DEFAULT_OAUTH_CONNECT_RETRY_DELAY_MS);
     assert.equal(calls[0].options.headers.Authorization, 'Bearer access1');
+    assert.equal(calls[0].options.headers['User-Agent'], OAUTH_USER_AGENT);
+    assert.equal(calls[0].options.headers['Accept-Encoding'], 'identity');
     assert.equal(usage.five_hour.utilization, 0.25);
     assert.equal(usage.seven_day.utilization, 0.5);
   });

@@ -8,6 +8,9 @@ export const DEFAULT_UPSTREAM_CONNECT_TIMEOUT_MS = 10 * 1000;
 export const DEFAULT_UPSTREAM_CONNECT_RETRIES = 3;
 export const DEFAULT_UPSTREAM_CONNECT_RETRY_DELAY_MS = 250;
 export const DEFAULT_WEEKLY_RESET_PRIORITY_WINDOW_MS = 36 * 60 * 60 * 1000;
+export const DEFAULT_USAGE_POLL_INTERVAL_MS = 15 * 60 * 1000;
+export const DEFAULT_USAGE_REFRESH_CONCURRENCY = 1;
+export const DEFAULT_USAGE_REFRESH_REQUEST_SPACING_MS = 1500;
 
 export function createDefaultConfig() {
   return {
@@ -27,6 +30,9 @@ export function createDefaultConfig() {
     },
     usagePolling: {
       enabled: true,
+      intervalMs: DEFAULT_USAGE_POLL_INTERVAL_MS,
+      concurrency: DEFAULT_USAGE_REFRESH_CONCURRENCY,
+      requestSpacingMs: DEFAULT_USAGE_REFRESH_REQUEST_SPACING_MS,
     },
     accounts: [],
   };
