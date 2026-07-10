@@ -15,6 +15,8 @@ import {
   DEFAULT_OAUTH_CONNECT_TIMEOUT_MS,
   DEFAULT_OAUTH_REQUEST_TIMEOUT_MS,
   DEFAULT_OAUTH_REFRESH_LEAD_MS,
+  DEFAULT_TOKEN_REFRESH_RETRY_AFTER_MS,
+  OAuthTokenRefreshError,
   OAUTH_USER_AGENT,
   parseUsageResponse,
   createAuthorizationUrl,
@@ -95,6 +97,27 @@ describe('token refresh', () => {
     assert.equal(calls, 2);
   });
 
+  it('retains a token endpoint cooldown without repeating the refresh request', async () => {
+    let calls = 0;
+    let now = 1000;
+    const coordinated = createSingleFlightTokenRefresher(async () => {
+      calls += 1;
+      throw new OAuthTokenRefreshError({
+        status: 429,
+        code: 'rate_limit_error',
+        retryAfterMs: 10_000,
+      });
+    }, { now: () => now });
+
+    await assert.rejects(coordinated('refresh-1'), { status: 429 });
+    await assert.rejects(coordinated('refresh-1'), { status: 429 });
+    assert.equal(calls, 1);
+
+    now += 10_001;
+    await assert.rejects(coordinated('refresh-1'), { status: 429 });
+    assert.equal(calls, 2);
+  });
+
   it('parses token endpoint responses', () => {
     const parsed = parseTokenResponse({
       access_token: 'access2',
@@ -130,6 +153,35 @@ describe('token refresh', () => {
     assert.equal(JSON.parse(calls[0].options.body).refresh_token, 'refresh1');
     assert.equal(calls[0].options.headers['User-Agent'], OAUTH_USER_AGENT);
     assert.equal(calls[0].options.headers['Accept-Encoding'], 'identity');
+  });
+
+  it('returns a sanitized refresh error with the server retry delay', async () => {
+    await assert.rejects(
+      refreshAccessToken('secret-refresh-token', {
+        fetchImpl: async () => jsonResponse(429, {
+          type: 'error',
+          error: { type: 'rate_limit_error', message: 'slow down' },
+        }, { 'retry-after': '105' }),
+        now: () => 1000,
+      }),
+      error => {
+        assert.equal(error instanceof OAuthTokenRefreshError, true);
+        assert.equal(error.status, 429);
+        assert.equal(error.oauthCode, 'rate_limit_error');
+        assert.equal(error.retryAfterMs, 105_000);
+        assert.equal(error.message.includes('secret-refresh-token'), false);
+        return true;
+      },
+    );
+  });
+
+  it('uses a conservative refresh cooldown when Retry-After is missing', async () => {
+    await assert.rejects(
+      refreshAccessToken('refresh-1', {
+        fetchImpl: async () => jsonResponse(429, { error: 'rate_limit_error' }),
+      }),
+      error => error.retryAfterMs === DEFAULT_TOKEN_REFRESH_RETRY_AFTER_MS,
+    );
   });
 });
 
@@ -286,8 +338,9 @@ describe('authorization URL', () => {
   });
 });
 
-function jsonResponse(status, body) {
+function jsonResponse(status, body, headers = {}) {
   return {
+    headers,
     ok: status >= 200 && status < 300,
     status,
     async json() {

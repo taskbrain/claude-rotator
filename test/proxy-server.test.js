@@ -4,6 +4,7 @@ import http from 'node:http';
 import { EventEmitter } from 'node:events';
 
 import { AccountManager } from '../src/account-manager.js';
+import { OAuthTokenRefreshError } from '../src/oauth.js';
 import { MemorySecretStore } from '../src/secret-store.js';
 import { createProxyServer } from '../src/proxy-server.js';
 
@@ -1787,6 +1788,66 @@ describe('createProxyServer', () => {
     assert.equal(response.body.accounts[0].quota.unified5h, 0.25);
     assert.equal(response.body.accounts[0].quota.unified7d, 0.5);
     assert.equal(response.body.accounts[0].status, 'active');
+  });
+
+  it('retries a rate-limited token refresh after the server cooldown', async () => {
+    const secretStore = new MemorySecretStore();
+    await secretStore.set('acct_1', {
+      accessToken: 'expired-token',
+      refreshToken: 'refresh-token-1',
+      expiresAt: 900,
+    });
+    const accountManager = new AccountManager({
+      accounts: [{ id: 'acct_1', name: 'a@example.com', type: 'oauth' }],
+      now: () => Date.now(),
+    });
+    let refreshCalls = 0;
+    const proxy = await listen(createProxyServer({
+      accountManager,
+      secretStore,
+      config: {
+        upstream: 'http://127.0.0.1:1',
+        usagePolling: {
+          enabled: true,
+          intervalMs: 10_000,
+          requestSpacingMs: 0,
+          resetCheckDelayMs: 5,
+        },
+      },
+      tokenRefresher: async () => {
+        refreshCalls += 1;
+        if (refreshCalls === 1) {
+          throw new OAuthTokenRefreshError({
+            status: 429,
+            code: 'rate_limit_error',
+            retryAfterMs: 500,
+          });
+        }
+        return {
+          accessToken: 'fresh-token',
+          refreshToken: 'refresh-token-2',
+          expiresAt: Date.now() + 60 * 60 * 1000,
+        };
+      },
+      usageFetcher: async () => ({
+        five_hour: { utilization: 0.2, resets_at: null },
+        seven_day: { utilization: 0.3, resets_at: null },
+      }),
+    }));
+    cleanupAfterTest(async () => {
+      await close(proxy.server);
+    });
+
+    const first = await requestJson(`${proxy.url}/internal/status`);
+    assert.equal(first.body.accounts[0].status, 'throttled');
+    assert.equal(first.body.accounts[0].unavailableReason.type, 'temporary_throttle');
+
+    await waitForStatus(() => refreshCalls, calls => calls >= 2, 3000);
+    const recovered = await requestJson(`${proxy.url}/internal/status`);
+    assert.equal(refreshCalls, 2);
+    assert.equal(recovered.body.accounts[0].status, 'active');
+    assert.equal(recovered.body.accounts[0].unavailableReason, null);
+    assert.equal((await secretStore.get('acct_1')).refreshToken, 'refresh-token-2');
   });
 
   it('refreshes exhausted usage again at the reported reset time', async () => {

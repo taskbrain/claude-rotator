@@ -15,6 +15,7 @@ export const DEFAULT_OAUTH_CONNECT_RETRIES = 3;
 export const DEFAULT_OAUTH_CONNECT_RETRY_DELAY_MS = 250;
 export const DEFAULT_OAUTH_REFRESH_LEAD_MS = 30 * 60 * 1000;
 export const DEFAULT_REFRESH_RESULT_RETENTION_MS = 5 * 60 * 1000;
+export const DEFAULT_TOKEN_REFRESH_RETRY_AFTER_MS = 60_000;
 export const OAUTH_SCOPES = [
   'org:create_api_key',
   'user:profile',
@@ -23,6 +24,20 @@ export const OAUTH_SCOPES = [
   'user:mcp_servers',
   'user:file_upload',
 ].join(' ');
+
+export class OAuthTokenRefreshError extends Error {
+  constructor({ status, code = 'unknown', retryAfterMs = null }) {
+    super(`Token refresh failed (${status}): ${code}`);
+    this.name = 'OAuthTokenRefreshError';
+    this.status = status;
+    this.oauthCode = code;
+    this.retryAfterMs = retryAfterMs;
+  }
+}
+
+export function isOAuthTokenRefreshRateLimit(error) {
+  return error instanceof OAuthTokenRefreshError && error.status === 429;
+}
 
 export function normalizeExpiresAt(expiresAt) {
   if (!expiresAt) return expiresAt;
@@ -83,11 +98,21 @@ export function createSingleFlightTokenRefresher(tokenRefresher, {
       }
       return refreshed;
     } catch (error) {
-      if (entries.get(refreshToken) === entry) {
-        entries.delete(refreshToken);
+      if (entries.get(refreshToken) === entry && !entry.completed) {
+        entry.completed = true;
         try {
           onFailure?.({ context, error });
         } catch {}
+        const retryAfterMs = Math.max(0, Number(error?.retryAfterMs) || 0);
+        if (retryAfterMs > 0) {
+          entry.expiresAt = now() + retryAfterMs;
+          entry.timer = setTimeout(() => {
+            if (entries.get(refreshToken) === entry) entries.delete(refreshToken);
+          }, retryAfterMs);
+          entry.timer.unref?.();
+        } else {
+          entries.delete(refreshToken);
+        }
       }
       throw error;
     }
@@ -120,7 +145,14 @@ export async function refreshAccessToken(refreshToken, options = {}) {
   }, options);
 
   if (!response.ok) {
-    throw new Error(`Token refresh failed (${response.status}): ${await response.text()}`);
+    const body = await response.text();
+    throw new OAuthTokenRefreshError({
+      status: response.status,
+      code: oauthErrorCode(body),
+      retryAfterMs: response.status === 429
+        ? oauthRetryAfterMs(response.headers, body, now())
+        : null,
+    });
   }
 
   return parseTokenResponse(await response.json(), refreshToken, now());
@@ -254,6 +286,41 @@ function normalizeUsageUtilization(value) {
   const number = Number(value);
   if (!Number.isFinite(number)) return value;
   return Math.max(0, Math.min(1, number / 100));
+}
+
+function oauthErrorCode(body) {
+  try {
+    const parsed = JSON.parse(body);
+    const value = parsed?.error?.type || parsed?.error || parsed?.type;
+    if (typeof value === 'string' && /^[A-Za-z0-9_.-]+$/.test(value)) return value;
+  } catch {}
+  return 'unknown';
+}
+
+function oauthRetryAfterMs(headers, body, nowMs) {
+  const retryAfter = responseHeader(headers, 'retry-after');
+  if (retryAfter != null) {
+    const seconds = Number(retryAfter);
+    if (Number.isFinite(seconds) && seconds >= 0) return seconds * 1000;
+    const at = Date.parse(retryAfter);
+    if (Number.isFinite(at)) return Math.max(0, at - nowMs);
+  }
+
+  try {
+    const parsed = JSON.parse(body);
+    const seconds = Number(parsed?.retry_after ?? parsed?.error?.retry_after);
+    if (Number.isFinite(seconds) && seconds >= 0) return seconds * 1000;
+  } catch {}
+  return DEFAULT_TOKEN_REFRESH_RETRY_AFTER_MS;
+}
+
+function responseHeader(headers, name) {
+  if (!headers) return null;
+  if (typeof headers.get === 'function') return headers.get(name);
+  const match = Object.entries(headers)
+    .find(([key]) => key.toLowerCase() === name.toLowerCase());
+  const value = match?.[1];
+  return Array.isArray(value) ? value[0] : value;
 }
 
 export function createPkcePair() {

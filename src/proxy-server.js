@@ -12,6 +12,7 @@ import {
   createSingleFlightTokenRefresher,
   fetchProfile,
   fetchUsage,
+  isOAuthTokenRefreshRateLimit,
   isTokenExpiringSoon,
   refreshAccessToken,
 } from './oauth.js';
@@ -252,6 +253,10 @@ function nextUsageRefreshDelay(status, config, nowMs) {
   if (resetAt != null) {
     delays.push(Math.max(0, resetAt - nowMs) + resetCheckDelayMs);
   }
+  const retryAt = nextTemporaryRetryAt(status);
+  if (retryAt != null) {
+    delays.push(Math.max(0, retryAt - nowMs) + resetCheckDelayMs);
+  }
 
   const intervalMs = usagePollingIntervalMs(config);
   if (intervalMs != null) delays.push(intervalMs);
@@ -290,6 +295,16 @@ function nextExhaustedQuotaResetAt(status) {
   }
   if (resetTimes.length === 0) return null;
   return Math.min(...resetTimes);
+}
+
+function nextTemporaryRetryAt(status) {
+  const retryTimes = [];
+  for (const account of status?.accounts || []) {
+    const retryAt = Date.parse(account.unavailableReason?.retryAt || '');
+    if (Number.isFinite(retryAt)) retryTimes.push(retryAt);
+  }
+  if (retryTimes.length === 0) return null;
+  return Math.min(...retryTimes);
 }
 
 function clampTimerDelay(delayMs) {
@@ -434,7 +449,8 @@ async function refreshAccountUsage({
     return { account: account.id, ok: true };
   } catch (caught) {
     const message = shortErrorMessage(caught);
-    if (isOAuthCredentialError(message)) {
+    const refreshRateLimited = markOAuthRefreshRateLimit(accountManager, account.id, caught);
+    if (!refreshRateLimited && isOAuthCredentialError(message)) {
       accountManager.markError(account.id, 'oauth_refresh_failed', 'OAuth token refresh failed');
     }
     return {
@@ -451,6 +467,13 @@ function rebalanceAfterUsageRefresh(accountManager) {
 
 function isOAuthCredentialError(message) {
   return /OAuth access token is missing|Token refresh failed|Usage fetch failed \(401\)/.test(String(message || ''));
+}
+
+function markOAuthRefreshRateLimit(accountManager, accountId, error) {
+  if (!isOAuthTokenRefreshRateLimit(error)) return false;
+  const retryAfterSeconds = Math.max(1, Math.ceil(error.retryAfterMs / 1000));
+  accountManager.markRateLimited(accountId, retryAfterSeconds);
+  return true;
 }
 
 async function forwardWithRotation({
@@ -526,8 +549,10 @@ async function forwardWithRotation({
         tokenRefresher,
         logger,
       });
-    } catch {
-      accountManager.markError(account.id, 'oauth_refresh_failed', 'OAuth token refresh failed');
+    } catch (caught) {
+      if (!markOAuthRefreshRateLimit(accountManager, account.id, caught)) {
+        accountManager.markError(account.id, 'oauth_refresh_failed', 'OAuth token refresh failed');
+      }
       continue;
     }
 
@@ -555,8 +580,10 @@ async function forwardWithRotation({
           tokenRefresher,
           logger,
         });
-      } catch {
-        accountManager.markError(account.id, 'oauth_refresh_failed', 'OAuth token refresh failed');
+      } catch (caught) {
+        if (!markOAuthRefreshRateLimit(accountManager, account.id, caught)) {
+          accountManager.markError(account.id, 'oauth_refresh_failed', 'OAuth token refresh failed');
+        }
         continue;
       }
       const retryResult = await forwardOnce({
