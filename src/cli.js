@@ -26,6 +26,7 @@ import { readJsonFile, writeJsonFile } from './json-file.js';
 
 const execFileAsync = promisify(execFile);
 const CURRENT_ACCOUNT_ID = 'current';
+const DEFAULT_SHUTDOWN_GRACE_MS = 5_000;
 
 export async function runCli(argv = [], deps = {}) {
   const write = deps.write || (text => process.stdout.write(text));
@@ -205,10 +206,29 @@ async function runServer({ write }) {
 function waitForShutdown(server) {
   return new Promise(resolve => {
     const shutdown = () => {
-      server.close(() => resolve());
+      closeServerWithDeadline(server).then(resolve);
     };
     process.once('SIGINT', shutdown);
     process.once('SIGTERM', shutdown);
+  });
+}
+
+export function closeServerWithDeadline(server, timeoutMs = DEFAULT_SHUTDOWN_GRACE_MS) {
+  return new Promise(resolve => {
+    let settled = false;
+    const finish = () => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      resolve();
+    };
+    const timer = setTimeout(() => {
+      server.closeAllConnections?.();
+      finish();
+    }, timeoutMs);
+
+    server.close(finish);
+    server.closeIdleConnections?.();
   });
 }
 
