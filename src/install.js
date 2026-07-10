@@ -1,4 +1,4 @@
-import { copyFile, mkdir, readFile, rm } from 'node:fs/promises';
+import { copyFile, mkdir, readFile, rm, symlink } from 'node:fs/promises';
 import { dirname, join } from 'node:path';
 
 import { mergeClaudeSettings, restoreClaudeSettings } from './config.js';
@@ -6,6 +6,7 @@ import { fileSha256, readJsonFile, writeJsonFile } from './json-file.js';
 
 export const MACOS_LAUNCH_AGENT_LABEL = 'io.github.claude-rotator';
 export const SERVICE_NODE_OPTIONS = '--dns-result-order=ipv4first';
+export const LINUX_NODE_LAUNCHER_NAME = 'claude-rotator';
 
 export async function installSettings({
   settingsPath,
@@ -54,6 +55,22 @@ export async function uninstallSettings({ settingsPath, installStatePath, force 
 
 export async function removeInstallState(installStatePath) {
   await rm(installStatePath, { force: true });
+}
+
+export function linuxNodeLauncherPath(configPath) {
+  return join(dirname(configPath), 'runtime', LINUX_NODE_LAUNCHER_NAME);
+}
+
+export async function installLinuxNodeLauncher({ nodePath, configPath }) {
+  const launcherPath = linuxNodeLauncherPath(configPath);
+  await mkdir(dirname(launcherPath), { recursive: true });
+  await rm(launcherPath, { force: true });
+  await symlink(nodePath, launcherPath);
+  return launcherPath;
+}
+
+export async function removeLinuxNodeLauncher(configPath) {
+  await rm(linuxNodeLauncherPath(configPath), { force: true });
 }
 
 export function renderLaunchAgentPlist({ nodePath, cliPath, configPath }) {

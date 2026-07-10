@@ -13,12 +13,14 @@ import { renderStatus } from './monitor.js';
 import { readCurrentClaudeCredentials } from './claude-credentials.js';
 import { fetchProfile, isTokenExpiringSoon, refreshAccessToken } from './oauth.js';
 import {
+  installLinuxNodeLauncher,
   installSettings,
   MACOS_LAUNCH_AGENT_LABEL,
   renderLaunchAgentPlist,
   renderServiceStartFailureMessage,
   renderSystemdUserService,
   removeInstallState,
+  removeLinuxNodeLauncher,
   uninstallSettings,
 } from './install.js';
 import { appConfigDir, backupDir, claudeSettingsPath, installStatePath, runtimeStatePath } from './paths.js';
@@ -267,6 +269,7 @@ async function installCommand({ argv, write }) {
 
 async function uninstallCommand({ argv, write }) {
   const home = homedir();
+  const configPath = getConfigPath();
   const statePath = installStatePath(process.env, home);
   const settingsPath = claudeSettingsPath(home);
   const force = argv.includes('--force');
@@ -274,7 +277,7 @@ async function uninstallCommand({ argv, write }) {
   await stopService().catch(() => {});
   const result = await uninstallSettings({ settingsPath, installStatePath: statePath, force });
   if (result.conflict) throw new Error(result.reason);
-  await removeServiceFile();
+  await removeServiceFile({ configPath });
   await removeInstallState(statePath);
   if (purgeSecrets) await createSecretStore().purge();
   write('Uninstalled claude-rotator\n');
@@ -612,16 +615,19 @@ async function installServiceFile({ configPath }) {
     await writeFile(path, renderLaunchAgentPlist({ nodePath: process.execPath, cliPath, configPath }), 'utf8');
     return;
   }
+  const nodePath = await installLinuxNodeLauncher({ nodePath: process.execPath, configPath });
+  const service = renderSystemdUserService({ nodePath, cliPath, configPath });
   const path = join(appConfigDir(), 'claude-rotator.service');
   await mkdir(dirname(path), { recursive: true });
-  await writeFile(path, renderSystemdUserService({ nodePath: process.execPath, cliPath, configPath }), 'utf8');
+  await writeFile(path, service, 'utf8');
   await mkdir(join(homedir(), '.config', 'systemd', 'user'), { recursive: true });
-  await writeFile(join(homedir(), '.config', 'systemd', 'user', 'claude-rotator.service'), renderSystemdUserService({ nodePath: process.execPath, cliPath, configPath }), 'utf8');
+  await writeFile(join(homedir(), '.config', 'systemd', 'user', 'claude-rotator.service'), service, 'utf8');
 }
 
-async function removeServiceFile() {
+async function removeServiceFile({ configPath }) {
   await rm(macosLaunchAgentPath(MACOS_LAUNCH_AGENT_LABEL), { force: true });
   await rm(join(homedir(), '.config', 'systemd', 'user', 'claude-rotator.service'), { force: true });
+  await removeLinuxNodeLauncher(configPath);
 }
 
 export async function startService({

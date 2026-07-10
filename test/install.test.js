@@ -1,11 +1,14 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtemp, readFile } from 'node:fs/promises';
+import { lstat, mkdtemp, readFile, readlink } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
 import {
+  installLinuxNodeLauncher,
   installSettings,
+  linuxNodeLauncherPath,
+  removeLinuxNodeLauncher,
   uninstallSettings,
   renderLaunchAgentPlist,
   renderSystemdUserService,
@@ -68,6 +71,23 @@ describe('installSettings and uninstallSettings', () => {
 });
 
 describe('service file rendering', () => {
+  it('creates a Linux Node launcher with a stable process name', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'claude-rotator-launcher-'));
+    const configPath = join(dir, 'config.json');
+    const launcherPath = await installLinuxNodeLauncher({
+      nodePath: '/usr/bin/node',
+      configPath,
+    });
+
+    assert.equal(launcherPath, join(dir, 'runtime', 'claude-rotator'));
+    assert.equal(launcherPath, linuxNodeLauncherPath(configPath));
+    assert.equal((await lstat(launcherPath)).isSymbolicLink(), true);
+    assert.equal(await readlink(launcherPath), '/usr/bin/node');
+
+    await removeLinuxNodeLauncher(configPath);
+    await assert.rejects(lstat(launcherPath), { code: 'ENOENT' });
+  });
+
   it('renders a macOS LaunchAgent plist', () => {
     const plist = renderLaunchAgentPlist({
       nodePath: '/opt/homebrew/bin/node',
@@ -84,13 +104,14 @@ describe('service file rendering', () => {
   });
 
   it('renders a Linux systemd user service', () => {
+    const configPath = '/home/alice/.config/claude-rotator/config.json';
     const service = renderSystemdUserService({
-      nodePath: '/usr/bin/node',
+      nodePath: linuxNodeLauncherPath(configPath),
       cliPath: '/repo/bin/claude-rotator.js',
-      configPath: '/home/alice/.config/claude-rotator/config.json',
+      configPath,
     });
 
-    assert.match(service, /ExecStart=\/usr\/bin\/node \/repo\/bin\/claude-rotator\.js server/);
+    assert.match(service, /ExecStart=\/home\/alice\/\.config\/claude-rotator\/runtime\/claude-rotator \/repo\/bin\/claude-rotator\.js server/);
     assert.match(service, /Environment=CLAUDE_ROTATOR_CONFIG=\/home\/alice\/.config\/claude-rotator\/config.json/);
     assert.match(service, /Environment=NODE_OPTIONS=--dns-result-order=ipv4first/);
     assert.match(service, /StandardOutput=append:\/home\/alice\/.config\/claude-rotator\/server\.log/);
