@@ -13,6 +13,8 @@ export const DEFAULT_OAUTH_REQUEST_TIMEOUT_MS = 60_000;
 export const DEFAULT_OAUTH_CONNECT_TIMEOUT_MS = 10_000;
 export const DEFAULT_OAUTH_CONNECT_RETRIES = 3;
 export const DEFAULT_OAUTH_CONNECT_RETRY_DELAY_MS = 250;
+export const DEFAULT_OAUTH_REFRESH_LEAD_MS = 30 * 60 * 1000;
+export const DEFAULT_REFRESH_RESULT_RETENTION_MS = 5 * 60 * 1000;
 export const OAUTH_SCOPES = [
   'org:create_api_key',
   'user:profile',
@@ -27,9 +29,69 @@ export function normalizeExpiresAt(expiresAt) {
   return expiresAt < 1e12 ? expiresAt * 1000 : expiresAt;
 }
 
-export function isTokenExpiringSoon(expiresAt, now = Date.now(), thresholdMs = 5 * 60 * 1000) {
+export function isTokenExpiringSoon(expiresAt, now = Date.now(), thresholdMs = DEFAULT_OAUTH_REFRESH_LEAD_MS) {
   if (!expiresAt) return false;
   return now + thresholdMs >= normalizeExpiresAt(expiresAt);
+}
+
+export function createSingleFlightTokenRefresher(tokenRefresher, {
+  retentionMs = DEFAULT_REFRESH_RESULT_RETENTION_MS,
+  now = Date.now,
+  onSuccess = null,
+  onFailure = null,
+} = {}) {
+  const entries = new Map();
+
+  return async (refreshToken, context = null) => {
+    const existing = entries.get(refreshToken);
+    if (existing && existing.expiresAt > now()) return existing.promise;
+    if (existing) {
+      if (existing.timer) clearTimeout(existing.timer);
+      entries.delete(refreshToken);
+    }
+
+    const entry = {
+      completed: false,
+      expiresAt: Number.POSITIVE_INFINITY,
+      promise: Promise.resolve().then(() => tokenRefresher(refreshToken)),
+      timer: null,
+    };
+    entries.set(refreshToken, entry);
+
+    try {
+      const refreshed = await entry.promise;
+      if (entries.get(refreshToken) === entry && !entry.completed) {
+        entry.completed = true;
+        const retainedForMs = Math.max(0, Number(retentionMs) || 0);
+        entry.expiresAt = now() + retainedForMs;
+        entry.promise = Promise.resolve(refreshed);
+        if (retainedForMs > 0) {
+          entry.timer = setTimeout(() => {
+            if (entries.get(refreshToken) === entry) entries.delete(refreshToken);
+          }, retainedForMs);
+          entry.timer.unref?.();
+        } else {
+          entries.delete(refreshToken);
+        }
+        try {
+          onSuccess?.({
+            context,
+            refreshed,
+            rotated: refreshed.refreshToken !== refreshToken,
+          });
+        } catch {}
+      }
+      return refreshed;
+    } catch (error) {
+      if (entries.get(refreshToken) === entry) {
+        entries.delete(refreshToken);
+        try {
+          onFailure?.({ context, error });
+        } catch {}
+      }
+      throw error;
+    }
+  };
 }
 
 export function parseTokenResponse(data, previousRefreshToken, now = Date.now()) {

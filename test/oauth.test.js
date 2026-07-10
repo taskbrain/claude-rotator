@@ -4,6 +4,7 @@ import { EventEmitter } from 'node:events';
 import https from 'node:https';
 
 import {
+  createSingleFlightTokenRefresher,
   normalizeExpiresAt,
   isTokenExpiringSoon,
   parseTokenResponse,
@@ -13,6 +14,7 @@ import {
   DEFAULT_OAUTH_CONNECT_RETRY_DELAY_MS,
   DEFAULT_OAUTH_CONNECT_TIMEOUT_MS,
   DEFAULT_OAUTH_REQUEST_TIMEOUT_MS,
+  DEFAULT_OAUTH_REFRESH_LEAD_MS,
   OAUTH_USER_AGENT,
   parseUsageResponse,
   createAuthorizationUrl,
@@ -30,9 +32,69 @@ describe('OAuth time helpers', () => {
     assert.equal(isTokenExpiringSoon(now + 2000, now, 3000), true);
     assert.equal(isTokenExpiringSoon(now + 10_000, now, 3000), false);
   });
+
+  it('starts refreshing early enough for the polling interval', () => {
+    const now = 1780580000000;
+
+    assert.equal(isTokenExpiringSoon(now + DEFAULT_OAUTH_REFRESH_LEAD_MS - 1, now), true);
+    assert.equal(isTokenExpiringSoon(now + DEFAULT_OAUTH_REFRESH_LEAD_MS + 1, now), false);
+  });
 });
 
 describe('token refresh', () => {
+  it('coalesces concurrent refreshes and retains the rotated result for late callers', async () => {
+    let calls = 0;
+    const successCallbacks = [];
+    let now = 1000;
+    const coordinated = createSingleFlightTokenRefresher(async refreshToken => {
+      calls += 1;
+      await new Promise(resolve => setImmediate(resolve));
+      return {
+        accessToken: `access-${calls}`,
+        refreshToken: `${refreshToken}-rotated-${calls}`,
+      };
+    }, {
+      retentionMs: 60_000,
+      now: () => now,
+      onSuccess: ({ context, rotated }) => {
+        successCallbacks.push({ context, rotated });
+      },
+    });
+
+    const [first, second] = await Promise.all([
+      coordinated('refresh-1', { accountId: 'acct-1' }),
+      coordinated('refresh-1'),
+    ]);
+    const late = await coordinated('refresh-1');
+
+    assert.equal(calls, 1);
+    assert.deepEqual(successCallbacks, [{ context: { accountId: 'acct-1' }, rotated: true }]);
+    assert.deepEqual(second, first);
+    assert.deepEqual(late, first);
+
+    now += 60_001;
+    const afterRetention = await coordinated('refresh-1');
+    assert.equal(calls, 2);
+    assert.equal(successCallbacks.length, 2);
+    assert.equal(afterRetention.refreshToken, 'refresh-1-rotated-2');
+  });
+
+  it('does not retain failed refresh attempts', async () => {
+    let calls = 0;
+    const coordinated = createSingleFlightTokenRefresher(async () => {
+      calls += 1;
+      if (calls === 1) throw new Error('temporary failure');
+      return { accessToken: 'recovered', refreshToken: 'refresh-2' };
+    });
+
+    await assert.rejects(coordinated('refresh-1'), /temporary failure/);
+    assert.deepEqual(await coordinated('refresh-1'), {
+      accessToken: 'recovered',
+      refreshToken: 'refresh-2',
+    });
+    assert.equal(calls, 2);
+  });
+
   it('parses token endpoint responses', () => {
     const parsed = parseTokenResponse({
       access_token: 'access2',

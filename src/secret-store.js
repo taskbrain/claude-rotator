@@ -1,9 +1,10 @@
 import { execFile } from 'node:child_process';
-import { mkdir, readdir, readFile, rm, writeFile } from 'node:fs/promises';
+import { mkdir, readdir, readFile, rm } from 'node:fs/promises';
 import { join } from 'node:path';
 import { promisify } from 'node:util';
 
 import { linuxAccountsDir } from './paths.js';
+import { writeJsonFile } from './json-file.js';
 
 const execFileAsync = promisify(execFile);
 const ID_RE = /^[A-Za-z0-9._@-]+$/;
@@ -57,9 +58,7 @@ export class LinuxFileSecretStore {
 
   async set(accountId, secret) {
     await mkdir(this.accountsDir, { recursive: true, mode: 0o700 });
-    await writeFile(this.secretPath(accountId), `${JSON.stringify(secret, null, 2)}\n`, {
-      mode: 0o600,
-    });
+    await writeJsonFile(this.secretPath(accountId), secret, 0o600);
   }
 
   async get(accountId) {

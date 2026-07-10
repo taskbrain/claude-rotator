@@ -8,7 +8,13 @@ import {
   DEFAULT_USAGE_REFRESH_CONCURRENCY,
   DEFAULT_USAGE_REFRESH_REQUEST_SPACING_MS,
 } from './config.js';
-import { fetchProfile, fetchUsage, isTokenExpiringSoon, refreshAccessToken } from './oauth.js';
+import {
+  createSingleFlightTokenRefresher,
+  fetchProfile,
+  fetchUsage,
+  isTokenExpiringSoon,
+  refreshAccessToken,
+} from './oauth.js';
 
 const HOP_HEADERS = new Set([
   'host',
@@ -54,11 +60,19 @@ export function createProxyServer({
   const upstreamConnectRetryDelayMs = config.proxy?.upstreamConnectRetryDelayMs
     ?? config.upstreamConnectRetryDelayMs
     ?? DEFAULT_UPSTREAM_CONNECT_RETRY_DELAY_MS;
+  const coordinatedTokenRefresher = createSingleFlightTokenRefresher(tokenRefresher, {
+    onSuccess({ context, refreshed, rotated }) {
+      logger?.(`${new Date().toISOString()} credential-refresh account=${context?.accountId || 'unknown'} result=success rotated=${rotated} expiresAt=${formatCredentialExpiry(refreshed.expiresAt)}`);
+    },
+    onFailure({ context, error }) {
+      logger?.(`${new Date().toISOString()} credential-refresh account=${context?.accountId || 'unknown'} result=failed errorType=${credentialRefreshErrorType(error)}`);
+    },
+  });
 
   const usageRefresher = createUsageRefresher({
     accountManager,
     secretStore,
-    tokenRefresher,
+    tokenRefresher: coordinatedTokenRefresher,
     currentCredentialReader,
     currentProfileFetcher,
     usageFetcher,
@@ -69,6 +83,7 @@ export function createProxyServer({
     },
     usageRefreshConcurrency: usagePollingConcurrency(config, accountManager.accounts.length),
     usageRefreshRequestSpacingMs: usagePollingRequestSpacingMs(config),
+    logger,
   });
   const usageScheduler = createUsageRefreshScheduler({
     config,
@@ -111,6 +126,7 @@ export function createProxyServer({
       }
 
       if (req.method === 'POST' && req.url === '/internal/reload') {
+        invalidateLiveClaudeCodeCache();
         if (reloadAccounts) {
           const accounts = await reloadAccounts();
           accountManager.replaceAccounts(accounts);
@@ -148,7 +164,7 @@ export function createProxyServer({
         upstream,
         accountManager,
         secretStore,
-        tokenRefresher,
+        tokenRefresher: coordinatedTokenRefresher,
         currentCredentialReader,
         currentProfileFetcher,
         logger,
@@ -291,6 +307,7 @@ function createUsageRefresher({
   usageRequestOptions,
   usageRefreshConcurrency,
   usageRefreshRequestSpacingMs,
+  logger,
 }) {
   let inFlight = null;
   let attempted = false;
@@ -306,6 +323,7 @@ function createUsageRefresher({
       usageRequestOptions,
       usageRefreshConcurrency,
       usageRefreshRequestSpacingMs,
+      logger,
     }).finally(() => {
       attempted = true;
       inFlight = null;
@@ -328,6 +346,7 @@ async function refreshAllOnce({
   usageRequestOptions,
   usageRefreshConcurrency,
   usageRefreshRequestSpacingMs,
+  logger,
 }) {
   const results = await mapWithConcurrency(
     accountManager.accounts,
@@ -342,6 +361,7 @@ async function refreshAllOnce({
       currentProfileFetcher,
       usageFetcher,
       usageRequestOptions,
+      logger,
     }),
   );
   rebalanceAfterUsageRefresh(accountManager);
@@ -389,6 +409,7 @@ async function refreshAccountUsage({
   currentProfileFetcher,
   usageFetcher,
   usageRequestOptions,
+  logger,
 }) {
   if (account.type === 'apikey') return { account: account.id, ok: true, skipped: 'apikey' };
 
@@ -398,6 +419,7 @@ async function refreshAccountUsage({
       secretStore,
       currentCredentialReader,
       currentProfileFetcher,
+      logger,
     });
     if (!secret?.accessToken) throw new Error('OAuth access token is missing');
     const freshSecret = await refreshSecretIfExpiring({
@@ -405,6 +427,7 @@ async function refreshAccountUsage({
       secret,
       secretStore,
       tokenRefresher,
+      logger,
     });
     const usage = await usageFetcher(freshSecret.accessToken, usageRequestOptions);
     accountManager.applyUsage(account.id, usage);
@@ -487,6 +510,7 @@ async function forwardWithRotation({
       secretStore,
       currentCredentialReader,
       currentProfileFetcher,
+      logger,
     });
     if (!secret) {
       accountManager.markError(account.id, 'credential_missing', 'No stored credential for account');
@@ -500,6 +524,7 @@ async function forwardWithRotation({
         secret,
         secretStore,
         tokenRefresher,
+        logger,
       });
     } catch {
       accountManager.markError(account.id, 'oauth_refresh_failed', 'OAuth token refresh failed');
@@ -528,6 +553,7 @@ async function forwardWithRotation({
           secret: freshSecret,
           secretStore,
           tokenRefresher,
+          logger,
         });
       } catch {
         accountManager.markError(account.id, 'oauth_refresh_failed', 'OAuth token refresh failed');
@@ -626,6 +652,7 @@ async function forwardCurrentUnavailableAccount({
     secretStore,
     currentCredentialReader,
     currentProfileFetcher,
+    logger,
   });
   if (!secret) return false;
 
@@ -636,6 +663,7 @@ async function forwardCurrentUnavailableAccount({
       secret,
       secretStore,
       tokenRefresher,
+      logger,
     });
   } catch {
     freshSecret = secret;
@@ -659,17 +687,29 @@ async function forwardCurrentUnavailableAccount({
   return true;
 }
 
-async function refreshSecretIfExpiring({ account, secret, secretStore, tokenRefresher }) {
+async function refreshSecretIfExpiring({ account, secret, secretStore, tokenRefresher, logger }) {
   if (!canRefreshSecret(account, secret)) return secret;
   if (!isTokenExpiringSoon(secret.expiresAt)) return secret;
-  return refreshAndStoreSecret({ account, secret, secretStore, tokenRefresher });
+  return refreshAndStoreSecret({ account, secret, secretStore, tokenRefresher, logger });
 }
 
-async function refreshAndStoreSecret({ account, secret, secretStore, tokenRefresher }) {
-  const refreshed = await tokenRefresher(secret.refreshToken);
+async function refreshAndStoreSecret({ account, secret, secretStore, tokenRefresher, logger }) {
+  const refreshed = await tokenRefresher(secret.refreshToken, { accountId: account.id });
   const nextSecret = { ...secret, ...refreshed };
-  await secretStore.set(account.id, nextSecret);
+  try {
+    await secretStore.set(account.id, nextSecret);
+  } catch (error) {
+    logger?.(`${new Date().toISOString()} credential-store account=${account.id} result=failed errorType=${error?.code || error?.name || 'unknown'}`);
+    throw error;
+  }
   return nextSecret;
+}
+
+function credentialRefreshErrorType(error) {
+  const message = String(error?.message || '');
+  if (/invalid_grant/i.test(message)) return 'invalid_grant';
+  const status = message.match(/Token refresh failed \((\d+)\)/)?.[1];
+  return status ? `http-${status}` : (error?.code || error?.name || 'unknown');
 }
 
 function canRefreshSecret(account, secret) {
@@ -682,6 +722,7 @@ async function resolveSecretForAccount({
   secretStore,
   currentCredentialReader,
   currentProfileFetcher,
+  logger,
 }) {
   if (account.type === 'apikey') return secretStore.get(account.id);
   if (account.id === 'current' || account.credentialSource === 'claude-code-current') {
@@ -695,8 +736,58 @@ async function resolveSecretForAccount({
     currentCredentialReader,
     currentProfileFetcher,
   }).catch(() => null);
-  if (current?.profile?.accountUuid !== account.accountUuid) return stored;
+  const matchesStoredCredential = Boolean(
+    current?.secret
+    && stored
+    && (
+      stored.accessToken === current.secret.accessToken
+      || stored.refreshToken === current.secret.refreshToken
+    )
+  );
+  if (!matchesStoredCredential && current?.profile?.accountUuid !== account.accountUuid) return stored;
+  await mirrorLiveClaudeCodeCredential({
+    account,
+    stored,
+    live: current.secret,
+    secretStore,
+    logger,
+  });
   return current.secret;
+}
+
+async function mirrorLiveClaudeCodeCredential({ account, stored, live, secretStore, logger }) {
+  if (!live?.accessToken || !live.refreshToken) return;
+  if (
+    stored?.accessToken === live.accessToken
+    && stored?.refreshToken === live.refreshToken
+    && normalizeCredentialExpiry(stored?.expiresAt) === normalizeCredentialExpiry(live.expiresAt)
+  ) return;
+
+  const mirrored = {
+    ...(stored || {}),
+    accessToken: live.accessToken,
+    refreshToken: live.refreshToken,
+    expiresAt: live.expiresAt,
+  };
+  delete mirrored.liveClaudeCodeCredential;
+
+  try {
+    await secretStore.set(account.id, mirrored);
+    logger?.(`${new Date().toISOString()} credential-sync account=${account.id} source=claude-code-current expiresAt=${formatCredentialExpiry(live.expiresAt)}`);
+  } catch (error) {
+    logger?.(`${new Date().toISOString()} credential-sync-failed account=${account.id} error=${shortErrorMessage(error)}`);
+  }
+}
+
+function normalizeCredentialExpiry(expiresAt) {
+  const value = Number(expiresAt);
+  if (!Number.isFinite(value)) return null;
+  return value < 1e12 ? value * 1000 : value;
+}
+
+function formatCredentialExpiry(expiresAt) {
+  const value = normalizeCredentialExpiry(expiresAt);
+  return value == null ? 'unknown' : new Date(value).toISOString();
 }
 
 async function liveClaudeCodeSecret(currentCredentialReader) {
@@ -708,6 +799,10 @@ async function liveClaudeCodeSecret(currentCredentialReader) {
 
 const LIVE_CLAUDE_CODE_CACHE_TTL_MS = 60_000;
 let liveClaudeCodeCache = null;
+
+function invalidateLiveClaudeCodeCache() {
+  liveClaudeCodeCache = null;
+}
 
 async function liveClaudeCodeCredentialWithProfile({
   currentCredentialReader,
@@ -724,7 +819,12 @@ async function liveClaudeCodeCredentialWithProfile({
   }
 
   const secret = await liveClaudeCodeSecret(currentCredentialReader);
-  const profile = secret.accessToken ? await currentProfileFetcher(secret.accessToken) : null;
+  let profile = null;
+  if (secret.accessToken) {
+    try {
+      profile = await currentProfileFetcher(secret.accessToken);
+    } catch {}
+  }
   const value = { secret, profile };
   liveClaudeCodeCache = {
     currentCredentialReader,
@@ -788,6 +888,9 @@ async function forwardOnce({
           if (canRefreshSecret(account, secret)) {
             outcome = 'auth-refresh-retry';
             return false;
+          } else if (secret.liveClaudeCodeCredential) {
+            outcome = 'auth-live-reload';
+            invalidateLiveClaudeCodeCache();
           } else {
             outcome = 'auth-account-passthrough';
             accountManager.markError(account.id, 'authentication_error', 'OAuth token rejected');

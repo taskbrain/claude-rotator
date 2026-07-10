@@ -117,6 +117,68 @@ describe('createProxyServer', () => {
     await close(upstream.server);
   });
 
+  it('refreshes an expired OAuth token only once for concurrent requests', async () => {
+    const upstreamSeen = [];
+    const logLines = [];
+    const upstream = await listen(http.createServer(async (req, res) => {
+      upstreamSeen.push(req.headers.authorization);
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ ok: true }));
+    }));
+
+    const secretStore = new MemorySecretStore();
+    await secretStore.set('acct_1', {
+      accessToken: 'expired-token',
+      refreshToken: 'refresh-token-1',
+      expiresAt: 900,
+    });
+    const accountManager = new AccountManager({
+      accounts: [{ id: 'acct_1', name: 'a@example.com', type: 'oauth' }],
+      now: () => 1000,
+    });
+    let refreshCalls = 0;
+    const proxy = await listen(createProxyServer({
+      accountManager,
+      secretStore,
+      config: { upstream: upstream.url },
+      tokenRefresher: async () => {
+        refreshCalls += 1;
+        await new Promise(resolve => setTimeout(resolve, 10));
+        return {
+          accessToken: 'fresh-token',
+          refreshToken: 'refresh-token-2',
+          expiresAt: Date.now() + 60 * 60 * 1000,
+        };
+      },
+      logger: line => logLines.push(line),
+    }));
+    cleanupAfterTest(async () => {
+      await close(proxy.server);
+      await close(upstream.server);
+    });
+
+    const responses = await Promise.all([
+      requestJson(`${proxy.url}/v1/messages`, {
+        method: 'POST',
+        body: JSON.stringify({ model: 'sonnet', request: 1 }),
+      }),
+      requestJson(`${proxy.url}/v1/messages`, {
+        method: 'POST',
+        body: JSON.stringify({ model: 'sonnet', request: 2 }),
+      }),
+    ]);
+
+    assert.deepEqual(responses.map(response => response.status), [200, 200]);
+    assert.equal(refreshCalls, 1);
+    assert.deepEqual(upstreamSeen, ['Bearer fresh-token', 'Bearer fresh-token']);
+    assert.equal((await secretStore.get('acct_1')).refreshToken, 'refresh-token-2');
+    const refreshLogs = logLines.filter(line => line.includes('credential-refresh'));
+    assert.equal(refreshLogs.length, 1);
+    assert.match(refreshLogs[0], /account=acct_1 result=success rotated=true/);
+    assert.equal(refreshLogs[0].includes('refresh-token'), false);
+    assert.equal(refreshLogs[0].includes('fresh-token'), false);
+  });
+
   it('uses live Claude Code credentials for the current account', async () => {
     const upstreamSeen = [];
     const upstream = await listen(http.createServer(async (req, res) => {
@@ -177,6 +239,7 @@ describe('createProxyServer', () => {
       accounts: [{ id: 'acct_1', name: 'a@example.com', type: 'oauth', accountUuid: 'uuid-live' }],
       now: () => 1000,
     });
+    const liveExpiresAt = Date.now() + 60 * 60 * 1000;
     const proxy = await listen(createProxyServer({
       accountManager,
       secretStore,
@@ -187,7 +250,7 @@ describe('createProxyServer', () => {
       currentCredentialReader: async () => ({
         accessToken: 'live-claude-code-token',
         refreshToken: 'live-claude-code-refresh',
-        expiresAt: Date.now() + 60 * 60 * 1000,
+        expiresAt: liveExpiresAt,
       }),
       currentProfileFetcher: async accessToken => {
         assert.equal(accessToken, 'live-claude-code-token');
@@ -206,6 +269,11 @@ describe('createProxyServer', () => {
 
     assert.equal(response.status, 200);
     assert.deepEqual(upstreamSeen, ['Bearer live-claude-code-token']);
+    assert.deepEqual(await secretStore.get('acct_1'), {
+      accessToken: 'live-claude-code-token',
+      refreshToken: 'live-claude-code-refresh',
+      expiresAt: liveExpiresAt,
+    });
   });
 
   it('records proxy request diagnostics without secrets', async () => {
@@ -314,10 +382,15 @@ describe('createProxyServer', () => {
     });
   });
 
-  it('passes through a non-refreshable OAuth rejection without switching accounts', async () => {
+  it('reloads a live Claude Code credential after an OAuth rejection', async () => {
     const upstreamSeen = [];
     const upstream = await listen(http.createServer(async (req, res) => {
       upstreamSeen.push(req.headers.authorization);
+      if (req.headers.authorization === 'Bearer fresh-current-token') {
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ ok: true }));
+        return;
+      }
       res.writeHead(401, { 'Content-Type': 'application/json', 'request-id': 'req_current_401' });
       res.end(JSON.stringify({
         type: 'error',
@@ -338,15 +411,19 @@ describe('createProxyServer', () => {
       ],
       now: () => 1000,
     });
+    let currentToken = 'stale-current-token';
     const proxy = await listen(createProxyServer({
       accountManager,
       secretStore,
       config: { upstream: upstream.url },
       currentCredentialReader: async () => ({
-        accessToken: 'live-current-token',
+        accessToken: currentToken,
         refreshToken: 'live-current-refresh',
         expiresAt: Date.now() + 60 * 60 * 1000,
       }),
+      tokenRefresher: async () => {
+        throw new Error('live Claude Code credentials must not be refreshed by the rotator');
+      },
     }));
     cleanupAfterTest(async () => {
       await close(proxy.server);
@@ -360,12 +437,15 @@ describe('createProxyServer', () => {
       type: 'error',
       error: { type: 'authentication_error', message: 'Invalid authentication credentials' },
     });
-    assert.deepEqual(upstreamSeen, ['Bearer live-current-token']);
+    assert.deepEqual(upstreamSeen, ['Bearer stale-current-token']);
     assert.equal(accountManager.getStatus().currentAccount, 'current');
-    assert.deepEqual(accountManager.getStatus().accounts[0].unavailableReason, {
-      type: 'authentication_error',
-      message: 'OAuth token rejected',
-    });
+    assert.equal(accountManager.getStatus().accounts[0].unavailableReason, null);
+
+    currentToken = 'fresh-current-token';
+    const retried = await requestJson(`${proxy.url}/api/oauth/profile`);
+    assert.equal(retried.status, 200);
+    assert.deepEqual(retried.body, { ok: true });
+    assert.deepEqual(upstreamSeen, ['Bearer stale-current-token', 'Bearer fresh-current-token']);
   });
 
   it('switches to the emptiest known account when the current account reaches quota', async () => {
