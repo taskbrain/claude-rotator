@@ -1801,6 +1801,12 @@ describe('createProxyServer', () => {
       accounts: [{ id: 'acct_1', name: 'a@example.com', type: 'oauth' }],
       now: () => Date.now(),
     });
+    accountManager.applyUsage('acct_1', {
+      seven_day: {
+        utilization: 1,
+        resets_at: new Date(Date.now() + 60 * 60 * 1000).toISOString(),
+      },
+    });
     let refreshCalls = 0;
     const proxy = await listen(createProxyServer({
       accountManager,
@@ -1839,8 +1845,8 @@ describe('createProxyServer', () => {
     });
 
     const first = await requestJson(`${proxy.url}/internal/status`);
-    assert.equal(first.body.accounts[0].status, 'throttled');
-    assert.equal(first.body.accounts[0].unavailableReason.type, 'temporary_throttle');
+    assert.equal(first.body.accounts[0].status, 'exhausted');
+    assert.notEqual(first.body.accounts[0].rateLimitedUntil, null);
 
     await waitForStatus(() => refreshCalls, calls => calls >= 2, 3000);
     const recovered = await requestJson(`${proxy.url}/internal/status`);

@@ -300,7 +300,7 @@ function nextExhaustedQuotaResetAt(status) {
 function nextTemporaryRetryAt(status) {
   const retryTimes = [];
   for (const account of status?.accounts || []) {
-    const retryAt = Date.parse(account.unavailableReason?.retryAt || '');
+    const retryAt = Date.parse(account.rateLimitedUntil || account.unavailableReason?.retryAt || '');
     if (Number.isFinite(retryAt)) retryTimes.push(retryAt);
   }
   if (retryTimes.length === 0) return null;
