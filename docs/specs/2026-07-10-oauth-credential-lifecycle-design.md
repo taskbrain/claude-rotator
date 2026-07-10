@@ -41,7 +41,8 @@ interrupted write can leave invalid JSON.
   token after a successful rotation.
 - Treat token-endpoint 429 responses as temporary throttles. Retain the
   `Retry-After` deadline, suppress duplicate refresh calls during that window,
-  and schedule a credential retry when the cooldown expires.
+  and schedule a credential retry when the cooldown expires. Repeated 429s use
+  exponential backoff capped at 15 minutes.
 - Invalidate the short-lived live-credential cache after a 401. Claude Code
   receives the 401 and remains responsible for refreshing its own credential;
   the next request reloads the Keychain or credentials file immediately.

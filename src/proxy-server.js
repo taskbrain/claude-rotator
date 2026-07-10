@@ -66,7 +66,10 @@ export function createProxyServer({
       logger?.(`${new Date().toISOString()} credential-refresh account=${context?.accountId || 'unknown'} result=success rotated=${rotated} expiresAt=${formatCredentialExpiry(refreshed.expiresAt)}`);
     },
     onFailure({ context, error }) {
-      logger?.(`${new Date().toISOString()} credential-refresh account=${context?.accountId || 'unknown'} result=failed errorType=${credentialRefreshErrorType(error)}`);
+      const retry = error?.retryAfterMs
+        ? ` retryAfterSec=${Math.ceil(error.retryAfterMs / 1000)}`
+        : '';
+      logger?.(`${new Date().toISOString()} credential-refresh account=${context?.accountId || 'unknown'} result=failed errorType=${credentialRefreshErrorType(error)}${retry}`);
     },
   });
 

@@ -16,6 +16,7 @@ export const DEFAULT_OAUTH_CONNECT_RETRY_DELAY_MS = 250;
 export const DEFAULT_OAUTH_REFRESH_LEAD_MS = 30 * 60 * 1000;
 export const DEFAULT_REFRESH_RESULT_RETENTION_MS = 5 * 60 * 1000;
 export const DEFAULT_TOKEN_REFRESH_RETRY_AFTER_MS = 60_000;
+export const DEFAULT_MAX_TOKEN_REFRESH_BACKOFF_MS = 15 * 60 * 1000;
 export const OAUTH_SCOPES = [
   'org:create_api_key',
   'user:profile',
@@ -54,8 +55,14 @@ export function createSingleFlightTokenRefresher(tokenRefresher, {
   now = Date.now,
   onSuccess = null,
   onFailure = null,
+  maxRateLimitBackoffMs = DEFAULT_MAX_TOKEN_REFRESH_BACKOFF_MS,
 } = {}) {
   const entries = new Map();
+  const rateLimitAttempts = new Map();
+  const maxBackoffMs = Math.max(
+    1,
+    Number(maxRateLimitBackoffMs) || DEFAULT_MAX_TOKEN_REFRESH_BACKOFF_MS,
+  );
 
   return async (refreshToken, context = null) => {
     const existing = entries.get(refreshToken);
@@ -77,6 +84,7 @@ export function createSingleFlightTokenRefresher(tokenRefresher, {
       const refreshed = await entry.promise;
       if (entries.get(refreshToken) === entry && !entry.completed) {
         entry.completed = true;
+        rateLimitAttempts.delete(refreshToken);
         const retainedForMs = Math.max(0, Number(retentionMs) || 0);
         entry.expiresAt = now() + retainedForMs;
         entry.promise = Promise.resolve(refreshed);
@@ -100,6 +108,17 @@ export function createSingleFlightTokenRefresher(tokenRefresher, {
     } catch (error) {
       if (entries.get(refreshToken) === entry && !entry.completed) {
         entry.completed = true;
+        const requestedRetryAfterMs = Math.max(0, Number(error?.retryAfterMs) || 0);
+        if (requestedRetryAfterMs > 0) {
+          const attempt = (rateLimitAttempts.get(refreshToken) || 0) + 1;
+          rateLimitAttempts.set(refreshToken, attempt);
+          error.retryAfterMs = Math.min(
+            maxBackoffMs,
+            Math.max(requestedRetryAfterMs, 1) * (2 ** Math.min(attempt - 1, 30)),
+          );
+        } else {
+          rateLimitAttempts.delete(refreshToken);
+        }
         try {
           onFailure?.({ context, error });
         } catch {}

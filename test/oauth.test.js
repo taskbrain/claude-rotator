@@ -114,8 +114,19 @@ describe('token refresh', () => {
     assert.equal(calls, 1);
 
     now += 10_001;
+    await assert.rejects(
+      coordinated('refresh-1'),
+      error => error.status === 429 && error.retryAfterMs === 20_000,
+    );
     await assert.rejects(coordinated('refresh-1'), { status: 429 });
     assert.equal(calls, 2);
+
+    now += 20_001;
+    await assert.rejects(
+      coordinated('refresh-1'),
+      error => error.status === 429 && error.retryAfterMs === 40_000,
+    );
+    assert.equal(calls, 3);
   });
 
   it('parses token endpoint responses', () => {
