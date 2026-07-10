@@ -119,6 +119,7 @@ Environment=NODE_OPTIONS=${systemdEscape(SERVICE_NODE_OPTIONS)}
 ExecStart=${systemdEscape(nodePath)} ${systemdEscape(cliPath)} server
 Restart=always
 RestartSec=3
+TimeoutStopSec=10
 StandardOutput=append:${systemdEscape(join(configDir, 'server.log'))}
 StandardError=append:${systemdEscape(join(configDir, 'server.err'))}
 

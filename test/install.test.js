@@ -114,6 +114,7 @@ describe('service file rendering', () => {
     assert.match(service, /ExecStart=\/home\/alice\/\.config\/claude-rotator\/runtime\/claude-rotator \/repo\/bin\/claude-rotator\.js server/);
     assert.match(service, /Environment=CLAUDE_ROTATOR_CONFIG=\/home\/alice\/.config\/claude-rotator\/config.json/);
     assert.match(service, /Environment=NODE_OPTIONS=--dns-result-order=ipv4first/);
+    assert.match(service, /TimeoutStopSec=10/);
     assert.match(service, /StandardOutput=append:\/home\/alice\/.config\/claude-rotator\/server\.log/);
     assert.match(service, /StandardError=append:\/home\/alice\/.config\/claude-rotator\/server\.err/);
   });
