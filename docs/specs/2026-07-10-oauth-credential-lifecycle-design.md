@@ -46,9 +46,11 @@ cycle can rate-limit the token endpoint for every account.
 - Preserve a newly returned refresh token and never intentionally retry the old
   token after a successful rotation.
 - Treat token-endpoint 429 responses as temporary throttles. Retain the
-  `Retry-After` deadline, serialize token-endpoint calls across accounts, and
-  suppress every account's refresh during the shared cooldown. Repeated 429s
-  use exponential backoff capped at six hours.
+  provider's explicit `Retry-After` deadline without amplifying it, subject to a
+  24-hour safety ceiling. When the provider omits that deadline, use
+  per-refresh-token exponential backoff capped at 15 minutes. Token-endpoint
+  calls remain serialized across accounts, but one account's cooldown must not
+  suppress or starve another account.
 - If a proactive refresh fails while the access token still has at least one
   minute remaining, keep using that access token until a later refresh can
   succeed. Do not make a working account unavailable merely because the token
@@ -71,6 +73,10 @@ cycle can rate-limit the token endpoint for every account.
 - macOS credentials remain in Keychain.
 - Linux credentials are written through a temporary `0600` file and atomic
   rename.
+- Persist whether a refresh cooldown came from an explicit provider deadline or
+  the local fallback policy. On upgrade, discard source-less legacy cooldowns
+  that exceed the new 15-minute cap. Preserve provider-marked deadlines up to
+  the 24-hour safety ceiling.
 - Logs may include account ID, refresh outcome, and expiry timestamp, but never
   access tokens, refresh tokens, authorization headers, or token hashes.
 
@@ -82,8 +88,8 @@ cycle can rate-limit the token endpoint for every account.
 - A live Claude Code credential is mirrored into the matching stored account.
 - A live credential rejected with 401 is re-read on the next request rather
   than independently refreshed or marked permanently invalid.
-- Concurrent refreshes for different accounts result in one token-endpoint
-  request when the first request establishes a shared cooldown.
+- Concurrent refreshes for different accounts are serialized, and each account
+  receives its own token-endpoint attempt and cooldown state.
 - A proactive refresh 429 does not interrupt a request authenticated by an
   access token that is still valid.
 - An expired saved credential is never forwarded after its refresh fails.

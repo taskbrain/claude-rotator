@@ -88,12 +88,12 @@ export async function runCli(argv = [], deps = {}) {
     }
 
     if (command === 'refresh-usage') {
-      const result = await postJson('/internal/refresh-usage', {});
+      const result = await (deps.postJson || postJson)('/internal/refresh-usage', {});
       const total = result.accounts?.length || 0;
       const ok = (result.accounts || []).filter(account => account.ok).length;
       write(`Refreshed usage for ${ok}/${total} accounts\n`);
       for (const account of result.accounts || []) {
-        if (!account.ok) write(`warning: ${account.account}: ${account.error}\n`);
+        if (!account.ok) write(`warning: ${account.account}: ${refreshUsageWarning(account)}\n`);
       }
       return result.ok ? 0 : 1;
     }
@@ -141,6 +141,15 @@ export async function runCli(argv = [], deps = {}) {
     error(`${caught.message}\n`);
     return 1;
   }
+}
+
+function refreshUsageWarning(account) {
+  if (account.error) return account.error;
+  if (account.skipped === 'credential-refresh-cooldown') {
+    return 'credential refresh cooldown is active';
+  }
+  if (account.skipped) return `skipped: ${account.skipped}`;
+  return 'unknown refresh error';
 }
 
 export function helpText() {

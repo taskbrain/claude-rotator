@@ -1674,6 +1674,74 @@ describe('createProxyServer', () => {
     assert.equal(refresh.body.accounts.filter(account => account.ok).length, 2);
   });
 
+  it('attempts each expired account when token refreshes are rate limited', async () => {
+    const secretStore = new MemorySecretStore();
+    await secretStore.set('acct_1', {
+      accessToken: 'expired-access-1',
+      refreshToken: 'refresh-token-1',
+      expiresAt: 1,
+    });
+    await secretStore.set('acct_2', {
+      accessToken: 'expired-access-2',
+      refreshToken: 'refresh-token-2',
+      expiresAt: 1,
+    });
+    const accountManager = new AccountManager({
+      accounts: [
+        { id: 'acct_1', name: 'a@example.com', type: 'oauth' },
+        { id: 'acct_2', name: 'b@example.com', type: 'oauth' },
+      ],
+      now: () => 1000,
+    });
+    const refreshCalls = [];
+    let active = 0;
+    let maxActive = 0;
+    const proxy = await listen(createProxyServer({
+      accountManager,
+      secretStore,
+      config: {
+        upstream: 'http://127.0.0.1:1',
+        usagePolling: { enabled: false, concurrency: 2, requestSpacingMs: 0 },
+      },
+      tokenRefresher: async refreshToken => {
+        refreshCalls.push(refreshToken);
+        active += 1;
+        maxActive = Math.max(maxActive, active);
+        await new Promise(resolve => setImmediate(resolve));
+        active -= 1;
+        throw new OAuthTokenRefreshError({
+          status: 429,
+          code: 'rate_limit_error',
+          retryAfterMs: 60_000,
+          retryAfterSource: 'fallback',
+        });
+      },
+      usageFetcher: async () => {
+        throw new Error('usage fetch should not run with expired credentials');
+      },
+    }));
+    cleanupAfterTest(async () => {
+      await close(proxy.server);
+    });
+
+    const refresh = await requestJson(`${proxy.url}/internal/refresh-usage`, { method: 'POST' });
+
+    assert.equal(refresh.status, 200);
+    assert.equal(refresh.body.ok, false);
+    assert.deepEqual(refreshCalls.sort(), ['refresh-token-1', 'refresh-token-2']);
+    assert.equal(maxActive, 1);
+    assert.equal(refresh.body.accounts.filter(account => account.ok).length, 0);
+    assert.deepEqual(
+      refresh.body.status.accounts.map(account => account.unavailableReason.type),
+      ['oauth_refresh_rate_limit', 'oauth_refresh_rate_limit'],
+    );
+    assert.deepEqual(
+      refresh.body.status.accounts.map(account => account.unavailableReason.retryAfterSource),
+      ['fallback', 'fallback'],
+    );
+    assert.equal(JSON.stringify(refresh.body).includes('refresh-token-'), false);
+  });
+
   it('refreshes OAuth usage accounts serially by default', async () => {
     const secretStore = new MemorySecretStore();
     await secretStore.set('acct_1', { accessToken: 'access-token-1' });

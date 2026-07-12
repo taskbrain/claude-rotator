@@ -484,7 +484,9 @@ function isOAuthCredentialError(message) {
 function markOAuthRefreshRateLimit(accountManager, accountId, error) {
   if (!isOAuthTokenRefreshRateLimit(error)) return false;
   const retryAfterSeconds = Math.max(1, Math.ceil(error.retryAfterMs / 1000));
-  accountManager.markCredentialRefreshRateLimited(accountId, retryAfterSeconds);
+  accountManager.markCredentialRefreshRateLimited(accountId, retryAfterSeconds, {
+    retryAfterSource: error.retryAfterSource,
+  });
   return true;
 }
 

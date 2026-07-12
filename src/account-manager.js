@@ -1,6 +1,11 @@
 import { emptyQuota, normalizeWeeklyScopedUsage, parseRateLimitHeaders } from './quota.js';
+import {
+  DEFAULT_MAX_PROVIDER_RETRY_AFTER_MS,
+  DEFAULT_MAX_TOKEN_REFRESH_BACKOFF_MS,
+} from './oauth.js';
 
 export const DEFAULT_WEEKLY_RESET_PRIORITY_WINDOW_MS = 36 * 60 * 60 * 1000;
+const MAX_DATE_TIMESTAMP_MS = 8_640_000_000_000_000;
 
 export class AccountManager {
   constructor({
@@ -124,9 +129,10 @@ export class AccountManager {
     });
   }
 
-  markCredentialRefreshRateLimited(accountId, retryAfterSeconds) {
+  markCredentialRefreshRateLimited(accountId, retryAfterSeconds, { retryAfterSource = null } = {}) {
     this.markTemporaryUnavailable(accountId, retryAfterSeconds, {
       type: 'oauth_refresh_rate_limit',
+      ...(retryAfterSource ? { retryAfterSource } : {}),
     }, {
       eventType: 'credential-refresh-throttled',
       retryAfterSeconds,
@@ -135,7 +141,8 @@ export class AccountManager {
 
   markTemporaryUnavailable(accountId, retryAfterSeconds, reason, event = {}) {
     const account = this.find(accountId);
-    account.rateLimitedUntil = this.now() + retryAfterSeconds * 1000;
+    const retryAfterMs = Math.max(0, Number(retryAfterSeconds) || 0) * 1000;
+    account.rateLimitedUntil = Math.min(MAX_DATE_TIMESTAMP_MS - 1, this.now() + retryAfterMs);
     account.temporaryUnavailableReason = { ...reason };
     account.status = 'throttled';
     this.events.unshift({
@@ -271,6 +278,7 @@ export class AccountManager {
       account.rateLimitedUntil = restoreTimestamp(saved.rateLimitedUntil);
       account.temporaryUnavailableReason = clonePlainObject(saved.temporaryUnavailableReason);
       account.errorReason = clonePlainObject(saved.errorReason);
+      this.normalizeRestoredCredentialCooldown(account);
       account.quotaExhaustionEventKey = null;
       this.refreshQuotaState(account);
     }
@@ -279,6 +287,24 @@ export class AccountManager {
       const index = this.accounts.findIndex(account => account.id === state.currentAccount);
       if (index >= 0) this.currentIndex = index;
     }
+  }
+
+  normalizeRestoredCredentialCooldown(account) {
+    const reason = account.temporaryUnavailableReason;
+    if (reason?.type !== 'oauth_refresh_rate_limit') return;
+    if (!account.rateLimitedUntil) return;
+    const remainingMs = account.rateLimitedUntil - this.now();
+    if (reason.retryAfterSource === 'provider') {
+      account.rateLimitedUntil = Math.min(
+        account.rateLimitedUntil,
+        this.now() + DEFAULT_MAX_PROVIDER_RETRY_AFTER_MS,
+      );
+      return;
+    }
+    if (remainingMs <= DEFAULT_MAX_TOKEN_REFRESH_BACKOFF_MS) return;
+    account.rateLimitedUntil = null;
+    account.temporaryUnavailableReason = null;
+    if (account.status === 'throttled') account.status = 'ready';
   }
 
   selectBestAvailableSwitchTarget() {

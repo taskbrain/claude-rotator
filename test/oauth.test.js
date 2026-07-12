@@ -15,6 +15,8 @@ import {
   DEFAULT_OAUTH_CONNECT_TIMEOUT_MS,
   DEFAULT_OAUTH_REQUEST_TIMEOUT_MS,
   DEFAULT_OAUTH_REFRESH_LEAD_MS,
+  DEFAULT_MAX_TOKEN_REFRESH_BACKOFF_MS,
+  DEFAULT_MAX_PROVIDER_RETRY_AFTER_MS,
   DEFAULT_TOKEN_REFRESH_RETRY_AFTER_MS,
   OAuthTokenRefreshError,
   OAUTH_USER_AGENT,
@@ -129,10 +131,10 @@ describe('token refresh', () => {
     assert.equal(calls, 3);
   });
 
-  it('shares the token endpoint cooldown across account refresh tokens', async () => {
+  it('keeps token endpoint cooldowns independent across account refresh tokens', async () => {
     let calls = 0;
     let now = 1000;
-    const deferred = [];
+    const failures = [];
     const coordinated = createSingleFlightTokenRefresher(async () => {
       calls += 1;
       throw new OAuthTokenRefreshError({
@@ -142,34 +144,34 @@ describe('token refresh', () => {
       });
     }, {
       now: () => now,
-      onFailure: ({ context, deferred: wasDeferred = false }) => {
-        deferred.push({ accountId: context.accountId, deferred: wasDeferred });
+      onFailure: ({ context }) => {
+        failures.push(context.accountId);
       },
     });
 
     await assert.rejects(coordinated('refresh-1', { accountId: 'acct-1' }), { status: 429 });
-    await assert.rejects(
-      coordinated('refresh-2', { accountId: 'acct-2' }),
-      error => error.status === 429 && error.deferred === true,
-    );
-    assert.equal(calls, 1);
-    assert.deepEqual(deferred, [
-      { accountId: 'acct-1', deferred: false },
-      { accountId: 'acct-2', deferred: true },
-    ]);
+    await assert.rejects(coordinated('refresh-2', { accountId: 'acct-2' }), { status: 429 });
+    assert.equal(calls, 2);
+    assert.deepEqual(failures, ['acct-1', 'acct-2']);
 
     now += 10_001;
     await assert.rejects(
       coordinated('refresh-2', { accountId: 'acct-2' }),
       error => error.status === 429 && error.retryAfterMs === 20_000,
     );
-    assert.equal(calls, 2);
+    assert.equal(calls, 3);
   });
 
-  it('serializes concurrent refreshes for different accounts before applying cooldown', async () => {
+  it('serializes concurrent refreshes for different accounts without starving either account', async () => {
     let calls = 0;
+    let active = 0;
+    let maxActive = 0;
     const coordinated = createSingleFlightTokenRefresher(async () => {
       calls += 1;
+      active += 1;
+      maxActive = Math.max(maxActive, active);
+      await new Promise(resolve => setImmediate(resolve));
+      active -= 1;
       throw new OAuthTokenRefreshError({
         status: 429,
         code: 'rate_limit_error',
@@ -184,8 +186,111 @@ describe('token refresh', () => {
 
     assert.equal(first.status, 'rejected');
     assert.equal(second.status, 'rejected');
-    assert.equal(second.reason.deferred, true);
+    assert.equal(calls, 2);
+    assert.equal(maxActive, 1);
+  });
+
+  it('caps fallback exponential backoff at fifteen minutes per refresh token', async () => {
+    let calls = 0;
+    let now = 1000;
+    const coordinated = createSingleFlightTokenRefresher(async () => {
+      calls += 1;
+      throw new OAuthTokenRefreshError({
+        status: 429,
+        code: 'rate_limit_error',
+        retryAfterMs: DEFAULT_TOKEN_REFRESH_RETRY_AFTER_MS,
+        retryAfterSource: 'fallback',
+      });
+    }, { now: () => now });
+
+    assert.equal(DEFAULT_MAX_TOKEN_REFRESH_BACKOFF_MS, 15 * 60 * 1000);
+    const expectedDelays = [60_000, 120_000, 240_000, 480_000, 900_000, 900_000];
+    for (const expectedDelay of expectedDelays) {
+      await assert.rejects(
+        coordinated('refresh-1'),
+        error => error.retryAfterMs === expectedDelay,
+      );
+      now += expectedDelay + 1;
+    }
+    assert.equal(calls, expectedDelays.length);
+  });
+
+  it('honors an explicit Retry-After without exponential amplification', async () => {
+    let calls = 0;
+    let now = 1000;
+    const coordinated = createSingleFlightTokenRefresher(async () => {
+      calls += 1;
+      throw new OAuthTokenRefreshError({
+        status: 429,
+        code: 'rate_limit_error',
+        retryAfterMs: 2 * 60 * 60 * 1000,
+        retryAfterSource: 'provider',
+      });
+    }, { now: () => now });
+
+    await assert.rejects(
+      coordinated('refresh-1'),
+      error => error.retryAfterMs === 2 * 60 * 60 * 1000,
+    );
+    now += 2 * 60 * 60 * 1000 + 1;
+    await assert.rejects(
+      coordinated('refresh-1'),
+      error => error.retryAfterMs === 2 * 60 * 60 * 1000,
+    );
+    assert.equal(calls, 2);
+  });
+
+  it('reports only the remaining cooldown to late callers', async () => {
+    let calls = 0;
+    let now = 1000;
+    const deferred = [];
+    const coordinated = createSingleFlightTokenRefresher(async () => {
+      calls += 1;
+      throw new OAuthTokenRefreshError({
+        status: 429,
+        code: 'rate_limit_error',
+        retryAfterMs: 120_000,
+        retryAfterSource: 'provider',
+      });
+    }, {
+      now: () => now,
+      onFailure: ({ deferred: wasDeferred }) => deferred.push(wasDeferred),
+    });
+
+    await assert.rejects(
+      coordinated('refresh-1'),
+      error => error.retryAfterMs === 120_000 && error.deferred !== true,
+    );
+    now += 30_000;
+    await assert.rejects(
+      coordinated('refresh-1'),
+      error => error.retryAfterMs === 90_000 && error.deferred === true,
+    );
     assert.equal(calls, 1);
+    assert.deepEqual(deferred, [false, true]);
+  });
+
+  it('resets the account backoff after a successful refresh', async () => {
+    let calls = 0;
+    let now = 1000;
+    const coordinated = createSingleFlightTokenRefresher(async refreshToken => {
+      calls += 1;
+      if (calls === 3) return { accessToken: 'recovered', refreshToken };
+      throw new OAuthTokenRefreshError({
+        status: 429,
+        code: 'rate_limit_error',
+        retryAfterMs: 10_000,
+        retryAfterSource: 'fallback',
+      });
+    }, { now: () => now, retentionMs: 0 });
+
+    await assert.rejects(coordinated('refresh-1'), error => error.retryAfterMs === 10_000);
+    now += 10_001;
+    await assert.rejects(coordinated('refresh-1'), error => error.retryAfterMs === 20_000);
+    now += 20_001;
+    await coordinated('refresh-1');
+    await assert.rejects(coordinated('refresh-1'), error => error.retryAfterMs === 10_000);
+    assert.equal(calls, 4);
   });
 
   it('parses token endpoint responses', () => {
@@ -239,6 +344,7 @@ describe('token refresh', () => {
         assert.equal(error.status, 429);
         assert.equal(error.oauthCode, 'rate_limit_error');
         assert.equal(error.retryAfterMs, 105_000);
+        assert.equal(error.retryAfterSource, 'provider');
         assert.equal(error.message.includes('secret-refresh-token'), false);
         return true;
       },
@@ -250,7 +356,29 @@ describe('token refresh', () => {
       refreshAccessToken('refresh-1', {
         fetchImpl: async () => jsonResponse(429, { error: 'rate_limit_error' }),
       }),
-      error => error.retryAfterMs === DEFAULT_TOKEN_REFRESH_RETRY_AFTER_MS,
+      error => error.retryAfterMs === DEFAULT_TOKEN_REFRESH_RETRY_AFTER_MS
+        && error.retryAfterSource === 'fallback',
+    );
+  });
+
+  it('bounds an extreme provider Retry-After to a representable deadline', async () => {
+    const now = Date.parse('2026-07-12T12:00:00Z');
+    await assert.rejects(
+      refreshAccessToken('refresh-1', {
+        fetchImpl: async () => jsonResponse(
+          429,
+          { error: 'rate_limit_error' },
+          { 'retry-after': String(Number.MAX_VALUE) },
+        ),
+        now: () => now,
+      }),
+      error => {
+        assert.equal(error.retryAfterSource, 'provider');
+        assert.equal(Number.isFinite(error.retryAfterMs), true);
+        assert.equal(error.retryAfterMs, DEFAULT_MAX_PROVIDER_RETRY_AFTER_MS);
+        assert.doesNotThrow(() => new Date(now + error.retryAfterMs).toISOString());
+        return true;
+      },
     );
   });
 });

@@ -713,4 +713,90 @@ describe('AccountManager', () => {
     assert.equal(status.accounts[0].status, 'exhausted');
     assert.equal(status.accounts[1].status, 'active');
   });
+
+  it('clears an excessive legacy OAuth refresh cooldown after restart', () => {
+    const now = Date.parse('2026-07-12T12:00:00Z');
+    const manager = new AccountManager({
+      accounts: [{ id: 'acct_1', name: 'a@example.com', type: 'oauth' }],
+      now: () => now,
+    });
+
+    manager.restoreState({
+      version: 1,
+      currentAccount: 'acct_1',
+      accounts: [{
+        id: 'acct_1',
+        status: 'throttled',
+        quota: {},
+        usage: {},
+        rateLimitedUntil: new Date(now + 6 * 60 * 60 * 1000).toISOString(),
+        temporaryUnavailableReason: { type: 'oauth_refresh_rate_limit' },
+        errorReason: { type: 'oauth_refresh_failed' },
+      }],
+    });
+
+    const account = manager.getStatus().accounts[0];
+    assert.equal(account.status, 'active');
+    assert.equal(account.rateLimitedUntil, null);
+    assert.equal(account.unavailableReason, null);
+  });
+
+  it('preserves a long provider Retry-After after restart', () => {
+    const now = Date.parse('2026-07-12T12:00:00Z');
+    const manager = new AccountManager({
+      accounts: [{ id: 'acct_1', name: 'a@example.com', type: 'oauth' }],
+      now: () => now,
+    });
+
+    manager.restoreState({
+      version: 1,
+      currentAccount: 'acct_1',
+      accounts: [{
+        id: 'acct_1',
+        status: 'throttled',
+        quota: {},
+        usage: {},
+        rateLimitedUntil: new Date(now + 2 * 60 * 60 * 1000).toISOString(),
+        temporaryUnavailableReason: {
+          type: 'oauth_refresh_rate_limit',
+          retryAfterSource: 'provider',
+        },
+        errorReason: null,
+      }],
+    });
+
+    const account = manager.getStatus().accounts[0];
+    assert.equal(account.status, 'throttled');
+    assert.equal(account.unavailableReason.retryAfterSource, 'provider');
+    assert.equal(account.unavailableReason.retryAt, '2026-07-12T14:00:00.000Z');
+  });
+
+  it('caps an excessive persisted provider Retry-After after restart', () => {
+    const now = Date.parse('2026-07-12T12:00:00Z');
+    const manager = new AccountManager({
+      accounts: [{ id: 'acct_1', name: 'a@example.com', type: 'oauth' }],
+      now: () => now,
+    });
+
+    manager.restoreState({
+      version: 1,
+      currentAccount: 'acct_1',
+      accounts: [{
+        id: 'acct_1',
+        status: 'throttled',
+        quota: {},
+        usage: {},
+        rateLimitedUntil: new Date(now + 7 * 24 * 60 * 60 * 1000).toISOString(),
+        temporaryUnavailableReason: {
+          type: 'oauth_refresh_rate_limit',
+          retryAfterSource: 'provider',
+        },
+        errorReason: null,
+      }],
+    });
+
+    const account = manager.getStatus().accounts[0];
+    assert.equal(account.status, 'throttled');
+    assert.equal(account.unavailableReason.retryAt, '2026-07-13T12:00:00.000Z');
+  });
 });

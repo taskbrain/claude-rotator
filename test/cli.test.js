@@ -38,6 +38,30 @@ describe('runCli', () => {
     assert.match(io.output(), /5h ███████░░░  76%/);
   });
 
+  it('prints a useful refresh-usage warning when an account is in credential cooldown', async () => {
+    const io = createIo();
+
+    const code = await runCli(['refresh-usage'], {
+      ...io,
+      postJson: async (path, body) => {
+        assert.equal(path, '/internal/refresh-usage');
+        assert.deepEqual(body, {});
+        return {
+          ok: false,
+          accounts: [{
+            account: 'acct_1',
+            ok: false,
+            skipped: 'credential-refresh-cooldown',
+          }],
+        };
+      },
+    });
+
+    assert.equal(code, 1);
+    assert.match(io.output(), /credential refresh cooldown is active/);
+    assert.doesNotMatch(io.output(), /undefined/);
+  });
+
   it('prints prepare-resume JSON using the internal API', async () => {
     const io = createIo();
 
