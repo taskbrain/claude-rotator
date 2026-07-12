@@ -29,7 +29,7 @@ export class AccountManager {
     }
 
     const reason = this.unavailableReason(current);
-    if (current?.status === 'error') {
+    if (current?.status === 'error' || reason?.type === 'oauth_refresh_rate_limit') {
       const next = this.selectBestAvailableSwitchTarget();
       if (next) {
         next.status = 'active';
@@ -90,6 +90,7 @@ export class AccountManager {
 
   applyUsage(accountId, payload) {
     const account = this.find(accountId);
+    this.markAuthenticated(account);
     if (payload?.five_hour) {
       if (typeof payload.five_hour.utilization === 'number') account.quota.unified5h = payload.five_hour.utilization;
       if (Object.prototype.hasOwnProperty.call(payload.five_hour, 'resets_at')) {
@@ -123,6 +124,15 @@ export class AccountManager {
     });
   }
 
+  markCredentialRefreshRateLimited(accountId, retryAfterSeconds) {
+    this.markTemporaryUnavailable(accountId, retryAfterSeconds, {
+      type: 'oauth_refresh_rate_limit',
+    }, {
+      eventType: 'credential-refresh-throttled',
+      retryAfterSeconds,
+    });
+  }
+
   markTemporaryUnavailable(accountId, retryAfterSeconds, reason, event = {}) {
     const account = this.find(accountId);
     account.rateLimitedUntil = this.now() + retryAfterSeconds * 1000;
@@ -148,6 +158,17 @@ export class AccountManager {
       account: account.id,
       reason: account.errorReason,
     });
+  }
+
+  markAuthenticated(accountOrId) {
+    const account = typeof accountOrId === 'string' ? this.find(accountOrId) : accountOrId;
+    const credentialThrottled = account.temporaryUnavailableReason?.type === 'oauth_refresh_rate_limit';
+    account.errorReason = null;
+    if (credentialThrottled) {
+      account.rateLimitedUntil = null;
+      account.temporaryUnavailableReason = null;
+    }
+    if (account.status === 'error' || credentialThrottled) account.status = 'ready';
   }
 
   recordProxyRequest(meta) {

@@ -35,6 +35,8 @@ const DEFAULT_UPSTREAM_CONNECT_RETRIES = 3;
 const DEFAULT_UPSTREAM_CONNECT_RETRY_DELAY_MS = 250;
 const DEFAULT_RESET_CHECK_DELAY_MS = 1000;
 const MAX_TIMER_DELAY_MS = 2_147_483_647;
+const MIN_USABLE_ACCESS_TOKEN_LIFETIME_MS = 60_000;
+const guardedUpstreamSockets = new WeakSet();
 
 export function createProxyServer({
   accountManager,
@@ -65,11 +67,12 @@ export function createProxyServer({
     onSuccess({ context, refreshed, rotated }) {
       logger?.(`${new Date().toISOString()} credential-refresh account=${context?.accountId || 'unknown'} result=success rotated=${rotated} expiresAt=${formatCredentialExpiry(refreshed.expiresAt)}`);
     },
-    onFailure({ context, error }) {
+    onFailure({ context, error, deferred = false }) {
       const retry = error?.retryAfterMs
         ? ` retryAfterSec=${Math.ceil(error.retryAfterMs / 1000)}`
         : '';
-      logger?.(`${new Date().toISOString()} credential-refresh account=${context?.accountId || 'unknown'} result=failed errorType=${credentialRefreshErrorType(error)}${retry}`);
+      const result = deferred ? 'deferred' : 'failed';
+      logger?.(`${new Date().toISOString()} credential-refresh account=${context?.accountId || 'unknown'} result=${result} errorType=${credentialRefreshErrorType(error)}${retry}`);
     },
   });
 
@@ -440,13 +443,19 @@ async function refreshAccountUsage({
       logger,
     });
     if (!secret?.accessToken) throw new Error('OAuth access token is missing');
-    const freshSecret = await refreshSecretIfExpiring({
-      account,
-      secret,
-      secretStore,
-      tokenRefresher,
-      logger,
-    });
+    const credentialCooldown = accountManager.unavailableReason(account)?.type === 'oauth_refresh_rate_limit';
+    if (credentialCooldown && !hasUsableAccessToken(secret)) {
+      return { account: account.id, ok: false, skipped: 'credential-refresh-cooldown' };
+    }
+    const freshSecret = credentialCooldown && hasUsableAccessToken(secret)
+      ? secret
+      : await refreshSecretIfExpiring({
+        account,
+        secret,
+        secretStore,
+        tokenRefresher,
+        logger,
+      });
     const usage = await usageFetcher(freshSecret.accessToken, usageRequestOptions);
     accountManager.applyUsage(account.id, usage);
     return { account: account.id, ok: true };
@@ -475,7 +484,7 @@ function isOAuthCredentialError(message) {
 function markOAuthRefreshRateLimit(accountManager, accountId, error) {
   if (!isOAuthTokenRefreshRateLimit(error)) return false;
   const retryAfterSeconds = Math.max(1, Math.ceil(error.retryAfterMs / 1000));
-  accountManager.markRateLimited(accountId, retryAfterSeconds);
+  accountManager.markCredentialRefreshRateLimited(accountId, retryAfterSeconds);
   return true;
 }
 
@@ -527,7 +536,7 @@ async function forwardWithRotation({
         upstreamConnectRetries,
         upstreamConnectRetryDelayMs,
       })) return;
-      sendUnavailableAccounts(res);
+      sendUnavailableAccounts(res, accountManager);
       return;
     }
 
@@ -647,7 +656,7 @@ async function forwardWithRotation({
       upstreamConnectRetries,
       upstreamConnectRetryDelayMs,
     })) return;
-    sendUnavailableAccounts(res);
+    sendUnavailableAccounts(res, accountManager);
   }
 }
 
@@ -686,6 +695,11 @@ async function forwardCurrentUnavailableAccount({
   });
   if (!secret) return false;
 
+  if (secret.liveClaudeCodeCredential && hasUsableAccessToken(secret)) {
+    accountManager.markAuthenticated(account.id);
+  }
+  if (isCredentialUnavailable(accountManager.unavailableReason(account))) return false;
+
   let freshSecret;
   try {
     freshSecret = await refreshSecretIfExpiring({
@@ -696,7 +710,7 @@ async function forwardCurrentUnavailableAccount({
       logger,
     });
   } catch {
-    freshSecret = secret;
+    return false;
   }
 
   await forwardOnce({
@@ -720,7 +734,15 @@ async function forwardCurrentUnavailableAccount({
 async function refreshSecretIfExpiring({ account, secret, secretStore, tokenRefresher, logger }) {
   if (!canRefreshSecret(account, secret)) return secret;
   if (!isTokenExpiringSoon(secret.expiresAt)) return secret;
-  return refreshAndStoreSecret({ account, secret, secretStore, tokenRefresher, logger });
+  try {
+    return await refreshAndStoreSecret({ account, secret, secretStore, tokenRefresher, logger });
+  } catch (error) {
+    if (!hasUsableAccessToken(secret)) throw error;
+    const expiresAt = normalizeCredentialExpiry(secret.expiresAt);
+    const remainingSec = expiresAt == null ? 'unknown' : Math.max(0, Math.floor((expiresAt - Date.now()) / 1000));
+    logger?.(`${new Date().toISOString()} credential-refresh-fallback account=${account.id} remainingSec=${remainingSec} errorType=${credentialRefreshErrorType(error)}`);
+    return secret;
+  }
 }
 
 async function refreshAndStoreSecret({ account, secret, secretStore, tokenRefresher, logger }) {
@@ -813,6 +835,18 @@ function normalizeCredentialExpiry(expiresAt) {
   const value = Number(expiresAt);
   if (!Number.isFinite(value)) return null;
   return value < 1e12 ? value * 1000 : value;
+}
+
+function hasUsableAccessToken(secret, now = Date.now()) {
+  if (!secret?.accessToken) return false;
+  const expiresAt = normalizeCredentialExpiry(secret.expiresAt);
+  return expiresAt == null || expiresAt - now > MIN_USABLE_ACCESS_TOKEN_LIFETIME_MS;
+}
+
+function isCredentialUnavailable(reason) {
+  return reason?.type === 'oauth_refresh_rate_limit'
+    || reason?.type === 'oauth_refresh_failed'
+    || reason?.type === 'authentication_error';
 }
 
 function formatCredentialExpiry(expiresAt) {
@@ -1105,6 +1139,7 @@ function requestUpstream({
       upstreamRes.on('error', settle);
     });
     req.on('socket', socket => {
+      guardUpstreamSocket(socket);
       if (!socket.connecting) {
         markConnected();
         return;
@@ -1123,6 +1158,13 @@ function requestUpstream({
     resetIdleTimer();
     req.end();
   });
+}
+
+function guardUpstreamSocket(socket) {
+  if (guardedUpstreamSockets.has(socket)) return;
+  guardedUpstreamSockets.add(socket);
+  // A TLS socket can emit a late EPIPE after its ClientRequest has already settled.
+  socket.on('error', () => {});
 }
 
 function isRetryableConnectError(error) {
@@ -1405,7 +1447,25 @@ function sendJson(res, status, body) {
   res.end(JSON.stringify(body));
 }
 
-function sendUnavailableAccounts(res) {
+function sendUnavailableAccounts(res, accountManager = null) {
+  const current = accountManager?.getCurrentAccount();
+  const reason = current ? accountManager.unavailableReason(current) : null;
+  if (isCredentialUnavailable(reason)) {
+    const headers = { 'Content-Type': 'application/json' };
+    const retryAt = Date.parse(reason.retryAt || '');
+    if (Number.isFinite(retryAt)) {
+      headers['Retry-After'] = String(Math.max(1, Math.ceil((retryAt - Date.now()) / 1000)));
+    }
+    res.writeHead(503, headers);
+    res.end(JSON.stringify({
+      type: 'error',
+      error: {
+        type: 'api_error',
+        message: 'No usable OAuth credential is currently available.',
+      },
+    }));
+    return;
+  }
   sendJson(res, 429, {
     type: 'error',
     error: { type: 'rate_limit_error', message: 'All configured accounts are unavailable.' },

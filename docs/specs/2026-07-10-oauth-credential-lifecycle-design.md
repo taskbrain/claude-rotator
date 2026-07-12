@@ -19,6 +19,12 @@ Two lifecycle gaps can invalidate those snapshots:
 Linux credential writes also replace the account file in place, so an
 interrupted write can leave invalid JSON.
 
+A third failure mode occurs when an expired saved account remains selected
+after Claude Code logs into another account. Passing the saved account's 401
+back to Claude Code makes Claude Code rotate its valid live credential, while
+the proxy continues to inject the expired saved credential. Repeating that
+cycle can rate-limit the token endpoint for every account.
+
 ## Ownership model
 
 - The current Claude Code credential is owned and refreshed by Claude Code.
@@ -40,9 +46,19 @@ interrupted write can leave invalid JSON.
 - Preserve a newly returned refresh token and never intentionally retry the old
   token after a successful rotation.
 - Treat token-endpoint 429 responses as temporary throttles. Retain the
-  `Retry-After` deadline, suppress duplicate refresh calls during that window,
-  and schedule a credential retry when the cooldown expires. Repeated 429s use
-  exponential backoff capped at 15 minutes.
+  `Retry-After` deadline, serialize token-endpoint calls across accounts, and
+  suppress every account's refresh during the shared cooldown. Repeated 429s
+  use exponential backoff capped at six hours.
+- If a proactive refresh fails while the access token still has at least one
+  minute remaining, keep using that access token until a later refresh can
+  succeed. Do not make a working account unavailable merely because the token
+  endpoint is throttled.
+- When an expired credential cannot be refreshed, switch to a known healthy
+  account. If no healthy account exists, return a local retryable 503 instead
+  of sending the expired credential upstream and leaking a misleading 401 to
+  Claude Code.
+- A successful authenticated usage request clears stale authentication state
+  for that account, including state persisted before a fresh Claude Code login.
 - Invalidate the short-lived live-credential cache after a 401. Claude Code
   receives the 401 and remains responsible for refreshing its own credential;
   the next request reloads the Keychain or credentials file immediately.
@@ -66,6 +82,12 @@ interrupted write can leave invalid JSON.
 - A live Claude Code credential is mirrored into the matching stored account.
 - A live credential rejected with 401 is re-read on the next request rather
   than independently refreshed or marked permanently invalid.
+- Concurrent refreshes for different accounts result in one token-endpoint
+  request when the first request establishes a shared cooldown.
+- A proactive refresh 429 does not interrupt a request authenticated by an
+  access token that is still valid.
+- An expired saved credential is never forwarded after its refresh fails.
+- A late upstream TLS `EPIPE` is handled without terminating the proxy process.
 - macOS and Linux persistence tests continue to enforce secure storage.
 
 ## Alternatives considered

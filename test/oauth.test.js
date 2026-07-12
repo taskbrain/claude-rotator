@@ -129,6 +129,65 @@ describe('token refresh', () => {
     assert.equal(calls, 3);
   });
 
+  it('shares the token endpoint cooldown across account refresh tokens', async () => {
+    let calls = 0;
+    let now = 1000;
+    const deferred = [];
+    const coordinated = createSingleFlightTokenRefresher(async () => {
+      calls += 1;
+      throw new OAuthTokenRefreshError({
+        status: 429,
+        code: 'rate_limit_error',
+        retryAfterMs: 10_000,
+      });
+    }, {
+      now: () => now,
+      onFailure: ({ context, deferred: wasDeferred = false }) => {
+        deferred.push({ accountId: context.accountId, deferred: wasDeferred });
+      },
+    });
+
+    await assert.rejects(coordinated('refresh-1', { accountId: 'acct-1' }), { status: 429 });
+    await assert.rejects(
+      coordinated('refresh-2', { accountId: 'acct-2' }),
+      error => error.status === 429 && error.deferred === true,
+    );
+    assert.equal(calls, 1);
+    assert.deepEqual(deferred, [
+      { accountId: 'acct-1', deferred: false },
+      { accountId: 'acct-2', deferred: true },
+    ]);
+
+    now += 10_001;
+    await assert.rejects(
+      coordinated('refresh-2', { accountId: 'acct-2' }),
+      error => error.status === 429 && error.retryAfterMs === 20_000,
+    );
+    assert.equal(calls, 2);
+  });
+
+  it('serializes concurrent refreshes for different accounts before applying cooldown', async () => {
+    let calls = 0;
+    const coordinated = createSingleFlightTokenRefresher(async () => {
+      calls += 1;
+      throw new OAuthTokenRefreshError({
+        status: 429,
+        code: 'rate_limit_error',
+        retryAfterMs: 10_000,
+      });
+    });
+
+    const [first, second] = await Promise.allSettled([
+      coordinated('refresh-1', { accountId: 'acct-1' }),
+      coordinated('refresh-2', { accountId: 'acct-2' }),
+    ]);
+
+    assert.equal(first.status, 'rejected');
+    assert.equal(second.status, 'rejected');
+    assert.equal(second.reason.deferred, true);
+    assert.equal(calls, 1);
+  });
+
   it('parses token endpoint responses', () => {
     const parsed = parseTokenResponse({
       access_token: 'access2',

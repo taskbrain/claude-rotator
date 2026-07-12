@@ -348,6 +348,26 @@ describe('AccountManager', () => {
     assert.equal(manager.getActiveAccount().id, 'acct_1');
   });
 
+  it('switches from an OAuth refresh cooldown to a known available account', () => {
+    const manager = new AccountManager({
+      accounts: [
+        { id: 'acct_1', name: 'a@example.com', type: 'oauth' },
+        { id: 'acct_2', name: 'b@example.com', type: 'oauth' },
+      ],
+      now: () => 1000,
+    });
+    manager.updateQuota('acct_2', {
+      'anthropic-ratelimit-unified-5h-utilization': '0.1',
+      'anthropic-ratelimit-unified-7d-utilization': '0.2',
+    });
+
+    manager.markCredentialRefreshRateLimited('acct_1', 60);
+
+    assert.equal(manager.getActiveAccount().id, 'acct_2');
+    assert.equal(manager.getCurrentAccount().id, 'acct_2');
+    assert.equal(manager.getStatus().accounts[0].unavailableReason.type, 'oauth_refresh_rate_limit');
+  });
+
   it('falls back to the current throttled account before an exhausted alternate', () => {
     const manager = new AccountManager({
       accounts: [
@@ -437,6 +457,23 @@ describe('AccountManager', () => {
       message: 'OAuth token refresh failed',
     });
     assert.equal(manager.selectBestExhaustedFallback(), null);
+  });
+
+  it('clears a stale authentication error after authenticated usage succeeds', () => {
+    const manager = new AccountManager({
+      accounts: [{ id: 'acct_1', name: 'a@example.com', type: 'oauth' }],
+      now: () => 1000,
+    });
+    manager.markError('acct_1', 'oauth_refresh_failed', 'OAuth token refresh failed');
+
+    manager.applyUsage('acct_1', {
+      five_hour: { utilization: 0.1, resets_at: null },
+      seven_day: { utilization: 0.2, resets_at: null },
+    });
+
+    const account = manager.getStatus().accounts[0];
+    assert.equal(account.status, 'active');
+    assert.equal(account.unavailableReason, null);
   });
 
   it('replaces account metadata for server reload', () => {

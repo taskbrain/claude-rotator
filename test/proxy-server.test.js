@@ -118,6 +118,53 @@ describe('createProxyServer', () => {
     await close(upstream.server);
   });
 
+  it('keeps using a valid access token when proactive refresh is rate limited', async () => {
+    const upstreamSeen = [];
+    const logLines = [];
+    const upstream = await listen(http.createServer(async (req, res) => {
+      upstreamSeen.push(req.headers.authorization);
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ ok: true }));
+    }));
+
+    const secretStore = new MemorySecretStore();
+    await secretStore.set('acct_1', {
+      accessToken: 'still-valid-token',
+      refreshToken: 'refresh-token-1',
+      expiresAt: Date.now() + 10 * 60 * 1000,
+    });
+    const accountManager = new AccountManager({
+      accounts: [{ id: 'acct_1', name: 'a@example.com', type: 'oauth' }],
+    });
+    const proxy = await listen(createProxyServer({
+      accountManager,
+      secretStore,
+      config: { upstream: upstream.url },
+      tokenRefresher: async () => {
+        throw new OAuthTokenRefreshError({
+          status: 429,
+          code: 'rate_limit_error',
+          retryAfterMs: 60_000,
+        });
+      },
+      logger: line => logLines.push(line),
+    }));
+    cleanupAfterTest(async () => {
+      await close(proxy.server);
+      await close(upstream.server);
+    });
+
+    const response = await requestJson(`${proxy.url}/v1/messages`, {
+      method: 'POST',
+      body: JSON.stringify({ model: 'sonnet' }),
+    });
+
+    assert.equal(response.status, 200);
+    assert.deepEqual(upstreamSeen, ['Bearer still-valid-token']);
+    assert.equal(accountManager.getStatus().accounts[0].unavailableReason, null);
+    assert.match(logLines.join('\n'), /credential-refresh-fallback account=acct_1/);
+  });
+
   it('refreshes an expired OAuth token only once for concurrent requests', async () => {
     const upstreamSeen = [];
     const logLines = [];
@@ -859,11 +906,13 @@ describe('createProxyServer', () => {
       /aborted|socket hang up|ECONNRESET|Parse Error|stream interrupted/,
     );
 
+    const health = await requestJson(`${proxy.url}/internal/health`);
+    assert.equal(health.status, 200);
     assert.deepEqual(upstreamSeen, ['Bearer access-token-1']);
     assert.equal(accountManager.getStatus().currentAccount, 'acct_1');
   });
 
-  it('keeps the current account when refreshing an expired token fails', async () => {
+  it('does not send an expired token upstream when refresh fails', async () => {
     const upstreamSeen = [];
     const upstream = await listen(http.createServer(async (req, res) => {
       upstreamSeen.push(req.headers.authorization);
@@ -907,8 +956,9 @@ describe('createProxyServer', () => {
       body: JSON.stringify({ model: 'sonnet' }),
     });
 
-    assert.equal(response.status, 200);
-    assert.deepEqual(upstreamSeen, ['Bearer expired-token']);
+    assert.equal(response.status, 503);
+    assert.deepEqual(upstreamSeen, []);
+    assert.equal(response.body.error.type, 'api_error');
     assert.equal(accountManager.getStatus().currentAccount, 'acct_1');
     assert.deepEqual(accountManager.getStatus().accounts[0].unavailableReason, {
       type: 'oauth_refresh_failed',
@@ -969,6 +1019,64 @@ describe('createProxyServer', () => {
     assert.deepEqual(upstreamSeen, ['Bearer access-token-2']);
     assert.equal(accountManager.getStatus().currentAccount, 'acct_2');
     assert.equal(accountManager.getStatus().accounts[0].status, 'error');
+  });
+
+  it('switches to a known available account when OAuth refresh is rate limited', async () => {
+    const upstreamSeen = [];
+    const upstream = await listen(http.createServer(async (req, res) => {
+      upstreamSeen.push(req.headers.authorization);
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ ok: true }));
+    }));
+
+    const secretStore = new MemorySecretStore();
+    await secretStore.set('acct_1', {
+      accessToken: 'expired-token',
+      refreshToken: 'rate-limited-refresh-token',
+      expiresAt: 900,
+    });
+    await secretStore.set('acct_2', {
+      accessToken: 'access-token-2',
+      refreshToken: 'refresh-token-2',
+      expiresAt: Date.now() + 60 * 60 * 1000,
+    });
+    const accountManager = new AccountManager({
+      accounts: [
+        { id: 'acct_1', name: 'a@example.com', type: 'oauth' },
+        { id: 'acct_2', name: 'b@example.com', type: 'oauth' },
+      ],
+      now: () => 1000,
+    });
+    accountManager.updateQuota('acct_2', {
+      'anthropic-ratelimit-unified-5h-utilization': '0.1',
+      'anthropic-ratelimit-unified-7d-utilization': '0.2',
+    });
+    const proxy = await listen(createProxyServer({
+      accountManager,
+      secretStore,
+      config: { upstream: upstream.url },
+      tokenRefresher: async () => {
+        throw new OAuthTokenRefreshError({
+          status: 429,
+          code: 'rate_limit_error',
+          retryAfterMs: 60_000,
+        });
+      },
+    }));
+    cleanupAfterTest(async () => {
+      await close(proxy.server);
+      await close(upstream.server);
+    });
+
+    const response = await requestJson(`${proxy.url}/v1/messages`, {
+      method: 'POST',
+      body: JSON.stringify({ model: 'sonnet' }),
+    });
+
+    assert.equal(response.status, 200);
+    assert.deepEqual(upstreamSeen, ['Bearer access-token-2']);
+    assert.equal(accountManager.getStatus().currentAccount, 'acct_2');
+    assert.equal(accountManager.getStatus().accounts[0].unavailableReason.type, 'oauth_refresh_rate_limit');
   });
 
   it('returns local quota exhaustion when the only account is exhausted', async () => {
@@ -1141,9 +1249,9 @@ describe('createProxyServer', () => {
       body: JSON.stringify({ model: 'sonnet' }),
     });
 
-    assert.equal(response.status, 401);
-    assert.deepEqual(upstreamSeen, ['Bearer stale-other-token']);
-    assert.equal(response.body.error.type, 'authentication_error');
+    assert.equal(response.status, 503);
+    assert.deepEqual(upstreamSeen, []);
+    assert.equal(response.body.error.type, 'api_error');
     assert.equal(accountManager.getStatus().currentAccount, 'other');
   });
 
@@ -1472,6 +1580,7 @@ describe('createProxyServer', () => {
       accounts: [{ id: 'acct_1', name: 'a@example.com', type: 'oauth', accountUuid: 'uuid-live' }],
       now: () => 1000,
     });
+    accountManager.markError('acct_1', 'oauth_refresh_failed', 'OAuth token refresh failed');
     const seenTokens = [];
     const proxy = await listen(createProxyServer({
       accountManager,
@@ -1506,6 +1615,8 @@ describe('createProxyServer', () => {
     assert.equal(refresh.status, 200);
     assert.equal(refresh.body.ok, true);
     assert.deepEqual(seenTokens, ['live-claude-code-token']);
+    assert.equal(refresh.body.status.accounts[0].status, 'active');
+    assert.equal(refresh.body.status.accounts[0].unavailableReason, null);
   });
 
   it('refreshes OAuth usage accounts concurrently when configured', async () => {

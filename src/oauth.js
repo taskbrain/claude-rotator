@@ -16,7 +16,7 @@ export const DEFAULT_OAUTH_CONNECT_RETRY_DELAY_MS = 250;
 export const DEFAULT_OAUTH_REFRESH_LEAD_MS = 30 * 60 * 1000;
 export const DEFAULT_REFRESH_RESULT_RETENTION_MS = 5 * 60 * 1000;
 export const DEFAULT_TOKEN_REFRESH_RETRY_AFTER_MS = 60_000;
-export const DEFAULT_MAX_TOKEN_REFRESH_BACKOFF_MS = 15 * 60 * 1000;
+export const DEFAULT_MAX_TOKEN_REFRESH_BACKOFF_MS = 6 * 60 * 60 * 1000;
 export const OAUTH_SCOPES = [
   'org:create_api_key',
   'user:profile',
@@ -58,7 +58,10 @@ export function createSingleFlightTokenRefresher(tokenRefresher, {
   maxRateLimitBackoffMs = DEFAULT_MAX_TOKEN_REFRESH_BACKOFF_MS,
 } = {}) {
   const entries = new Map();
-  const rateLimitAttempts = new Map();
+  let rateLimitAttempts = 0;
+  let globalRateLimitUntil = 0;
+  let globalRateLimitError = null;
+  let refreshTail = Promise.resolve();
   const maxBackoffMs = Math.max(
     1,
     Number(maxRateLimitBackoffMs) || DEFAULT_MAX_TOKEN_REFRESH_BACKOFF_MS,
@@ -72,10 +75,51 @@ export function createSingleFlightTokenRefresher(tokenRefresher, {
       entries.delete(refreshToken);
     }
 
+    const currentTime = now();
+    if (globalRateLimitUntil > currentTime && globalRateLimitError) {
+      const error = deferredRefreshError(globalRateLimitError, globalRateLimitUntil - currentTime);
+      try {
+        onFailure?.({ context, error, deferred: true });
+      } catch {}
+      throw error;
+    }
+
+    const executeRefresh = async () => {
+      const executionTime = now();
+      if (globalRateLimitUntil > executionTime && globalRateLimitError) {
+        throw deferredRefreshError(globalRateLimitError, globalRateLimitUntil - executionTime);
+      }
+
+      try {
+        const refreshed = await tokenRefresher(refreshToken);
+        rateLimitAttempts = 0;
+        globalRateLimitUntil = 0;
+        globalRateLimitError = null;
+        return refreshed;
+      } catch (error) {
+        const requestedRetryAfterMs = Math.max(0, Number(error?.retryAfterMs) || 0);
+        if (requestedRetryAfterMs > 0) {
+          rateLimitAttempts += 1;
+          error.retryAfterMs = Math.min(
+            maxBackoffMs,
+            Math.max(requestedRetryAfterMs, 1) * (2 ** Math.min(rateLimitAttempts - 1, 30)),
+          );
+          globalRateLimitUntil = now() + error.retryAfterMs;
+          globalRateLimitError = error;
+        } else {
+          rateLimitAttempts = 0;
+          globalRateLimitUntil = 0;
+          globalRateLimitError = null;
+        }
+        throw error;
+      }
+    };
+    const promise = refreshTail.then(executeRefresh, executeRefresh);
+    refreshTail = promise.catch(() => {});
     const entry = {
       completed: false,
       expiresAt: Number.POSITIVE_INFINITY,
-      promise: Promise.resolve().then(() => tokenRefresher(refreshToken)),
+      promise,
       timer: null,
     };
     entries.set(refreshToken, entry);
@@ -84,7 +128,6 @@ export function createSingleFlightTokenRefresher(tokenRefresher, {
       const refreshed = await entry.promise;
       if (entries.get(refreshToken) === entry && !entry.completed) {
         entry.completed = true;
-        rateLimitAttempts.delete(refreshToken);
         const retainedForMs = Math.max(0, Number(retentionMs) || 0);
         entry.expiresAt = now() + retainedForMs;
         entry.promise = Promise.resolve(refreshed);
@@ -108,19 +151,8 @@ export function createSingleFlightTokenRefresher(tokenRefresher, {
     } catch (error) {
       if (entries.get(refreshToken) === entry && !entry.completed) {
         entry.completed = true;
-        const requestedRetryAfterMs = Math.max(0, Number(error?.retryAfterMs) || 0);
-        if (requestedRetryAfterMs > 0) {
-          const attempt = (rateLimitAttempts.get(refreshToken) || 0) + 1;
-          rateLimitAttempts.set(refreshToken, attempt);
-          error.retryAfterMs = Math.min(
-            maxBackoffMs,
-            Math.max(requestedRetryAfterMs, 1) * (2 ** Math.min(attempt - 1, 30)),
-          );
-        } else {
-          rateLimitAttempts.delete(refreshToken);
-        }
         try {
-          onFailure?.({ context, error });
+          onFailure?.({ context, error, deferred: error?.deferred === true });
         } catch {}
         const retryAfterMs = Math.max(0, Number(error?.retryAfterMs) || 0);
         if (retryAfterMs > 0) {
@@ -136,6 +168,16 @@ export function createSingleFlightTokenRefresher(tokenRefresher, {
       throw error;
     }
   };
+}
+
+function deferredRefreshError(source, retryAfterMs) {
+  const error = new OAuthTokenRefreshError({
+    status: source?.status || 429,
+    code: source?.oauthCode || 'rate_limit_error',
+    retryAfterMs: Math.max(1, Math.ceil(retryAfterMs)),
+  });
+  error.deferred = true;
+  return error;
 }
 
 export function parseTokenResponse(data, previousRefreshToken, now = Date.now()) {
