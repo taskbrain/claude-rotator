@@ -17,6 +17,8 @@ export const DEFAULT_OAUTH_REFRESH_LEAD_MS = 5 * 60 * 1000;
 export const DEFAULT_REFRESH_RESULT_RETENTION_MS = 5 * 60 * 1000;
 export const DEFAULT_TOKEN_REFRESH_RETRY_AFTER_MS = 60_000;
 export const DEFAULT_MAX_TOKEN_REFRESH_BACKOFF_MS = 15 * 60 * 1000;
+export const DEFAULT_SUSTAINED_TOKEN_REFRESH_RETRY_MS = 60 * 60 * 1000;
+export const DEFAULT_TOKEN_REFRESH_CIRCUIT_ATTEMPTS = 6;
 export const DEFAULT_MAX_PROVIDER_RETRY_AFTER_MS = 24 * 60 * 60 * 1000;
 const MAX_TIMER_DELAY_MS = 2_147_483_647;
 const MAX_DATE_TIMESTAMP_MS = 8_640_000_000_000_000;
@@ -75,7 +77,10 @@ export function createSingleFlightTokenRefresher(tokenRefresher, {
   const maxBackoffMs = Number.isFinite(configuredMaxBackoffMs) && configuredMaxBackoffMs > 0
     ? configuredMaxBackoffMs
     : DEFAULT_MAX_TOKEN_REFRESH_BACKOFF_MS;
-  const attemptRetentionMs = Math.max(maxBackoffMs * 2, DEFAULT_MAX_TOKEN_REFRESH_BACKOFF_MS * 2);
+  const attemptRetentionMs = Math.max(
+    maxBackoffMs * 2,
+    DEFAULT_SUSTAINED_TOKEN_REFRESH_RETRY_MS * 2,
+  );
 
   const clearRateLimitAttempt = attemptKey => {
     const state = rateLimitAttempts.get(attemptKey);
@@ -135,11 +140,14 @@ export function createSingleFlightTokenRefresher(tokenRefresher, {
             error.retryAfterMs = requestedRetryAfterMs;
           } else {
             const attempt = incrementRateLimitAttempt(credentialKey);
+            const exponentialBackoffMs = Math.min(
+              maxBackoffMs,
+              Math.max(requestedRetryAfterMs, 1) * (2 ** Math.min(attempt - 1, 30)),
+            );
             error.retryAfterMs = boundedRetryAfterMs(
-              Math.min(
-                maxBackoffMs,
-                Math.max(requestedRetryAfterMs, 1) * (2 ** Math.min(attempt - 1, 30)),
-              ),
+              attempt > DEFAULT_TOKEN_REFRESH_CIRCUIT_ATTEMPTS
+                ? Math.max(exponentialBackoffMs, DEFAULT_SUSTAINED_TOKEN_REFRESH_RETRY_MS)
+                : exponentialBackoffMs,
               Math.max(1, MAX_DATE_TIMESTAMP_MS - Number(failedAt) - 1),
             );
             error.retryAfterSource ||= 'fallback';

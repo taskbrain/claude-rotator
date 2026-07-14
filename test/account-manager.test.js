@@ -511,6 +511,25 @@ describe('AccountManager', () => {
     assert.equal(manager.getActiveAccount().id, 'acct_1');
   });
 
+  it('clears an OAuth refresh cooldown after credentials are reloaded', () => {
+    const manager = new AccountManager({
+      accounts: [{ id: 'acct_1', name: 'a@example.com', type: 'oauth' }],
+      now: () => 1000,
+    });
+    manager.markCredentialRefreshRateLimited('acct_1', 3600, {
+      retryAfterSource: 'fallback',
+    });
+
+    manager.replaceAccounts([
+      { id: 'acct_1', name: 'a@example.com', type: 'oauth' },
+    ]);
+
+    const account = manager.getStatus().accounts[0];
+    assert.equal(account.status, 'active');
+    assert.equal(account.rateLimitedUntil, null);
+    assert.equal(account.unavailableReason, null);
+  });
+
   it('reports precise unavailable reasons for quota, throttling, and errors', () => {
     const manager = new AccountManager({
       accounts: [

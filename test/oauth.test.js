@@ -16,6 +16,7 @@ import {
   DEFAULT_OAUTH_REQUEST_TIMEOUT_MS,
   DEFAULT_OAUTH_REFRESH_LEAD_MS,
   DEFAULT_MAX_TOKEN_REFRESH_BACKOFF_MS,
+  DEFAULT_SUSTAINED_TOKEN_REFRESH_RETRY_MS,
   DEFAULT_MAX_PROVIDER_RETRY_AFTER_MS,
   DEFAULT_TOKEN_REFRESH_RETRY_AFTER_MS,
   CLAUDE_AI_OAUTH_SCOPES,
@@ -209,7 +210,7 @@ describe('token refresh', () => {
     assert.equal(maxActive, 1);
   });
 
-  it('caps fallback exponential backoff at fifteen minutes per refresh token', async () => {
+  it('opens a fixed hourly circuit after repeated fifteen-minute refresh failures', async () => {
     let calls = 0;
     let now = 1000;
     const coordinated = createSingleFlightTokenRefresher(async () => {
@@ -223,7 +224,16 @@ describe('token refresh', () => {
     }, { now: () => now });
 
     assert.equal(DEFAULT_MAX_TOKEN_REFRESH_BACKOFF_MS, 15 * 60 * 1000);
-    const expectedDelays = [60_000, 120_000, 240_000, 480_000, 900_000, 900_000];
+    const expectedDelays = [
+      60_000,
+      120_000,
+      240_000,
+      480_000,
+      900_000,
+      900_000,
+      DEFAULT_SUSTAINED_TOKEN_REFRESH_RETRY_MS,
+      DEFAULT_SUSTAINED_TOKEN_REFRESH_RETRY_MS,
+    ];
     for (const expectedDelay of expectedDelays) {
       await assert.rejects(
         coordinated('refresh-1'),

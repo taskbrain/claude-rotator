@@ -200,14 +200,21 @@ export class AccountManager {
     this.accounts = accounts.map((account, index) => {
       const existing = existingById.get(account.id);
       if (!existing) return this.createAccount(account, index);
+      const resetCredentialCooldown = existing.temporaryUnavailableReason?.type
+        === 'oauth_refresh_rate_limit';
+      const resetError = existing.status === 'error';
       return {
         ...existing,
         name: account.name || account.email || account.id,
         type: account.type || 'oauth',
         accountUuid: account.accountUuid || null,
         priority: account.priority ?? index,
-        status: existing.status === 'error' ? 'ready' : existing.status,
-        errorReason: existing.status === 'error' ? null : existing.errorReason,
+        status: resetError || resetCredentialCooldown ? 'ready' : existing.status,
+        errorReason: resetError ? null : existing.errorReason,
+        rateLimitedUntil: resetCredentialCooldown ? null : existing.rateLimitedUntil,
+        temporaryUnavailableReason: resetCredentialCooldown
+          ? null
+          : existing.temporaryUnavailableReason,
       };
     });
     if (this.currentIndex >= this.accounts.length) this.currentIndex = 0;
