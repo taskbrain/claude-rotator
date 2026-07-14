@@ -508,7 +508,11 @@ async function inspectDoctorWarnings(deps = {}) {
       try {
         profile = await profileFetcher(profileSecret.accessToken);
       } catch (profileError) {
-        if (!secret.refreshToken || profileSecret !== secret) throw profileError;
+        if (
+          account.id === CURRENT_ACCOUNT_ID
+          || !secret.refreshToken
+          || profileSecret !== secret
+        ) throw profileError;
         const refreshedSecret = await refreshDoctorSecret({
           account,
           secret,
@@ -536,14 +540,37 @@ async function inspectDoctorWarnings(deps = {}) {
 }
 
 async function refreshDoctorSecretIfNeeded({ account, secret, store, tokenRefresher }) {
+  if (account.id === CURRENT_ACCOUNT_ID) return secret;
   if (!secret.refreshToken || !isTokenExpiringSoon(secret.expiresAt)) return secret;
   return refreshDoctorSecret({ account, secret, store, tokenRefresher });
 }
 
 async function refreshDoctorSecret({ account, secret, store, tokenRefresher }) {
-  const refreshed = { ...secret, ...(await tokenRefresher(secret.refreshToken)) };
-  if (account.id !== CURRENT_ACCOUNT_ID && store.set) await store.set(account.id, refreshed);
+  if (account.id === CURRENT_ACCOUNT_ID) {
+    throw new Error('Live Claude Code credentials must be refreshed by Claude Code');
+  }
+  const refreshed = {
+    ...secret,
+    ...(await tokenRefresher(secret.refreshToken, tokenRefreshContext(account, secret))),
+  };
+  const latestSecret = await store.get(account.id);
+  if (latestSecret?.refreshToken !== secret.refreshToken) {
+    if (latestSecret?.accessToken) return latestSecret;
+    throw new Error('Stored OAuth credential changed while token refresh was in flight');
+  }
+  if (store.set) await store.set(account.id, refreshed);
   return refreshed;
+}
+
+function tokenRefreshContext(account, secret) {
+  return {
+    accountId: account.id,
+    scopes: secret.scopes,
+    refreshTokenExpiresAt: secret.refreshTokenExpiresAt,
+    clientId: secret.clientId,
+    subscriptionType: secret.subscriptionType,
+    rateLimitTier: secret.rateLimitTier,
+  };
 }
 
 function duplicateAccountUuidWarnings(accounts) {

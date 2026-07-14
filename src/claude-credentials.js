@@ -10,11 +10,27 @@ export function parseClaudeCredentials(raw) {
   const parsed = typeof raw === 'string' ? JSON.parse(raw) : raw;
   const data = parsed.claudeAiOauth || parsed;
   if (!data.accessToken) throw new Error('Claude credentials JSON must contain accessToken');
-  return {
+  const credential = {
     accessToken: data.accessToken,
     refreshToken: data.refreshToken || null,
     expiresAt: data.expiresAt || null,
   };
+  const scopes = normalizeScopes(data.scopes);
+  if (scopes.length > 0) credential.scopes = scopes;
+  for (const field of [
+    'refreshTokenExpiresAt',
+    'clientId',
+    'subscriptionType',
+    'rateLimitTier',
+  ]) {
+    if (data[field] != null) credential[field] = data[field];
+  }
+  return credential;
+}
+
+function normalizeScopes(value) {
+  const entries = Array.isArray(value) ? value : String(value || '').split(/\s+/);
+  return [...new Set(entries.map(scope => String(scope).trim()).filter(Boolean))];
 }
 
 export async function readCurrentClaudeCredentials({ platform = process.platform, home = homedir() } = {}) {

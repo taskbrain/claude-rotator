@@ -18,6 +18,7 @@ import {
   DEFAULT_MAX_TOKEN_REFRESH_BACKOFF_MS,
   DEFAULT_MAX_PROVIDER_RETRY_AFTER_MS,
   DEFAULT_TOKEN_REFRESH_RETRY_AFTER_MS,
+  CLAUDE_AI_OAUTH_SCOPES,
   OAuthTokenRefreshError,
   OAUTH_USER_AGENT,
   parseUsageResponse,
@@ -37,9 +38,10 @@ describe('OAuth time helpers', () => {
     assert.equal(isTokenExpiringSoon(now + 10_000, now, 3000), false);
   });
 
-  it('starts refreshing early enough for the polling interval', () => {
+  it('matches Claude Code\'s five-minute refresh window', () => {
     const now = 1780580000000;
 
+    assert.equal(DEFAULT_OAUTH_REFRESH_LEAD_MS, 5 * 60 * 1000);
     assert.equal(isTokenExpiringSoon(now + DEFAULT_OAUTH_REFRESH_LEAD_MS - 1, now), true);
     assert.equal(isTokenExpiringSoon(now + DEFAULT_OAUTH_REFRESH_LEAD_MS + 1, now), false);
   });
@@ -48,10 +50,12 @@ describe('OAuth time helpers', () => {
 describe('token refresh', () => {
   it('coalesces concurrent refreshes and retains the rotated result for late callers', async () => {
     let calls = 0;
+    const refreshContexts = [];
     const successCallbacks = [];
     let now = 1000;
-    const coordinated = createSingleFlightTokenRefresher(async refreshToken => {
+    const coordinated = createSingleFlightTokenRefresher(async (refreshToken, context) => {
       calls += 1;
+      refreshContexts.push(context);
       await new Promise(resolve => setImmediate(resolve));
       return {
         accessToken: `access-${calls}`,
@@ -72,6 +76,7 @@ describe('token refresh', () => {
     const late = await coordinated('refresh-1');
 
     assert.equal(calls, 1);
+    assert.deepEqual(refreshContexts, [{ accountId: 'acct-1' }]);
     assert.deepEqual(successCallbacks, [{ context: { accountId: 'acct-1' }, rotated: true }]);
     assert.deepEqual(second, first);
     assert.deepEqual(late, first);
@@ -79,6 +84,7 @@ describe('token refresh', () => {
     now += 60_001;
     const afterRetention = await coordinated('refresh-1');
     assert.equal(calls, 2);
+    assert.deepEqual(refreshContexts, [{ accountId: 'acct-1' }, undefined]);
     assert.equal(successCallbacks.length, 2);
     assert.equal(afterRetention.refreshToken, 'refresh-1-rotated-2');
   });
@@ -97,6 +103,19 @@ describe('token refresh', () => {
       refreshToken: 'refresh-2',
     });
     assert.equal(calls, 2);
+  });
+
+  it('does not pass a null options object when refresh context is omitted', async () => {
+    const coordinated = createSingleFlightTokenRefresher(async (
+      refreshToken,
+      options = {},
+    ) => {
+      assert.equal(refreshToken, 'refresh-1');
+      assert.deepEqual(options, {});
+      return { accessToken: 'access-1', refreshToken };
+    }, { retentionMs: 0 });
+
+    assert.equal((await coordinated('refresh-1')).accessToken, 'access-1');
   });
 
   it('retains a token endpoint cooldown without repeating the refresh request', async () => {
@@ -307,6 +326,48 @@ describe('token refresh', () => {
     });
   });
 
+  it('preserves OAuth scopes and refresh-token expiry metadata', () => {
+    const now = 1780580000000;
+    const parsed = parseTokenResponse({
+      access_token: 'access2',
+      expires_in: 3600,
+      refresh_token_expires_in: 7200,
+      scope: 'user:profile user:inference user:profile',
+    }, 'refresh1', now, {
+      scopes: ['stale:scope'],
+      clientId: 'client-1',
+      subscriptionType: 'max',
+      rateLimitTier: 'default_claude_max_20x',
+    });
+
+    assert.deepEqual(parsed, {
+      accessToken: 'access2',
+      refreshToken: 'refresh1',
+      expiresAt: now + 3600 * 1000,
+      scopes: ['user:profile', 'user:inference'],
+      refreshTokenExpiresAt: now + 7200 * 1000,
+      clientId: 'client-1',
+      subscriptionType: 'max',
+      rateLimitTier: 'default_claude_max_20x',
+    });
+  });
+
+  it('keeps the previous refresh-token expiry for missing or invalid durations', () => {
+    const now = 1780580000000;
+    const previousRefreshTokenExpiresAt = 1812118800;
+
+    for (const value of [null, '', Number.MAX_VALUE]) {
+      const parsed = parseTokenResponse({
+        access_token: 'access2',
+        expires_in: 3600,
+        refresh_token_expires_in: value,
+      }, 'refresh1', now, {
+        refreshTokenExpiresAt: previousRefreshTokenExpiresAt,
+      });
+      assert.equal(parsed.refreshTokenExpiresAt, previousRefreshTokenExpiresAt * 1000);
+    }
+  });
+
   it('refreshes access tokens through injected fetch', async () => {
     const calls = [];
     const fetchImpl = async (url, options) => {
@@ -325,9 +386,47 @@ describe('token refresh', () => {
     assert.equal(result.accessToken, 'access2');
     assert.equal(result.refreshToken, 'refresh1');
     assert.equal(result.expiresAt, 3601000);
-    assert.equal(JSON.parse(calls[0].options.body).refresh_token, 'refresh1');
+    assert.deepEqual(JSON.parse(calls[0].options.body), {
+      grant_type: 'refresh_token',
+      refresh_token: 'refresh1',
+      client_id: '9d1c250a-e61b-44d9-88ed-5944d1962f5e',
+      scope: CLAUDE_AI_OAUTH_SCOPES.join(' '),
+    });
+    assert.deepEqual(result.scopes, CLAUDE_AI_OAUTH_SCOPES);
     assert.equal(calls[0].options.headers['User-Agent'], OAUTH_USER_AGENT);
     assert.equal(calls[0].options.headers['Accept-Encoding'], 'identity');
+    assert.equal(calls[0].options.headers['Content-Length'], Buffer.byteLength(calls[0].options.body));
+  });
+
+  it('uses imported OAuth scopes and client id when refreshing', async () => {
+    let request;
+    const result = await refreshAccessToken('refresh1', {
+      fetchImpl: async (url, options) => {
+        request = { url, options };
+        return jsonResponse(200, { access_token: 'access2', expires_in: 3600 });
+      },
+      now: () => 1000,
+      scopes: ['user:profile', 'user:inference'],
+      clientId: 'custom-client',
+      refreshTokenExpiresAt: 9999999999999,
+    });
+
+    assert.deepEqual(JSON.parse(request.options.body), {
+      grant_type: 'refresh_token',
+      refresh_token: 'refresh1',
+      client_id: 'custom-client',
+      scope: 'user:profile user:inference',
+    });
+    assert.deepEqual(result.scopes, ['user:profile', 'user:inference']);
+    assert.equal(result.clientId, 'custom-client');
+    assert.equal(result.refreshTokenExpiresAt, 9999999999999);
+  });
+
+  it('requires stored scopes for custom OAuth clients', async () => {
+    await assert.rejects(
+      refreshAccessToken('refresh1', { clientId: 'custom-client' }),
+      /OAuth scopes are required for custom client credentials/,
+    );
   });
 
   it('returns a sanitized refresh error with the server retry delay', async () => {

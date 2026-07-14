@@ -344,6 +344,8 @@ describe('runCli', () => {
         accessToken: 'expired-token',
         refreshToken: 'refresh-token',
         expiresAt: 1000,
+        scopes: ['user:profile', 'user:inference'],
+        refreshTokenExpiresAt: 9999999999999,
       },
     };
     const secretStore = {
@@ -360,8 +362,11 @@ describe('runCli', () => {
         ],
       }),
       secretStore,
-      refreshAccessToken: async refreshToken => {
+      refreshAccessToken: async (refreshToken, context) => {
         assert.equal(refreshToken, 'refresh-token');
+        assert.deepEqual(context.scopes, ['user:profile', 'user:inference']);
+        assert.equal(context.refreshTokenExpiresAt, 9999999999999);
+        assert.equal(context.accountId, 'acct_1');
         return {
           accessToken: 'fresh-token',
           refreshToken,
@@ -377,6 +382,81 @@ describe('runCli', () => {
     assert.equal(code, 0);
     assert.match(io.output(), /accounts: ok/);
     assert.equal(stored.acct_1.accessToken, 'fresh-token');
+  });
+
+  it('leaves current Claude Code credential refresh to Claude Code', async () => {
+    const io = createIo();
+    let refreshCalls = 0;
+
+    const code = await runCli(['doctor'], {
+      ...io,
+      readHealth: async () => ({ ok: true }),
+      loadConfig: async () => ({
+        accounts: [{ id: 'current', name: 'person@example.com', type: 'oauth' }],
+      }),
+      readCurrentCredentials: async () => ({
+        accessToken: 'expired-current-token',
+        refreshToken: 'current-refresh-token',
+        expiresAt: 1000,
+      }),
+      refreshAccessToken: async () => {
+        refreshCalls += 1;
+        throw new Error('current credential must not be refreshed by doctor');
+      },
+      fetchProfile: async () => {
+        throw new Error('Profile fetch failed (401)');
+      },
+    });
+
+    assert.equal(code, 0);
+    assert.equal(refreshCalls, 0);
+    assert.match(io.output(), /current: credential profile check failed: Profile fetch failed \(401\)/);
+  });
+
+  it('discards a doctor refresh result when a newer credential was stored in flight', async () => {
+    const io = createIo();
+    const stored = {
+      acct_1: {
+        accessToken: 'expired-token',
+        refreshToken: 'refresh-token-1',
+        expiresAt: 1000,
+      },
+    };
+    const newerSecret = {
+      accessToken: 'newer-token',
+      refreshToken: 'refresh-token-3',
+      expiresAt: Date.now() + 60 * 60 * 1000,
+    };
+    const secretStore = {
+      get: async id => stored[id],
+      set: async (id, secret) => { stored[id] = secret; },
+    };
+
+    const code = await runCli(['doctor'], {
+      ...io,
+      readHealth: async () => ({ ok: true }),
+      loadConfig: async () => ({
+        accounts: [
+          { id: 'acct_1', name: 'person@example.com', type: 'oauth', accountUuid: 'uuid-1' },
+        ],
+      }),
+      secretStore,
+      refreshAccessToken: async () => {
+        await secretStore.set('acct_1', newerSecret);
+        return {
+          accessToken: 'stale-refresh-result',
+          refreshToken: 'refresh-token-2',
+          expiresAt: Date.now() + 60 * 60 * 1000,
+        };
+      },
+      fetchProfile: async token => {
+        assert.equal(token, 'newer-token');
+        return { email: 'person@example.com', accountUuid: 'uuid-1' };
+      },
+    });
+
+    assert.equal(code, 0);
+    assert.deepEqual(stored.acct_1, newerSecret);
   });
 });
 

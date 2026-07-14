@@ -30,6 +30,28 @@ describe('parseClaudeCredentials', () => {
     assert.equal(parsed.accessToken, 'access');
   });
 
+  it('preserves Claude Code OAuth refresh metadata', () => {
+    const parsed = parseClaudeCredentials({
+      accessToken: 'access',
+      refreshToken: 'refresh',
+      expiresAt: 1780582800000,
+      refreshTokenExpiresAt: 1812118800000,
+      scopes: ['user:profile', 'user:inference', 'user:profile'],
+      subscriptionType: 'max',
+      rateLimitTier: 'default_claude_max_20x',
+    });
+
+    assert.deepEqual(parsed, {
+      accessToken: 'access',
+      refreshToken: 'refresh',
+      expiresAt: 1780582800000,
+      scopes: ['user:profile', 'user:inference'],
+      refreshTokenExpiresAt: 1812118800000,
+      subscriptionType: 'max',
+      rateLimitTier: 'default_claude_max_20x',
+    });
+  });
+
   it('rejects JSON without accessToken', () => {
     assert.throws(() => parseClaudeCredentials({ refreshToken: 'refresh' }), /accessToken/);
   });

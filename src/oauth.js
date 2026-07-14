@@ -13,7 +13,7 @@ export const DEFAULT_OAUTH_REQUEST_TIMEOUT_MS = 60_000;
 export const DEFAULT_OAUTH_CONNECT_TIMEOUT_MS = 10_000;
 export const DEFAULT_OAUTH_CONNECT_RETRIES = 3;
 export const DEFAULT_OAUTH_CONNECT_RETRY_DELAY_MS = 250;
-export const DEFAULT_OAUTH_REFRESH_LEAD_MS = 30 * 60 * 1000;
+export const DEFAULT_OAUTH_REFRESH_LEAD_MS = 5 * 60 * 1000;
 export const DEFAULT_REFRESH_RESULT_RETENTION_MS = 5 * 60 * 1000;
 export const DEFAULT_TOKEN_REFRESH_RETRY_AFTER_MS = 60_000;
 export const DEFAULT_MAX_TOKEN_REFRESH_BACKOFF_MS = 15 * 60 * 1000;
@@ -28,6 +28,13 @@ export const OAUTH_SCOPES = [
   'user:mcp_servers',
   'user:file_upload',
 ].join(' ');
+export const CLAUDE_AI_OAUTH_SCOPES = Object.freeze([
+  'user:profile',
+  'user:inference',
+  'user:sessions:claude_code',
+  'user:mcp_servers',
+  'user:file_upload',
+]);
 
 export class OAuthTokenRefreshError extends Error {
   constructor({ status, code = 'unknown', retryAfterMs = null, retryAfterSource = null }) {
@@ -111,7 +118,7 @@ export function createSingleFlightTokenRefresher(tokenRefresher, {
 
     const executeRefresh = async () => {
       try {
-        const refreshed = await tokenRefresher(refreshToken);
+        const refreshed = await tokenRefresher(refreshToken, context ?? undefined);
         clearRateLimitAttempt(credentialKey);
         return refreshed;
       } catch (error) {
@@ -231,29 +238,65 @@ function scheduleEntryExpiry(entries, credentialKey, entry, now) {
   expire();
 }
 
-export function parseTokenResponse(data, previousRefreshToken, now = Date.now()) {
-  return {
+export function parseTokenResponse(data, previousRefreshToken, now = Date.now(), previous = {}) {
+  const parsed = {
     accessToken: data.access_token,
     refreshToken: data.refresh_token || previousRefreshToken,
     expiresAt: normalizeExpiresAt(data.expires_at) || (now + (data.expires_in || 3600) * 1000),
   };
+
+  const responseScopes = normalizeOAuthScopes(data.scope);
+  const scopes = responseScopes.length > 0
+    ? responseScopes
+    : normalizeOAuthScopes(previous.scopes);
+  if (scopes.length > 0) parsed.scopes = scopes;
+
+  const rawRefreshTokenExpiresIn = data.refresh_token_expires_in;
+  const refreshTokenExpiresIn = Number(rawRefreshTokenExpiresIn);
+  const refreshTokenExpiresAt = now + refreshTokenExpiresIn * 1000;
+  if (
+    rawRefreshTokenExpiresIn != null
+    && rawRefreshTokenExpiresIn !== ''
+    && Number.isFinite(refreshTokenExpiresIn)
+    && refreshTokenExpiresIn >= 0
+    && Number.isFinite(refreshTokenExpiresAt)
+    && refreshTokenExpiresAt <= MAX_DATE_TIMESTAMP_MS
+  ) {
+    parsed.refreshTokenExpiresAt = refreshTokenExpiresAt;
+  } else if (previous.refreshTokenExpiresAt != null) {
+    parsed.refreshTokenExpiresAt = normalizeExpiresAt(previous.refreshTokenExpiresAt);
+  }
+
+  for (const field of ['clientId', 'subscriptionType', 'rateLimitTier']) {
+    if (previous[field] != null) parsed[field] = previous[field];
+  }
+  return parsed;
 }
 
 export async function refreshAccessToken(refreshToken, options = {}) {
+  options ||= {};
   const endpoint = options.endpoint || OAUTH_TOKEN_URL;
   const now = options.now || Date.now;
+  const scopes = normalizeOAuthScopes(options.scopes);
+  if (scopes.length === 0 && options.clientId && options.clientId !== OAUTH_CLIENT_ID) {
+    throw new Error('OAuth scopes are required for custom client credentials');
+  }
+  const refreshScopes = scopes.length > 0 ? scopes : [...CLAUDE_AI_OAUTH_SCOPES];
+  const body = JSON.stringify({
+    grant_type: 'refresh_token',
+    refresh_token: refreshToken,
+    client_id: options.clientId || OAUTH_CLIENT_ID,
+    scope: refreshScopes.join(' '),
+  });
   const response = await requestEndpoint(endpoint, {
     method: 'POST',
     headers: {
       ...oauthClientHeaders(),
       'Content-Type': 'application/json',
       'Accept': 'application/json, text/plain, */*',
+      'Content-Length': Buffer.byteLength(body),
     },
-    body: JSON.stringify({
-      grant_type: 'refresh_token',
-      refresh_token: refreshToken,
-      client_id: OAUTH_CLIENT_ID,
-    }),
+    body,
   }, options);
 
   if (!response.ok) {
@@ -268,7 +311,18 @@ export async function refreshAccessToken(refreshToken, options = {}) {
     });
   }
 
-  return parseTokenResponse(await response.json(), refreshToken, now());
+  return parseTokenResponse(await response.json(), refreshToken, now(), {
+    scopes: refreshScopes,
+    refreshTokenExpiresAt: options.refreshTokenExpiresAt,
+    clientId: options.clientId,
+    subscriptionType: options.subscriptionType,
+    rateLimitTier: options.rateLimitTier,
+  });
+}
+
+function normalizeOAuthScopes(value) {
+  const entries = Array.isArray(value) ? value : String(value || '').split(/\s+/);
+  return [...new Set(entries.map(scope => String(scope).trim()).filter(Boolean))];
 }
 
 export async function fetchProfile(accessToken, options = {}) {

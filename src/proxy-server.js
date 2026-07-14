@@ -71,8 +71,11 @@ export function createProxyServer({
       const retry = error?.retryAfterMs
         ? ` retryAfterSec=${Math.ceil(error.retryAfterMs / 1000)}`
         : '';
+      const retrySource = ['provider', 'fallback'].includes(error?.retryAfterSource)
+        ? ` retrySource=${error.retryAfterSource}`
+        : '';
       const result = deferred ? 'deferred' : 'failed';
-      logger?.(`${new Date().toISOString()} credential-refresh account=${context?.accountId || 'unknown'} result=${result} errorType=${credentialRefreshErrorType(error)}${retry}`);
+      logger?.(`${new Date().toISOString()} credential-refresh account=${context?.accountId || 'unknown'} result=${result} errorType=${credentialRefreshErrorType(error)}${retry}${retrySource}`);
     },
   });
 
@@ -748,15 +751,32 @@ async function refreshSecretIfExpiring({ account, secret, secretStore, tokenRefr
 }
 
 async function refreshAndStoreSecret({ account, secret, secretStore, tokenRefresher, logger }) {
-  const refreshed = await tokenRefresher(secret.refreshToken, { accountId: account.id });
+  const refreshed = await tokenRefresher(secret.refreshToken, tokenRefreshContext(account, secret));
   const nextSecret = { ...secret, ...refreshed };
   try {
+    const latestSecret = await secretStore.get(account.id);
+    if (latestSecret?.refreshToken !== secret.refreshToken) {
+      logger?.(`${new Date().toISOString()} credential-refresh account=${account.id} result=discarded reason=credential-changed`);
+      if (latestSecret?.accessToken) return latestSecret;
+      throw new Error('Stored OAuth credential changed while token refresh was in flight');
+    }
     await secretStore.set(account.id, nextSecret);
   } catch (error) {
     logger?.(`${new Date().toISOString()} credential-store account=${account.id} result=failed errorType=${error?.code || error?.name || 'unknown'}`);
     throw error;
   }
   return nextSecret;
+}
+
+function tokenRefreshContext(account, secret) {
+  return {
+    accountId: account.id,
+    scopes: secret.scopes,
+    refreshTokenExpiresAt: secret.refreshTokenExpiresAt,
+    clientId: secret.clientId,
+    subscriptionType: secret.subscriptionType,
+    rateLimitTier: secret.rateLimitTier,
+  };
 }
 
 function credentialRefreshErrorType(error) {
@@ -811,19 +831,15 @@ async function resolveSecretForAccount({
 
 async function mirrorLiveClaudeCodeCredential({ account, stored, live, secretStore, logger }) {
   if (!live?.accessToken || !live.refreshToken) return;
-  if (
-    stored?.accessToken === live.accessToken
-    && stored?.refreshToken === live.refreshToken
-    && normalizeCredentialExpiry(stored?.expiresAt) === normalizeCredentialExpiry(live.expiresAt)
-  ) return;
-
   const mirrored = {
     ...(stored || {}),
-    accessToken: live.accessToken,
-    refreshToken: live.refreshToken,
-    expiresAt: live.expiresAt,
+    ...live,
   };
+  for (const field of ['clientId', 'scopes']) {
+    if (!(field in live)) delete mirrored[field];
+  }
   delete mirrored.liveClaudeCodeCredential;
+  if (credentialsMatch(stored, mirrored)) return;
 
   try {
     await secretStore.set(account.id, mirrored);
@@ -831,6 +847,18 @@ async function mirrorLiveClaudeCodeCredential({ account, stored, live, secretSto
   } catch (error) {
     logger?.(`${new Date().toISOString()} credential-sync-failed account=${account.id} error=${shortErrorMessage(error)}`);
   }
+}
+
+function credentialsMatch(left, right) {
+  return left?.accessToken === right?.accessToken
+    && left?.refreshToken === right?.refreshToken
+    && normalizeCredentialExpiry(left?.expiresAt) === normalizeCredentialExpiry(right?.expiresAt)
+    && normalizeCredentialExpiry(left?.refreshTokenExpiresAt)
+      === normalizeCredentialExpiry(right?.refreshTokenExpiresAt)
+    && JSON.stringify(left?.scopes || null) === JSON.stringify(right?.scopes || null)
+    && left?.clientId === right?.clientId
+    && left?.subscriptionType === right?.subscriptionType
+    && left?.rateLimitTier === right?.rateLimitTier;
 }
 
 function normalizeCredentialExpiry(expiresAt) {

@@ -82,6 +82,8 @@ describe('createProxyServer', () => {
       accessToken: 'expired-token',
       refreshToken: 'refresh-token-1',
       expiresAt: 900,
+      scopes: ['user:profile', 'user:inference'],
+      refreshTokenExpiresAt: 9999999999999,
     });
     const accountManager = new AccountManager({
       accounts: [{ id: 'acct_1', name: 'a@example.com', type: 'oauth' }],
@@ -91,12 +93,17 @@ describe('createProxyServer', () => {
       accountManager,
       secretStore,
       config: { upstream: upstream.url },
-      tokenRefresher: async refreshToken => {
+      tokenRefresher: async (refreshToken, context) => {
         assert.equal(refreshToken, 'refresh-token-1');
+        assert.equal(context.accountId, 'acct_1');
+        assert.deepEqual(context.scopes, ['user:profile', 'user:inference']);
+        assert.equal(context.refreshTokenExpiresAt, 9999999999999);
         return {
           accessToken: 'fresh-token',
           refreshToken: 'refresh-token-2',
           expiresAt: 100000,
+          scopes: context.scopes,
+          refreshTokenExpiresAt: context.refreshTokenExpiresAt,
         };
       },
     }));
@@ -112,6 +119,8 @@ describe('createProxyServer', () => {
       accessToken: 'fresh-token',
       refreshToken: 'refresh-token-2',
       expiresAt: 100000,
+      scopes: ['user:profile', 'user:inference'],
+      refreshTokenExpiresAt: 9999999999999,
     });
 
     await close(proxy.server);
@@ -131,7 +140,7 @@ describe('createProxyServer', () => {
     await secretStore.set('acct_1', {
       accessToken: 'still-valid-token',
       refreshToken: 'refresh-token-1',
-      expiresAt: Date.now() + 10 * 60 * 1000,
+      expiresAt: Date.now() + 4 * 60 * 1000,
     });
     const accountManager = new AccountManager({
       accounts: [{ id: 'acct_1', name: 'a@example.com', type: 'oauth' }],
@@ -163,6 +172,61 @@ describe('createProxyServer', () => {
     assert.deepEqual(upstreamSeen, ['Bearer still-valid-token']);
     assert.equal(accountManager.getStatus().accounts[0].unavailableReason, null);
     assert.match(logLines.join('\n'), /credential-refresh-fallback account=acct_1/);
+  });
+
+  it('discards a refresh result when a newer credential was stored in flight', async () => {
+    const upstreamSeen = [];
+    const logLines = [];
+    const upstream = await listen(http.createServer(async (req, res) => {
+      upstreamSeen.push(req.headers.authorization);
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ ok: true }));
+    }));
+
+    const secretStore = new MemorySecretStore();
+    await secretStore.set('acct_1', {
+      accessToken: 'expired-token',
+      refreshToken: 'refresh-token-1',
+      expiresAt: 900,
+    });
+    const accountManager = new AccountManager({
+      accounts: [{ id: 'acct_1', name: 'a@example.com', type: 'oauth' }],
+      now: () => 1000,
+    });
+    const newerSecret = {
+      accessToken: 'newer-access-token',
+      refreshToken: 'refresh-token-3',
+      expiresAt: Date.now() + 60 * 60 * 1000,
+    };
+    const proxy = await listen(createProxyServer({
+      accountManager,
+      secretStore,
+      config: { upstream: upstream.url },
+      tokenRefresher: async () => {
+        await secretStore.set('acct_1', newerSecret);
+        return {
+          accessToken: 'stale-refresh-result',
+          refreshToken: 'refresh-token-2',
+          expiresAt: Date.now() + 60 * 60 * 1000,
+        };
+      },
+      logger: line => logLines.push(line),
+    }));
+    cleanupAfterTest(async () => {
+      await close(proxy.server);
+      await close(upstream.server);
+    });
+
+    const response = await requestJson(`${proxy.url}/v1/messages`, {
+      method: 'POST',
+      body: JSON.stringify({ model: 'sonnet' }),
+    });
+
+    assert.equal(response.status, 200);
+    assert.deepEqual(upstreamSeen, ['Bearer newer-access-token']);
+    assert.deepEqual(await secretStore.get('acct_1'), newerSecret);
+    assert.match(logLines.join('\n'), /result=discarded reason=credential-changed/);
+    assert.equal(logLines.join('\n').includes('stale-refresh-result'), false);
   });
 
   it('refreshes an expired OAuth token only once for concurrent requests', async () => {
@@ -227,6 +291,46 @@ describe('createProxyServer', () => {
     assert.equal(refreshLogs[0].includes('fresh-token'), false);
   });
 
+  it('logs only sanitized OAuth refresh retry metadata', async () => {
+    const logLines = [];
+    const secretStore = new MemorySecretStore();
+    await secretStore.set('acct_1', {
+      accessToken: 'expired-token',
+      refreshToken: 'secret-refresh-token',
+      expiresAt: 900,
+    });
+    const accountManager = new AccountManager({
+      accounts: [{ id: 'acct_1', name: 'a@example.com', type: 'oauth' }],
+      now: () => 1000,
+    });
+    const proxy = await listen(createProxyServer({
+      accountManager,
+      secretStore,
+      config: { upstream: 'http://127.0.0.1:1', usagePolling: { enabled: false } },
+      tokenRefresher: async () => {
+        throw new OAuthTokenRefreshError({
+          status: 429,
+          code: 'rate_limit_error',
+          retryAfterMs: 60_000,
+          retryAfterSource: 'fallback',
+        });
+      },
+      logger: line => logLines.push(line),
+    }));
+    cleanupAfterTest(async () => {
+      await close(proxy.server);
+    });
+
+    await requestJson(`${proxy.url}/v1/messages`, {
+      method: 'POST',
+      body: JSON.stringify({ model: 'sonnet' }),
+    });
+
+    assert.match(logLines.join('\n'), /retryAfterSec=60 retrySource=fallback/);
+    assert.equal(logLines.join('\n').includes('secret-refresh-token'), false);
+    assert.equal(logLines.join('\n').includes('expired-token'), false);
+  });
+
   it('uses live Claude Code credentials for the current account', async () => {
     const upstreamSeen = [];
     const upstream = await listen(http.createServer(async (req, res) => {
@@ -282,12 +386,15 @@ describe('createProxyServer', () => {
       accessToken: 'expired-saved-token',
       refreshToken: 'saved-refresh-token',
       expiresAt: 900,
+      clientId: 'stale-custom-client',
+      scopes: ['stale:scope'],
     });
     const accountManager = new AccountManager({
       accounts: [{ id: 'acct_1', name: 'a@example.com', type: 'oauth', accountUuid: 'uuid-live' }],
       now: () => 1000,
     });
     const liveExpiresAt = Date.now() + 60 * 60 * 1000;
+    const liveRefreshExpiresAt = Date.now() + 30 * 24 * 60 * 60 * 1000;
     const proxy = await listen(createProxyServer({
       accountManager,
       secretStore,
@@ -299,6 +406,9 @@ describe('createProxyServer', () => {
         accessToken: 'live-claude-code-token',
         refreshToken: 'live-claude-code-refresh',
         expiresAt: liveExpiresAt,
+        refreshTokenExpiresAt: liveRefreshExpiresAt,
+        scopes: ['user:profile', 'user:inference'],
+        subscriptionType: 'max',
       }),
       currentProfileFetcher: async accessToken => {
         assert.equal(accessToken, 'live-claude-code-token');
@@ -321,6 +431,9 @@ describe('createProxyServer', () => {
       accessToken: 'live-claude-code-token',
       refreshToken: 'live-claude-code-refresh',
       expiresAt: liveExpiresAt,
+      refreshTokenExpiresAt: liveRefreshExpiresAt,
+      scopes: ['user:profile', 'user:inference'],
+      subscriptionType: 'max',
     });
   });
 
