@@ -16,7 +16,12 @@ export const DEFAULT_OAUTH_CONNECT_RETRY_DELAY_MS = 250;
 export const DEFAULT_OAUTH_REFRESH_LEAD_MS = 30 * 60 * 1000;
 export const DEFAULT_REFRESH_RESULT_RETENTION_MS = 5 * 60 * 1000;
 export const DEFAULT_TOKEN_REFRESH_RETRY_AFTER_MS = 60_000;
-export const DEFAULT_MAX_TOKEN_REFRESH_BACKOFF_MS = 6 * 60 * 60 * 1000;
+export const DEFAULT_MAX_TOKEN_REFRESH_BACKOFF_MS = 15 * 60 * 1000;
+export const DEFAULT_SUSTAINED_TOKEN_REFRESH_RETRY_MS = 60 * 60 * 1000;
+export const DEFAULT_TOKEN_REFRESH_CIRCUIT_ATTEMPTS = 6;
+export const DEFAULT_MAX_PROVIDER_RETRY_AFTER_MS = 24 * 60 * 60 * 1000;
+const MAX_TIMER_DELAY_MS = 2_147_483_647;
+const MAX_DATE_TIMESTAMP_MS = 8_640_000_000_000_000;
 export const OAUTH_SCOPES = [
   'org:create_api_key',
   'user:profile',
@@ -25,19 +30,32 @@ export const OAUTH_SCOPES = [
   'user:mcp_servers',
   'user:file_upload',
 ].join(' ');
+export const CLAUDE_AI_OAUTH_SCOPES = Object.freeze([
+  'user:profile',
+  'user:inference',
+  'user:sessions:claude_code',
+  'user:mcp_servers',
+  'user:file_upload',
+]);
 
 export class OAuthTokenRefreshError extends Error {
-  constructor({ status, code = 'unknown', retryAfterMs = null }) {
+  constructor({ status, code = 'unknown', retryAfterMs = null, retryAfterSource = null }) {
     super(`Token refresh failed (${status}): ${code}`);
     this.name = 'OAuthTokenRefreshError';
     this.status = status;
     this.oauthCode = code;
     this.retryAfterMs = retryAfterMs;
+    this.retryAfterSource = retryAfterSource;
   }
 }
 
 export function isOAuthTokenRefreshRateLimit(error) {
-  return error instanceof OAuthTokenRefreshError && error.status === 429;
+  return (error instanceof OAuthTokenRefreshError && error.status === 429)
+    || (
+      error?.retryAfterSource === 'fixed'
+      && Number.isFinite(Number(error?.retryAfterMs))
+      && Number(error.retryAfterMs) > 0
+    );
 }
 
 export function normalizeExpiresAt(expiresAt) {
@@ -58,58 +76,92 @@ export function createSingleFlightTokenRefresher(tokenRefresher, {
   maxRateLimitBackoffMs = DEFAULT_MAX_TOKEN_REFRESH_BACKOFF_MS,
 } = {}) {
   const entries = new Map();
-  let rateLimitAttempts = 0;
-  let globalRateLimitUntil = 0;
-  let globalRateLimitError = null;
+  const rateLimitAttempts = new Map();
   let refreshTail = Promise.resolve();
-  const maxBackoffMs = Math.max(
-    1,
-    Number(maxRateLimitBackoffMs) || DEFAULT_MAX_TOKEN_REFRESH_BACKOFF_MS,
+  const configuredMaxBackoffMs = Number(maxRateLimitBackoffMs);
+  const maxBackoffMs = Number.isFinite(configuredMaxBackoffMs) && configuredMaxBackoffMs > 0
+    ? configuredMaxBackoffMs
+    : DEFAULT_MAX_TOKEN_REFRESH_BACKOFF_MS;
+  const attemptRetentionMs = Math.max(
+    maxBackoffMs * 2,
+    DEFAULT_SUSTAINED_TOKEN_REFRESH_RETRY_MS * 2,
   );
 
+  const clearRateLimitAttempt = attemptKey => {
+    const state = rateLimitAttempts.get(attemptKey);
+    if (state?.timer) clearTimeout(state.timer);
+    rateLimitAttempts.delete(attemptKey);
+  };
+  const incrementRateLimitAttempt = attemptKey => {
+    const previous = rateLimitAttempts.get(attemptKey);
+    if (previous?.timer) clearTimeout(previous.timer);
+    const state = {
+      count: (previous?.count || 0) + 1,
+      timer: null,
+    };
+    rateLimitAttempts.set(attemptKey, state);
+    state.timer = setTimeout(() => {
+      if (rateLimitAttempts.get(attemptKey) === state) rateLimitAttempts.delete(attemptKey);
+    }, Math.min(Math.ceil(attemptRetentionMs), MAX_TIMER_DELAY_MS));
+    state.timer.unref?.();
+    return state.count;
+  };
+
   return async (refreshToken, context = null) => {
-    const existing = entries.get(refreshToken);
-    if (existing && existing.expiresAt > now()) return existing.promise;
+    const credentialKey = credentialDigestKey(refreshToken);
+    const existing = entries.get(credentialKey);
+    const currentTime = now();
+    if (existing && existing.expiresAt > currentTime) {
+      if (existing.error) {
+        const error = deferredRefreshError(existing.error, existing.expiresAt - currentTime);
+        try {
+          onFailure?.({ context, error, deferred: true });
+        } catch {}
+        throw error;
+      }
+      return existing.promise;
+    }
     if (existing) {
       if (existing.timer) clearTimeout(existing.timer);
-      entries.delete(refreshToken);
-    }
-
-    const currentTime = now();
-    if (globalRateLimitUntil > currentTime && globalRateLimitError) {
-      const error = deferredRefreshError(globalRateLimitError, globalRateLimitUntil - currentTime);
-      try {
-        onFailure?.({ context, error, deferred: true });
-      } catch {}
-      throw error;
+      entries.delete(credentialKey);
     }
 
     const executeRefresh = async () => {
-      const executionTime = now();
-      if (globalRateLimitUntil > executionTime && globalRateLimitError) {
-        throw deferredRefreshError(globalRateLimitError, globalRateLimitUntil - executionTime);
-      }
-
       try {
-        const refreshed = await tokenRefresher(refreshToken);
-        rateLimitAttempts = 0;
-        globalRateLimitUntil = 0;
-        globalRateLimitError = null;
+        const refreshed = await tokenRefresher(refreshToken, context ?? undefined);
+        clearRateLimitAttempt(credentialKey);
         return refreshed;
       } catch (error) {
-        const requestedRetryAfterMs = Math.max(0, Number(error?.retryAfterMs) || 0);
+        const failedAt = now();
+        const requestedRetryAfterMs = boundedRetryAfterMs(
+          error?.retryAfterMs,
+          error?.retryAfterSource === 'provider'
+            ? DEFAULT_MAX_PROVIDER_RETRY_AFTER_MS
+            : Math.max(1, MAX_DATE_TIMESTAMP_MS - Number(failedAt) - 1),
+        );
         if (requestedRetryAfterMs > 0) {
-          rateLimitAttempts += 1;
-          error.retryAfterMs = Math.min(
-            maxBackoffMs,
-            Math.max(requestedRetryAfterMs, 1) * (2 ** Math.min(rateLimitAttempts - 1, 30)),
-          );
-          globalRateLimitUntil = now() + error.retryAfterMs;
-          globalRateLimitError = error;
+          if (error?.retryAfterSource === 'provider') {
+            clearRateLimitAttempt(credentialKey);
+            error.retryAfterMs = requestedRetryAfterMs;
+          } else if (error?.retryAfterSource === 'fixed') {
+            clearRateLimitAttempt(credentialKey);
+            error.retryAfterMs = requestedRetryAfterMs;
+          } else {
+            const attempt = incrementRateLimitAttempt(credentialKey);
+            const exponentialBackoffMs = Math.min(
+              maxBackoffMs,
+              Math.max(requestedRetryAfterMs, 1) * (2 ** Math.min(attempt - 1, 30)),
+            );
+            error.retryAfterMs = boundedRetryAfterMs(
+              attempt > DEFAULT_TOKEN_REFRESH_CIRCUIT_ATTEMPTS
+                ? Math.max(exponentialBackoffMs, DEFAULT_SUSTAINED_TOKEN_REFRESH_RETRY_MS)
+                : exponentialBackoffMs,
+              Math.max(1, MAX_DATE_TIMESTAMP_MS - Number(failedAt) - 1),
+            );
+            error.retryAfterSource ||= 'fallback';
+          }
         } else {
-          rateLimitAttempts = 0;
-          globalRateLimitUntil = 0;
-          globalRateLimitError = null;
+          clearRateLimitAttempt(credentialKey);
         }
         throw error;
       }
@@ -118,26 +170,24 @@ export function createSingleFlightTokenRefresher(tokenRefresher, {
     refreshTail = promise.catch(() => {});
     const entry = {
       completed: false,
+      error: null,
       expiresAt: Number.POSITIVE_INFINITY,
       promise,
       timer: null,
     };
-    entries.set(refreshToken, entry);
+    entries.set(credentialKey, entry);
 
     try {
       const refreshed = await entry.promise;
-      if (entries.get(refreshToken) === entry && !entry.completed) {
+      if (entries.get(credentialKey) === entry && !entry.completed) {
         entry.completed = true;
         const retainedForMs = Math.max(0, Number(retentionMs) || 0);
         entry.expiresAt = now() + retainedForMs;
         entry.promise = Promise.resolve(refreshed);
         if (retainedForMs > 0) {
-          entry.timer = setTimeout(() => {
-            if (entries.get(refreshToken) === entry) entries.delete(refreshToken);
-          }, retainedForMs);
-          entry.timer.unref?.();
+          scheduleEntryExpiry(entries, credentialKey, entry, now);
         } else {
-          entries.delete(refreshToken);
+          entries.delete(credentialKey);
         }
         try {
           onSuccess?.({
@@ -149,20 +199,18 @@ export function createSingleFlightTokenRefresher(tokenRefresher, {
       }
       return refreshed;
     } catch (error) {
-      if (entries.get(refreshToken) === entry && !entry.completed) {
+      if (entries.get(credentialKey) === entry && !entry.completed) {
         entry.completed = true;
+        entry.error = error;
         try {
-          onFailure?.({ context, error, deferred: error?.deferred === true });
+          onFailure?.({ context, error, deferred: false });
         } catch {}
         const retryAfterMs = Math.max(0, Number(error?.retryAfterMs) || 0);
         if (retryAfterMs > 0) {
           entry.expiresAt = now() + retryAfterMs;
-          entry.timer = setTimeout(() => {
-            if (entries.get(refreshToken) === entry) entries.delete(refreshToken);
-          }, retryAfterMs);
-          entry.timer.unref?.();
+          scheduleEntryExpiry(entries, credentialKey, entry, now);
         } else {
-          entries.delete(refreshToken);
+          entries.delete(credentialKey);
         }
       }
       throw error;
@@ -170,53 +218,127 @@ export function createSingleFlightTokenRefresher(tokenRefresher, {
   };
 }
 
+function credentialDigestKey(refreshToken) {
+  const digest = createHash('sha256').update(String(refreshToken)).digest('base64url');
+  return `token-sha256:${digest}`;
+}
+
+function boundedRetryAfterMs(value, maxDelayMs) {
+  const delayMs = Number(value);
+  if (Number.isNaN(delayMs) || delayMs <= 0) return 0;
+  return Math.min(delayMs, Math.max(1, Number(maxDelayMs) || 1));
+}
+
 function deferredRefreshError(source, retryAfterMs) {
   const error = new OAuthTokenRefreshError({
     status: source?.status || 429,
     code: source?.oauthCode || 'rate_limit_error',
     retryAfterMs: Math.max(1, Math.ceil(retryAfterMs)),
+    retryAfterSource: source?.retryAfterSource || null,
   });
   error.deferred = true;
   return error;
 }
 
-export function parseTokenResponse(data, previousRefreshToken, now = Date.now()) {
-  return {
+function scheduleEntryExpiry(entries, credentialKey, entry, now) {
+  const expire = () => {
+    if (entries.get(credentialKey) !== entry) return;
+    const remainingMs = entry.expiresAt - now();
+    if (remainingMs <= 0) {
+      entries.delete(credentialKey);
+      return;
+    }
+    entry.timer = setTimeout(expire, Math.min(Math.ceil(remainingMs), MAX_TIMER_DELAY_MS));
+    entry.timer.unref?.();
+  };
+  expire();
+}
+
+export function parseTokenResponse(data, previousRefreshToken, now = Date.now(), previous = {}) {
+  const parsed = {
     accessToken: data.access_token,
     refreshToken: data.refresh_token || previousRefreshToken,
     expiresAt: normalizeExpiresAt(data.expires_at) || (now + (data.expires_in || 3600) * 1000),
   };
+
+  const responseScopes = normalizeOAuthScopes(data.scope);
+  const scopes = responseScopes.length > 0
+    ? responseScopes
+    : normalizeOAuthScopes(previous.scopes);
+  if (scopes.length > 0) parsed.scopes = scopes;
+
+  const rawRefreshTokenExpiresIn = data.refresh_token_expires_in;
+  const refreshTokenExpiresIn = Number(rawRefreshTokenExpiresIn);
+  const refreshTokenExpiresAt = now + refreshTokenExpiresIn * 1000;
+  if (
+    rawRefreshTokenExpiresIn != null
+    && rawRefreshTokenExpiresIn !== ''
+    && Number.isFinite(refreshTokenExpiresIn)
+    && refreshTokenExpiresIn >= 0
+    && Number.isFinite(refreshTokenExpiresAt)
+    && refreshTokenExpiresAt <= MAX_DATE_TIMESTAMP_MS
+  ) {
+    parsed.refreshTokenExpiresAt = refreshTokenExpiresAt;
+  } else if (previous.refreshTokenExpiresAt != null) {
+    parsed.refreshTokenExpiresAt = normalizeExpiresAt(previous.refreshTokenExpiresAt);
+  }
+
+  for (const field of ['clientId', 'subscriptionType', 'rateLimitTier']) {
+    if (previous[field] != null) parsed[field] = previous[field];
+  }
+  return parsed;
 }
 
 export async function refreshAccessToken(refreshToken, options = {}) {
+  options ||= {};
   const endpoint = options.endpoint || OAUTH_TOKEN_URL;
   const now = options.now || Date.now;
+  const scopes = normalizeOAuthScopes(options.scopes);
+  if (scopes.length === 0 && options.clientId && options.clientId !== OAUTH_CLIENT_ID) {
+    throw new Error('OAuth scopes are required for custom client credentials');
+  }
+  const refreshScopes = scopes.length > 0 ? scopes : [...CLAUDE_AI_OAUTH_SCOPES];
+  const body = JSON.stringify({
+    grant_type: 'refresh_token',
+    refresh_token: refreshToken,
+    client_id: options.clientId || OAUTH_CLIENT_ID,
+    scope: refreshScopes.join(' '),
+  });
   const response = await requestEndpoint(endpoint, {
     method: 'POST',
     headers: {
       ...oauthClientHeaders(),
       'Content-Type': 'application/json',
       'Accept': 'application/json, text/plain, */*',
+      'Content-Length': Buffer.byteLength(body),
     },
-    body: JSON.stringify({
-      grant_type: 'refresh_token',
-      refresh_token: refreshToken,
-      client_id: OAUTH_CLIENT_ID,
-    }),
+    body,
   }, options);
 
   if (!response.ok) {
     const body = await response.text();
+    const retryAfter = response.status === 429
+      ? oauthRetryAfter(response.headers, body, now())
+      : { retryAfterMs: null, retryAfterSource: null };
     throw new OAuthTokenRefreshError({
       status: response.status,
       code: oauthErrorCode(body),
-      retryAfterMs: response.status === 429
-        ? oauthRetryAfterMs(response.headers, body, now())
-        : null,
+      ...retryAfter,
     });
   }
 
-  return parseTokenResponse(await response.json(), refreshToken, now());
+  return parseTokenResponse(await response.json(), refreshToken, now(), {
+    scopes: refreshScopes,
+    refreshTokenExpiresAt: options.refreshTokenExpiresAt,
+    clientId: options.clientId,
+    subscriptionType: options.subscriptionType,
+    rateLimitTier: options.rateLimitTier,
+  });
+}
+
+function normalizeOAuthScopes(value) {
+  const entries = Array.isArray(value) ? value : String(value || '').split(/\s+/);
+  return [...new Set(entries.map(scope => String(scope).trim()).filter(Boolean))];
 }
 
 export async function fetchProfile(accessToken, options = {}) {
@@ -358,21 +480,39 @@ function oauthErrorCode(body) {
   return 'unknown';
 }
 
-function oauthRetryAfterMs(headers, body, nowMs) {
+function oauthRetryAfter(headers, body, nowMs) {
   const retryAfter = responseHeader(headers, 'retry-after');
   if (retryAfter != null) {
     const seconds = Number(retryAfter);
-    if (Number.isFinite(seconds) && seconds >= 0) return seconds * 1000;
+    if (Number.isFinite(seconds) && seconds >= 0) {
+      return {
+        retryAfterMs: boundedRetryAfterMs(seconds * 1000, DEFAULT_MAX_PROVIDER_RETRY_AFTER_MS),
+        retryAfterSource: 'provider',
+      };
+    }
     const at = Date.parse(retryAfter);
-    if (Number.isFinite(at)) return Math.max(0, at - nowMs);
+    if (Number.isFinite(at)) {
+      return {
+        retryAfterMs: boundedRetryAfterMs(at - nowMs, DEFAULT_MAX_PROVIDER_RETRY_AFTER_MS),
+        retryAfterSource: 'provider',
+      };
+    }
   }
 
   try {
     const parsed = JSON.parse(body);
     const seconds = Number(parsed?.retry_after ?? parsed?.error?.retry_after);
-    if (Number.isFinite(seconds) && seconds >= 0) return seconds * 1000;
+    if (Number.isFinite(seconds) && seconds >= 0) {
+      return {
+        retryAfterMs: boundedRetryAfterMs(seconds * 1000, DEFAULT_MAX_PROVIDER_RETRY_AFTER_MS),
+        retryAfterSource: 'provider',
+      };
+    }
   } catch {}
-  return DEFAULT_TOKEN_REFRESH_RETRY_AFTER_MS;
+  return {
+    retryAfterMs: DEFAULT_TOKEN_REFRESH_RETRY_AFTER_MS,
+    retryAfterSource: 'fallback',
+  };
 }
 
 function responseHeader(headers, name) {

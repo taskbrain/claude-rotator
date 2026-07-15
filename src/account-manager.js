@@ -1,6 +1,12 @@
 import { emptyQuota, normalizeWeeklyScopedUsage, parseRateLimitHeaders } from './quota.js';
+import {
+  DEFAULT_MAX_PROVIDER_RETRY_AFTER_MS,
+  DEFAULT_MAX_TOKEN_REFRESH_BACKOFF_MS,
+  DEFAULT_SUSTAINED_TOKEN_REFRESH_RETRY_MS,
+} from './oauth.js';
 
 export const DEFAULT_WEEKLY_RESET_PRIORITY_WINDOW_MS = 36 * 60 * 60 * 1000;
+const MAX_DATE_TIMESTAMP_MS = 8_640_000_000_000_000;
 
 export class AccountManager {
   constructor({
@@ -124,9 +130,10 @@ export class AccountManager {
     });
   }
 
-  markCredentialRefreshRateLimited(accountId, retryAfterSeconds) {
+  markCredentialRefreshRateLimited(accountId, retryAfterSeconds, { retryAfterSource = null } = {}) {
     this.markTemporaryUnavailable(accountId, retryAfterSeconds, {
       type: 'oauth_refresh_rate_limit',
+      ...(retryAfterSource ? { retryAfterSource } : {}),
     }, {
       eventType: 'credential-refresh-throttled',
       retryAfterSeconds,
@@ -135,7 +142,8 @@ export class AccountManager {
 
   markTemporaryUnavailable(accountId, retryAfterSeconds, reason, event = {}) {
     const account = this.find(accountId);
-    account.rateLimitedUntil = this.now() + retryAfterSeconds * 1000;
+    const retryAfterMs = Math.max(0, Number(retryAfterSeconds) || 0) * 1000;
+    account.rateLimitedUntil = Math.min(MAX_DATE_TIMESTAMP_MS - 1, this.now() + retryAfterMs);
     account.temporaryUnavailableReason = { ...reason };
     account.status = 'throttled';
     this.events.unshift({
@@ -193,14 +201,26 @@ export class AccountManager {
     this.accounts = accounts.map((account, index) => {
       const existing = existingById.get(account.id);
       if (!existing) return this.createAccount(account, index);
+      const incomingCredentialRevision = normalizeCredentialRevision(account.credentialRevision);
+      const credentialRevisionChanged = incomingCredentialRevision != null
+        && existing.credentialRevision != null
+        && incomingCredentialRevision !== existing.credentialRevision;
+      const resetCredentialCooldown = credentialRevisionChanged
+        && existing.temporaryUnavailableReason?.type === 'oauth_refresh_rate_limit';
+      const resetError = credentialRevisionChanged && existing.status === 'error';
       return {
         ...existing,
         name: account.name || account.email || account.id,
         type: account.type || 'oauth',
         accountUuid: account.accountUuid || null,
         priority: account.priority ?? index,
-        status: existing.status === 'error' ? 'ready' : existing.status,
-        errorReason: existing.status === 'error' ? null : existing.errorReason,
+        credentialRevision: incomingCredentialRevision ?? existing.credentialRevision,
+        status: resetError || resetCredentialCooldown ? 'ready' : existing.status,
+        errorReason: credentialRevisionChanged ? null : existing.errorReason,
+        rateLimitedUntil: resetCredentialCooldown ? null : existing.rateLimitedUntil,
+        temporaryUnavailableReason: resetCredentialCooldown
+          ? null
+          : existing.temporaryUnavailableReason,
       };
     });
     if (this.currentIndex >= this.accounts.length) this.currentIndex = 0;
@@ -246,6 +266,7 @@ export class AccountManager {
       currentAccount: active?.id || null,
       accounts: this.accounts.map(account => ({
         id: account.id,
+        credentialRevision: account.credentialRevision,
         status: account.status,
         quota: { ...account.quota },
         usage: { ...account.usage },
@@ -265,12 +286,23 @@ export class AccountManager {
     for (const account of this.accounts) {
       const saved = savedById.get(account.id);
       if (!saved) continue;
-      account.status = restoreStatus(saved.status);
+      const savedCredentialRevision = normalizeCredentialRevision(saved.credentialRevision);
+      const credentialRevisionChanged = savedCredentialRevision != null
+        && account.credentialRevision != null
+        && savedCredentialRevision !== account.credentialRevision;
+      account.status = credentialRevisionChanged ? 'ready' : restoreStatus(saved.status);
       account.quota = restoreQuota(saved.quota);
       account.usage = restoreUsage(saved.usage);
-      account.rateLimitedUntil = restoreTimestamp(saved.rateLimitedUntil);
-      account.temporaryUnavailableReason = clonePlainObject(saved.temporaryUnavailableReason);
-      account.errorReason = clonePlainObject(saved.errorReason);
+      account.rateLimitedUntil = credentialRevisionChanged
+        ? null
+        : restoreTimestamp(saved.rateLimitedUntil);
+      account.temporaryUnavailableReason = credentialRevisionChanged
+        ? null
+        : clonePlainObject(saved.temporaryUnavailableReason);
+      account.errorReason = credentialRevisionChanged
+        ? null
+        : clonePlainObject(saved.errorReason);
+      this.normalizeRestoredCredentialCooldown(account);
       account.quotaExhaustionEventKey = null;
       this.refreshQuotaState(account);
     }
@@ -279,6 +311,20 @@ export class AccountManager {
       const index = this.accounts.findIndex(account => account.id === state.currentAccount);
       if (index >= 0) this.currentIndex = index;
     }
+  }
+
+  normalizeRestoredCredentialCooldown(account) {
+    const reason = account.temporaryUnavailableReason;
+    if (reason?.type !== 'oauth_refresh_rate_limit') return;
+    if (!account.rateLimitedUntil) return;
+    const remainingMs = account.rateLimitedUntil - this.now();
+    const maximumRestoredCooldownMs = restoredCredentialCooldownLimitMs(
+      reason.retryAfterSource,
+    );
+    if (remainingMs <= maximumRestoredCooldownMs) return;
+    account.rateLimitedUntil = null;
+    account.temporaryUnavailableReason = null;
+    if (account.status === 'throttled') account.status = 'ready';
   }
 
   selectBestAvailableSwitchTarget() {
@@ -606,6 +652,7 @@ export class AccountManager {
       type: account.type || 'oauth',
       accountUuid: account.accountUuid || null,
       priority: account.priority ?? index,
+      credentialRevision: normalizeCredentialRevision(account.credentialRevision),
       status: 'ready',
       quota: emptyQuota(),
       usage: {
@@ -620,6 +667,18 @@ export class AccountManager {
       quotaExhaustionEventKey: null,
     };
   }
+}
+
+function restoredCredentialCooldownLimitMs(retryAfterSource) {
+  if (retryAfterSource === 'provider') return DEFAULT_MAX_PROVIDER_RETRY_AFTER_MS;
+  if (retryAfterSource === 'fixed') return DEFAULT_SUSTAINED_TOKEN_REFRESH_RETRY_MS;
+  return DEFAULT_MAX_TOKEN_REFRESH_BACKOFF_MS;
+}
+
+function normalizeCredentialRevision(value) {
+  if (typeof value === 'string' && value.length > 0) return value;
+  if (Number.isSafeInteger(value) && value >= 0) return value;
+  return null;
 }
 
 export function quotaUnavailableReason(quota, threshold) {

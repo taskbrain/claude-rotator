@@ -16,6 +16,7 @@ import {
   isTokenExpiringSoon,
   refreshAccessToken,
 } from './oauth.js';
+import { createNativeClaudeRefresher } from './native-claude-refresher.js';
 
 const HOP_HEADERS = new Set([
   'host',
@@ -43,12 +44,13 @@ export function createProxyServer({
   secretStore,
   config,
   reloadAccounts = null,
-  tokenRefresher = refreshAccessToken,
+  tokenRefresher = null,
   currentCredentialReader = readCurrentClaudeCredentials,
   currentProfileFetcher = fetchProfile,
   usageFetcher = fetchUsage,
   logger = null,
   stateWriter = null,
+  platform = process.platform,
 }) {
   const upstream = config.upstream || 'https://api.anthropic.com';
   const upstreamIdleTimeoutMs = config.proxy?.upstreamIdleTimeoutMs
@@ -63,7 +65,15 @@ export function createProxyServer({
   const upstreamConnectRetryDelayMs = config.proxy?.upstreamConnectRetryDelayMs
     ?? config.upstreamConnectRetryDelayMs
     ?? DEFAULT_UPSTREAM_CONNECT_RETRY_DELAY_MS;
-  const coordinatedTokenRefresher = createSingleFlightTokenRefresher(tokenRefresher, {
+  const resolvedTokenRefresher = tokenRefresher || defaultTokenRefresher({
+    platform,
+    nativeOptions: {
+      onCleanupError(error) {
+        logger?.(`${new Date().toISOString()} credential-refresh-cleanup result=failed errorType=${error?.code || error?.name || 'unknown'}`);
+      },
+    },
+  });
+  const coordinatedTokenRefresher = createSingleFlightTokenRefresher(resolvedTokenRefresher, {
     onSuccess({ context, refreshed, rotated }) {
       logger?.(`${new Date().toISOString()} credential-refresh account=${context?.accountId || 'unknown'} result=success rotated=${rotated} expiresAt=${formatCredentialExpiry(refreshed.expiresAt)}`);
     },
@@ -71,8 +81,11 @@ export function createProxyServer({
       const retry = error?.retryAfterMs
         ? ` retryAfterSec=${Math.ceil(error.retryAfterMs / 1000)}`
         : '';
+      const retrySource = ['provider', 'fallback', 'fixed'].includes(error?.retryAfterSource)
+        ? ` retrySource=${error.retryAfterSource}`
+        : '';
       const result = deferred ? 'deferred' : 'failed';
-      logger?.(`${new Date().toISOString()} credential-refresh account=${context?.accountId || 'unknown'} result=${result} errorType=${credentialRefreshErrorType(error)}${retry}`);
+      logger?.(`${new Date().toISOString()} credential-refresh account=${context?.accountId || 'unknown'} result=${result} errorType=${credentialRefreshErrorType(error)}${retry}${retrySource}`);
     },
   });
 
@@ -197,6 +210,18 @@ export function createProxyServer({
 
   usageScheduler.start(server);
   return server;
+}
+
+export function defaultTokenRefresher({
+  platform = process.platform,
+  nativeRefresherFactory = createNativeClaudeRefresher,
+  directRefresher = refreshAccessToken,
+  nativeOptions = {},
+} = {}) {
+  if (platform === 'linux' || platform === 'darwin') {
+    return nativeRefresherFactory({ ...nativeOptions, platform });
+  }
+  return directRefresher;
 }
 
 function usagePollingEnabled(config) {
@@ -484,7 +509,9 @@ function isOAuthCredentialError(message) {
 function markOAuthRefreshRateLimit(accountManager, accountId, error) {
   if (!isOAuthTokenRefreshRateLimit(error)) return false;
   const retryAfterSeconds = Math.max(1, Math.ceil(error.retryAfterMs / 1000));
-  accountManager.markCredentialRefreshRateLimited(accountId, retryAfterSeconds);
+  accountManager.markCredentialRefreshRateLimited(accountId, retryAfterSeconds, {
+    retryAfterSource: error.retryAfterSource,
+  });
   return true;
 }
 
@@ -746,15 +773,35 @@ async function refreshSecretIfExpiring({ account, secret, secretStore, tokenRefr
 }
 
 async function refreshAndStoreSecret({ account, secret, secretStore, tokenRefresher, logger }) {
-  const refreshed = await tokenRefresher(secret.refreshToken, { accountId: account.id });
+  const compareAndSet = requireSecretStoreCompareAndSet(secretStore);
+  const refreshed = await tokenRefresher(secret.refreshToken, tokenRefreshContext(account, secret));
   const nextSecret = { ...secret, ...refreshed };
   try {
-    await secretStore.set(account.id, nextSecret);
+    if (!await compareAndSet(account.id, secret, nextSecret)) {
+      const latestSecret = await secretStore.get(account.id);
+      logger?.(`${new Date().toISOString()} credential-refresh account=${account.id} result=discarded reason=credential-changed`);
+      if (latestSecret?.accessToken) return latestSecret;
+      throw new Error('Stored OAuth credential changed while token refresh was in flight');
+    }
   } catch (error) {
     logger?.(`${new Date().toISOString()} credential-store account=${account.id} result=failed errorType=${error?.code || error?.name || 'unknown'}`);
     throw error;
   }
   return nextSecret;
+}
+
+function tokenRefreshContext(account, secret) {
+  return {
+    accountId: account.id,
+    accessToken: secret.accessToken,
+    refreshToken: secret.refreshToken,
+    expiresAt: secret.expiresAt,
+    scopes: secret.scopes,
+    refreshTokenExpiresAt: secret.refreshTokenExpiresAt,
+    clientId: secret.clientId,
+    subscriptionType: secret.subscriptionType,
+    rateLimitTier: secret.rateLimitTier,
+  };
 }
 
 function credentialRefreshErrorType(error) {
@@ -809,26 +856,47 @@ async function resolveSecretForAccount({
 
 async function mirrorLiveClaudeCodeCredential({ account, stored, live, secretStore, logger }) {
   if (!live?.accessToken || !live.refreshToken) return;
-  if (
-    stored?.accessToken === live.accessToken
-    && stored?.refreshToken === live.refreshToken
-    && normalizeCredentialExpiry(stored?.expiresAt) === normalizeCredentialExpiry(live.expiresAt)
-  ) return;
-
   const mirrored = {
     ...(stored || {}),
-    accessToken: live.accessToken,
-    refreshToken: live.refreshToken,
-    expiresAt: live.expiresAt,
+    ...live,
   };
+  for (const field of ['clientId', 'scopes']) {
+    if (!(field in live)) delete mirrored[field];
+  }
   delete mirrored.liveClaudeCodeCredential;
+  if (credentialsMatch(stored, mirrored)) return;
 
   try {
-    await secretStore.set(account.id, mirrored);
+    const compareAndSet = requireSecretStoreCompareAndSet(secretStore);
+    if (!await compareAndSet(account.id, stored, mirrored)) {
+      logger?.(`${new Date().toISOString()} credential-sync-discarded account=${account.id} reason=credential-changed`);
+      return;
+    }
     logger?.(`${new Date().toISOString()} credential-sync account=${account.id} source=claude-code-current expiresAt=${formatCredentialExpiry(live.expiresAt)}`);
   } catch (error) {
     logger?.(`${new Date().toISOString()} credential-sync-failed account=${account.id} error=${shortErrorMessage(error)}`);
   }
+}
+
+function requireSecretStoreCompareAndSet(secretStore) {
+  if (typeof secretStore?.compareAndSet !== 'function') {
+    const error = new Error('Secret store does not support atomic compare-and-set');
+    error.code = 'SECRET_STORE_CAS_UNAVAILABLE';
+    throw error;
+  }
+  return secretStore.compareAndSet.bind(secretStore);
+}
+
+function credentialsMatch(left, right) {
+  return left?.accessToken === right?.accessToken
+    && left?.refreshToken === right?.refreshToken
+    && normalizeCredentialExpiry(left?.expiresAt) === normalizeCredentialExpiry(right?.expiresAt)
+    && normalizeCredentialExpiry(left?.refreshTokenExpiresAt)
+      === normalizeCredentialExpiry(right?.refreshTokenExpiresAt)
+    && JSON.stringify(left?.scopes || null) === JSON.stringify(right?.scopes || null)
+    && left?.clientId === right?.clientId
+    && left?.subscriptionType === right?.subscriptionType
+    && left?.rateLimitTier === right?.rateLimitTier;
 }
 
 function normalizeCredentialExpiry(expiresAt) {
@@ -1452,9 +1520,15 @@ function sendUnavailableAccounts(res, accountManager = null) {
   const reason = current ? accountManager.unavailableReason(current) : null;
   if (isCredentialUnavailable(reason)) {
     const headers = { 'Content-Type': 'application/json' };
-    const retryAt = Date.parse(reason.retryAt || '');
-    if (Number.isFinite(retryAt)) {
-      headers['Retry-After'] = String(Math.max(1, Math.ceil((retryAt - Date.now()) / 1000)));
+    const now = Date.now();
+    const retryTimes = (accountManager?.accounts || [])
+      .map(account => accountManager.unavailableReason(account))
+      .flatMap(accountReason => [accountReason?.retryAt, accountReason?.resetAt])
+      .map(recoveryAt => Date.parse(recoveryAt || ''))
+      .filter(retryAt => Number.isFinite(retryAt) && retryAt > now);
+    const retryAt = retryTimes.length > 0 ? Math.min(...retryTimes) : null;
+    if (retryAt != null) {
+      headers['Retry-After'] = String(Math.max(1, Math.ceil((retryAt - now) / 1000)));
     }
     res.writeHead(503, headers);
     res.end(JSON.stringify({

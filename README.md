@@ -44,6 +44,8 @@ macOS では次の LaunchAgent が作られます。
 ~/Library/LaunchAgents/io.github.claude-rotator.plist
 ```
 
+インストール時にClaude Codeの実行可能ファイルを絶対パスで解決し、macOS LaunchAgentとUbuntu systemd user serviceの `CLAUDE_ROTATOR_CLAUDE_BIN` と安全な `PATH` に固定します。Homebrew、nvm、asdf、Volta、custom npm prefixなどで管理された `claude` が対話shellでだけ見つかり、常駐サービスでは見つからない状態を防ぎます。実行場所を明示する場合は、インストール前に `CLAUDE_ROTATOR_CLAUDE_BIN=/absolute/path/to/claude` を設定してください。
+
 サービス操作:
 
 ```bash
@@ -195,7 +197,7 @@ account1@example.com        active
 
 OAuth Usage API は 429 を返しやすいため、usage 取得はデフォルトで 15 分間隔、1アカウントずつ、各リクエストの開始間隔 1.5 秒で実行します。必要な場合だけ `~/.config/claude-rotator/config.json` の `usagePolling.intervalMs`、`usagePolling.concurrency`、`usagePolling.requestSpacingMs` を変更してください。短すぎる間隔や高い concurrency は `claude-rotator refresh-usage` でも 429 の原因になります。
 
-OAuth access token は期限の30分前から自動更新対象になります。同じ refresh token に対する同時更新は1回へ集約し、OAuth server が新しい refresh token を返した場合は、使用前に Keychain またはLinuxのcredential fileへ保存します。token endpoint が429を返した場合は `Retry-After` の間そのアカウントを一時停止し、期限後に自動再試行します。429が続く場合は待機時間を指数的に延ばし、最大15分までbackoffします。現在のClaude Codeログインと `accountUuid` が一致する保存アカウントには、Claude Codeが更新した最新credentialをミラーします。これにより、後でClaude Codeのログイン先を変えても古いrefresh tokenへ戻りません。provider側で明示的にrevocationされたtokenの期限自体をrotatorから延長することはできません。
+OAuth access token は期限の30分前から自動更新対象になります。保存時に Claude Code の OAuth scope と refresh token の期限を保持します。macOS / Ubuntu の保存アカウントは、通常のClaude Codeログインを変更しない隔離領域でClaude Code本体へ更新を委譲するため、access token が数時間で切れてもrefresh tokenが有効な間は対話ログイン不要です。同じ refresh token に対する同時更新は1回へ集約し、異なるアカウントの更新も直列化します。新しい refresh token は、競合する再ログインを上書きしない原子的比較更新で、使用前に Keychain またはLinuxのcredential fileへ保存します。macOS / Ubuntu のnative更新が一時失敗した場合の再試行は5分固定で、失敗回数に応じて15分や60分へ増幅しません。providerが明示した `Retry-After` は増幅せず、異常値による永久停止を避ける24時間の安全上限内で尊重します。native更新を使わない環境のdirect token更新だけは、明示値が無い一時失敗をrefresh token単位で1/2/4/8/15分までbackoffし、その後は指数を増やさず固定60分の疎通確認へ移ります。1アカウントの待機は他アカウントの更新を停止せず、実際にcredentialが変わった再リンクだけがそのアカウントの古い待機状態を解除します。現在のClaude Codeログインと `accountUuid` が一致する保存アカウントには、Claude Codeが更新した最新credentialとOAuth metadataをミラーします。provider側で明示的にrevocationされたtokenの期限自体をrotatorから延長することはできません。
 
 ## ログと切り替え診断
 
@@ -223,7 +225,7 @@ proxy request ログに出るのは `account`、`method`、`path`、`status`、`
 
 retryable な上流 5xx / 529 / `x-should-retry` 付きレスポンス、または上流アイドルタイムアウトが起きた場合も、アカウント切り替えは行いません。上流の error body または proxy の timeout error を可能な限りそのまま返します。
 
-Usage API の再取得は、デフォルトでは 60 秒ごとの定期 polling と、100% 到達済みの枠がリセットされる時刻の直後に実行されます。間隔は `~/.config/claude-rotator/config.json` の `usagePolling.intervalMs` で変更できます。Claude Code 側の早期リセットや一時的な状態変化を確認したい場合は、次の手動コマンドで全登録アカウントを即時再確認します。
+Usage API の再取得は、デフォルトでは 15 分ごとの定期 polling と、100% 到達済みの枠がリセットされる時刻の直後に実行されます。間隔は `~/.config/claude-rotator/config.json` の `usagePolling.intervalMs` で変更できます。Claude Code 側の早期リセットや一時的な状態変化を確認したい場合は、次の手動コマンドで全登録アカウントを即時再確認します。
 
 ```bash
 claude-rotator refresh-usage
@@ -232,9 +234,9 @@ claude-rotator status
 
 `refresh-usage` 後は `claude-rotator status` で active を確認してください。Usage API の再取得で現在の active が 100% と判明した場合、または 7日枠の reset が近く週次枠を優先消化したい利用可能アカウントがある場合は、active が更新されることがあります。意図的に active を変更する場合は `claude-rotator switch <account>` を使います。
 
-OAuth usage refresh は Node.js fetch の 10 秒 connect timeout に依存しないよう native HTTP client を使い、登録アカウントを並列に取得します。各リクエストの idle timeout は 60 秒です。HTTPS 接続が確立する前の timeout / unreachable は、proxy と同じ `proxy.upstreamConnectTimeoutMs`、`proxy.upstreamConnectRetries`、`proxy.upstreamConnectRetryDelayMs` で短く retry します。
+OAuth usage refresh は Node.js fetch の 10 秒 connect timeout に依存しないよう native HTTP client を使い、デフォルトでは登録アカウントを1件ずつ直列に取得します。各リクエストの idle timeout は 60 秒です。HTTPS 接続が確立する前の timeout / unreachable は、proxy と同じ `proxy.upstreamConnectTimeoutMs`、`proxy.upstreamConnectRetries`、`proxy.upstreamConnectRetryDelayMs` で短く retry します。
 
-同一ネットワークから Anthropic 宛ての TCP 接続が断続的に timeout する場合は、`usagePolling.concurrency` を `1` にすると、`refresh-usage` が複数アカウントを同時に接続しに行くことを避けられます。未指定時は従来どおり登録アカウントを並列に取得します。
+`usagePolling.concurrency` のデフォルトは `1` です。同一ネットワークから Anthropic 宛ての TCP 接続が安定しており、意図的に複数アカウントを同時取得したい場合だけ、この値を増やしてください。
 
 直近の quota / usage / active account は `~/.config/claude-rotator/runtime-state.json` に保存されます。これにより、service 再起動直後に Usage API へ到達できない場合でも、最後に取得できた status を復元して切り替え判断に使えます。reset 時刻を過ぎた quota は、復元後の status 計算時に stale として消去されます。
 
@@ -366,6 +368,8 @@ claude-rotator install
 - macOS: `~/Library/LaunchAgents/io.github.claude-rotator.plist`
 - Ubuntu/Linux: `~/.config/systemd/user/claude-rotator.service`
 
+On macOS and Ubuntu/Linux, installation resolves Claude Code to an executable absolute path and records it as `CLAUDE_ROTATOR_CLAUDE_BIN`, together with the required service `PATH`. This keeps Homebrew, nvm, asdf, Volta, and custom npm-prefix installs available under launchd or systemd's minimal environment. Set `CLAUDE_ROTATOR_CLAUDE_BIN=/absolute/path/to/claude` before `claude-rotator install` to override discovery.
+
 Ubuntu uses a systemd user service:
 
 ```bash
@@ -408,7 +412,7 @@ claude-rotator monitor
 
 Recent proxy requests are shown in `claude-rotator status` / `claude-rotator monitor`, and the service writes metadata-only request logs to `~/.config/claude-rotator/server.log`. Internal proxy errors are logged as `proxy-error method=... path=... error=...` without tokens or bodies. Automatic rotation happens when the current account reaches the configured 5h, 7d, or model-scoped weekly usage threshold. If the OAuth Usage API reports scoped weekly limits in `limits[]`, they appear as extra status rows such as `7d Fable`, `7d Sonnet`, or `7d Opus`, including reset times. If an available account exists, the proxy usually chooses the lowest known `max(5h, 7d)` usage. When an available account has a 7d reset within the weekly priority window, the proxy prefers that account so expiring weekly quota can be consumed before reset; usage refresh can proactively move the active account even when the current account is not yet exhausted. The weekly priority window defaults to 36 hours and can be adjusted with `rotationPolicy.weeklyResetPriorityWindowMs` in `~/.config/claude-rotator/config.json`. If every candidate is exhausted, the proxy switches to the exhausted account with the earliest known reset and returns a local 429 for that shortest resume target. OAuth refresh failures, authentication errors, and temporary throttles do not rotate to exhausted accounts. OAuth usage is refreshed at startup, reload, first status read, every 15 minutes by default, and at reported reset times for exhausted accounts. Requests run one account at a time with 1.5 seconds between starts to reduce Usage API throttling. Set the `usagePolling` fields in `~/.config/claude-rotator/config.json` to adjust this behavior. Use `claude-rotator refresh-usage` to force an immediate recheck of all registered accounts, or `claude-rotator prepare-resume --json` from external resume tooling to switch to the earliest resume target before reinjection. If `server.log` repeatedly shows `outcome=upstream-error errorType=ETIMEDOUT` around 75 seconds, the proxy is receiving Claude Code requests but cannot complete the upstream request. The CLI and generated macOS LaunchAgent / Ubuntu systemd service prefer IPv4 DNS results to avoid Node.js preferring a broken IPv6 route. On Ubuntu, the installer also runs the service through a launcher named `claude-rotator`, separating the proxy from broad earlyoom rules that prefer terminating every `node` process.
 
-OAuth access tokens become refresh candidates 30 minutes before expiry. Concurrent refreshes for the same token are coalesced, rotated credentials are persisted before use, and the current Claude Code credential is mirrored to the matching saved account. A 429 from the token endpoint is held for its `Retry-After` duration and retried automatically, with repeated throttles backing off exponentially up to 15 minutes. Provider-side revocation and maximum token lifetime remain controlled by the OAuth provider.
+OAuth access tokens become refresh candidates 30 minutes before expiry. On macOS and Ubuntu, saved accounts are refreshed by Claude Code itself inside isolated credential storage, without changing the user's normal Claude Code login. Claude Code OAuth metadata is preserved, refreshes are coalesced and serialized, and a rotated credential is atomically persisted before use without overwriting a concurrent relink. A transient native-refresh failure uses a fixed five-minute retry and does not grow to 15 or 60 minutes. An explicit provider `Retry-After` is honored without amplification, up to a 24-hour safety ceiling. Only the direct token-refresh fallback used on other platforms backs off missing-deadline failures through 1/2/4/8/15 minutes and then moves to a fixed hourly probe. Only a relink that actually changes an account credential clears that account's stale cooldown. Provider-side revocation and maximum token lifetime remain controlled by the OAuth provider.
 
 ### Restore
 

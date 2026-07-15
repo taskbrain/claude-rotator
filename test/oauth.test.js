@@ -7,6 +7,7 @@ import {
   createSingleFlightTokenRefresher,
   normalizeExpiresAt,
   isTokenExpiringSoon,
+  isOAuthTokenRefreshRateLimit,
   parseTokenResponse,
   refreshAccessToken,
   fetchUsage,
@@ -15,7 +16,11 @@ import {
   DEFAULT_OAUTH_CONNECT_TIMEOUT_MS,
   DEFAULT_OAUTH_REQUEST_TIMEOUT_MS,
   DEFAULT_OAUTH_REFRESH_LEAD_MS,
+  DEFAULT_MAX_TOKEN_REFRESH_BACKOFF_MS,
+  DEFAULT_SUSTAINED_TOKEN_REFRESH_RETRY_MS,
+  DEFAULT_MAX_PROVIDER_RETRY_AFTER_MS,
   DEFAULT_TOKEN_REFRESH_RETRY_AFTER_MS,
+  CLAUDE_AI_OAUTH_SCOPES,
   OAuthTokenRefreshError,
   OAUTH_USER_AGENT,
   parseUsageResponse,
@@ -35,9 +40,10 @@ describe('OAuth time helpers', () => {
     assert.equal(isTokenExpiringSoon(now + 10_000, now, 3000), false);
   });
 
-  it('starts refreshing early enough for the polling interval', () => {
+  it('refreshes early enough for multiple default polling opportunities', () => {
     const now = 1780580000000;
 
+    assert.equal(DEFAULT_OAUTH_REFRESH_LEAD_MS, 30 * 60 * 1000);
     assert.equal(isTokenExpiringSoon(now + DEFAULT_OAUTH_REFRESH_LEAD_MS - 1, now), true);
     assert.equal(isTokenExpiringSoon(now + DEFAULT_OAUTH_REFRESH_LEAD_MS + 1, now), false);
   });
@@ -46,10 +52,12 @@ describe('OAuth time helpers', () => {
 describe('token refresh', () => {
   it('coalesces concurrent refreshes and retains the rotated result for late callers', async () => {
     let calls = 0;
+    const refreshContexts = [];
     const successCallbacks = [];
     let now = 1000;
-    const coordinated = createSingleFlightTokenRefresher(async refreshToken => {
+    const coordinated = createSingleFlightTokenRefresher(async (refreshToken, context) => {
       calls += 1;
+      refreshContexts.push(context);
       await new Promise(resolve => setImmediate(resolve));
       return {
         accessToken: `access-${calls}`,
@@ -70,6 +78,7 @@ describe('token refresh', () => {
     const late = await coordinated('refresh-1');
 
     assert.equal(calls, 1);
+    assert.deepEqual(refreshContexts, [{ accountId: 'acct-1' }]);
     assert.deepEqual(successCallbacks, [{ context: { accountId: 'acct-1' }, rotated: true }]);
     assert.deepEqual(second, first);
     assert.deepEqual(late, first);
@@ -77,6 +86,7 @@ describe('token refresh', () => {
     now += 60_001;
     const afterRetention = await coordinated('refresh-1');
     assert.equal(calls, 2);
+    assert.deepEqual(refreshContexts, [{ accountId: 'acct-1' }, undefined]);
     assert.equal(successCallbacks.length, 2);
     assert.equal(afterRetention.refreshToken, 'refresh-1-rotated-2');
   });
@@ -95,6 +105,19 @@ describe('token refresh', () => {
       refreshToken: 'refresh-2',
     });
     assert.equal(calls, 2);
+  });
+
+  it('does not pass a null options object when refresh context is omitted', async () => {
+    const coordinated = createSingleFlightTokenRefresher(async (
+      refreshToken,
+      options = {},
+    ) => {
+      assert.equal(refreshToken, 'refresh-1');
+      assert.deepEqual(options, {});
+      return { accessToken: 'access-1', refreshToken };
+    }, { retentionMs: 0 });
+
+    assert.equal((await coordinated('refresh-1')).accessToken, 'access-1');
   });
 
   it('retains a token endpoint cooldown without repeating the refresh request', async () => {
@@ -129,10 +152,10 @@ describe('token refresh', () => {
     assert.equal(calls, 3);
   });
 
-  it('shares the token endpoint cooldown across account refresh tokens', async () => {
+  it('keeps token endpoint cooldowns independent across account refresh tokens', async () => {
     let calls = 0;
     let now = 1000;
-    const deferred = [];
+    const failures = [];
     const coordinated = createSingleFlightTokenRefresher(async () => {
       calls += 1;
       throw new OAuthTokenRefreshError({
@@ -142,34 +165,34 @@ describe('token refresh', () => {
       });
     }, {
       now: () => now,
-      onFailure: ({ context, deferred: wasDeferred = false }) => {
-        deferred.push({ accountId: context.accountId, deferred: wasDeferred });
+      onFailure: ({ context }) => {
+        failures.push(context.accountId);
       },
     });
 
     await assert.rejects(coordinated('refresh-1', { accountId: 'acct-1' }), { status: 429 });
-    await assert.rejects(
-      coordinated('refresh-2', { accountId: 'acct-2' }),
-      error => error.status === 429 && error.deferred === true,
-    );
-    assert.equal(calls, 1);
-    assert.deepEqual(deferred, [
-      { accountId: 'acct-1', deferred: false },
-      { accountId: 'acct-2', deferred: true },
-    ]);
+    await assert.rejects(coordinated('refresh-2', { accountId: 'acct-2' }), { status: 429 });
+    assert.equal(calls, 2);
+    assert.deepEqual(failures, ['acct-1', 'acct-2']);
 
     now += 10_001;
     await assert.rejects(
       coordinated('refresh-2', { accountId: 'acct-2' }),
       error => error.status === 429 && error.retryAfterMs === 20_000,
     );
-    assert.equal(calls, 2);
+    assert.equal(calls, 3);
   });
 
-  it('serializes concurrent refreshes for different accounts before applying cooldown', async () => {
+  it('serializes concurrent refreshes for different accounts without starving either account', async () => {
     let calls = 0;
+    let active = 0;
+    let maxActive = 0;
     const coordinated = createSingleFlightTokenRefresher(async () => {
       calls += 1;
+      active += 1;
+      maxActive = Math.max(maxActive, active);
+      await new Promise(resolve => setImmediate(resolve));
+      active -= 1;
       throw new OAuthTokenRefreshError({
         status: 429,
         code: 'rate_limit_error',
@@ -184,8 +207,143 @@ describe('token refresh', () => {
 
     assert.equal(first.status, 'rejected');
     assert.equal(second.status, 'rejected');
-    assert.equal(second.reason.deferred, true);
+    assert.equal(calls, 2);
+    assert.equal(maxActive, 1);
+  });
+
+  it('opens a fixed hourly circuit after repeated fifteen-minute refresh failures', async () => {
+    let calls = 0;
+    let now = 1000;
+    const coordinated = createSingleFlightTokenRefresher(async () => {
+      calls += 1;
+      throw new OAuthTokenRefreshError({
+        status: 429,
+        code: 'rate_limit_error',
+        retryAfterMs: DEFAULT_TOKEN_REFRESH_RETRY_AFTER_MS,
+        retryAfterSource: 'fallback',
+      });
+    }, { now: () => now });
+
+    assert.equal(DEFAULT_MAX_TOKEN_REFRESH_BACKOFF_MS, 15 * 60 * 1000);
+    const expectedDelays = [
+      60_000,
+      120_000,
+      240_000,
+      480_000,
+      900_000,
+      900_000,
+      DEFAULT_SUSTAINED_TOKEN_REFRESH_RETRY_MS,
+      DEFAULT_SUSTAINED_TOKEN_REFRESH_RETRY_MS,
+    ];
+    for (const expectedDelay of expectedDelays) {
+      await assert.rejects(
+        coordinated('refresh-1'),
+        error => error.retryAfterMs === expectedDelay,
+      );
+      now += expectedDelay + 1;
+    }
+    assert.equal(calls, expectedDelays.length);
+  });
+
+  it('honors an explicit Retry-After without exponential amplification', async () => {
+    let calls = 0;
+    let now = 1000;
+    const coordinated = createSingleFlightTokenRefresher(async () => {
+      calls += 1;
+      throw new OAuthTokenRefreshError({
+        status: 429,
+        code: 'rate_limit_error',
+        retryAfterMs: 2 * 60 * 60 * 1000,
+        retryAfterSource: 'provider',
+      });
+    }, { now: () => now });
+
+    await assert.rejects(
+      coordinated('refresh-1'),
+      error => error.retryAfterMs === 2 * 60 * 60 * 1000,
+    );
+    now += 2 * 60 * 60 * 1000 + 1;
+    await assert.rejects(
+      coordinated('refresh-1'),
+      error => error.retryAfterMs === 2 * 60 * 60 * 1000,
+    );
+    assert.equal(calls, 2);
+  });
+
+  it('keeps a native fixed retry delay constant without exponential amplification', async () => {
+    let calls = 0;
+    let now = 1000;
+    const coordinated = createSingleFlightTokenRefresher(async () => {
+      calls += 1;
+      throw Object.assign(new Error('native refresh failed'), {
+        code: 'NATIVE_REFRESH_COMMAND_FAILED',
+        retryAfterMs: 5 * 60 * 1000,
+        retryAfterSource: 'fixed',
+      });
+    }, { now: () => now });
+
+    for (let attempt = 0; attempt < 8; attempt += 1) {
+      await assert.rejects(
+        coordinated('refresh-1'),
+        error => error.retryAfterMs === 5 * 60 * 1000
+          && isOAuthTokenRefreshRateLimit(error),
+      );
+      now += 5 * 60 * 1000 + 1;
+    }
+    assert.equal(calls, 8);
+  });
+
+  it('reports only the remaining cooldown to late callers', async () => {
+    let calls = 0;
+    let now = 1000;
+    const deferred = [];
+    const coordinated = createSingleFlightTokenRefresher(async () => {
+      calls += 1;
+      throw new OAuthTokenRefreshError({
+        status: 429,
+        code: 'rate_limit_error',
+        retryAfterMs: 120_000,
+        retryAfterSource: 'provider',
+      });
+    }, {
+      now: () => now,
+      onFailure: ({ deferred: wasDeferred }) => deferred.push(wasDeferred),
+    });
+
+    await assert.rejects(
+      coordinated('refresh-1'),
+      error => error.retryAfterMs === 120_000 && error.deferred !== true,
+    );
+    now += 30_000;
+    await assert.rejects(
+      coordinated('refresh-1'),
+      error => error.retryAfterMs === 90_000 && error.deferred === true,
+    );
     assert.equal(calls, 1);
+    assert.deepEqual(deferred, [false, true]);
+  });
+
+  it('resets the account backoff after a successful refresh', async () => {
+    let calls = 0;
+    let now = 1000;
+    const coordinated = createSingleFlightTokenRefresher(async refreshToken => {
+      calls += 1;
+      if (calls === 3) return { accessToken: 'recovered', refreshToken };
+      throw new OAuthTokenRefreshError({
+        status: 429,
+        code: 'rate_limit_error',
+        retryAfterMs: 10_000,
+        retryAfterSource: 'fallback',
+      });
+    }, { now: () => now, retentionMs: 0 });
+
+    await assert.rejects(coordinated('refresh-1'), error => error.retryAfterMs === 10_000);
+    now += 10_001;
+    await assert.rejects(coordinated('refresh-1'), error => error.retryAfterMs === 20_000);
+    now += 20_001;
+    await coordinated('refresh-1');
+    await assert.rejects(coordinated('refresh-1'), error => error.retryAfterMs === 10_000);
+    assert.equal(calls, 4);
   });
 
   it('parses token endpoint responses', () => {
@@ -200,6 +358,48 @@ describe('token refresh', () => {
       refreshToken: 'refresh2',
       expiresAt: 1780582800000,
     });
+  });
+
+  it('preserves OAuth scopes and refresh-token expiry metadata', () => {
+    const now = 1780580000000;
+    const parsed = parseTokenResponse({
+      access_token: 'access2',
+      expires_in: 3600,
+      refresh_token_expires_in: 7200,
+      scope: 'user:profile user:inference user:profile',
+    }, 'refresh1', now, {
+      scopes: ['stale:scope'],
+      clientId: 'client-1',
+      subscriptionType: 'max',
+      rateLimitTier: 'default_claude_max_20x',
+    });
+
+    assert.deepEqual(parsed, {
+      accessToken: 'access2',
+      refreshToken: 'refresh1',
+      expiresAt: now + 3600 * 1000,
+      scopes: ['user:profile', 'user:inference'],
+      refreshTokenExpiresAt: now + 7200 * 1000,
+      clientId: 'client-1',
+      subscriptionType: 'max',
+      rateLimitTier: 'default_claude_max_20x',
+    });
+  });
+
+  it('keeps the previous refresh-token expiry for missing or invalid durations', () => {
+    const now = 1780580000000;
+    const previousRefreshTokenExpiresAt = 1812118800;
+
+    for (const value of [null, '', Number.MAX_VALUE]) {
+      const parsed = parseTokenResponse({
+        access_token: 'access2',
+        expires_in: 3600,
+        refresh_token_expires_in: value,
+      }, 'refresh1', now, {
+        refreshTokenExpiresAt: previousRefreshTokenExpiresAt,
+      });
+      assert.equal(parsed.refreshTokenExpiresAt, previousRefreshTokenExpiresAt * 1000);
+    }
   });
 
   it('refreshes access tokens through injected fetch', async () => {
@@ -220,9 +420,47 @@ describe('token refresh', () => {
     assert.equal(result.accessToken, 'access2');
     assert.equal(result.refreshToken, 'refresh1');
     assert.equal(result.expiresAt, 3601000);
-    assert.equal(JSON.parse(calls[0].options.body).refresh_token, 'refresh1');
+    assert.deepEqual(JSON.parse(calls[0].options.body), {
+      grant_type: 'refresh_token',
+      refresh_token: 'refresh1',
+      client_id: '9d1c250a-e61b-44d9-88ed-5944d1962f5e',
+      scope: CLAUDE_AI_OAUTH_SCOPES.join(' '),
+    });
+    assert.deepEqual(result.scopes, CLAUDE_AI_OAUTH_SCOPES);
     assert.equal(calls[0].options.headers['User-Agent'], OAUTH_USER_AGENT);
     assert.equal(calls[0].options.headers['Accept-Encoding'], 'identity');
+    assert.equal(calls[0].options.headers['Content-Length'], Buffer.byteLength(calls[0].options.body));
+  });
+
+  it('uses imported OAuth scopes and client id when refreshing', async () => {
+    let request;
+    const result = await refreshAccessToken('refresh1', {
+      fetchImpl: async (url, options) => {
+        request = { url, options };
+        return jsonResponse(200, { access_token: 'access2', expires_in: 3600 });
+      },
+      now: () => 1000,
+      scopes: ['user:profile', 'user:inference'],
+      clientId: 'custom-client',
+      refreshTokenExpiresAt: 9999999999999,
+    });
+
+    assert.deepEqual(JSON.parse(request.options.body), {
+      grant_type: 'refresh_token',
+      refresh_token: 'refresh1',
+      client_id: 'custom-client',
+      scope: 'user:profile user:inference',
+    });
+    assert.deepEqual(result.scopes, ['user:profile', 'user:inference']);
+    assert.equal(result.clientId, 'custom-client');
+    assert.equal(result.refreshTokenExpiresAt, 9999999999999);
+  });
+
+  it('requires stored scopes for custom OAuth clients', async () => {
+    await assert.rejects(
+      refreshAccessToken('refresh1', { clientId: 'custom-client' }),
+      /OAuth scopes are required for custom client credentials/,
+    );
   });
 
   it('returns a sanitized refresh error with the server retry delay', async () => {
@@ -239,6 +477,7 @@ describe('token refresh', () => {
         assert.equal(error.status, 429);
         assert.equal(error.oauthCode, 'rate_limit_error');
         assert.equal(error.retryAfterMs, 105_000);
+        assert.equal(error.retryAfterSource, 'provider');
         assert.equal(error.message.includes('secret-refresh-token'), false);
         return true;
       },
@@ -250,7 +489,29 @@ describe('token refresh', () => {
       refreshAccessToken('refresh-1', {
         fetchImpl: async () => jsonResponse(429, { error: 'rate_limit_error' }),
       }),
-      error => error.retryAfterMs === DEFAULT_TOKEN_REFRESH_RETRY_AFTER_MS,
+      error => error.retryAfterMs === DEFAULT_TOKEN_REFRESH_RETRY_AFTER_MS
+        && error.retryAfterSource === 'fallback',
+    );
+  });
+
+  it('bounds an extreme provider Retry-After to a representable deadline', async () => {
+    const now = Date.parse('2026-07-12T12:00:00Z');
+    await assert.rejects(
+      refreshAccessToken('refresh-1', {
+        fetchImpl: async () => jsonResponse(
+          429,
+          { error: 'rate_limit_error' },
+          { 'retry-after': String(Number.MAX_VALUE) },
+        ),
+        now: () => now,
+      }),
+      error => {
+        assert.equal(error.retryAfterSource, 'provider');
+        assert.equal(Number.isFinite(error.retryAfterMs), true);
+        assert.equal(error.retryAfterMs, DEFAULT_MAX_PROVIDER_RETRY_AFTER_MS);
+        assert.doesNotThrow(() => new Date(now + error.retryAfterMs).toISOString());
+        return true;
+      },
     );
   });
 });

@@ -10,16 +10,37 @@ export function parseClaudeCredentials(raw) {
   const parsed = typeof raw === 'string' ? JSON.parse(raw) : raw;
   const data = parsed.claudeAiOauth || parsed;
   if (!data.accessToken) throw new Error('Claude credentials JSON must contain accessToken');
-  return {
+  const credential = {
     accessToken: data.accessToken,
     refreshToken: data.refreshToken || null,
     expiresAt: data.expiresAt || null,
   };
+  const scopes = normalizeScopes(data.scopes);
+  if (scopes.length > 0) credential.scopes = scopes;
+  for (const field of [
+    'refreshTokenExpiresAt',
+    'clientId',
+    'subscriptionType',
+    'rateLimitTier',
+  ]) {
+    if (data[field] != null) credential[field] = data[field];
+  }
+  return credential;
 }
 
-export async function readCurrentClaudeCredentials({ platform = process.platform, home = homedir() } = {}) {
+function normalizeScopes(value) {
+  const entries = Array.isArray(value) ? value : String(value || '').split(/\s+/);
+  return [...new Set(entries.map(scope => String(scope).trim()).filter(Boolean))];
+}
+
+export async function readCurrentClaudeCredentials({
+  platform = process.platform,
+  home = homedir(),
+  execFileImpl = execFileAsync,
+  readFileImpl = readFile,
+} = {}) {
   if (platform === 'darwin') {
-    const { stdout } = await execFileAsync('security', [
+    const { stdout } = await execFileImpl('security', [
       'find-generic-password',
       '-s',
       'Claude Code-credentials',
@@ -29,5 +50,5 @@ export async function readCurrentClaudeCredentials({ platform = process.platform
   }
 
   const path = join(home, '.claude', '.credentials.json');
-  return parseClaudeCredentials(await readFile(path, 'utf8'));
+  return parseClaudeCredentials(await readFileImpl(path, 'utf8'));
 }

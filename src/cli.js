@@ -1,17 +1,23 @@
 import { execFile } from 'node:child_process';
-import { mkdir, rm, writeFile } from 'node:fs/promises';
+import { randomUUID } from 'node:crypto';
+import { constants as fsConstants } from 'node:fs';
+import { access, mkdir, rm, stat, writeFile } from 'node:fs/promises';
 import http from 'node:http';
 import { homedir } from 'node:os';
-import { dirname, join, resolve } from 'node:path';
-import { promisify } from 'node:util';
+import { dirname, isAbsolute, join, resolve } from 'node:path';
+import { isDeepStrictEqual, promisify } from 'node:util';
 
 import { AccountManager } from './account-manager.js';
 import { createDefaultConfig, getConfigPath, loadOrCreateConfig, proxyBaseUrl, saveConfig } from './config.js';
-import { createProxyServer } from './proxy-server.js';
+import { createProxyServer, defaultTokenRefresher } from './proxy-server.js';
 import { createSecretStore } from './secret-store.js';
 import { renderStatus } from './monitor.js';
 import { readCurrentClaudeCredentials } from './claude-credentials.js';
 import { fetchProfile, isTokenExpiringSoon, refreshAccessToken } from './oauth.js';
+import {
+  createNativeClaudeRefresher,
+  resolveNativeClaudeCommand,
+} from './native-claude-refresher.js';
 import {
   installLinuxNodeLauncher,
   installSettings,
@@ -88,12 +94,12 @@ export async function runCli(argv = [], deps = {}) {
     }
 
     if (command === 'refresh-usage') {
-      const result = await postJson('/internal/refresh-usage', {});
+      const result = await (deps.postJson || postJson)('/internal/refresh-usage', {});
       const total = result.accounts?.length || 0;
       const ok = (result.accounts || []).filter(account => account.ok).length;
       write(`Refreshed usage for ${ok}/${total} accounts\n`);
       for (const account of result.accounts || []) {
-        if (!account.ok) write(`warning: ${account.account}: ${account.error}\n`);
+        if (!account.ok) write(`warning: ${account.account}: ${refreshUsageWarning(account)}\n`);
       }
       return result.ok ? 0 : 1;
     }
@@ -143,6 +149,15 @@ export async function runCli(argv = [], deps = {}) {
   }
 }
 
+function refreshUsageWarning(account) {
+  if (account.error) return account.error;
+  if (account.skipped === 'credential-refresh-cooldown') {
+    return 'credential refresh cooldown is active';
+  }
+  if (account.skipped) return `skipped: ${account.skipped}`;
+  return 'unknown refresh error';
+}
+
 export function helpText() {
   return `Usage:
   claude-rotator install [--no-start] [--force]
@@ -179,6 +194,7 @@ function renderPrepareResume(result) {
 
 async function runServer({ write }) {
   const config = await loadOrCreateConfig();
+  if (ensureCredentialRevisions(config)) await saveConfig(config);
   const secretStore = createSecretStore();
   const accountManager = new AccountManager({
     accounts: config.accounts,
@@ -203,6 +219,20 @@ async function runServer({ write }) {
   await new Promise(resolve => server.listen(config.proxy.port, config.proxy.host, resolve));
   write(`claude-rotator listening on ${proxyBaseUrl(config)}\n`);
   await waitForShutdown(server);
+}
+
+export function ensureCredentialRevisions(config, {
+  createRevision = randomUUID,
+} = {}) {
+  let changed = false;
+  config.accounts = (config.accounts || []).map(account => {
+    if (typeof account.credentialRevision === 'string' && account.credentialRevision.length > 0) {
+      return account;
+    }
+    changed = true;
+    return { ...account, credentialRevision: createRevision() };
+  });
+  return changed;
 }
 
 function waitForShutdown(server) {
@@ -242,6 +272,17 @@ async function installCommand({ argv, write }) {
   const settingsPath = claudeSettingsPath(home);
   const force = argv.includes('--force');
   const noStart = argv.includes('--no-start');
+  let claudePath = null;
+  if (['darwin', 'linux'].includes(process.platform)) {
+    claudePath = await resolveNativeClaudeCommand();
+    if (!isAbsolute(claudePath)) {
+      throw new Error('Could not resolve an absolute Claude Code executable for the service');
+    }
+    await access(claudePath, fsConstants.X_OK);
+    if (!(await stat(claudePath)).isFile()) {
+      throw new Error('Claude Code executable for the service is not a regular file');
+    }
+  }
   await installSettings({
     settingsPath,
     installStatePath: statePath,
@@ -249,7 +290,7 @@ async function installCommand({ argv, write }) {
     proxyBaseUrl: proxyBaseUrl(config),
     force,
   });
-  await installServiceFile({ configPath });
+  await installServiceFile({ configPath, claudePath });
   write(`Installed claude-rotator at ${proxyBaseUrl(config)}\n`);
   if (noStart) {
     write('Service start skipped because --no-start was set.\n');
@@ -293,10 +334,20 @@ async function loginJsonCommand({ argv, write, deps }) {
   const secret = JSON.parse(json);
   const config = await loadOrCreateConfig();
   const store = createSecretStore();
+  const previousSecret = await store.get(id);
   await store.set(id, secret);
 
-  const account = { id, name, type: secret.apiKey ? 'apikey' : 'oauth' };
   const existing = config.accounts.findIndex(item => item.id === id);
+  const account = {
+    id,
+    name,
+    type: secret.apiKey ? 'apikey' : 'oauth',
+    credentialRevision: credentialRevisionAfterWrite(
+      config.accounts[existing],
+      previousSecret,
+      secret,
+    ),
+  };
   if (existing >= 0) config.accounts[existing] = account;
   else config.accounts.push(account);
   await saveConfig(config);
@@ -430,13 +481,31 @@ async function saveImportedAccount({ id, name, accountUuid = null, secret, expli
   }
 
   const store = deps.secretStore || createSecretStore();
+  const previousSecret = await store.get(targetId);
   await store.set(targetId, secret);
-  const account = { id: targetId, name, type: secret.apiKey ? 'apikey' : 'oauth', accountUuid };
   const existing = config.accounts.findIndex(item => item.id === targetId);
+  const account = {
+    id: targetId,
+    name,
+    type: secret.apiKey ? 'apikey' : 'oauth',
+    accountUuid,
+    credentialRevision: credentialRevisionAfterWrite(
+      config.accounts[existing],
+      previousSecret,
+      secret,
+    ),
+  };
   if (existing >= 0) config.accounts[existing] = account;
   else config.accounts.push(account);
   if (deps.saveConfig) await deps.saveConfig(config);
   else await saveConfig(config);
+}
+
+function credentialRevisionAfterWrite(existingAccount, previousSecret, nextSecret) {
+  if (isDeepStrictEqual(previousSecret, nextSecret)) {
+    return existingAccount?.credentialRevision || null;
+  }
+  return randomUUID();
 }
 
 async function readProfileForLogin(secret, deps) {
@@ -469,7 +538,11 @@ async function inspectDoctorWarnings(deps = {}) {
   const store = deps.secretStore || createSecretStore();
   const readCurrent = deps.readCurrentCredentials || readCurrentClaudeCredentials;
   const profileFetcher = deps.fetchProfile || fetchProfile;
-  const tokenRefresher = deps.refreshAccessToken || refreshAccessToken;
+  const tokenRefresher = deps.refreshAccessToken || defaultTokenRefresher({
+    platform: deps.platform || process.platform,
+    nativeRefresherFactory: options => createNativeClaudeRefresher(options),
+    directRefresher: refreshAccessToken,
+  });
   const liveProfiles = [];
 
   for (const account of accounts) {
@@ -499,7 +572,11 @@ async function inspectDoctorWarnings(deps = {}) {
       try {
         profile = await profileFetcher(profileSecret.accessToken);
       } catch (profileError) {
-        if (!secret.refreshToken || profileSecret !== secret) throw profileError;
+        if (
+          account.id === CURRENT_ACCOUNT_ID
+          || !secret.refreshToken
+          || profileSecret !== secret
+        ) throw profileError;
         const refreshedSecret = await refreshDoctorSecret({
           account,
           secret,
@@ -527,14 +604,44 @@ async function inspectDoctorWarnings(deps = {}) {
 }
 
 async function refreshDoctorSecretIfNeeded({ account, secret, store, tokenRefresher }) {
+  if (account.id === CURRENT_ACCOUNT_ID) return secret;
   if (!secret.refreshToken || !isTokenExpiringSoon(secret.expiresAt)) return secret;
   return refreshDoctorSecret({ account, secret, store, tokenRefresher });
 }
 
 async function refreshDoctorSecret({ account, secret, store, tokenRefresher }) {
-  const refreshed = { ...secret, ...(await tokenRefresher(secret.refreshToken)) };
-  if (account.id !== CURRENT_ACCOUNT_ID && store.set) await store.set(account.id, refreshed);
+  if (account.id === CURRENT_ACCOUNT_ID) {
+    throw new Error('Live Claude Code credentials must be refreshed by Claude Code');
+  }
+  if (typeof store?.compareAndSet !== 'function') {
+    const error = new Error('Secret store does not support atomic compare-and-set');
+    error.code = 'SECRET_STORE_CAS_UNAVAILABLE';
+    throw error;
+  }
+  const refreshed = {
+    ...secret,
+    ...(await tokenRefresher(secret.refreshToken, tokenRefreshContext(account, secret))),
+  };
+  if (!await store.compareAndSet(account.id, secret, refreshed)) {
+    const latestSecret = await store.get(account.id);
+    if (latestSecret?.accessToken) return latestSecret;
+    throw new Error('Stored OAuth credential changed while token refresh was in flight');
+  }
   return refreshed;
+}
+
+function tokenRefreshContext(account, secret) {
+  return {
+    accountId: account.id,
+    accessToken: secret.accessToken,
+    refreshToken: secret.refreshToken,
+    expiresAt: secret.expiresAt,
+    scopes: secret.scopes,
+    refreshTokenExpiresAt: secret.refreshTokenExpiresAt,
+    clientId: secret.clientId,
+    subscriptionType: secret.subscriptionType,
+    rateLimitTier: secret.rateLimitTier,
+  };
 }
 
 function duplicateAccountUuidWarnings(accounts) {
@@ -607,16 +714,38 @@ function nextAccountId(config) {
   return `account${Date.now()}`;
 }
 
-async function installServiceFile({ configPath }) {
+async function installServiceFile({ configPath, claudePath = null }) {
   const cliPath = resolve(process.argv[1]);
+  const servicePath = [...new Set([
+    claudePath ? dirname(claudePath) : null,
+    dirname(process.execPath),
+    '/opt/homebrew/bin',
+    '/usr/local/bin',
+    '/usr/bin',
+    '/bin',
+    '/usr/sbin',
+    '/sbin',
+  ].filter(Boolean))].join(':');
   if (process.platform === 'darwin') {
     const path = macosLaunchAgentPath(MACOS_LAUNCH_AGENT_LABEL);
     await mkdir(dirname(path), { recursive: true });
-    await writeFile(path, renderLaunchAgentPlist({ nodePath: process.execPath, cliPath, configPath }), 'utf8');
+    await writeFile(path, renderLaunchAgentPlist({
+      nodePath: process.execPath,
+      cliPath,
+      configPath,
+      claudePath,
+      servicePath,
+    }), 'utf8');
     return;
   }
   const nodePath = await installLinuxNodeLauncher({ nodePath: process.execPath, configPath });
-  const service = renderSystemdUserService({ nodePath, cliPath, configPath });
+  const service = renderSystemdUserService({
+    nodePath,
+    cliPath,
+    configPath,
+    claudePath,
+    servicePath,
+  });
   const path = join(appConfigDir(), 'claude-rotator.service');
   await mkdir(dirname(path), { recursive: true });
   await writeFile(path, service, 'utf8');
