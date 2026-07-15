@@ -28,7 +28,7 @@ import {
   NativeClaudeRefreshError,
   nativeClaudeKeychainAccount,
   nativeClaudeKeychainServiceName,
-  refreshWithNativeClaudeCode,
+  refreshWithNativeClaudeCode as refreshWithNativeClaudeCodeImpl,
   resolveNativeClaudeCommand,
   resolveNativeTempRoot,
 } from '../src/native-claude-refresher.js';
@@ -40,6 +40,13 @@ const NEW_REFRESH_TOKEN = 'rotated-refresh-token-secret';
 const NOW = 1_700_000_000_000;
 const OLD_EXPIRES_AT = 1_800_000_000_000;
 const NEW_EXPIRES_AT = OLD_EXPIRES_AT + 60 * 60 * 1000;
+
+function refreshWithNativeClaudeCode(refreshToken, previousCredential, options = {}) {
+  return refreshWithNativeClaudeCodeImpl(refreshToken, previousCredential, {
+    platform: 'linux',
+    ...options,
+  });
+}
 
 describe('native Claude credential refresher', () => {
   let testRoot;
@@ -391,6 +398,7 @@ describe('native Claude credential refresher', () => {
 
   it('accepts a rotated refresh token and preserves metadata omitted by native Claude', async () => {
     const refresher = createNativeClaudeRefresher({
+      platform: 'linux',
       tempRoot: testRoot,
       execFileImpl: async (command, args, options) => {
         await writeCredential(join(options.env.CLAUDE_CONFIG_DIR, '.credentials.json'), {
