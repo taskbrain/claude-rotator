@@ -2,6 +2,7 @@ import { emptyQuota, normalizeWeeklyScopedUsage, parseRateLimitHeaders } from '.
 import {
   DEFAULT_MAX_PROVIDER_RETRY_AFTER_MS,
   DEFAULT_MAX_TOKEN_REFRESH_BACKOFF_MS,
+  DEFAULT_SUSTAINED_TOKEN_REFRESH_RETRY_MS,
 } from './oauth.js';
 
 export const DEFAULT_WEEKLY_RESET_PRIORITY_WINDOW_MS = 36 * 60 * 60 * 1000;
@@ -308,7 +309,11 @@ export class AccountManager {
       );
       return;
     }
-    if (remainingMs <= DEFAULT_MAX_TOKEN_REFRESH_BACKOFF_MS) return;
+    const maximumCurrentFallbackCooldownMs = Math.max(
+      DEFAULT_MAX_TOKEN_REFRESH_BACKOFF_MS,
+      DEFAULT_SUSTAINED_TOKEN_REFRESH_RETRY_MS,
+    );
+    if (remainingMs <= maximumCurrentFallbackCooldownMs) return;
     account.rateLimitedUntil = null;
     account.temporaryUnavailableReason = null;
     if (account.status === 'throttled') account.status = 'ready';

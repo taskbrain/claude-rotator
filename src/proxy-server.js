@@ -16,6 +16,7 @@ import {
   isTokenExpiringSoon,
   refreshAccessToken,
 } from './oauth.js';
+import { createNativeClaudeRefresher } from './native-claude-refresher.js';
 
 const HOP_HEADERS = new Set([
   'host',
@@ -43,7 +44,7 @@ export function createProxyServer({
   secretStore,
   config,
   reloadAccounts = null,
-  tokenRefresher = refreshAccessToken,
+  tokenRefresher = null,
   currentCredentialReader = readCurrentClaudeCredentials,
   currentProfileFetcher = fetchProfile,
   usageFetcher = fetchUsage,
@@ -63,7 +64,8 @@ export function createProxyServer({
   const upstreamConnectRetryDelayMs = config.proxy?.upstreamConnectRetryDelayMs
     ?? config.upstreamConnectRetryDelayMs
     ?? DEFAULT_UPSTREAM_CONNECT_RETRY_DELAY_MS;
-  const coordinatedTokenRefresher = createSingleFlightTokenRefresher(tokenRefresher, {
+  const resolvedTokenRefresher = tokenRefresher || defaultTokenRefresher();
+  const coordinatedTokenRefresher = createSingleFlightTokenRefresher(resolvedTokenRefresher, {
     onSuccess({ context, refreshed, rotated }) {
       logger?.(`${new Date().toISOString()} credential-refresh account=${context?.accountId || 'unknown'} result=success rotated=${rotated} expiresAt=${formatCredentialExpiry(refreshed.expiresAt)}`);
     },
@@ -71,7 +73,7 @@ export function createProxyServer({
       const retry = error?.retryAfterMs
         ? ` retryAfterSec=${Math.ceil(error.retryAfterMs / 1000)}`
         : '';
-      const retrySource = ['provider', 'fallback'].includes(error?.retryAfterSource)
+      const retrySource = ['provider', 'fallback', 'fixed'].includes(error?.retryAfterSource)
         ? ` retrySource=${error.retryAfterSource}`
         : '';
       const result = deferred ? 'deferred' : 'failed';
@@ -200,6 +202,12 @@ export function createProxyServer({
 
   usageScheduler.start(server);
   return server;
+}
+
+function defaultTokenRefresher() {
+  return process.platform === 'linux'
+    ? createNativeClaudeRefresher()
+    : refreshAccessToken;
 }
 
 function usagePollingEnabled(config) {
@@ -771,6 +779,9 @@ async function refreshAndStoreSecret({ account, secret, secretStore, tokenRefres
 function tokenRefreshContext(account, secret) {
   return {
     accountId: account.id,
+    accessToken: secret.accessToken,
+    refreshToken: secret.refreshToken,
+    expiresAt: secret.expiresAt,
     scopes: secret.scopes,
     refreshTokenExpiresAt: secret.refreshTokenExpiresAt,
     clientId: secret.clientId,
@@ -1482,9 +1493,14 @@ function sendUnavailableAccounts(res, accountManager = null) {
   const reason = current ? accountManager.unavailableReason(current) : null;
   if (isCredentialUnavailable(reason)) {
     const headers = { 'Content-Type': 'application/json' };
-    const retryAt = Date.parse(reason.retryAt || '');
-    if (Number.isFinite(retryAt)) {
-      headers['Retry-After'] = String(Math.max(1, Math.ceil((retryAt - Date.now()) / 1000)));
+    const now = Date.now();
+    const retryTimes = (accountManager?.accounts || [])
+      .map(account => accountManager.unavailableReason(account))
+      .map(accountReason => Date.parse(accountReason?.retryAt || ''))
+      .filter(retryAt => Number.isFinite(retryAt) && retryAt > now);
+    const retryAt = retryTimes.length > 0 ? Math.min(...retryTimes) : null;
+    if (retryAt != null) {
+      headers['Retry-After'] = String(Math.max(1, Math.ceil((retryAt - now) / 1000)));
     }
     res.writeHead(503, headers);
     res.end(JSON.stringify({

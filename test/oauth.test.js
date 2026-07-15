@@ -7,6 +7,7 @@ import {
   createSingleFlightTokenRefresher,
   normalizeExpiresAt,
   isTokenExpiringSoon,
+  isOAuthTokenRefreshRateLimit,
   parseTokenResponse,
   refreshAccessToken,
   fetchUsage,
@@ -267,6 +268,29 @@ describe('token refresh', () => {
       error => error.retryAfterMs === 2 * 60 * 60 * 1000,
     );
     assert.equal(calls, 2);
+  });
+
+  it('keeps a native fixed retry delay constant without exponential amplification', async () => {
+    let calls = 0;
+    let now = 1000;
+    const coordinated = createSingleFlightTokenRefresher(async () => {
+      calls += 1;
+      throw Object.assign(new Error('native refresh failed'), {
+        code: 'NATIVE_REFRESH_COMMAND_FAILED',
+        retryAfterMs: 5 * 60 * 1000,
+        retryAfterSource: 'fixed',
+      });
+    }, { now: () => now });
+
+    for (let attempt = 0; attempt < 8; attempt += 1) {
+      await assert.rejects(
+        coordinated('refresh-1'),
+        error => error.retryAfterMs === 5 * 60 * 1000
+          && isOAuthTokenRefreshRateLimit(error),
+      );
+      now += 5 * 60 * 1000 + 1;
+    }
+    assert.equal(calls, 8);
   });
 
   it('reports only the remaining cooldown to late callers', async () => {

@@ -96,6 +96,9 @@ describe('createProxyServer', () => {
       tokenRefresher: async (refreshToken, context) => {
         assert.equal(refreshToken, 'refresh-token-1');
         assert.equal(context.accountId, 'acct_1');
+        assert.equal(context.accessToken, 'expired-token');
+        assert.equal(context.refreshToken, 'refresh-token-1');
+        assert.equal(context.expiresAt, 900);
         assert.deepEqual(context.scopes, ['user:profile', 'user:inference']);
         assert.equal(context.refreshTokenExpiresAt, 9999999999999);
         return {
@@ -1072,11 +1075,55 @@ describe('createProxyServer', () => {
     assert.equal(response.status, 503);
     assert.deepEqual(upstreamSeen, []);
     assert.equal(response.body.error.type, 'api_error');
+    assert.equal(response.headers['retry-after'], undefined);
     assert.equal(accountManager.getStatus().currentAccount, 'acct_1');
     assert.deepEqual(accountManager.getStatus().accounts[0].unavailableReason, {
       type: 'oauth_refresh_failed',
       message: 'OAuth token refresh failed',
     });
+  });
+
+  it('uses the earliest known account retry time for a local credential 503', async () => {
+    const now = Date.now();
+    const accountManager = new AccountManager({
+      accounts: [
+        { id: 'slow', name: 'slow@example.com', type: 'oauth' },
+        { id: 'fast', name: 'fast@example.com', type: 'oauth' },
+        { id: 'quota', name: 'quota@example.com', type: 'oauth' },
+      ],
+      now: () => now,
+    });
+    accountManager.markCredentialRefreshRateLimited('slow', 120);
+    accountManager.markCredentialRefreshRateLimited('fast', 30);
+    accountManager.updateQuota('quota', {
+      'anthropic-ratelimit-unified-5h-utilization': '1',
+      'anthropic-ratelimit-unified-5h-reset': String(Math.ceil((now + 5_000) / 1000)),
+    });
+    const proxy = await listen(createProxyServer({
+      accountManager,
+      secretStore: new MemorySecretStore(),
+      config: {
+        upstream: 'http://127.0.0.1:1',
+        usagePolling: { enabled: false },
+      },
+      tokenRefresher: async () => {
+        throw new Error('token refresher should not be called');
+      },
+      currentCredentialReader: async () => null,
+    }));
+    cleanupAfterTest(async () => {
+      await close(proxy.server);
+    });
+
+    const response = await requestJson(`${proxy.url}/v1/messages`, {
+      method: 'POST',
+      body: JSON.stringify({ model: 'sonnet' }),
+    });
+
+    const retryAfter = Number.parseInt(response.headers['retry-after'], 10);
+    assert.equal(response.status, 503);
+    assert.ok(retryAfter >= 25 && retryAfter <= 30, `unexpected Retry-After: ${retryAfter}`);
+    assert.equal(accountManager.getStatus().currentAccount, 'slow');
   });
 
   it('switches to a known available account when the current OAuth refresh fails', async () => {

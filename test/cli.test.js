@@ -364,6 +364,9 @@ describe('runCli', () => {
       secretStore,
       refreshAccessToken: async (refreshToken, context) => {
         assert.equal(refreshToken, 'refresh-token');
+        assert.equal(context.accessToken, 'expired-token');
+        assert.equal(context.refreshToken, 'refresh-token');
+        assert.equal(context.expiresAt, 1000);
         assert.deepEqual(context.scopes, ['user:profile', 'user:inference']);
         assert.equal(context.refreshTokenExpiresAt, 9999999999999);
         assert.equal(context.accountId, 'acct_1');

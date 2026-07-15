@@ -760,6 +760,40 @@ describe('AccountManager', () => {
     assert.equal(account.unavailableReason, null);
   });
 
+  it('preserves the sustained one-hour OAuth refresh cooldown after restart', () => {
+    const now = Date.parse('2026-07-12T12:00:00Z');
+    const manager = new AccountManager({
+      accounts: [{ id: 'acct_1', name: 'a@example.com', type: 'oauth' }],
+      now: () => now,
+    });
+
+    manager.restoreState({
+      version: 1,
+      currentAccount: 'acct_1',
+      accounts: [{
+        id: 'acct_1',
+        status: 'throttled',
+        quota: {},
+        usage: {},
+        rateLimitedUntil: new Date(now + 60 * 60 * 1000).toISOString(),
+        temporaryUnavailableReason: {
+          type: 'oauth_refresh_rate_limit',
+          retryAfterSource: 'fallback',
+        },
+        errorReason: null,
+      }],
+    });
+
+    const account = manager.getStatus().accounts[0];
+    assert.equal(account.status, 'throttled');
+    assert.equal(account.rateLimitedUntil, '2026-07-12T13:00:00.000Z');
+    assert.deepEqual(account.unavailableReason, {
+      type: 'oauth_refresh_rate_limit',
+      retryAfterSource: 'fallback',
+      retryAt: '2026-07-12T13:00:00.000Z',
+    });
+  });
+
   it('preserves a long provider Retry-After after restart', () => {
     const now = Date.parse('2026-07-12T12:00:00Z');
     const manager = new AccountManager({

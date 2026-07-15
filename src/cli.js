@@ -12,6 +12,7 @@ import { createSecretStore } from './secret-store.js';
 import { renderStatus } from './monitor.js';
 import { readCurrentClaudeCredentials } from './claude-credentials.js';
 import { fetchProfile, isTokenExpiringSoon, refreshAccessToken } from './oauth.js';
+import { createNativeClaudeRefresher } from './native-claude-refresher.js';
 import {
   installLinuxNodeLauncher,
   installSettings,
@@ -478,7 +479,9 @@ async function inspectDoctorWarnings(deps = {}) {
   const store = deps.secretStore || createSecretStore();
   const readCurrent = deps.readCurrentCredentials || readCurrentClaudeCredentials;
   const profileFetcher = deps.fetchProfile || fetchProfile;
-  const tokenRefresher = deps.refreshAccessToken || refreshAccessToken;
+  const tokenRefresher = deps.refreshAccessToken || (
+    process.platform === 'linux' ? createNativeClaudeRefresher() : refreshAccessToken
+  );
   const liveProfiles = [];
 
   for (const account of accounts) {
@@ -565,6 +568,9 @@ async function refreshDoctorSecret({ account, secret, store, tokenRefresher }) {
 function tokenRefreshContext(account, secret) {
   return {
     accountId: account.id,
+    accessToken: secret.accessToken,
+    refreshToken: secret.refreshToken,
+    expiresAt: secret.expiresAt,
     scopes: secret.scopes,
     refreshTokenExpiresAt: secret.refreshTokenExpiresAt,
     clientId: secret.clientId,

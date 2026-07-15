@@ -50,7 +50,12 @@ export class OAuthTokenRefreshError extends Error {
 }
 
 export function isOAuthTokenRefreshRateLimit(error) {
-  return error instanceof OAuthTokenRefreshError && error.status === 429;
+  return (error instanceof OAuthTokenRefreshError && error.status === 429)
+    || (
+      error?.retryAfterSource === 'fixed'
+      && Number.isFinite(Number(error?.retryAfterMs))
+      && Number(error.retryAfterMs) > 0
+    );
 }
 
 export function normalizeExpiresAt(expiresAt) {
@@ -136,6 +141,9 @@ export function createSingleFlightTokenRefresher(tokenRefresher, {
         );
         if (requestedRetryAfterMs > 0) {
           if (error?.retryAfterSource === 'provider') {
+            clearRateLimitAttempt(credentialKey);
+            error.retryAfterMs = requestedRetryAfterMs;
+          } else if (error?.retryAfterSource === 'fixed') {
             clearRateLimitAttempt(credentialKey);
             error.retryAfterMs = requestedRetryAfterMs;
           } else {
