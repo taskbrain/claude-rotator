@@ -1,10 +1,15 @@
 import { afterEach, beforeEach, describe, it } from 'node:test';
 import assert from 'node:assert/strict';
+import { createHash } from 'node:crypto';
+import { constants as fsConstants } from 'node:fs';
 import {
   access,
+  chmod,
   mkdir,
   mkdtemp,
+  open,
   readFile,
+  rename,
   rm,
   stat,
   symlink,
@@ -15,11 +20,17 @@ import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 
 import {
+  createNativeClaudeCredentialStorage,
   createNativeClaudeRefresher,
   DEFAULT_NATIVE_CLAUDE_REFRESH_ARGS,
   DEFAULT_NATIVE_CLAUDE_REFRESH_RETRY_AFTER_MS,
+  executeSecurityCommand,
   NativeClaudeRefreshError,
+  nativeClaudeKeychainAccount,
+  nativeClaudeKeychainServiceName,
   refreshWithNativeClaudeCode,
+  resolveNativeClaudeCommand,
+  resolveNativeTempRoot,
 } from '../src/native-claude-refresher.js';
 
 const OLD_ACCESS_TOKEN = 'old-access-token-secret';
@@ -39,6 +50,95 @@ describe('native Claude credential refresher', () => {
 
   afterEach(async () => {
     await rm(testRoot, { recursive: true, force: true });
+  });
+
+  it('prefers an override, then an executable native installer binary, then PATH', async () => {
+    let accessCalls = 0;
+    assert.equal(await resolveNativeClaudeCommand({
+      command: '/configured/claude',
+      env: { HOME: '/home/tester' },
+      accessImpl: async () => {
+        accessCalls += 1;
+      },
+    }), '/configured/claude');
+    assert.equal(accessCalls, 0);
+
+    const nativeInstallerCommand = '/home/tester/.local/bin/claude';
+    assert.equal(await resolveNativeClaudeCommand({
+      env: { HOME: '/home/tester' },
+      accessImpl: async (path, mode) => {
+        accessCalls += 1;
+        assert.equal(path, nativeInstallerCommand);
+        assert.equal(mode, fsConstants.X_OK);
+      },
+    }), nativeInstallerCommand);
+    assert.equal(accessCalls, 1);
+
+    assert.equal(await resolveNativeClaudeCommand({
+      env: { HOME: '/home/tester' },
+      accessImpl: async () => {
+        throw Object.assign(new Error('not executable'), { code: 'EACCES' });
+      },
+    }), 'claude');
+
+    const checked = [];
+    assert.equal(await resolveNativeClaudeCommand({
+      env: {
+        HOME: '/Users/tester',
+        PATH: '/missing:/opt/homebrew/bin:/usr/bin',
+      },
+      accessImpl: async (path, mode) => {
+        checked.push(path);
+        assert.equal(mode, fsConstants.X_OK);
+        if (path !== '/opt/homebrew/bin/claude') throw Object.assign(new Error('missing'), { code: 'ENOENT' });
+      },
+    }), '/opt/homebrew/bin/claude');
+    assert.ok(checked.includes('/Users/tester/.local/bin/claude'));
+    assert.ok(checked.includes('/opt/homebrew/bin/claude'));
+  });
+
+  it('uses only a private owner-matched XDG runtime directory as the default temp root', async () => {
+    const runtimeDir = join(testRoot, 'runtime');
+    await mkdir(runtimeDir, { mode: 0o700 });
+    await chmod(runtimeDir, 0o700);
+
+    assert.equal(await resolveNativeTempRoot({
+      env: { XDG_RUNTIME_DIR: runtimeDir },
+      fallback: '/fallback',
+    }), runtimeDir);
+
+    await chmod(runtimeDir, 0o755);
+    assert.equal(await resolveNativeTempRoot({
+      env: { XDG_RUNTIME_DIR: runtimeDir },
+      fallback: '/fallback',
+    }), '/fallback');
+  });
+
+  it('derives the exact normalized Claude Code Keychain identity and sanitizes USER', () => {
+    const decomposedConfigDir = join(testRoot, 'cafe\u0301');
+    const normalized = decomposedConfigDir.normalize('NFC');
+    const expectedHash = createHash('sha256').update(normalized).digest('hex').slice(0, 8);
+
+    assert.equal(
+      nativeClaudeKeychainServiceName(decomposedConfigDir),
+      `Claude Code-credentials-${expectedHash}`,
+    );
+    assert.equal(
+      nativeClaudeKeychainServiceName(normalized),
+      `Claude Code-credentials-${expectedHash}`,
+    );
+    assert.equal(
+      nativeClaudeKeychainAccount({ USER: 'safe.user-1' }, () => ({ username: 'ignored' })),
+      'safe.user-1',
+    );
+    assert.equal(
+      nativeClaudeKeychainAccount({ USER: 'unsafe user;rm' }, () => ({ username: 'ignored' })),
+      'claude-code-user',
+    );
+    assert.equal(
+      nativeClaudeKeychainAccount({}, () => ({ username: 'local_user' })),
+      'local_user',
+    );
   });
 
   it('refreshes inside private isolated config and leaves global credentials and settings untouched', async () => {
@@ -152,6 +252,141 @@ describe('native Claude credential refresher', () => {
       await readFile(join(globalHome, '.claude', 'settings.json'), 'utf8'),
       'home-settings-sentinel',
     );
+  });
+
+  it('refreshes on macOS through an isolated temporary Keychain service without argv secrets', async () => {
+    const keychain = createFakeKeychainExecutor();
+    let isolatedService;
+    let isolatedAccount;
+
+    const refreshed = await refreshWithNativeClaudeCode(
+      OLD_REFRESH_TOKEN,
+      previousContext(),
+      {
+        command: 'claude',
+        platform: 'darwin',
+        tempRoot: testRoot,
+        env: {
+          HOME: join(testRoot, 'global-home'),
+          USER: 'mac.test-user',
+          LOGNAME: 'different-global-name',
+          PATH: process.env.PATH,
+        },
+        keychainExecImpl: keychain.exec,
+        now: () => NOW,
+        execFileImpl: async (command, args, options) => {
+          isolatedService = nativeClaudeKeychainServiceName(
+            options.env.CLAUDE_SECURESTORAGE_CONFIG_DIR,
+          );
+          isolatedAccount = options.env.USER;
+          assert.equal(options.env.LOGNAME, isolatedAccount);
+          assert.equal(options.env.CLAUDE_CONFIG_DIR, options.env.CLAUDE_SECURESTORAGE_CONFIG_DIR);
+          await assert.rejects(
+            access(join(options.env.CLAUDE_CONFIG_DIR, '.credentials.json')),
+            error => error.code === 'ENOENT',
+          );
+
+          const seeded = JSON.parse(keychain.items.get(
+            keychainItemKey(isolatedAccount, isolatedService),
+          ));
+          assert.equal(seeded.claudeAiOauth.accessToken, OLD_ACCESS_TOKEN);
+          assert.equal(seeded.claudeAiOauth.refreshToken, OLD_REFRESH_TOKEN);
+          assert.equal(seeded.claudeAiOauth.expiresAt, NOW - 1);
+          keychain.items.set(
+            keychainItemKey(isolatedAccount, isolatedService),
+            JSON.stringify({
+              claudeAiOauth: {
+                accessToken: NEW_ACCESS_TOKEN,
+                refreshToken: NEW_REFRESH_TOKEN,
+                expiresAt: NEW_EXPIRES_AT,
+              },
+            }),
+          );
+        },
+      },
+    );
+
+    assert.equal(isolatedAccount, 'mac.test-user');
+    assert.match(isolatedService, /^Claude Code-credentials-[0-9a-f]{8}$/);
+    assert.equal(refreshed.accessToken, NEW_ACCESS_TOKEN);
+    assert.equal(refreshed.refreshToken, NEW_REFRESH_TOKEN);
+    assert.equal(refreshed.expiresAt, NEW_EXPIRES_AT);
+    assert.equal(keychain.items.size, 0);
+    const seedCall = keychain.calls.find(call => call.args[0] === '-i');
+    assert.deepEqual(seedCall.args, ['-i']);
+    assert.doesNotMatch(seedCall.args.join(' '), /old-access|old-refresh|new-access|new-refresh/);
+    assert.match(seedCall.options.input, /^add-generic-password .+ -X "[0-9a-f]+"\n$/);
+  });
+
+  it('round-trips an isolated credential through the real macOS Keychain adapter', {
+    skip: process.platform !== 'darwin',
+  }, async () => {
+    const configDir = join(testRoot, 'native-keychain-config');
+    const account = `ci-${process.pid}-${Date.now()}`;
+    await mkdir(configDir, { recursive: true, mode: 0o700 });
+    const storage = createNativeClaudeCredentialStorage({
+      platform: 'darwin',
+      configDir,
+      keychainAccount: account,
+      keychainExecImpl: executeSecurityCommand,
+      openImpl: open,
+      timeoutMs: 5_000,
+    });
+    const credential = {
+      accessToken: 'fake-native-access-token',
+      refreshToken: 'fake-native-refresh-token',
+      expiresAt: 4_102_444_800_000,
+      scopes: ['user:inference'],
+    };
+
+    try {
+      await storage.seed(credential);
+      assert.deepEqual(await storage.read('seed'), credential);
+      await storage.cleanup();
+      await assert.rejects(
+        () => storage.read('refreshed'),
+        error => error.code === 'NATIVE_REFRESH_INVALID_OUTPUT',
+      );
+    } finally {
+      await storage.cleanup().catch(() => {});
+    }
+  });
+
+  it('waits for child close and pending pre-input fencing before rejecting a timeout', async () => {
+    let closeObserved = false;
+    let beforeInputFinished = false;
+    let releaseBeforeInput;
+    let settled = false;
+    const beforeInputGate = new Promise(resolve => { releaseBeforeInput = resolve; });
+
+    const execution = executeSecurityCommand(process.execPath, [
+      '-e',
+      'setInterval(() => {}, 1000)',
+    ], {
+      timeout: 20,
+      beforeInput: async () => {
+        await beforeInputGate;
+        beforeInputFinished = true;
+      },
+      afterClose: () => {
+        closeObserved = true;
+      },
+    });
+    execution.then(
+      () => { settled = true; },
+      () => { settled = true; },
+    );
+    await new Promise(resolve => setTimeout(resolve, 50));
+    assert.equal(settled, false);
+    assert.equal(beforeInputFinished, false);
+
+    releaseBeforeInput();
+    await assert.rejects(
+      () => execution,
+      error => error.code === 'ETIMEDOUT',
+    );
+    assert.equal(beforeInputFinished, true);
+    assert.equal(closeObserved, true);
   });
 
   it('accepts a rotated refresh token and preserves metadata omitted by native Claude', async () => {
@@ -394,6 +629,50 @@ describe('native Claude credential refresher', () => {
     assert.equal((await stat(externalCredential)).mode & 0o777, 0o600);
   });
 
+  it('reads from an O_NOFOLLOW file handle safely when the path is swapped after open', async () => {
+    const externalCredential = join(testRoot, 'external-swap-target.json');
+    const externalContents = 'external-target-must-not-be-read-or-modified';
+    await writeFile(externalCredential, externalContents, { mode: 0o600 });
+    let readOpenCount = 0;
+    const cleanupReports = [];
+
+    const refreshed = await refreshWithNativeClaudeCode(
+      OLD_REFRESH_TOKEN,
+      previousContext(),
+      {
+        command: 'claude',
+        tempRoot: testRoot,
+        openImpl: async (path, flags, ...rest) => {
+          const handle = await open(path, flags, ...rest);
+          if (flags === (fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW)) {
+            readOpenCount += 1;
+            if (readOpenCount === 2) {
+              await rename(path, `${path}.opened`);
+              await symlink(externalCredential, path);
+            }
+          }
+          return handle;
+        },
+        execFileImpl: async (command, args, options) => {
+          await writeCredential(join(options.env.CLAUDE_CONFIG_DIR, '.credentials.json'), {
+            accessToken: NEW_ACCESS_TOKEN,
+            refreshToken: NEW_REFRESH_TOKEN,
+            expiresAt: NEW_EXPIRES_AT,
+          });
+        },
+        onCleanupError: error => cleanupReports.push(error),
+      },
+    );
+
+    assert.equal(refreshed.accessToken, NEW_ACCESS_TOKEN);
+    assert.equal(refreshed.refreshToken, NEW_REFRESH_TOKEN);
+    assert.equal(readOpenCount, 2);
+    assert.equal(await readFile(externalCredential, 'utf8'), externalContents);
+    assert.equal((await stat(externalCredential)).mode & 0o777, 0o600);
+    assert.equal(cleanupReports.length, 1);
+    assert.equal(cleanupReports[0].code, 'NATIVE_REFRESH_CLEANUP_FAILED');
+  });
+
   it('rejects refreshed credentials that are already expired', async () => {
     await assert.rejects(
       refreshWithNativeClaudeCode(
@@ -483,7 +762,8 @@ describe('native Claude credential refresher', () => {
     );
   });
 
-  it('surfaces cleanup failures even when the native refresh command also fails', async () => {
+  it('preserves a primary command failure and reports cleanup failures separately', async () => {
+    const cleanupReports = [];
     await assert.rejects(
       refreshWithNativeClaudeCode(
         OLD_REFRESH_TOKEN,
@@ -496,12 +776,81 @@ describe('native Claude credential refresher', () => {
           removeImpl: async () => {
             throw new Error('cleanup failure');
           },
+          onCleanupError: error => cleanupReports.push(error),
         },
       ),
       error => error instanceof NativeClaudeRefreshError
-        && error.code === 'NATIVE_REFRESH_CLEANUP_FAILED'
+        && error.code === 'NATIVE_REFRESH_COMMAND_FAILED'
         && !/command failure|cleanup failure/.test(error.message),
     );
+    assert.equal(cleanupReports.length, 1);
+    assert.equal(cleanupReports[0].code, 'NATIVE_REFRESH_CLEANUP_FAILED');
+    assert.doesNotMatch(cleanupReports[0].message, /old-access|old-refresh|cleanup failure/);
+  });
+
+  it('returns a refreshed result when sandbox cleanup fails and reports the failure', async () => {
+    const cleanupReports = [];
+    const refreshed = await refreshWithNativeClaudeCode(
+      OLD_REFRESH_TOKEN,
+      previousContext(),
+      {
+        command: 'claude',
+        tempRoot: testRoot,
+        execFileImpl: async (command, args, options) => {
+          await writeCredential(join(options.env.CLAUDE_CONFIG_DIR, '.credentials.json'), {
+            accessToken: NEW_ACCESS_TOKEN,
+            refreshToken: NEW_REFRESH_TOKEN,
+            expiresAt: NEW_EXPIRES_AT,
+          });
+        },
+        removeImpl: async () => {
+          throw new Error(`cleanup-${OLD_ACCESS_TOKEN}-${OLD_REFRESH_TOKEN}`);
+        },
+        onCleanupError: error => cleanupReports.push(error),
+      },
+    );
+
+    assert.equal(refreshed.accessToken, NEW_ACCESS_TOKEN);
+    assert.equal(refreshed.refreshToken, NEW_REFRESH_TOKEN);
+    assert.equal(cleanupReports.length, 1);
+    assert.equal(cleanupReports[0].code, 'NATIVE_REFRESH_CLEANUP_FAILED');
+    assert.doesNotMatch(cleanupReports[0].message, /old-access|old-refresh/);
+  });
+
+  it('returns a macOS refreshed result when Keychain deletion fails and reports the failure', async () => {
+    const keychain = createFakeKeychainExecutor({ deleteFailure: true });
+    const cleanupReports = [];
+    const refreshed = await refreshWithNativeClaudeCode(
+      OLD_REFRESH_TOKEN,
+      previousContext(),
+      {
+        command: 'claude',
+        platform: 'darwin',
+        tempRoot: testRoot,
+        env: { USER: 'mac-user', HOME: testRoot },
+        keychainExecImpl: keychain.exec,
+        execFileImpl: async (command, args, options) => {
+          const service = nativeClaudeKeychainServiceName(
+            options.env.CLAUDE_SECURESTORAGE_CONFIG_DIR,
+          );
+          keychain.items.set(
+            keychainItemKey(options.env.USER, service),
+            JSON.stringify({
+              claudeAiOauth: {
+                accessToken: NEW_ACCESS_TOKEN,
+                refreshToken: NEW_REFRESH_TOKEN,
+                expiresAt: NEW_EXPIRES_AT,
+              },
+            }),
+          );
+        },
+        onCleanupError: error => cleanupReports.push(error),
+      },
+    );
+
+    assert.equal(refreshed.accessToken, NEW_ACCESS_TOKEN);
+    assert.equal(cleanupReports.length, 1);
+    assert.equal(cleanupReports[0].code, 'NATIVE_REFRESH_CLEANUP_FAILED');
   });
 });
 
@@ -523,4 +872,48 @@ async function writeCredential(path, credential) {
     encoding: 'utf8',
     mode: 0o600,
   });
+}
+
+function keychainItemKey(account, service) {
+  return `${account}\0${service}`;
+}
+
+function createFakeKeychainExecutor({ deleteFailure = false } = {}) {
+  const items = new Map();
+  const calls = [];
+  const exec = async (command, args, options = {}) => {
+    calls.push({ command, args: [...args], options: { ...options } });
+    assert.equal(command, 'security');
+    if (args[0] === '-i') {
+      const match = options.input.match(
+        /^add-generic-password -U -a "([a-zA-Z0-9._-]+)" -s "(Claude Code-credentials-[0-9a-f]{8})" -X "([0-9a-f]+)"\n$/,
+      );
+      assert.ok(match, 'seed command must use safe identifiers and a hex stdin payload');
+      items.set(keychainItemKey(match[1], match[2]), Buffer.from(match[3], 'hex').toString('utf8'));
+      return { stdout: '', stderr: '' };
+    }
+
+    const account = args[args.indexOf('-a') + 1];
+    const service = args[args.indexOf('-s') + 1];
+    const key = keychainItemKey(account, service);
+    if (args[0] === 'find-generic-password') {
+      if (!items.has(key)) {
+        const error = new Error('missing keychain item');
+        error.code = 44;
+        throw error;
+      }
+      return { stdout: items.get(key), stderr: '' };
+    }
+    if (args[0] === 'delete-generic-password') {
+      if (deleteFailure) throw new Error('injected keychain cleanup failure');
+      if (!items.delete(key)) {
+        const error = new Error('missing keychain item');
+        error.code = 44;
+        throw error;
+      }
+      return { stdout: '', stderr: '' };
+    }
+    throw new Error('unexpected fake Keychain command');
+  };
+  return { calls, exec, items };
 }

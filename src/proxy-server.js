@@ -50,6 +50,7 @@ export function createProxyServer({
   usageFetcher = fetchUsage,
   logger = null,
   stateWriter = null,
+  platform = process.platform,
 }) {
   const upstream = config.upstream || 'https://api.anthropic.com';
   const upstreamIdleTimeoutMs = config.proxy?.upstreamIdleTimeoutMs
@@ -64,7 +65,14 @@ export function createProxyServer({
   const upstreamConnectRetryDelayMs = config.proxy?.upstreamConnectRetryDelayMs
     ?? config.upstreamConnectRetryDelayMs
     ?? DEFAULT_UPSTREAM_CONNECT_RETRY_DELAY_MS;
-  const resolvedTokenRefresher = tokenRefresher || defaultTokenRefresher();
+  const resolvedTokenRefresher = tokenRefresher || defaultTokenRefresher({
+    platform,
+    nativeOptions: {
+      onCleanupError(error) {
+        logger?.(`${new Date().toISOString()} credential-refresh-cleanup result=failed errorType=${error?.code || error?.name || 'unknown'}`);
+      },
+    },
+  });
   const coordinatedTokenRefresher = createSingleFlightTokenRefresher(resolvedTokenRefresher, {
     onSuccess({ context, refreshed, rotated }) {
       logger?.(`${new Date().toISOString()} credential-refresh account=${context?.accountId || 'unknown'} result=success rotated=${rotated} expiresAt=${formatCredentialExpiry(refreshed.expiresAt)}`);
@@ -204,10 +212,16 @@ export function createProxyServer({
   return server;
 }
 
-function defaultTokenRefresher() {
-  return process.platform === 'linux'
-    ? createNativeClaudeRefresher()
-    : refreshAccessToken;
+export function defaultTokenRefresher({
+  platform = process.platform,
+  nativeRefresherFactory = createNativeClaudeRefresher,
+  directRefresher = refreshAccessToken,
+  nativeOptions = {},
+} = {}) {
+  if (platform === 'linux' || platform === 'darwin') {
+    return nativeRefresherFactory({ ...nativeOptions, platform });
+  }
+  return directRefresher;
 }
 
 function usagePollingEnabled(config) {
@@ -759,16 +773,16 @@ async function refreshSecretIfExpiring({ account, secret, secretStore, tokenRefr
 }
 
 async function refreshAndStoreSecret({ account, secret, secretStore, tokenRefresher, logger }) {
+  const compareAndSet = requireSecretStoreCompareAndSet(secretStore);
   const refreshed = await tokenRefresher(secret.refreshToken, tokenRefreshContext(account, secret));
   const nextSecret = { ...secret, ...refreshed };
   try {
-    const latestSecret = await secretStore.get(account.id);
-    if (latestSecret?.refreshToken !== secret.refreshToken) {
+    if (!await compareAndSet(account.id, secret, nextSecret)) {
+      const latestSecret = await secretStore.get(account.id);
       logger?.(`${new Date().toISOString()} credential-refresh account=${account.id} result=discarded reason=credential-changed`);
       if (latestSecret?.accessToken) return latestSecret;
       throw new Error('Stored OAuth credential changed while token refresh was in flight');
     }
-    await secretStore.set(account.id, nextSecret);
   } catch (error) {
     logger?.(`${new Date().toISOString()} credential-store account=${account.id} result=failed errorType=${error?.code || error?.name || 'unknown'}`);
     throw error;
@@ -853,11 +867,24 @@ async function mirrorLiveClaudeCodeCredential({ account, stored, live, secretSto
   if (credentialsMatch(stored, mirrored)) return;
 
   try {
-    await secretStore.set(account.id, mirrored);
+    const compareAndSet = requireSecretStoreCompareAndSet(secretStore);
+    if (!await compareAndSet(account.id, stored, mirrored)) {
+      logger?.(`${new Date().toISOString()} credential-sync-discarded account=${account.id} reason=credential-changed`);
+      return;
+    }
     logger?.(`${new Date().toISOString()} credential-sync account=${account.id} source=claude-code-current expiresAt=${formatCredentialExpiry(live.expiresAt)}`);
   } catch (error) {
     logger?.(`${new Date().toISOString()} credential-sync-failed account=${account.id} error=${shortErrorMessage(error)}`);
   }
+}
+
+function requireSecretStoreCompareAndSet(secretStore) {
+  if (typeof secretStore?.compareAndSet !== 'function') {
+    const error = new Error('Secret store does not support atomic compare-and-set');
+    error.code = 'SECRET_STORE_CAS_UNAVAILABLE';
+    throw error;
+  }
+  return secretStore.compareAndSet.bind(secretStore);
 }
 
 function credentialsMatch(left, right) {
@@ -1496,7 +1523,8 @@ function sendUnavailableAccounts(res, accountManager = null) {
     const now = Date.now();
     const retryTimes = (accountManager?.accounts || [])
       .map(account => accountManager.unavailableReason(account))
-      .map(accountReason => Date.parse(accountReason?.retryAt || ''))
+      .flatMap(accountReason => [accountReason?.retryAt, accountReason?.resetAt])
+      .map(recoveryAt => Date.parse(recoveryAt || ''))
       .filter(retryAt => Number.isFinite(retryAt) && retryAt > now);
     const retryAt = retryTimes.length > 0 ? Math.min(...retryTimes) : null;
     if (retryAt != null) {

@@ -6,7 +6,7 @@ import { EventEmitter } from 'node:events';
 import { AccountManager } from '../src/account-manager.js';
 import { OAuthTokenRefreshError } from '../src/oauth.js';
 import { MemorySecretStore } from '../src/secret-store.js';
-import { createProxyServer } from '../src/proxy-server.js';
+import { createProxyServer, defaultTokenRefresher } from '../src/proxy-server.js';
 
 const cleanupCallbacks = [];
 
@@ -18,6 +18,44 @@ afterEach(async () => {
 function cleanupAfterTest(callback) {
   cleanupCallbacks.push(callback);
 }
+
+describe('defaultTokenRefresher', () => {
+  it('uses the native Claude Code adapter on Ubuntu/Linux and macOS', () => {
+    const calls = [];
+    const nativeRefresherFactory = options => {
+      calls.push(options);
+      return `native-${options.platform}`;
+    };
+    const directRefresher = () => 'direct';
+
+    assert.equal(defaultTokenRefresher({
+      platform: 'linux',
+      nativeRefresherFactory,
+      directRefresher,
+      nativeOptions: { marker: 'linux-test' },
+    }), 'native-linux');
+    assert.equal(defaultTokenRefresher({
+      platform: 'darwin',
+      nativeRefresherFactory,
+      directRefresher,
+      nativeOptions: { marker: 'mac-test' },
+    }), 'native-darwin');
+    assert.deepEqual(calls, [
+      { marker: 'linux-test', platform: 'linux' },
+      { marker: 'mac-test', platform: 'darwin' },
+    ]);
+  });
+
+  it('keeps the direct OAuth refresher as the fallback on other platforms', () => {
+    const directRefresher = () => 'direct';
+
+    assert.equal(defaultTokenRefresher({
+      platform: 'win32',
+      nativeRefresherFactory: () => assert.fail('native adapter must not be selected'),
+      directRefresher,
+    }), directRefresher);
+  });
+});
 
 describe('createProxyServer', () => {
   it('forwards requests with the selected OAuth token and records quota headers', async () => {
@@ -177,7 +215,7 @@ describe('createProxyServer', () => {
     assert.match(logLines.join('\n'), /credential-refresh-fallback account=acct_1/);
   });
 
-  it('discards a refresh result when a newer credential was stored in flight', async () => {
+  it('discards a refresh result when credential metadata changed in flight', async () => {
     const upstreamSeen = [];
     const logLines = [];
     const upstream = await listen(http.createServer(async (req, res) => {
@@ -198,8 +236,10 @@ describe('createProxyServer', () => {
     });
     const newerSecret = {
       accessToken: 'newer-access-token',
-      refreshToken: 'refresh-token-3',
+      refreshToken: 'refresh-token-1',
       expiresAt: Date.now() + 60 * 60 * 1000,
+      scopes: ['user:inference', 'user:profile'],
+      subscriptionType: 'max',
     };
     const proxy = await listen(createProxyServer({
       accountManager,
@@ -287,7 +327,7 @@ describe('createProxyServer', () => {
     assert.equal(refreshCalls, 1);
     assert.deepEqual(upstreamSeen, ['Bearer fresh-token', 'Bearer fresh-token']);
     assert.equal((await secretStore.get('acct_1')).refreshToken, 'refresh-token-2');
-    const refreshLogs = logLines.filter(line => line.includes('credential-refresh'));
+    const refreshLogs = logLines.filter(line => line.includes('credential-refresh') && line.includes('result=success'));
     assert.equal(refreshLogs.length, 1);
     assert.match(refreshLogs[0], /account=acct_1 result=success rotated=true/);
     assert.equal(refreshLogs[0].includes('refresh-token'), false);
@@ -438,6 +478,64 @@ describe('createProxyServer', () => {
       scopes: ['user:profile', 'user:inference'],
       subscriptionType: 'max',
     });
+  });
+
+  it('does not let live credential mirroring overwrite an in-flight metadata update', async () => {
+    const upstreamSeen = [];
+    const logLines = [];
+    const upstream = await listen(http.createServer(async (req, res) => {
+      upstreamSeen.push(req.headers.authorization);
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ ok: true }));
+    }));
+    const secretStore = new MemorySecretStore();
+    const stored = {
+      accessToken: 'saved-token',
+      refreshToken: 'shared-refresh-token',
+      expiresAt: 900,
+      subscriptionType: 'pro',
+    };
+    const concurrentUpdate = {
+      ...stored,
+      accessToken: 'concurrent-token',
+      expiresAt: Date.now() + 60 * 60 * 1000,
+      subscriptionType: 'max',
+      rateLimitTier: 'tier-2',
+    };
+    await secretStore.set('acct_1', stored);
+    const accountManager = new AccountManager({
+      accounts: [{ id: 'acct_1', name: 'a@example.com', type: 'oauth', accountUuid: 'uuid-live' }],
+      now: () => 1000,
+    });
+    const proxy = await listen(createProxyServer({
+      accountManager,
+      secretStore,
+      config: { upstream: upstream.url },
+      currentCredentialReader: async () => ({
+        accessToken: 'live-token',
+        refreshToken: 'shared-refresh-token',
+        expiresAt: Date.now() + 60 * 60 * 1000,
+      }),
+      currentProfileFetcher: async () => {
+        await secretStore.set('acct_1', concurrentUpdate);
+        return { accountUuid: 'uuid-live' };
+      },
+      logger: line => logLines.push(line),
+    }));
+    cleanupAfterTest(async () => {
+      await close(proxy.server);
+      await close(upstream.server);
+    });
+
+    const response = await requestJson(`${proxy.url}/v1/messages`, {
+      method: 'POST',
+      body: JSON.stringify({ model: 'sonnet' }),
+    });
+
+    assert.equal(response.status, 200);
+    assert.deepEqual(upstreamSeen, ['Bearer live-token']);
+    assert.deepEqual(await secretStore.get('acct_1'), concurrentUpdate);
+    assert.match(logLines.join('\n'), /credential-sync-discarded account=acct_1 reason=credential-changed/);
   });
 
   it('records proxy request diagnostics without secrets', async () => {
@@ -1083,7 +1181,48 @@ describe('createProxyServer', () => {
     });
   });
 
-  it('uses the earliest known account retry time for a local credential 503', async () => {
+  it('fails closed before refresh when the secret store lacks atomic compare-and-set', async () => {
+    const upstreamSeen = [];
+    let refreshCalls = 0;
+    const upstream = await listen(http.createServer(async (req, res) => {
+      upstreamSeen.push(req.headers.authorization);
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ ok: true }));
+    }));
+    const secret = {
+      accessToken: 'expired-token',
+      refreshToken: 'refresh-token',
+      expiresAt: 900,
+    };
+    const accountManager = new AccountManager({
+      accounts: [{ id: 'acct_1', name: 'a@example.com', type: 'oauth' }],
+      now: () => 1000,
+    });
+    const proxy = await listen(createProxyServer({
+      accountManager,
+      secretStore: { get: async () => ({ ...secret }) },
+      config: { upstream: upstream.url },
+      tokenRefresher: async () => {
+        refreshCalls++;
+        return { accessToken: 'must-not-be-used' };
+      },
+    }));
+    cleanupAfterTest(async () => {
+      await close(proxy.server);
+      await close(upstream.server);
+    });
+
+    const response = await requestJson(`${proxy.url}/v1/messages`, {
+      method: 'POST',
+      body: JSON.stringify({ model: 'sonnet' }),
+    });
+
+    assert.equal(response.status, 503);
+    assert.equal(refreshCalls, 0);
+    assert.deepEqual(upstreamSeen, []);
+  });
+
+  it('uses the earliest known credential retry or quota reset for a local 503', async () => {
     const now = Date.now();
     const accountManager = new AccountManager({
       accounts: [
@@ -1122,7 +1261,7 @@ describe('createProxyServer', () => {
 
     const retryAfter = Number.parseInt(response.headers['retry-after'], 10);
     assert.equal(response.status, 503);
-    assert.ok(retryAfter >= 25 && retryAfter <= 30, `unexpected Retry-After: ${retryAfter}`);
+    assert.ok(retryAfter >= 1 && retryAfter <= 6, `unexpected Retry-After: ${retryAfter}`);
     assert.equal(accountManager.getStatus().currentAccount, 'slow');
   });
 

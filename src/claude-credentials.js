@@ -33,9 +33,14 @@ function normalizeScopes(value) {
   return [...new Set(entries.map(scope => String(scope).trim()).filter(Boolean))];
 }
 
-export async function readCurrentClaudeCredentials({ platform = process.platform, home = homedir() } = {}) {
+export async function readCurrentClaudeCredentials({
+  platform = process.platform,
+  home = homedir(),
+  execFileImpl = execFileAsync,
+  readFileImpl = readFile,
+} = {}) {
   if (platform === 'darwin') {
-    const { stdout } = await execFileAsync('security', [
+    const { stdout } = await execFileImpl('security', [
       'find-generic-password',
       '-s',
       'Claude Code-credentials',
@@ -45,5 +50,5 @@ export async function readCurrentClaudeCredentials({ platform = process.platform
   }
 
   const path = join(home, '.claude', '.credentials.json');
-  return parseClaudeCredentials(await readFile(path, 'utf8'));
+  return parseClaudeCredentials(await readFileImpl(path, 'utf8'));
 }

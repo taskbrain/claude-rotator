@@ -73,7 +73,13 @@ export async function removeLinuxNodeLauncher(configPath) {
   await rm(linuxNodeLauncherPath(configPath), { force: true });
 }
 
-export function renderLaunchAgentPlist({ nodePath, cliPath, configPath }) {
+export function renderLaunchAgentPlist({
+  nodePath,
+  cliPath,
+  configPath,
+  claudePath,
+  servicePath,
+}) {
   return `<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
@@ -92,6 +98,10 @@ export function renderLaunchAgentPlist({ nodePath, cliPath, configPath }) {
     <string>${xmlEscape(configPath)}</string>
     <key>NODE_OPTIONS</key>
     <string>${xmlEscape(SERVICE_NODE_OPTIONS)}</string>
+    <key>CLAUDE_ROTATOR_CLAUDE_BIN</key>
+    <string>${xmlEscape(claudePath)}</string>
+    <key>PATH</key>
+    <string>${xmlEscape(servicePath)}</string>
   </dict>
   <key>RunAtLoad</key>
   <true/>

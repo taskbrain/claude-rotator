@@ -1,7 +1,29 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 
-import { runCli, startService } from '../src/cli.js';
+import { ensureCredentialRevisions, runCli, startService } from '../src/cli.js';
+
+describe('ensureCredentialRevisions', () => {
+  it('assigns a non-secret baseline only to accounts missing a revision', () => {
+    const config = {
+      accounts: [
+        { id: 'legacy', name: 'legacy@example.com' },
+        { id: 'current', name: 'current@example.com', credentialRevision: 'keep-me' },
+      ],
+    };
+    const revisions = ['generated-revision'];
+
+    assert.equal(ensureCredentialRevisions(config, {
+      createRevision: () => revisions.shift(),
+    }), true);
+    assert.equal(config.accounts[0].credentialRevision, 'generated-revision');
+    assert.equal(config.accounts[1].credentialRevision, 'keep-me');
+    assert.equal(ensureCredentialRevisions(config, {
+      createRevision: () => assert.fail('no new revision expected'),
+    }), false);
+  });
+});
+import { MemorySecretStore } from '../src/secret-store.js';
 
 describe('runCli', () => {
   it('prints help', async () => {
@@ -234,6 +256,7 @@ describe('runCli', () => {
       }),
       saveConfig: async config => { savedConfig = config; },
       secretStore: {
+        get: async () => null,
         set: async (id, secret) => { stored.push({ id, secret }); },
       },
       reloadServer: async () => {},
@@ -241,12 +264,13 @@ describe('runCli', () => {
 
     assert.equal(code, 0);
     assert.deepEqual(stored, [{ id: 'custom-person', secret: { accessToken: 'new-access', refreshToken: 'new-refresh' } }]);
-    assert.deepEqual(savedConfig.accounts, [{
+    assert.deepEqual(savedConfig.accounts.map(({ credentialRevision, ...account }) => account), [{
       id: 'custom-person',
       name: 'person@example.com',
       type: 'oauth',
       accountUuid: 'uuid-1',
     }]);
+    assert.match(savedConfig.accounts[0].credentialRevision, /^[0-9a-f-]{36}$/);
     assert.match(io.output(), /Imported person@example\.com/);
   });
 
@@ -339,19 +363,14 @@ describe('runCli', () => {
 
   it('refreshes expired stored credentials before doctor profile checks', async () => {
     const io = createIo();
-    const stored = {
-      acct_1: {
-        accessToken: 'expired-token',
-        refreshToken: 'refresh-token',
-        expiresAt: 1000,
-        scopes: ['user:profile', 'user:inference'],
-        refreshTokenExpiresAt: 9999999999999,
-      },
-    };
-    const secretStore = {
-      get: async id => stored[id],
-      set: async (id, secret) => { stored[id] = secret; },
-    };
+    const secretStore = new MemorySecretStore();
+    await secretStore.set('acct_1', {
+      accessToken: 'expired-token',
+      refreshToken: 'refresh-token',
+      expiresAt: 1000,
+      scopes: ['user:profile', 'user:inference'],
+      refreshTokenExpiresAt: 9999999999999,
+    });
 
     const code = await runCli(['doctor'], {
       ...io,
@@ -384,7 +403,7 @@ describe('runCli', () => {
 
     assert.equal(code, 0);
     assert.match(io.output(), /accounts: ok/);
-    assert.equal(stored.acct_1.accessToken, 'fresh-token');
+    assert.equal((await secretStore.get('acct_1')).accessToken, 'fresh-token');
   });
 
   it('leaves current Claude Code credential refresh to Claude Code', async () => {
@@ -416,23 +435,21 @@ describe('runCli', () => {
     assert.match(io.output(), /current: credential profile check failed: Profile fetch failed \(401\)/);
   });
 
-  it('discards a doctor refresh result when a newer credential was stored in flight', async () => {
+  it('discards a doctor refresh result when credential metadata changed in flight', async () => {
     const io = createIo();
-    const stored = {
-      acct_1: {
-        accessToken: 'expired-token',
-        refreshToken: 'refresh-token-1',
-        expiresAt: 1000,
-      },
-    };
+    const secretStore = new MemorySecretStore();
+    await secretStore.set('acct_1', {
+      accessToken: 'expired-token',
+      refreshToken: 'refresh-token-1',
+      expiresAt: 1000,
+      subscriptionType: 'pro',
+    });
     const newerSecret = {
       accessToken: 'newer-token',
-      refreshToken: 'refresh-token-3',
+      refreshToken: 'refresh-token-1',
       expiresAt: Date.now() + 60 * 60 * 1000,
-    };
-    const secretStore = {
-      get: async id => stored[id],
-      set: async (id, secret) => { stored[id] = secret; },
+      subscriptionType: 'max',
+      rateLimitTier: 'tier-2',
     };
 
     const code = await runCli(['doctor'], {
@@ -459,7 +476,35 @@ describe('runCli', () => {
     });
 
     assert.equal(code, 0);
-    assert.deepEqual(stored.acct_1, newerSecret);
+    assert.deepEqual(await secretStore.get('acct_1'), newerSecret);
+  });
+
+  it('fails doctor refresh closed when atomic compare-and-set is unavailable', async () => {
+    const io = createIo();
+    let refreshCalls = 0;
+    const secret = {
+      accessToken: 'expired-token',
+      refreshToken: 'refresh-token',
+      expiresAt: 1000,
+    };
+
+    const code = await runCli(['doctor'], {
+      ...io,
+      readHealth: async () => ({ ok: true }),
+      loadConfig: async () => ({
+        accounts: [{ id: 'acct_1', name: 'person@example.com', type: 'oauth' }],
+      }),
+      secretStore: { get: async () => ({ ...secret }) },
+      refreshAccessToken: async () => {
+        refreshCalls++;
+        return { accessToken: 'must-not-be-used' };
+      },
+      fetchProfile: async () => ({ email: 'person@example.com' }),
+    });
+
+    assert.equal(code, 0);
+    assert.equal(refreshCalls, 0);
+    assert.match(io.output(), /Secret store does not support atomic compare-and-set/);
   });
 });
 

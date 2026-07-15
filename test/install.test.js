@@ -1,8 +1,10 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
-import { lstat, mkdtemp, readFile, readlink } from 'node:fs/promises';
+import { execFile } from 'node:child_process';
+import { lstat, mkdtemp, readFile, readlink, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { promisify } from 'node:util';
 
 import {
   installLinuxNodeLauncher,
@@ -15,6 +17,8 @@ import {
   renderServiceStartFailureMessage,
 } from '../src/install.js';
 import { readJsonFile, writeJsonFile } from '../src/json-file.js';
+
+const execFileAsync = promisify(execFile);
 
 describe('installSettings and uninstallSettings', () => {
   it('backs up settings, writes install state, and restores on uninstall', async () => {
@@ -93,6 +97,8 @@ describe('service file rendering', () => {
       nodePath: '/opt/homebrew/bin/node',
       cliPath: '/repo/bin/claude-rotator.js',
       configPath: '/home/alice/.config/claude-rotator/config.json',
+      claudePath: '/opt/homebrew/bin/claude',
+      servicePath: '/opt/homebrew/bin:/usr/bin:/bin',
     });
 
     assert.match(plist, /io\.github\.claude-rotator/);
@@ -101,6 +107,27 @@ describe('service file rendering', () => {
     assert.match(plist, /<string>\/home\/alice\/.config\/claude-rotator\/config.json<\/string>/);
     assert.match(plist, /<key>NODE_OPTIONS<\/key>/);
     assert.match(plist, /<string>--dns-result-order=ipv4first<\/string>/);
+    assert.match(plist, /<key>CLAUDE_ROTATOR_CLAUDE_BIN<\/key>/);
+    assert.match(plist, /<string>\/opt\/homebrew\/bin\/claude<\/string>/);
+    assert.match(plist, /<key>PATH<\/key>/);
+    assert.match(plist, /<string>\/opt\/homebrew\/bin:\/usr\/bin:\/bin<\/string>/);
+  });
+
+  it('renders a LaunchAgent accepted by macOS plutil', {
+    skip: process.platform !== 'darwin',
+  }, async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'claude-rotator-plist-'));
+    const path = join(dir, 'io.github.claude-rotator.plist');
+    await writeFile(path, renderLaunchAgentPlist({
+      nodePath: '/opt/homebrew/bin/node',
+      cliPath: '/repo/bin/claude-rotator.js',
+      configPath: '/Users/alice/.config/claude-rotator/config.json',
+      claudePath: '/opt/homebrew/bin/claude',
+      servicePath: '/opt/homebrew/bin:/usr/bin:/bin',
+    }), 'utf8');
+
+    const { stdout } = await execFileAsync('plutil', ['-lint', path]);
+    assert.match(stdout, /OK/);
   });
 
   it('renders a Linux systemd user service', () => {

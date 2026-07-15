@@ -37,6 +37,14 @@ cycle can rate-limit the token endpoint for every account.
 - A refresh token has at most one in-flight refresh request in the proxy
   process. Successful results remain available briefly to late callers that
   still hold the old token.
+- Account metadata may include an explicit, non-secret `credentialRevision`.
+  Reloading accounts clears an OAuth cooldown or credential error only when
+  both the previous and incoming revisions are present and differ. An unchanged
+  or missing revision is not evidence that credentials changed, and a revision
+  change for one account must not reset another account's state.
+- On first start after upgrade, accounts without a revision receive a random
+  non-secret baseline revision. Runtime state also records this revision, so a
+  later credential change cannot restore an older cooldown after a restart.
 
 ## Refresh policy
 
@@ -51,6 +59,8 @@ cycle can rate-limit the token endpoint for every account.
   per-refresh-token exponential backoff capped at 15 minutes. Token-endpoint
   calls remain serialized across accounts, but one account's cooldown must not
   suppress or starve another account.
+- The macOS and Linux native Claude Code adapter uses a fixed five-minute retry
+  for transient failures; repeated failures do not amplify that delay.
 - If a proactive refresh fails while the access token still has at least one
   minute remaining, keep using that access token until a later refresh can
   succeed. Do not make a working account unavailable merely because the token
@@ -70,13 +80,19 @@ cycle can rate-limit the token endpoint for every account.
 
 ## Persistence and diagnostics
 
-- macOS credentials remain in Keychain.
+- macOS credentials remain in Keychain. Mutating `security` commands receive
+  credential input through stdin, and their child PID is protected by the
+  account lock until the process closes so a crashed parent cannot permit a
+  late Keychain write to overwrite a concurrent relink.
 - Linux credentials are written through a temporary `0600` file and atomic
-  rename.
-- Persist whether a refresh cooldown came from an explicit provider deadline or
-  the local fallback policy. On upgrade, discard source-less legacy cooldowns
-  that exceed the new 15-minute cap. Preserve provider-marked deadlines up to
-  the 24-hour safety ceiling.
+  rename. Purge removes abandoned credential temporary files under the same
+  per-account lock without destroying a live writer's lock.
+- Persist whether a refresh cooldown came from an explicit provider deadline,
+  the local fallback policy, or a fixed retry policy. On restore, retain a
+  provider deadline for at most 24 hours, a fixed retry for at most 60 minutes,
+  and a fallback or source-less legacy retry for at most 15 minutes. Discard a
+  restored cooldown that exceeds the limit for its source instead of carrying
+  an excessive delay into the restarted process.
 - Logs may include account ID, refresh outcome, and expiry timestamp, but never
   access tokens, refresh tokens, authorization headers, or token hashes.
 
@@ -90,6 +106,11 @@ cycle can rate-limit the token endpoint for every account.
   than independently refreshed or marked permanently invalid.
 - Concurrent refreshes for different accounts are serialized, and each account
   receives its own token-endpoint attempt and cooldown state.
+- Reloading an account with a changed `credentialRevision` clears only that
+  account's OAuth cooldown or error; unchanged and missing revisions preserve
+  the existing state.
+- Restored provider, fixed, fallback, and source-less cooldowns enforce their
+  source-specific maximum durations.
 - A proactive refresh 429 does not interrupt a request authenticated by an
   access token that is still valid.
 - An expired saved credential is never forwarded after its refresh fails.

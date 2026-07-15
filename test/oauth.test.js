@@ -40,10 +40,10 @@ describe('OAuth time helpers', () => {
     assert.equal(isTokenExpiringSoon(now + 10_000, now, 3000), false);
   });
 
-  it('matches Claude Code\'s five-minute refresh window', () => {
+  it('refreshes early enough for multiple default polling opportunities', () => {
     const now = 1780580000000;
 
-    assert.equal(DEFAULT_OAUTH_REFRESH_LEAD_MS, 5 * 60 * 1000);
+    assert.equal(DEFAULT_OAUTH_REFRESH_LEAD_MS, 30 * 60 * 1000);
     assert.equal(isTokenExpiringSoon(now + DEFAULT_OAUTH_REFRESH_LEAD_MS - 1, now), true);
     assert.equal(isTokenExpiringSoon(now + DEFAULT_OAUTH_REFRESH_LEAD_MS + 1, now), false);
   });

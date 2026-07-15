@@ -493,36 +493,191 @@ describe('AccountManager', () => {
     assert.equal(status.accounts[0].accountUuid, 'uuid-2');
   });
 
-  it('allows an errored existing account to be retried after reload', () => {
+  it('allows an errored existing account to be retried after its credential revision changes', () => {
     const manager = new AccountManager({
       accounts: [
-        { id: 'acct_1', name: 'a@example.com', type: 'oauth' },
-        { id: 'acct_2', name: 'b@example.com', type: 'oauth' },
+        {
+          id: 'acct_1',
+          name: 'a@example.com',
+          type: 'oauth',
+          credentialRevision: 'revision-1',
+        },
+        {
+          id: 'acct_2',
+          name: 'b@example.com',
+          type: 'oauth',
+          credentialRevision: 'revision-1',
+        },
       ],
       now: () => 1000,
     });
-    manager.accounts[0].status = 'error';
+    manager.markError('acct_1', 'oauth_refresh_failed', 'OAuth token refresh failed');
 
     manager.replaceAccounts([
-      { id: 'acct_1', name: 'a@example.com', type: 'oauth' },
-      { id: 'acct_2', name: 'b@example.com', type: 'oauth' },
+      {
+        id: 'acct_1',
+        name: 'a@example.com',
+        type: 'oauth',
+        credentialRevision: 'revision-2',
+      },
+      {
+        id: 'acct_2',
+        name: 'b@example.com',
+        type: 'oauth',
+        credentialRevision: 'revision-1',
+      },
     ]);
 
     assert.equal(manager.getActiveAccount().id, 'acct_1');
+    assert.equal(manager.accounts[0].credentialRevision, 'revision-2');
+    assert.equal(manager.accounts[0].errorReason, null);
+    assert.equal(manager.getStatus().accounts[0].unavailableReason, null);
   });
 
-  it('clears an OAuth refresh cooldown after credentials are reloaded', () => {
+  it('keeps an OAuth error when the credential revision is unchanged', () => {
     const manager = new AccountManager({
-      accounts: [{ id: 'acct_1', name: 'a@example.com', type: 'oauth' }],
+      accounts: [{
+        id: 'acct_1',
+        name: 'a@example.com',
+        type: 'oauth',
+        credentialRevision: 'revision-1',
+      }],
+      now: () => 1000,
+    });
+    manager.markError('acct_1', 'oauth_refresh_failed', 'OAuth token refresh failed');
+
+    manager.replaceAccounts([{
+      id: 'acct_1',
+      name: 'a@example.com',
+      type: 'oauth',
+      credentialRevision: 'revision-1',
+    }]);
+
+    const account = manager.getStatus().accounts[0];
+    assert.equal(account.status, 'error');
+    assert.equal(account.unavailableReason.type, 'oauth_refresh_failed');
+  });
+
+  it('clears only the changed account OAuth cooldown after credential reload', () => {
+    const manager = new AccountManager({
+      accounts: [
+        {
+          id: 'acct_1',
+          name: 'a@example.com',
+          type: 'oauth',
+          credentialRevision: 'revision-1',
+        },
+        {
+          id: 'acct_2',
+          name: 'b@example.com',
+          type: 'oauth',
+          credentialRevision: 'revision-1',
+        },
+      ],
       now: () => 1000,
     });
     manager.markCredentialRefreshRateLimited('acct_1', 3600, {
       retryAfterSource: 'fallback',
     });
+    manager.markCredentialRefreshRateLimited('acct_2', 3600, {
+      retryAfterSource: 'fallback',
+    });
 
     manager.replaceAccounts([
-      { id: 'acct_1', name: 'a@example.com', type: 'oauth' },
+      {
+        id: 'acct_1',
+        name: 'a@example.com',
+        type: 'oauth',
+        credentialRevision: 'revision-2',
+      },
+      {
+        id: 'acct_2',
+        name: 'b@example.com',
+        type: 'oauth',
+        credentialRevision: 'revision-1',
+      },
     ]);
+
+    const status = manager.getStatus();
+    assert.equal(status.accounts[0].status, 'active');
+    assert.equal(status.accounts[0].rateLimitedUntil, null);
+    assert.equal(status.accounts[0].unavailableReason, null);
+    assert.equal(status.accounts[1].status, 'throttled');
+    assert.notEqual(status.accounts[1].rateLimitedUntil, null);
+    assert.equal(status.accounts[1].unavailableReason.type, 'oauth_refresh_rate_limit');
+    assert.equal(manager.accounts[0].credentialRevision, 'revision-2');
+    assert.equal(manager.accounts[1].credentialRevision, 'revision-1');
+  });
+
+  it('keeps OAuth state when either credential revision is missing', () => {
+    const manager = new AccountManager({
+      accounts: [
+        {
+          id: 'existing-revision',
+          name: 'a@example.com',
+          type: 'oauth',
+          credentialRevision: 'revision-1',
+        },
+        { id: 'new-revision', name: 'b@example.com', type: 'oauth' },
+      ],
+      now: () => 1000,
+    });
+    manager.markError(
+      'existing-revision',
+      'oauth_refresh_failed',
+      'OAuth token refresh failed',
+    );
+    manager.markCredentialRefreshRateLimited('new-revision', 3600, {
+      retryAfterSource: 'fallback',
+    });
+
+    manager.replaceAccounts([
+      { id: 'existing-revision', name: 'a@example.com', type: 'oauth' },
+      {
+        id: 'new-revision',
+        name: 'b@example.com',
+        type: 'oauth',
+        credentialRevision: 'revision-1',
+      },
+    ]);
+
+    const status = manager.getStatus();
+    assert.equal(status.accounts[0].status, 'error');
+    assert.equal(status.accounts[0].unavailableReason.type, 'oauth_refresh_failed');
+    assert.equal(status.accounts[1].status, 'throttled');
+    assert.equal(status.accounts[1].unavailableReason.type, 'oauth_refresh_rate_limit');
+    assert.equal(manager.accounts[0].credentialRevision, 'revision-1');
+    assert.equal(manager.accounts[1].credentialRevision, 'revision-1');
+  });
+
+  it('does not restore a credential error from an older credential revision', () => {
+    const manager = new AccountManager({
+      accounts: [{
+        id: 'acct_1',
+        name: 'a@example.com',
+        type: 'oauth',
+        credentialRevision: 'revision-2',
+      }],
+      now: () => 1000,
+    });
+
+    manager.restoreState({
+      version: 1,
+      currentAccount: 'acct_1',
+      accounts: [{
+        id: 'acct_1',
+        credentialRevision: 'revision-1',
+        status: 'error',
+        quota: {},
+        usage: {},
+        rateLimitedUntil: new Date(61_000).toISOString(),
+        temporaryUnavailableReason: {
+          type: 'oauth_refresh_rate_limit',
+          retryAfterSource: 'fallback',
+        },
+        errorReason: { type: 'oauth_refresh_failed' },
+      }],
+    });
 
     const account = manager.getStatus().accounts[0];
     assert.equal(account.status, 'active');
@@ -748,7 +903,7 @@ describe('AccountManager', () => {
         status: 'throttled',
         quota: {},
         usage: {},
-        rateLimitedUntil: new Date(now + 6 * 60 * 60 * 1000).toISOString(),
+        rateLimitedUntil: new Date(now + 45 * 60 * 1000).toISOString(),
         temporaryUnavailableReason: { type: 'oauth_refresh_rate_limit' },
         errorReason: { type: 'oauth_refresh_failed' },
       }],
@@ -760,7 +915,71 @@ describe('AccountManager', () => {
     assert.equal(account.unavailableReason, null);
   });
 
-  it('preserves the sustained one-hour OAuth refresh cooldown after restart', () => {
+  it('preserves a fallback OAuth refresh cooldown up to fifteen minutes after restart', () => {
+    const now = Date.parse('2026-07-12T12:00:00Z');
+    const manager = new AccountManager({
+      accounts: [{ id: 'acct_1', name: 'a@example.com', type: 'oauth' }],
+      now: () => now,
+    });
+
+    manager.restoreState({
+      version: 1,
+      currentAccount: 'acct_1',
+      accounts: [{
+        id: 'acct_1',
+        status: 'throttled',
+        quota: {},
+        usage: {},
+        rateLimitedUntil: new Date(now + 15 * 60 * 1000).toISOString(),
+        temporaryUnavailableReason: {
+          type: 'oauth_refresh_rate_limit',
+          retryAfterSource: 'fallback',
+        },
+        errorReason: null,
+      }],
+    });
+
+    const account = manager.getStatus().accounts[0];
+    assert.equal(account.status, 'throttled');
+    assert.equal(account.rateLimitedUntil, '2026-07-12T12:15:00.000Z');
+    assert.deepEqual(account.unavailableReason, {
+      type: 'oauth_refresh_rate_limit',
+      retryAfterSource: 'fallback',
+      retryAt: '2026-07-12T12:15:00.000Z',
+    });
+  });
+
+  it('clears a fallback OAuth refresh cooldown over fifteen minutes after restart', () => {
+    const now = Date.parse('2026-07-12T12:00:00Z');
+    const manager = new AccountManager({
+      accounts: [{ id: 'acct_1', name: 'a@example.com', type: 'oauth' }],
+      now: () => now,
+    });
+
+    manager.restoreState({
+      version: 1,
+      currentAccount: 'acct_1',
+      accounts: [{
+        id: 'acct_1',
+        status: 'throttled',
+        quota: {},
+        usage: {},
+        rateLimitedUntil: new Date(now + 16 * 60 * 1000).toISOString(),
+        temporaryUnavailableReason: {
+          type: 'oauth_refresh_rate_limit',
+          retryAfterSource: 'fallback',
+        },
+        errorReason: null,
+      }],
+    });
+
+    const account = manager.getStatus().accounts[0];
+    assert.equal(account.status, 'active');
+    assert.equal(account.rateLimitedUntil, null);
+    assert.equal(account.unavailableReason, null);
+  });
+
+  it('preserves a fixed OAuth refresh cooldown up to one hour after restart', () => {
     const now = Date.parse('2026-07-12T12:00:00Z');
     const manager = new AccountManager({
       accounts: [{ id: 'acct_1', name: 'a@example.com', type: 'oauth' }],
@@ -778,7 +997,7 @@ describe('AccountManager', () => {
         rateLimitedUntil: new Date(now + 60 * 60 * 1000).toISOString(),
         temporaryUnavailableReason: {
           type: 'oauth_refresh_rate_limit',
-          retryAfterSource: 'fallback',
+          retryAfterSource: 'fixed',
         },
         errorReason: null,
       }],
@@ -787,11 +1006,37 @@ describe('AccountManager', () => {
     const account = manager.getStatus().accounts[0];
     assert.equal(account.status, 'throttled');
     assert.equal(account.rateLimitedUntil, '2026-07-12T13:00:00.000Z');
-    assert.deepEqual(account.unavailableReason, {
-      type: 'oauth_refresh_rate_limit',
-      retryAfterSource: 'fallback',
-      retryAt: '2026-07-12T13:00:00.000Z',
+    assert.equal(account.unavailableReason.retryAfterSource, 'fixed');
+  });
+
+  it('clears a fixed OAuth refresh cooldown over one hour after restart', () => {
+    const now = Date.parse('2026-07-12T12:00:00Z');
+    const manager = new AccountManager({
+      accounts: [{ id: 'acct_1', name: 'a@example.com', type: 'oauth' }],
+      now: () => now,
     });
+
+    manager.restoreState({
+      version: 1,
+      currentAccount: 'acct_1',
+      accounts: [{
+        id: 'acct_1',
+        status: 'throttled',
+        quota: {},
+        usage: {},
+        rateLimitedUntil: new Date(now + 61 * 60 * 1000).toISOString(),
+        temporaryUnavailableReason: {
+          type: 'oauth_refresh_rate_limit',
+          retryAfterSource: 'fixed',
+        },
+        errorReason: null,
+      }],
+    });
+
+    const account = manager.getStatus().accounts[0];
+    assert.equal(account.status, 'active');
+    assert.equal(account.rateLimitedUntil, null);
+    assert.equal(account.unavailableReason, null);
   });
 
   it('preserves a long provider Retry-After after restart', () => {
@@ -824,7 +1069,7 @@ describe('AccountManager', () => {
     assert.equal(account.unavailableReason.retryAt, '2026-07-12T14:00:00.000Z');
   });
 
-  it('caps an excessive persisted provider Retry-After after restart', () => {
+  it('clears an excessive persisted provider Retry-After after restart', () => {
     const now = Date.parse('2026-07-12T12:00:00Z');
     const manager = new AccountManager({
       accounts: [{ id: 'acct_1', name: 'a@example.com', type: 'oauth' }],
@@ -849,7 +1094,8 @@ describe('AccountManager', () => {
     });
 
     const account = manager.getStatus().accounts[0];
-    assert.equal(account.status, 'throttled');
-    assert.equal(account.unavailableReason.retryAt, '2026-07-13T12:00:00.000Z');
+    assert.equal(account.status, 'active');
+    assert.equal(account.rateLimitedUntil, null);
+    assert.equal(account.unavailableReason, null);
   });
 });
