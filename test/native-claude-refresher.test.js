@@ -102,6 +102,17 @@ describe('native Claude credential refresher', () => {
     }), '/opt/homebrew/bin/claude');
     assert.ok(checked.includes('/Users/tester/.local/bin/claude'));
     assert.ok(checked.includes('/opt/homebrew/bin/claude'));
+
+    const nvmCommand = '/home/tester/.nvm/versions/node/v20/bin/claude';
+    assert.equal(await resolveNativeClaudeCommand({
+      env: {
+        HOME: '/home/tester',
+        PATH: '/home/tester/.nvm/versions/node/v20/bin:/usr/bin',
+      },
+      accessImpl: async path => {
+        if (path !== nvmCommand) throw Object.assign(new Error('missing'), { code: 'ENOENT' });
+      },
+    }), nvmCommand);
   });
 
   it('uses only a private owner-matched XDG runtime directory as the default temp root', async () => {

@@ -116,7 +116,13 @@ export function renderLaunchAgentPlist({
 `;
 }
 
-export function renderSystemdUserService({ nodePath, cliPath, configPath }) {
+export function renderSystemdUserService({
+  nodePath,
+  cliPath,
+  configPath,
+  claudePath,
+  servicePath,
+}) {
   const configDir = dirname(configPath);
   return `[Unit]
 Description=Claude Rotator proxy
@@ -126,6 +132,8 @@ After=network-online.target
 Type=simple
 Environment=CLAUDE_ROTATOR_CONFIG=${systemdEscape(configPath)}
 Environment=NODE_OPTIONS=${systemdEscape(SERVICE_NODE_OPTIONS)}
+Environment=CLAUDE_ROTATOR_CLAUDE_BIN=${systemdEscape(claudePath)}
+Environment=PATH=${systemdEscape(servicePath)}
 ExecStart=${systemdEscape(nodePath)} ${systemdEscape(cliPath)} server
 Restart=always
 RestartSec=3

@@ -61,6 +61,9 @@ cycle can rate-limit the token endpoint for every account.
   suppress or starve another account.
 - The macOS and Linux native Claude Code adapter uses a fixed five-minute retry
   for transient failures; repeated failures do not amplify that delay.
+- Installation pins the resolved Claude Code executable and a service-safe PATH
+  in both the macOS LaunchAgent and Linux systemd user unit, so native refresh
+  does not depend on an interactive shell's PATH.
 - If a proactive refresh fails while the access token still has at least one
   minute remaining, keep using that access token until a later refresh can
   succeed. Do not make a working account unavailable merely because the token

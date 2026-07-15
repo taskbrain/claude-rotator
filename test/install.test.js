@@ -136,11 +136,15 @@ describe('service file rendering', () => {
       nodePath: linuxNodeLauncherPath(configPath),
       cliPath: '/repo/bin/claude-rotator.js',
       configPath,
+      claudePath: '/home/alice/.nvm/versions/node/v20/bin/claude',
+      servicePath: '/home/alice/.nvm/versions/node/v20/bin:/usr/local/bin:/usr/bin:/bin',
     });
 
     assert.match(service, /ExecStart=\/home\/alice\/\.config\/claude-rotator\/runtime\/claude-rotator \/repo\/bin\/claude-rotator\.js server/);
     assert.match(service, /Environment=CLAUDE_ROTATOR_CONFIG=\/home\/alice\/.config\/claude-rotator\/config.json/);
     assert.match(service, /Environment=NODE_OPTIONS=--dns-result-order=ipv4first/);
+    assert.match(service, /Environment=CLAUDE_ROTATOR_CLAUDE_BIN=\/home\/alice\/.nvm\/versions\/node\/v20\/bin\/claude/);
+    assert.match(service, /Environment=PATH=\/home\/alice\/.nvm\/versions\/node\/v20\/bin:\/usr\/local\/bin:\/usr\/bin:\/bin/);
     assert.match(service, /TimeoutStopSec=10/);
     assert.match(service, /StandardOutput=append:\/home\/alice\/.config\/claude-rotator\/server\.log/);
     assert.match(service, /StandardError=append:\/home\/alice\/.config\/claude-rotator\/server\.err/);

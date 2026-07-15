@@ -273,14 +273,14 @@ async function installCommand({ argv, write }) {
   const force = argv.includes('--force');
   const noStart = argv.includes('--no-start');
   let claudePath = null;
-  if (process.platform === 'darwin') {
+  if (['darwin', 'linux'].includes(process.platform)) {
     claudePath = await resolveNativeClaudeCommand();
     if (!isAbsolute(claudePath)) {
-      throw new Error('Could not resolve an absolute Claude Code executable for the macOS service');
+      throw new Error('Could not resolve an absolute Claude Code executable for the service');
     }
     await access(claudePath, fsConstants.X_OK);
     if (!(await stat(claudePath)).isFile()) {
-      throw new Error('Claude Code executable for the macOS service is not a regular file');
+      throw new Error('Claude Code executable for the service is not a regular file');
     }
   }
   await installSettings({
@@ -716,18 +716,18 @@ function nextAccountId(config) {
 
 async function installServiceFile({ configPath, claudePath = null }) {
   const cliPath = resolve(process.argv[1]);
+  const servicePath = [...new Set([
+    claudePath ? dirname(claudePath) : null,
+    dirname(process.execPath),
+    '/opt/homebrew/bin',
+    '/usr/local/bin',
+    '/usr/bin',
+    '/bin',
+    '/usr/sbin',
+    '/sbin',
+  ].filter(Boolean))].join(':');
   if (process.platform === 'darwin') {
     const path = macosLaunchAgentPath(MACOS_LAUNCH_AGENT_LABEL);
-    const servicePath = [...new Set([
-      dirname(claudePath),
-      dirname(process.execPath),
-      '/opt/homebrew/bin',
-      '/usr/local/bin',
-      '/usr/bin',
-      '/bin',
-      '/usr/sbin',
-      '/sbin',
-    ])].join(':');
     await mkdir(dirname(path), { recursive: true });
     await writeFile(path, renderLaunchAgentPlist({
       nodePath: process.execPath,
@@ -739,7 +739,13 @@ async function installServiceFile({ configPath, claudePath = null }) {
     return;
   }
   const nodePath = await installLinuxNodeLauncher({ nodePath: process.execPath, configPath });
-  const service = renderSystemdUserService({ nodePath, cliPath, configPath });
+  const service = renderSystemdUserService({
+    nodePath,
+    cliPath,
+    configPath,
+    claudePath,
+    servicePath,
+  });
   const path = join(appConfigDir(), 'claude-rotator.service');
   await mkdir(dirname(path), { recursive: true });
   await writeFile(path, service, 'utf8');

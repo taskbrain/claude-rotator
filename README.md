@@ -44,7 +44,7 @@ macOS では次の LaunchAgent が作られます。
 ~/Library/LaunchAgents/io.github.claude-rotator.plist
 ```
 
-インストール時にClaude Codeの実行可能ファイルを絶対パスで解決し、LaunchAgentの `CLAUDE_ROTATOR_CLAUDE_BIN` と安全な `PATH` に固定します。Homebrewやnpm管理の `claude` が対話shellでだけ見つかり、常駐サービスでは見つからない状態を防ぎます。実行場所を明示する場合は、インストール前に `CLAUDE_ROTATOR_CLAUDE_BIN=/absolute/path/to/claude` を設定してください。
+インストール時にClaude Codeの実行可能ファイルを絶対パスで解決し、macOS LaunchAgentとUbuntu systemd user serviceの `CLAUDE_ROTATOR_CLAUDE_BIN` と安全な `PATH` に固定します。Homebrew、nvm、asdf、Volta、custom npm prefixなどで管理された `claude` が対話shellでだけ見つかり、常駐サービスでは見つからない状態を防ぎます。実行場所を明示する場合は、インストール前に `CLAUDE_ROTATOR_CLAUDE_BIN=/absolute/path/to/claude` を設定してください。
 
 サービス操作:
 
@@ -368,7 +368,7 @@ claude-rotator install
 - macOS: `~/Library/LaunchAgents/io.github.claude-rotator.plist`
 - Ubuntu/Linux: `~/.config/systemd/user/claude-rotator.service`
 
-On macOS, installation resolves Claude Code to an executable absolute path and records it as `CLAUDE_ROTATOR_CLAUDE_BIN`, together with the required service `PATH`, so Homebrew and npm installs work under launchd's minimal environment.
+On macOS and Ubuntu/Linux, installation resolves Claude Code to an executable absolute path and records it as `CLAUDE_ROTATOR_CLAUDE_BIN`, together with the required service `PATH`. This keeps Homebrew, nvm, asdf, Volta, and custom npm-prefix installs available under launchd or systemd's minimal environment. Set `CLAUDE_ROTATOR_CLAUDE_BIN=/absolute/path/to/claude` before `claude-rotator install` to override discovery.
 
 Ubuntu uses a systemd user service:
 
