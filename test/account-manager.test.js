@@ -23,6 +23,27 @@ describe('parseRateLimitHeaders', () => {
 });
 
 describe('AccountManager', () => {
+  it('normalizes an out-of-range switch threshold before selecting quota targets', () => {
+    const manager = new AccountManager({
+      accounts: [
+        { id: 'exhausted', type: 'oauth' },
+        { id: 'available', type: 'oauth' },
+      ],
+      switchThreshold: 1.5,
+      now: () => 1000,
+    });
+    manager.updateQuota('exhausted', {
+      'anthropic-ratelimit-unified-5h-utilization': '1',
+      'anthropic-ratelimit-unified-5h-reset': '10',
+    });
+    manager.updateQuota('available', {
+      'anthropic-ratelimit-unified-5h-utilization': '0.2',
+    });
+
+    assert.equal(manager.switchThreshold, 1);
+    assert.equal(manager.getActiveAccount().id, 'available');
+  });
+
   it('switches to the emptiest known account when 5h quota reaches threshold', () => {
     const manager = new AccountManager({
       accounts: [
@@ -534,6 +555,102 @@ describe('AccountManager', () => {
     assert.equal(manager.getStatus().accounts[0].unavailableReason, null);
   });
 
+  it('clears quota and usage when a reloaded account has a new credential identity', () => {
+    const manager = new AccountManager({
+      accounts: [{
+        id: 'acct_1',
+        name: 'a@example.com',
+        type: 'oauth',
+        accountUuid: 'uuid-1',
+        credentialRevision: 'revision-1',
+      }],
+      now: () => 1000,
+    });
+    manager.updateQuota('acct_1', {
+      'anthropic-ratelimit-unified-5h-utilization': '0.8',
+      'anthropic-ratelimit-unified-5h-reset': '3600',
+      'anthropic-ratelimit-unified-7d-utilization': '0.6',
+      'anthropic-ratelimit-unified-7d-reset': '7200',
+      'anthropic-ratelimit-tokens-limit': '1000',
+      'anthropic-ratelimit-tokens-remaining': '200',
+    });
+    manager.applyUsage('acct_1', {
+      scoped_weekly: [{
+        key: 'fable',
+        label: 'Fable',
+        utilization: 0.7,
+        resets_at: '2026-07-07T00:00:00Z',
+      }],
+    });
+    manager.updateUsage('acct_1', { inputTokens: 100, outputTokens: 50 });
+
+    manager.replaceAccounts([{
+      id: 'acct_1',
+      name: 'a@example.com',
+      type: 'oauth',
+      accountUuid: 'uuid-2',
+      credentialRevision: 'revision-2',
+    }]);
+
+    const account = manager.getStatus().accounts[0];
+    assert.equal(account.accountUuid, 'uuid-2');
+    assert.deepEqual(account.quota, {
+      unified5h: null,
+      unified7d: null,
+      unified5hReset: null,
+      unified7dReset: null,
+      weeklyScoped: [],
+      unifiedStatus: null,
+      tokensLimit: null,
+      tokensRemaining: null,
+      requestsLimit: null,
+      requestsRemaining: null,
+      resetsAt: null,
+    });
+    assert.deepEqual(account.usage, {
+      totalInputTokens: 0,
+      totalOutputTokens: 0,
+      totalRequests: 0,
+      lastUsed: null,
+    });
+  });
+
+  it('clears quota and usage when only a reloaded account UUID changes', () => {
+    const manager = new AccountManager({
+      accounts: [{
+        id: 'acct_1',
+        name: 'a@example.com',
+        type: 'oauth',
+        accountUuid: 'uuid-1',
+        credentialRevision: 'revision-1',
+      }],
+      now: () => 1000,
+    });
+    manager.updateQuota('acct_1', {
+      'anthropic-ratelimit-unified-5h-utilization': '0.8',
+      'anthropic-ratelimit-unified-5h-reset': '3600',
+    });
+    manager.updateUsage('acct_1', { inputTokens: 100, outputTokens: 50 });
+
+    manager.replaceAccounts([{
+      id: 'acct_1',
+      name: 'a@example.com',
+      type: 'oauth',
+      accountUuid: 'uuid-2',
+      credentialRevision: 'revision-1',
+    }]);
+
+    const account = manager.getStatus().accounts[0];
+    assert.equal(account.quota.unified5h, null);
+    assert.equal(account.quota.unified5hReset, null);
+    assert.deepEqual(account.usage, {
+      totalInputTokens: 0,
+      totalOutputTokens: 0,
+      totalRequests: 0,
+      lastUsed: null,
+    });
+  });
+
   it('keeps an OAuth error when the credential revision is unchanged', () => {
     const manager = new AccountManager({
       accounts: [{
@@ -685,6 +802,162 @@ describe('AccountManager', () => {
     assert.equal(account.unavailableReason, null);
   });
 
+  it('does not restore quota, usage, or availability evidence from an older credential revision', () => {
+    const manager = new AccountManager({
+      accounts: [{
+        id: 'acct_1',
+        name: 'a@example.com',
+        type: 'oauth',
+        credentialRevision: 'revision-2',
+      }],
+      switchThreshold: 1,
+      now: () => 1000,
+    });
+
+    manager.restoreState({
+      version: 1,
+      currentAccount: 'acct_1',
+      accounts: [{
+        id: 'acct_1',
+        credentialRevision: 'revision-1',
+        status: 'exhausted',
+        quota: {
+          unified5h: 1,
+          unified5hReset: 3600000,
+          unified7d: 0.9,
+          unified7dReset: 7200000,
+          weeklyScoped: [{
+            key: 'fable',
+            label: 'Fable',
+            utilization: 1,
+            resetAt: 7200000,
+          }],
+          tokensLimit: 1000,
+          tokensRemaining: 0,
+        },
+        usage: {
+          totalInputTokens: 100,
+          totalOutputTokens: 50,
+          totalRequests: 3,
+          lastUsed: '2026-07-01T00:00:00.000Z',
+        },
+        rateLimitedUntil: new Date(3600000).toISOString(),
+        temporaryUnavailableReason: { type: 'oauth_refresh_rate_limit' },
+        errorReason: { type: 'oauth_refresh_failed' },
+      }],
+    });
+
+    const account = manager.getStatus().accounts[0];
+    assert.equal(account.status, 'active');
+    assert.equal(account.rateLimitedUntil, null);
+    assert.equal(account.unavailableReason, null);
+    assert.deepEqual(account.quota, {
+      unified5h: null,
+      unified7d: null,
+      unified5hReset: null,
+      unified7dReset: null,
+      weeklyScoped: [],
+      unifiedStatus: null,
+      tokensLimit: null,
+      tokensRemaining: null,
+      requestsLimit: null,
+      requestsRemaining: null,
+      resetsAt: null,
+    });
+    assert.deepEqual(account.usage, {
+      totalInputTokens: 0,
+      totalOutputTokens: 0,
+      totalRequests: 0,
+      lastUsed: null,
+    });
+  });
+
+  it('does not restore quota or usage from a different account UUID with the same revision', () => {
+    const original = new AccountManager({
+      accounts: [{
+        id: 'acct_1',
+        type: 'oauth',
+        accountUuid: 'uuid-1',
+        credentialRevision: 'revision-1',
+      }],
+      now: () => 1000,
+    });
+    original.applyUsage('acct_1', {
+      five_hour: { utilization: 1, resets_at: '2026-08-20T00:00:00.000Z' },
+    });
+    original.updateUsage('acct_1', { inputTokens: 100, outputTokens: 50 });
+    const saved = original.exportState();
+    assert.equal(saved.accounts[0].accountUuid, 'uuid-1');
+
+    const restarted = new AccountManager({
+      accounts: [{
+        id: 'acct_1',
+        type: 'oauth',
+        accountUuid: 'uuid-2',
+        credentialRevision: 'revision-1',
+      }],
+      now: () => 1000,
+    });
+    restarted.restoreState(saved);
+
+    const account = restarted.getStatus().accounts[0];
+    assert.equal(account.status, 'active');
+    assert.equal(account.unavailableReason, null);
+    assert.equal(account.quota.unified5h, null);
+    assert.deepEqual(account.usage, {
+      totalInputTokens: 0,
+      totalOutputTokens: 0,
+      totalRequests: 0,
+      lastUsed: null,
+    });
+  });
+
+  it('does not restore availability evidence from legacy state without an account UUID', () => {
+    const manager = new AccountManager({
+      accounts: [{
+        id: 'acct_1',
+        type: 'oauth',
+        accountUuid: 'uuid-current',
+        credentialRevision: 'revision-1',
+      }],
+      now: () => 1000,
+    });
+
+    manager.restoreState({
+      version: 1,
+      currentAccount: 'acct_1',
+      accounts: [{
+        id: 'acct_1',
+        credentialRevision: 'revision-1',
+        status: 'ready',
+        quota: {
+          unified5h: 0.05,
+          unified5hReset: 3600000,
+          unified7d: 0.1,
+          unified7dReset: 7200000,
+        },
+        usage: {
+          totalInputTokens: 100,
+          totalOutputTokens: 50,
+          totalRequests: 3,
+          lastUsed: '2026-07-01T00:00:00.000Z',
+        },
+      }],
+    });
+
+    const account = manager.getStatus().accounts[0];
+    assert.equal(account.status, 'active');
+    assert.equal(account.quota.unified5h, null);
+    assert.equal(account.quota.unified7d, null);
+    assert.equal(manager.switchTargetScore(manager.accounts[0]), null);
+    assert.deepEqual(account.usage, {
+      totalInputTokens: 0,
+      totalOutputTokens: 0,
+      totalRequests: 0,
+      lastUsed: null,
+    });
+  });
+
   it('reports precise unavailable reasons for quota, throttling, and errors', () => {
     const manager = new AccountManager({
       accounts: [
@@ -791,6 +1064,40 @@ describe('AccountManager', () => {
         resetAt: Date.parse('2026-07-07T00:00:00Z'),
       },
     ]);
+  });
+
+  it('clears exhausted quota from a full empty OAuth usage snapshot', () => {
+    const manager = new AccountManager({
+      accounts: [{ id: 'acct_1', name: 'a@example.com', type: 'oauth' }],
+      switchThreshold: 1,
+      now: () => 1000,
+    });
+
+    manager.applyUsage('acct_1', {
+      five_hour: { utilization: 1, resets_at: '2026-07-05T05:00:00Z' },
+      seven_day: { utilization: 1, resets_at: '2026-07-07T00:00:00Z' },
+      scoped_weekly: [{
+        key: 'fable',
+        label: 'Fable',
+        utilization: 1,
+        resets_at: '2026-07-07T00:00:00Z',
+      }],
+    });
+    manager.applyUsage('acct_1', {
+      five_hour: null,
+      seven_day: null,
+      scoped_weekly: [],
+    });
+
+    const account = manager.getStatus().accounts[0];
+    assert.deepEqual([
+      account.quota.unified5h,
+      account.quota.unified5hReset,
+      account.quota.unified7d,
+      account.quota.unified7dReset,
+      account.quota.weeklyScoped,
+    ], [null, null, null, null, []]);
+    assert.equal(account.unavailableReason, null);
   });
 
   it('switches away from accounts with exhausted model-scoped weekly usage', () => {

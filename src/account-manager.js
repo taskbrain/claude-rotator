@@ -17,7 +17,7 @@ export class AccountManager {
     rotationPolicy = null,
   } = {}) {
     this.now = now;
-    this.switchThreshold = switchThreshold;
+    this.switchThreshold = normalizeSwitchThreshold(switchThreshold);
     this.rotationPolicy = normalizeRotationPolicy(rotationPolicy);
     this.events = [];
     this.accounts = accounts.map((account, index) => this.createAccount(account, index));
@@ -87,9 +87,13 @@ export class AccountManager {
     });
   }
 
-  updateQuota(accountId, headers) {
+  updateQuota(accountId, headers, { atomicUnifiedWindows = false } = {}) {
     const account = this.find(accountId);
     const parsed = parseRateLimitHeaders(headers);
+    if (atomicUnifiedWindows) {
+      keepUnifiedWindowAtomic(parsed, 'unified5h', 'unified5hReset');
+      keepUnifiedWindowAtomic(parsed, 'unified7d', 'unified7dReset');
+    }
     account.quota = { ...account.quota, ...parsed };
     this.refreshQuotaState(account);
   }
@@ -97,10 +101,22 @@ export class AccountManager {
   applyUsage(accountId, payload) {
     const account = this.find(accountId);
     this.markAuthenticated(account);
+    if (Object.prototype.hasOwnProperty.call(payload || {}, 'five_hour')) {
+      if (payload.five_hour == null) {
+        account.quota.unified5h = null;
+        account.quota.unified5hReset = null;
+      }
+    }
     if (payload?.five_hour) {
       if (typeof payload.five_hour.utilization === 'number') account.quota.unified5h = payload.five_hour.utilization;
       if (Object.prototype.hasOwnProperty.call(payload.five_hour, 'resets_at')) {
         account.quota.unified5hReset = parseUsageReset(payload.five_hour.resets_at);
+      }
+    }
+    if (Object.prototype.hasOwnProperty.call(payload || {}, 'seven_day')) {
+      if (payload.seven_day == null) {
+        account.quota.unified7d = null;
+        account.quota.unified7dReset = null;
       }
     }
     if (payload?.seven_day) {
@@ -205,22 +221,27 @@ export class AccountManager {
       const credentialRevisionChanged = incomingCredentialRevision != null
         && existing.credentialRevision != null
         && incomingCredentialRevision !== existing.credentialRevision;
-      const resetCredentialCooldown = credentialRevisionChanged
-        && existing.temporaryUnavailableReason?.type === 'oauth_refresh_rate_limit';
-      const resetError = credentialRevisionChanged && existing.status === 'error';
+      const incomingAccountUuid = account.accountUuid || null;
+      const credentialIdentityChanged = credentialRevisionChanged
+        || incomingAccountUuid !== existing.accountUuid;
       return {
         ...existing,
         name: account.name || account.email || account.id,
         type: account.type || 'oauth',
-        accountUuid: account.accountUuid || null,
+        accountUuid: incomingAccountUuid,
         priority: account.priority ?? index,
         credentialRevision: incomingCredentialRevision ?? existing.credentialRevision,
-        status: resetError || resetCredentialCooldown ? 'ready' : existing.status,
-        errorReason: credentialRevisionChanged ? null : existing.errorReason,
-        rateLimitedUntil: resetCredentialCooldown ? null : existing.rateLimitedUntil,
-        temporaryUnavailableReason: resetCredentialCooldown
+        status: credentialIdentityChanged ? 'ready' : existing.status,
+        quota: credentialIdentityChanged ? emptyQuota() : existing.quota,
+        usage: credentialIdentityChanged ? emptyAccountUsage() : existing.usage,
+        errorReason: credentialIdentityChanged ? null : existing.errorReason,
+        rateLimitedUntil: credentialIdentityChanged ? null : existing.rateLimitedUntil,
+        temporaryUnavailableReason: credentialIdentityChanged
           ? null
           : existing.temporaryUnavailableReason,
+        quotaExhaustionEventKey: credentialIdentityChanged
+          ? null
+          : existing.quotaExhaustionEventKey,
       };
     });
     if (this.currentIndex >= this.accounts.length) this.currentIndex = 0;
@@ -266,6 +287,7 @@ export class AccountManager {
       currentAccount: active?.id || null,
       accounts: this.accounts.map(account => ({
         id: account.id,
+        accountUuid: account.accountUuid,
         credentialRevision: account.credentialRevision,
         status: account.status,
         quota: { ...account.quota },
@@ -290,16 +312,21 @@ export class AccountManager {
       const credentialRevisionChanged = savedCredentialRevision != null
         && account.credentialRevision != null
         && savedCredentialRevision !== account.credentialRevision;
-      account.status = credentialRevisionChanged ? 'ready' : restoreStatus(saved.status);
-      account.quota = restoreQuota(saved.quota);
-      account.usage = restoreUsage(saved.usage);
-      account.rateLimitedUntil = credentialRevisionChanged
+      const savedHasAccountUuid = Object.prototype.hasOwnProperty.call(saved, 'accountUuid');
+      const accountUuidChanged = savedHasAccountUuid
+        ? (saved.accountUuid || null) !== account.accountUuid
+        : account.accountUuid != null;
+      const credentialIdentityChanged = credentialRevisionChanged || accountUuidChanged;
+      account.status = credentialIdentityChanged ? 'ready' : restoreStatus(saved.status);
+      account.quota = credentialIdentityChanged ? emptyQuota() : restoreQuota(saved.quota);
+      account.usage = credentialIdentityChanged ? emptyAccountUsage() : restoreUsage(saved.usage);
+      account.rateLimitedUntil = credentialIdentityChanged
         ? null
         : restoreTimestamp(saved.rateLimitedUntil);
-      account.temporaryUnavailableReason = credentialRevisionChanged
+      account.temporaryUnavailableReason = credentialIdentityChanged
         ? null
         : clonePlainObject(saved.temporaryUnavailableReason);
-      account.errorReason = credentialRevisionChanged
+      account.errorReason = credentialIdentityChanged
         ? null
         : clonePlainObject(saved.errorReason);
       this.normalizeRestoredCredentialCooldown(account);
@@ -405,10 +432,14 @@ export class AccountManager {
     return this.switchToCandidate(selected, 'weekly-reset-priority');
   }
 
-  bestAvailableSwitchCandidate({ excludeCurrent } = {}) {
+  bestAvailableSwitchCandidate({ excludeCurrent, allowedAccounts = null } = {}) {
     const candidates = this.accounts
       .map((account, index) => ({ account, index, score: this.switchTargetScore(account) }))
-      .filter(candidate => (!excludeCurrent || candidate.index !== this.currentIndex) && candidate.score);
+      .filter(candidate => (
+        (!excludeCurrent || candidate.index !== this.currentIndex)
+        && (!allowedAccounts || allowedAccounts.has(candidate.account))
+        && candidate.score
+      ));
 
     candidates.sort((left, right) => compareSwitchTargetScores(left, right));
     return candidates[0] || null;
@@ -655,18 +686,37 @@ export class AccountManager {
       credentialRevision: normalizeCredentialRevision(account.credentialRevision),
       status: 'ready',
       quota: emptyQuota(),
-      usage: {
-        totalInputTokens: 0,
-        totalOutputTokens: 0,
-        totalRequests: 0,
-        lastUsed: null,
-      },
+      usage: emptyAccountUsage(),
       rateLimitedUntil: null,
       temporaryUnavailableReason: null,
       errorReason: null,
       quotaExhaustionEventKey: null,
     };
   }
+}
+
+function keepUnifiedWindowAtomic(parsed, utilizationKey, resetKey) {
+  const hasUtilization = Object.prototype.hasOwnProperty.call(parsed, utilizationKey);
+  const hasReset = Object.prototype.hasOwnProperty.call(parsed, resetKey);
+  if (hasUtilization === hasReset) return;
+  delete parsed[utilizationKey];
+  delete parsed[resetKey];
+}
+
+function emptyAccountUsage() {
+  return {
+    totalInputTokens: 0,
+    totalOutputTokens: 0,
+    totalRequests: 0,
+    lastUsed: null,
+  };
+}
+
+function normalizeSwitchThreshold(value) {
+  const threshold = Number(value);
+  return Number.isFinite(threshold) && threshold > 0 && threshold <= 1
+    ? threshold
+    : 1;
 }
 
 function restoredCredentialCooldownLimitMs(retryAfterSource) {

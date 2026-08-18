@@ -1,3 +1,4 @@
+import { createHash } from 'node:crypto';
 import http from 'node:http';
 import https from 'node:https';
 
@@ -17,6 +18,7 @@ import {
   refreshAccessToken,
 } from './oauth.js';
 import { createNativeClaudeRefresher } from './native-claude-refresher.js';
+import { parseRateLimitHeaders } from './quota.js';
 
 const HOP_HEADERS = new Set([
   'host',
@@ -34,6 +36,13 @@ const DEFAULT_UPSTREAM_IDLE_TIMEOUT_MS = 180000;
 const DEFAULT_UPSTREAM_CONNECT_TIMEOUT_MS = 10_000;
 const DEFAULT_UPSTREAM_CONNECT_RETRIES = 3;
 const DEFAULT_UPSTREAM_CONNECT_RETRY_DELAY_MS = 250;
+const REACTIVE_QUOTA_CONFIRM_TIMEOUT_MS = 5_000;
+const REACTIVE_QUOTA_EXHAUSTION_THRESHOLD = 1;
+const REACTIVE_QUOTA_SINGLE_FLIGHT_GRACE_MS = 250;
+const SCOPED_USAGE_FIELD_PREFIX = 'scoped_weekly:';
+const SCOPED_USAGE_SNAPSHOT_FIELD = 'scoped_weekly:*';
+const SCOPED_USAGE_MERGE_FIELD = 'scoped_weekly_merge';
+const SCOPED_USAGE_PRESERVE_PREFIX = 'scoped_weekly_preserve:';
 const DEFAULT_RESET_CHECK_DELAY_MS = 1000;
 const MAX_TIMER_DELAY_MS = 2_147_483_647;
 const MIN_USABLE_ACCESS_TOKEN_LIFETIME_MS = 60_000;
@@ -48,10 +57,12 @@ export function createProxyServer({
   currentCredentialReader = readCurrentClaudeCredentials,
   currentProfileFetcher = fetchProfile,
   usageFetcher = fetchUsage,
+  reactiveQuotaConfirmTimeoutMs = REACTIVE_QUOTA_CONFIRM_TIMEOUT_MS,
   logger = null,
   stateWriter = null,
   platform = process.platform,
 }) {
+  assertLoopbackProxyHost(config.proxy?.host || '127.0.0.1');
   const upstream = config.upstream || 'https://api.anthropic.com';
   const upstreamIdleTimeoutMs = config.proxy?.upstreamIdleTimeoutMs
     ?? config.upstreamIdleTimeoutMs
@@ -89,6 +100,12 @@ export function createProxyServer({
     },
   });
 
+  const usageObservationTracker = createUsageObservationTracker();
+  const usageRequestOptions = {
+    connectTimeoutMs: upstreamConnectTimeoutMs,
+    connectRetries: upstreamConnectRetries,
+    connectRetryDelayMs: upstreamConnectRetryDelayMs,
+  };
   const usageRefresher = createUsageRefresher({
     accountManager,
     secretStore,
@@ -96,13 +113,23 @@ export function createProxyServer({
     currentCredentialReader,
     currentProfileFetcher,
     usageFetcher,
-    usageRequestOptions: {
-      connectTimeoutMs: upstreamConnectTimeoutMs,
-      connectRetries: upstreamConnectRetries,
-      connectRetryDelayMs: upstreamConnectRetryDelayMs,
-    },
+    usageRequestOptions,
+    usageObservationTracker,
     usageRefreshConcurrency: usagePollingConcurrency(config, accountManager.accounts.length),
     usageRefreshRequestSpacingMs: usagePollingRequestSpacingMs(config),
+    logger,
+  });
+  const reactiveQuotaConfirmer = createReactiveQuotaConfirmer({
+    accountManager,
+    secretStore,
+    currentCredentialReader,
+    usageFetcher,
+    usageRequestOptions,
+    usageObservationTracker,
+    timeoutMs: positiveTimeoutOrDefault(
+      reactiveQuotaConfirmTimeoutMs,
+      REACTIVE_QUOTA_CONFIRM_TIMEOUT_MS,
+    ),
     logger,
   });
   const usageScheduler = createUsageRefreshScheduler({
@@ -110,17 +137,26 @@ export function createProxyServer({
     usageRefresher,
     persistState,
   });
-  async function persistState() {
+  let persistTail = Promise.resolve();
+  function persistState() {
     if (!stateWriter) return;
-    try {
-      await stateWriter(accountManager.exportState());
-    } catch (error) {
+    const snapshot = accountManager.exportState();
+    const write = persistTail.then(() => stateWriter(snapshot));
+    persistTail = write.catch(error => {
       logger?.(`state persist failed: ${shortErrorMessage(error)}`);
-    }
+    });
+    return persistTail;
   }
 
   const server = http.createServer(async (req, res) => {
     try {
+      if (!isTrustedLocalHttpRequest(req)) {
+        sendJson(res, 403, {
+          type: 'error',
+          error: { type: 'forbidden', message: 'Cross-site proxy requests are not allowed' },
+        });
+        return;
+      }
       if (req.method === 'GET' && req.url === '/internal/health') {
         sendJson(res, 200, {
           ok: true,
@@ -151,7 +187,9 @@ export function createProxyServer({
           const accounts = await reloadAccounts();
           accountManager.replaceAccounts(accounts);
         }
-        if (usagePollingEnabled(config)) await usageScheduler.refreshNow();
+        if (usagePollingEnabled(config)) {
+          await usageScheduler.refreshNow({ afterCurrent: true });
+        }
         sendJson(res, 200, accountManager.getStatus());
         return;
       }
@@ -173,6 +211,15 @@ export function createProxyServer({
         return;
       }
 
+      try {
+        configuredUpstreamTarget(req.url, upstream);
+      } catch {
+        sendJson(res, 400, {
+          type: 'error',
+          error: { type: 'invalid_request_target', message: 'Invalid request target' },
+        });
+        return;
+      }
       const body = await readBody(req);
       if (usagePollingEnabled(config) && !usageScheduler.hasAttempted()) {
         await usageScheduler.refreshNow();
@@ -187,6 +234,7 @@ export function createProxyServer({
         tokenRefresher: coordinatedTokenRefresher,
         currentCredentialReader,
         currentProfileFetcher,
+        reactiveQuotaConfirmer,
         logger,
         upstreamIdleTimeoutMs,
         upstreamConnectTimeoutMs,
@@ -196,7 +244,7 @@ export function createProxyServer({
       await persistState();
     } catch (error) {
       const message = shortErrorMessage(error);
-      logger?.(`${new Date().toISOString()} proxy-error method=${req.method} path=${new URL(req.url, 'http://claude-rotator.local').pathname} error=${message}`);
+      logger?.(`${new Date().toISOString()} proxy-error method=${req.method} path=${safeRequestPath(req.url)} error=${message}`);
       if (!res.headersSent) {
         sendJson(res, 502, {
           type: 'error',
@@ -255,8 +303,8 @@ function createUsageRefreshScheduler({
     timer.unref?.();
   };
 
-  const refreshNow = async () => {
-    const result = await usageRefresher.refreshAll();
+  const refreshNow = async (options = {}) => {
+    const result = await usageRefresher.refreshAll(options);
     await persistState();
     scheduleFromStatus(result.status);
     return result;
@@ -351,14 +399,22 @@ function createUsageRefresher({
   currentProfileFetcher,
   usageFetcher,
   usageRequestOptions,
+  usageObservationTracker,
   usageRefreshConcurrency,
   usageRefreshRequestSpacingMs,
   logger,
 }) {
   let inFlight = null;
   let attempted = false;
-  const refreshAll = async () => {
-    if (inFlight) return inFlight;
+  const refreshAll = async ({ afterCurrent = false } = {}) => {
+    if (inFlight) {
+      if (!afterCurrent) return inFlight;
+      const current = inFlight;
+      try {
+        await current;
+      } catch {}
+      return refreshAll();
+    }
     inFlight = refreshAllOnce({
       accountManager,
       secretStore,
@@ -367,6 +423,7 @@ function createUsageRefresher({
       currentProfileFetcher,
       usageFetcher,
       usageRequestOptions,
+      usageObservationTracker,
       usageRefreshConcurrency,
       usageRefreshRequestSpacingMs,
       logger,
@@ -382,6 +439,800 @@ function createUsageRefresher({
   };
 }
 
+function createUsageObservationTracker() {
+  let nextGeneration = 0;
+  const states = new WeakMap();
+
+  const stateFor = account => {
+    let state = states.get(account);
+    if (!state) {
+      state = {
+        latestStarted: 0,
+        latestSuccessful: 0,
+        pending: new Set(),
+        fieldGenerations: new Map(),
+        fieldEvidence: new Map(),
+        deferredFailures: [],
+      };
+      states.set(account, state);
+    }
+    return state;
+  };
+
+  const settleDeferredFailures = state => {
+    const remaining = [];
+    for (const deferred of state.deferredFailures) {
+      if (state.latestSuccessful > deferred.generation) continue;
+      if ([...state.pending].some(generation => generation > deferred.generation)) {
+        remaining.push(deferred);
+        continue;
+      }
+      deferred.applyFailure();
+    }
+    state.deferredFailures = remaining;
+  };
+
+  return {
+    start(account, accessToken = null) {
+      nextGeneration += 1;
+      const state = stateFor(account);
+      state.latestStarted = nextGeneration;
+      state.pending.add(nextGeneration);
+      return {
+        account,
+        generation: nextGeneration,
+        credentialFingerprint: usageCredentialFingerprint(accessToken),
+        completed: false,
+      };
+    },
+    bindCredential(observation, accessToken) {
+      if (observation.completed) return;
+      observation.credentialFingerprint = usageCredentialFingerprint(accessToken);
+    },
+    apply(observation, usage, applyUsage) {
+      if (observation.completed) return observation.result;
+      const state = stateFor(observation.account);
+      const fields = usageObservationFields(usage);
+      const acceptedFields = new Set();
+      const scopedSnapshotGeneration = state.fieldGenerations.get(
+        SCOPED_USAGE_SNAPSHOT_FIELD,
+      ) || 0;
+      const newerScopedFields = [...state.fieldGenerations.entries()]
+        .filter(([field, generation]) => (
+          isScopedUsageField(field) && generation > observation.generation
+        ))
+        .map(([field]) => field);
+      for (const [field, evidence] of fields) {
+        if (field === SCOPED_USAGE_SNAPSHOT_FIELD) continue;
+        if (
+          isScopedUsageField(field)
+          && observation.generation < scopedSnapshotGeneration
+        ) continue;
+        if (observation.generation < (state.fieldGenerations.get(field) || 0)) continue;
+        acceptedFields.add(field);
+      }
+      if (
+        fields.has(SCOPED_USAGE_SNAPSHOT_FIELD)
+        && observation.generation >= scopedSnapshotGeneration
+      ) {
+        acceptedFields.add(SCOPED_USAGE_SNAPSHOT_FIELD);
+        if (newerScopedFields.length > 0) {
+          acceptedFields.add(SCOPED_USAGE_MERGE_FIELD);
+          for (const field of newerScopedFields) {
+            acceptedFields.add(
+              `${SCOPED_USAGE_PRESERVE_PREFIX}${scopedUsageIdentityFromField(field)}`,
+            );
+          }
+        }
+      }
+      if (acceptedFields.size > 0) applyUsage(acceptedFields);
+      if (acceptedFields.has(SCOPED_USAGE_SNAPSHOT_FIELD)) {
+        const preserved = new Set(newerScopedFields);
+        for (const field of state.fieldGenerations.keys()) {
+          if (
+            isScopedUsageField(field)
+            && !preserved.has(field)
+            && !acceptedFields.has(field)
+          ) state.fieldGenerations.delete(field);
+        }
+        for (const field of state.fieldEvidence.keys()) {
+          if (
+            isScopedUsageField(field)
+            && !preserved.has(field)
+            && !acceptedFields.has(field)
+          ) state.fieldEvidence.delete(field);
+        }
+      }
+      for (const field of acceptedFields) {
+        if (!fields.has(field)) continue;
+        state.fieldGenerations.set(field, observation.generation);
+        state.fieldEvidence.set(field, {
+          generation: observation.generation,
+          credentialFingerprint: observation.credentialFingerprint,
+          evidence: fields.get(field),
+        });
+      }
+      state.latestSuccessful = Math.max(state.latestSuccessful, observation.generation);
+      state.pending.delete(observation.generation);
+      observation.completed = true;
+      observation.result = { acceptedFields };
+      settleDeferredFailures(state);
+      return observation.result;
+    },
+    fail(observation) {
+      if (observation.completed) return;
+      const state = stateFor(observation.account);
+      state.pending.delete(observation.generation);
+      observation.completed = true;
+      settleDeferredFailures(state);
+    },
+    deferFailure(observation, applyFailure) {
+      const state = stateFor(observation.account);
+      if (state.latestSuccessful > observation.generation) return true;
+      if ([...state.pending].some(generation => generation > observation.generation)) {
+        state.deferredFailures.push({
+          generation: observation.generation,
+          applyFailure,
+        });
+        return true;
+      }
+      return false;
+    },
+    hasNewerStarted(observation) {
+      return observation.generation < stateFor(observation.account).latestStarted;
+    },
+    newerSuccessfulEvidence(observation) {
+      const state = stateFor(observation.account);
+      if (
+        state.latestSuccessful <= observation.generation
+        || state.latestSuccessful !== state.latestStarted
+      ) return null;
+      const fieldEvidence = [...state.fieldEvidence.entries()]
+        .filter(([, value]) => value.generation === state.latestSuccessful);
+      if (
+        !observation.credentialFingerprint
+        || fieldEvidence.some(([, value]) => (
+          value.credentialFingerprint !== observation.credentialFingerprint
+        ))
+      ) return null;
+      return {
+        generation: state.latestSuccessful,
+        evidence: fieldEvidence.map(([field, value]) => [field, value.evidence]),
+      };
+    },
+    currentSuccessfulEvidence(account, generation, credentialFingerprint = null) {
+      const state = stateFor(account);
+      if (state.latestStarted !== generation || state.latestSuccessful !== generation) return [];
+      return [...state.fieldEvidence.entries()]
+        .filter(([, value]) => (
+          value.generation === generation
+          && (!credentialFingerprint || value.credentialFingerprint === credentialFingerprint)
+        ))
+        .map(([field, value]) => [field, value.evidence]);
+    },
+  };
+}
+
+function createReactiveQuotaConfirmer({
+  accountManager,
+  secretStore,
+  currentCredentialReader,
+  usageFetcher,
+  usageRequestOptions,
+  usageObservationTracker,
+  timeoutMs,
+  logger,
+}) {
+  const inFlight = new WeakMap();
+
+  const fetchAndApply = ({ account, accessToken }) => {
+    let accountFlights = inFlight.get(account);
+    if (!accountFlights) {
+      accountFlights = new Map();
+      inFlight.set(account, accountFlights);
+    }
+    const existing = accountFlights.get(accessToken);
+    if (existing) return existing;
+
+    const observation = usageObservationTracker.start(account, accessToken);
+    const entry = {
+      abortController: new AbortController(),
+      completed: false,
+      deadline: null,
+      expired: false,
+      request: null,
+      waiters: 0,
+    };
+    entry.request = Promise.resolve()
+      .then(() => {
+        if (!accountManager.accounts.includes(account)) {
+          const error = new Error('Reactive quota account changed before usage confirmation');
+          error.code = 'REACTIVE_QUOTA_ACCOUNT_STALE';
+          throw error;
+        }
+        return Promise.all([
+          usageFetcher(accessToken, {
+            ...usageRequestOptions,
+            timeoutMs,
+            connectTimeoutMs: Math.min(
+              Number(usageRequestOptions.connectTimeoutMs) || timeoutMs,
+              timeoutMs,
+            ),
+            connectRetries: 0,
+            connectRetryDelayMs: 0,
+            signal: entry.abortController.signal,
+          }),
+          snapshotKnownAvailableAlternates({
+            accountManager,
+            account,
+            secretStore,
+            currentCredentialReader,
+            signal: entry.abortController.signal,
+          }),
+        ]);
+      })
+      .then(([usage, replayTargets]) => {
+        if (entry.expired || !accountManager.accounts.includes(account)) {
+          usageObservationTracker.fail(observation);
+          return { applied: false, stale: true };
+        }
+        const safeUsage = safeUsageObservation(
+          usage,
+          accountManager.switchThreshold,
+          accountManager.now(),
+        );
+        const result = usageObservationTracker.apply(observation, safeUsage, acceptedFields => {
+          accountManager.applyUsage(
+            account.id,
+            usagePayloadForFields(safeUsage, acceptedFields, account),
+          );
+        });
+        return {
+          observation,
+          safeUsage,
+          result,
+          replayTargets,
+          stale: false,
+        };
+      }, error => {
+        usageObservationTracker.fail(observation);
+        entry.abortController.abort();
+        throw error;
+      });
+    accountFlights.set(accessToken, entry);
+    entry.expire = () => {
+      if (entry.completed || entry.expired) return;
+      entry.expired = true;
+      if (accountFlights.get(accessToken) === entry) accountFlights.delete(accessToken);
+      if (accountFlights.size === 0 && inFlight.get(account) === accountFlights) {
+        inFlight.delete(account);
+      }
+      usageObservationTracker.fail(observation);
+      entry.abortController.abort();
+    };
+    entry.deadline = withDeadline(entry.request, timeoutMs, entry.expire);
+    const cleanup = () => {
+      entry.completed = true;
+      if (accountFlights.get(accessToken) === entry) accountFlights.delete(accessToken);
+      if (accountFlights.size === 0 && inFlight.get(account) === accountFlights) {
+        inFlight.delete(account);
+      }
+    };
+    entry.request.then(
+      () => {
+        entry.completed = true;
+        const timer = setTimeout(cleanup, REACTIVE_QUOTA_SINGLE_FLIGHT_GRACE_MS);
+        timer.unref?.();
+      },
+      cleanup,
+    );
+    return entry;
+  };
+
+  return {
+    async confirm({
+      account,
+      accessToken,
+      requestBody,
+      clientRequest = null,
+      clientResponse = null,
+    }) {
+      const modelFamily = requestModelFamily(requestBody);
+      let clientAborted = false;
+      let entry = null;
+      try {
+        entry = fetchAndApply({ account, accessToken });
+        entry.waiters += 1;
+        const result = await waitForClientOrPromise(
+          entry.deadline,
+          clientRequest,
+          clientResponse,
+          () => { clientAborted = true; },
+        );
+        if (
+          entry.expired
+          || result.stale
+          || !accountManager.accounts.includes(account)
+        ) return { confirmed: false, replayTargets: new Set() };
+        const directEvidence = !usageObservationTracker.hasNewerStarted(result.observation)
+          && usageEvidenceConfirmsRequest(
+            usageObservationFields(result.safeUsage),
+            REACTIVE_QUOTA_EXHAUSTION_THRESHOLD,
+            modelFamily,
+            accountManager.now(),
+          );
+        const newerObservation = usageObservationTracker.newerSuccessfulEvidence(
+          result.observation,
+        );
+        const newerEvidence = usageEvidenceConfirmsRequest(
+          newerObservation?.evidence || [],
+          REACTIVE_QUOTA_EXHAUSTION_THRESHOLD,
+          modelFamily,
+          accountManager.now(),
+        );
+        const authorizationGeneration = directEvidence
+          ? result.observation.generation
+          : (newerEvidence ? newerObservation.generation : null);
+        const replayTargets = authorizationGeneration == null
+          ? new Map()
+          : result.replayTargets;
+        const confirmed = replayTargets.size > 0;
+        logger?.(`${new Date().toISOString()} reactive-quota-confirmation account=${account.id} model=${modelFamily || 'unknown'} result=${confirmed ? 'confirmed' : 'not-confirmed'}`);
+        return {
+          confirmed,
+          replayTargets,
+          replayAuthorization: confirmed ? {
+            source: account,
+            generation: authorizationGeneration,
+            credentialFingerprint: result.observation.credentialFingerprint,
+            modelFamily,
+          } : null,
+        };
+      } catch (error) {
+        logger?.(`${new Date().toISOString()} reactive-quota-confirmation account=${account.id} model=${modelFamily || 'unknown'} result=failed errorType=${error?.code || error?.name || 'unknown'}`);
+        return { confirmed: false, replayTargets: new Map(), replayAuthorization: null };
+      } finally {
+        if (entry) {
+          entry.waiters = Math.max(0, entry.waiters - 1);
+          if (clientAborted && entry.waiters === 0) entry.expire();
+        }
+      }
+    },
+    isReplayAuthorized(authorization) {
+      if (!authorization || !accountManager.accounts.includes(authorization.source)) return false;
+      const nowMs = accountManager.now();
+      const evidence = usageObservationTracker.currentSuccessfulEvidence(
+        authorization.source,
+        authorization.generation,
+        authorization.credentialFingerprint,
+      );
+      return usageEvidenceConfirmsRequest(
+        evidence,
+        REACTIVE_QUOTA_EXHAUSTION_THRESHOLD,
+        authorization.modelFamily,
+        nowMs,
+      ) && accountQuotaConfirmsModelFamily(
+        authorization.source,
+        authorization.modelFamily,
+        REACTIVE_QUOTA_EXHAUSTION_THRESHOLD,
+        nowMs,
+      );
+    },
+  };
+}
+
+function waitForClientOrPromise(promise, req, res, onClientAbort) {
+  if (!req || !res) return promise;
+  if (req.aborted || res.destroyed) {
+    onClientAbort?.();
+    return Promise.reject(clientRequestAbortedError());
+  }
+  return new Promise((resolve, reject) => {
+    let settled = false;
+    const cleanup = () => {
+      req.removeListener('aborted', abort);
+      res.removeListener('close', close);
+    };
+    const settle = (error, value) => {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      if (error) reject(error);
+      else resolve(value);
+    };
+    const abort = () => {
+      onClientAbort?.();
+      settle(clientRequestAbortedError());
+    };
+    const close = () => {
+      if (!res.writableEnded) abort();
+    };
+    req.once('aborted', abort);
+    res.once('close', close);
+    if (req.aborted || res.destroyed) {
+      abort();
+      return;
+    }
+    promise.then(value => settle(null, value), error => settle(error));
+  });
+}
+
+function clientRequestAbortedError() {
+  const error = new Error('Client request aborted');
+  error.code = 'CLIENT_REQUEST_ABORTED';
+  return error;
+}
+
+function withDeadline(promise, timeoutMs, onTimeout) {
+  return new Promise((resolve, reject) => {
+    let settled = false;
+    const timer = setTimeout(() => {
+      if (settled) return;
+      settled = true;
+      onTimeout?.();
+      const error = new Error(`Reactive quota confirmation timed out after ${timeoutMs}ms`);
+      error.code = 'REACTIVE_QUOTA_CONFIRM_TIMEOUT';
+      reject(error);
+    }, timeoutMs);
+    timer.unref?.();
+    promise.then(
+      value => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        resolve(value);
+      },
+      error => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        reject(error);
+      },
+    );
+  });
+}
+
+function positiveTimeoutOrDefault(value, fallback) {
+  const parsed = Number(value);
+  return Number.isFinite(parsed) && parsed > 0
+    ? Math.min(parsed, fallback)
+    : fallback;
+}
+
+function requestModelFamily(body) {
+  try {
+    const model = JSON.parse(body.toString('utf8'))?.model;
+    return isCanonicalFableModelId(model) ? 'fable' : null;
+  } catch {
+    return null;
+  }
+}
+
+function isCanonicalFableModelId(value) {
+  return value === 'claude-fable-5';
+}
+
+function safeUsageObservation(usage, threshold, nowMs) {
+  const safe = {};
+  if (Object.prototype.hasOwnProperty.call(usage || {}, 'five_hour')) {
+    const fiveHour = safeUsageBucket(usage.five_hour, threshold, nowMs);
+    if (fiveHour.accepted) safe.five_hour = fiveHour.value;
+  }
+  if (Object.prototype.hasOwnProperty.call(usage || {}, 'seven_day')) {
+    const sevenDay = safeUsageBucket(usage.seven_day, threshold, nowMs);
+    if (sevenDay.accepted) safe.seven_day = sevenDay.value;
+  }
+  if (Object.prototype.hasOwnProperty.call(usage || {}, 'scoped_weekly')) {
+    const scopedIsArray = Array.isArray(usage.scoped_weekly);
+    const scopedResults = (scopedIsArray ? usage.scoped_weekly : [])
+      .map(limit => safeScopedUsageBucket(limit, threshold, nowMs));
+    const acceptedScopedResults = scopedResults.filter(result => result.accepted);
+    if (
+      scopedIsArray
+      && (usage.scoped_weekly.length === 0 || acceptedScopedResults.length > 0)
+    ) {
+      safe.scopedWeeklyFields = acceptedScopedResults.map(result => ({
+        field: scopedUsageField(result.limit),
+        value: result.value,
+      }));
+      safe.scoped_weekly = acceptedScopedResults
+        .map(result => result.value)
+        .filter(Boolean);
+      safe.scopedWeeklyComplete = scopedResults.every(result => result.accepted);
+    }
+  }
+  return safe;
+}
+
+function safeUsageBucket(bucket, threshold, nowMs) {
+  if (bucket == null) return { accepted: true, value: null };
+  const utilization = typeof bucket?.utilization === 'number'
+    ? bucket.utilization
+    : Number.NaN;
+  if (!Number.isFinite(utilization)) return { accepted: false, value: null };
+  const resetAt = Date.parse(bucket?.resets_at);
+  if (utilization >= threshold && (!Number.isFinite(resetAt) || resetAt <= nowMs)) {
+    return { accepted: true, value: null };
+  }
+  return {
+    accepted: true,
+    value: {
+      utilization,
+      resets_at: Number.isFinite(resetAt) ? new Date(resetAt).toISOString() : null,
+    },
+  };
+}
+
+function safeScopedUsageBucket(limit, threshold, nowMs) {
+  if (!limit || typeof limit !== 'object') return { accepted: false, value: null };
+  const bucket = safeUsageBucket(limit, threshold, nowMs);
+  if (!bucket.accepted) return { accepted: false, value: null };
+  if (bucket.value == null) return { accepted: true, limit, value: null };
+  return {
+    accepted: true,
+    limit,
+    value: {
+      key: limit?.key,
+      label: limit?.label,
+      ...bucket.value,
+    },
+  };
+}
+
+function usageObservationFields(usage) {
+  const fields = new Map([['auth', true]]);
+  if (Object.prototype.hasOwnProperty.call(usage || {}, 'five_hour')) {
+    fields.set('five_hour', usage.five_hour);
+  }
+  if (Object.prototype.hasOwnProperty.call(usage || {}, 'seven_day')) {
+    fields.set('seven_day', usage.seven_day);
+  }
+  for (const scopedField of usage?.scopedWeeklyFields || []) {
+    fields.set(scopedField.field, scopedField.value);
+  }
+  if (usage?.scopedWeeklyComplete) {
+    fields.set(SCOPED_USAGE_SNAPSHOT_FIELD, usage.scoped_weekly);
+  }
+  return fields;
+}
+
+function usagePayloadForFields(usage, acceptedFields, account = null) {
+  const payload = {};
+  if (acceptedFields.has('five_hour')) payload.five_hour = usage.five_hour;
+  if (acceptedFields.has('seven_day')) payload.seven_day = usage.seven_day;
+  const acceptedScopedFields = [...acceptedFields].filter(isScopedUsageField);
+  if (
+    acceptedFields.has(SCOPED_USAGE_SNAPSHOT_FIELD)
+    && !acceptedFields.has(SCOPED_USAGE_MERGE_FIELD)
+  ) {
+    payload.scoped_weekly = usage.scoped_weekly;
+  } else if (
+    acceptedScopedFields.length > 0
+    || acceptedFields.has(SCOPED_USAGE_MERGE_FIELD)
+  ) {
+    payload.scoped_weekly = mergeAcceptedScopedUsage({
+      existing: account?.quota?.weeklyScoped,
+      observedFields: usage.scopedWeeklyFields,
+      acceptedFields,
+      replace: acceptedFields.has(SCOPED_USAGE_SNAPSHOT_FIELD),
+    });
+  }
+  return payload;
+}
+
+function mergeAcceptedScopedUsage({ existing, observedFields, acceptedFields, replace }) {
+  const merged = new Map();
+  if (!replace) {
+    for (const limit of Array.isArray(existing) ? existing : []) {
+      merged.set(scopedUsageIdentity(limit), limit);
+    }
+  }
+  for (const observed of observedFields || []) {
+    if (!acceptedFields.has(observed.field)) continue;
+    const identity = scopedUsageIdentityFromField(observed.field);
+    if (observed.value == null) merged.delete(identity);
+    else merged.set(identity, observed.value);
+  }
+  if (replace && acceptedFields.has(SCOPED_USAGE_MERGE_FIELD)) {
+    for (const limit of Array.isArray(existing) ? existing : []) {
+      const identity = scopedUsageIdentity(limit);
+      if (acceptedFields.has(`${SCOPED_USAGE_PRESERVE_PREFIX}${identity}`)) {
+        merged.set(identity, limit);
+      }
+    }
+  }
+  return [...merged.values()];
+}
+
+function scopedUsageField(limit) {
+  return `${SCOPED_USAGE_FIELD_PREFIX}${scopedUsageIdentity(limit)}`;
+}
+
+function isScopedUsageField(field) {
+  return typeof field === 'string'
+    && field.startsWith(SCOPED_USAGE_FIELD_PREFIX)
+    && field !== SCOPED_USAGE_SNAPSHOT_FIELD;
+}
+
+function scopedUsageIdentityFromField(field) {
+  return field.slice(SCOPED_USAGE_FIELD_PREFIX.length);
+}
+
+function scopedUsageIdentity(limit) {
+  const value = String(limit?.key || limit?.label || '')
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, '_')
+    .replace(/^_+|_+$/g, '');
+  return isExactFableScopeIdentity(value) ? 'fable' : (value || 'scoped');
+}
+
+function usageEvidenceConfirmsRequest(fields, threshold, modelFamily, nowMs) {
+  for (const [field, evidence] of fields) {
+    if (
+      (field === 'five_hour' || field === 'seven_day')
+      && usageBucketConfirmsQuota(evidence, threshold, nowMs)
+    ) return true;
+    if (
+      isScopedUsageField(field)
+      && modelFamily
+      && scopedUsageMatchesModelFamily(evidence, modelFamily)
+      && usageBucketConfirmsQuota(evidence, threshold, nowMs)
+    ) return true;
+  }
+  return false;
+}
+
+function usageBucketConfirmsQuota(bucket, threshold, nowMs) {
+  const utilization = Number(bucket?.utilization);
+  const rawResetAt = bucket?.resets_at ?? bucket?.resetAt;
+  const resetAt = typeof rawResetAt === 'number' ? rawResetAt : Date.parse(rawResetAt);
+  return Number.isFinite(utilization)
+    && utilization >= threshold
+    && Number.isFinite(resetAt)
+    && resetAt > nowMs;
+}
+
+function accountQuotaConfirmsModelFamily(account, modelFamily, threshold, nowMs) {
+  const quota = account?.quota || {};
+  if (usageBucketConfirmsQuota({
+    utilization: quota.unified5h,
+    resetAt: quota.unified5hReset,
+  }, threshold, nowMs)) return true;
+  if (usageBucketConfirmsQuota({
+    utilization: quota.unified7d,
+    resetAt: quota.unified7dReset,
+  }, threshold, nowMs)) return true;
+  return modelFamily === 'fable'
+    && Array.isArray(quota.weeklyScoped)
+    && quota.weeklyScoped.some(limit => (
+      scopedUsageMatchesModelFamily(limit, modelFamily)
+      && usageBucketConfirmsQuota(limit, threshold, nowMs)
+    ));
+}
+
+function scopedUsageMatchesModelFamily(limit, modelFamily) {
+  if (modelFamily !== 'fable') return false;
+  const key = String(limit?.key || '').trim().toLowerCase();
+  if (key) return isExactFableScopeIdentity(key);
+  const label = String(limit?.label || '').trim().toLowerCase();
+  return isExactFableScopeIdentity(label);
+}
+
+function isExactFableScopeIdentity(value) {
+  return [
+    'fable',
+    'fable 5',
+    'fable_5',
+    'claude-fable-5',
+    'claude_fable_5',
+  ].includes(String(value || '').trim().toLowerCase());
+}
+
+function unifiedQuotaHeaderEvidence(headers, threshold, nowMs) {
+  const parsed = parseRateLimitHeaders(headers);
+  const windows = [
+    [parsed.unified5h, parsed.unified5hReset],
+    [parsed.unified7d, parsed.unified7dReset],
+  ];
+  const confirmsExhaustion = windows.some(([utilization, resetAt]) => (
+    Number.isFinite(utilization)
+    && utilization >= threshold
+    && Number.isFinite(resetAt)
+    && resetAt > nowMs
+  ));
+  const hasIncompleteExhaustion = windows.some(([utilization, resetAt]) => (
+    Number.isFinite(utilization)
+    && utilization >= threshold
+    && (!Number.isFinite(resetAt) || resetAt <= nowMs)
+  ));
+  return { confirmsExhaustion, hasIncompleteExhaustion };
+}
+
+async function snapshotKnownAvailableAlternates({
+  accountManager,
+  account,
+  secretStore,
+  currentCredentialReader,
+  signal = null,
+}) {
+  throwIfOperationAborted(signal);
+  const candidates = accountManager.accounts.filter(candidate => (
+    candidate !== account
+    && accountManager.isAvailable(candidate)
+    && accountManager.switchTargetScore(candidate) != null
+  ));
+  const snapshots = await Promise.all(candidates.map(async candidate => {
+    const secret = await resolveReactiveReplaySecret({
+      account: candidate,
+      secretStore,
+      currentCredentialReader,
+      signal,
+    });
+    throwIfOperationAborted(signal);
+    if (!stableReactiveReplaySecret(candidate, secret)) return null;
+    return [candidate, {
+      credentialRevision: candidate.credentialRevision,
+      credentialFingerprint: replayCredentialFingerprint(candidate, secret),
+    }];
+  }));
+  return new Map(snapshots.filter(Boolean));
+}
+
+async function resolveReactiveReplaySecret({
+  account,
+  secretStore,
+  currentCredentialReader,
+  signal = null,
+}) {
+  throwIfOperationAborted(signal);
+  const secret = account.id === 'current' || account.credentialSource === 'claude-code-current'
+    ? await liveClaudeCodeSecret(currentCredentialReader)
+    : await secretStore.get(account.id);
+  throwIfOperationAborted(signal);
+  return secret;
+}
+
+function validReactiveReplayTarget({
+  accountManager,
+  reactiveQuotaConfirmer,
+  authorization,
+  source,
+  targets,
+  candidate,
+  secret = null,
+}) {
+  const snapshot = targets?.get(candidate);
+  return Boolean(
+    source
+    && candidate
+    && snapshot
+    && accountManager.accounts.includes(source)
+    && accountManager.accounts.includes(candidate)
+    && accountManager.isAvailable(candidate)
+    && accountManager.switchTargetScore(candidate) != null
+    && candidate.credentialRevision === snapshot.credentialRevision
+    && (!secret || (
+      stableReactiveReplaySecret(candidate, secret)
+      && replayCredentialFingerprint(candidate, secret) === snapshot.credentialFingerprint
+    ))
+    && reactiveQuotaConfirmer?.isReplayAuthorized(authorization)
+  );
+}
+
+function stableReactiveReplaySecret(account, secret) {
+  if (account.type === 'apikey') return Boolean(secret?.apiKey);
+  return hasUsableAccessToken(secret)
+    && !(canRefreshSecret(account, secret) && isTokenExpiringSoon(secret.expiresAt));
+}
+
+function replayCredentialFingerprint(account, secret) {
+  return credentialFingerprint(
+    account.type === 'apikey' ? 'apikey' : 'oauth',
+    account.type === 'apikey' ? secret?.apiKey : secret?.accessToken,
+  );
+}
+
 async function refreshAllOnce({
   accountManager,
   secretStore,
@@ -390,6 +1241,7 @@ async function refreshAllOnce({
   currentProfileFetcher,
   usageFetcher,
   usageRequestOptions,
+  usageObservationTracker,
   usageRefreshConcurrency,
   usageRefreshRequestSpacingMs,
   logger,
@@ -407,6 +1259,7 @@ async function refreshAllOnce({
       currentProfileFetcher,
       usageFetcher,
       usageRequestOptions,
+      usageObservationTracker,
       logger,
     }),
   );
@@ -455,9 +1308,11 @@ async function refreshAccountUsage({
   currentProfileFetcher,
   usageFetcher,
   usageRequestOptions,
+  usageObservationTracker,
   logger,
 }) {
   if (account.type === 'apikey') return { account: account.id, ok: true, skipped: 'apikey' };
+  const observation = usageObservationTracker.start(account);
 
   try {
     const secret = await resolveSecretForAccount({
@@ -467,9 +1322,14 @@ async function refreshAccountUsage({
       currentProfileFetcher,
       logger,
     });
+    if (!accountManager.accounts.includes(account)) {
+      usageObservationTracker.fail(observation);
+      return { account: account.id, ok: true, stale: true };
+    }
     if (!secret?.accessToken) throw new Error('OAuth access token is missing');
     const credentialCooldown = accountManager.unavailableReason(account)?.type === 'oauth_refresh_rate_limit';
     if (credentialCooldown && !hasUsableAccessToken(secret)) {
+      usageObservationTracker.fail(observation);
       return { account: account.id, ok: false, skipped: 'credential-refresh-cooldown' };
     }
     const freshSecret = credentialCooldown && hasUsableAccessToken(secret)
@@ -481,18 +1341,51 @@ async function refreshAccountUsage({
         tokenRefresher,
         logger,
       });
+    usageObservationTracker.bindCredential(observation, freshSecret.accessToken);
+    if (!accountManager.accounts.includes(account)) {
+      usageObservationTracker.fail(observation);
+      return { account: account.id, ok: true, stale: true };
+    }
     const usage = await usageFetcher(freshSecret.accessToken, usageRequestOptions);
-    accountManager.applyUsage(account.id, usage);
-    return { account: account.id, ok: true };
+    if (!accountManager.accounts.includes(account)) {
+      usageObservationTracker.fail(observation);
+      return { account: account.id, ok: true, stale: true };
+    }
+    const safeUsage = safeUsageObservation(
+      usage,
+      accountManager.switchThreshold,
+      accountManager.now(),
+    );
+    const result = usageObservationTracker.apply(observation, safeUsage, acceptedFields => {
+      accountManager.applyUsage(
+        account.id,
+        usagePayloadForFields(safeUsage, acceptedFields, account),
+      );
+    });
+    return {
+      account: account.id,
+      ok: true,
+      ...(result.acceptedFields.size > 0 ? {} : { stale: true }),
+    };
   } catch (caught) {
     const message = shortErrorMessage(caught);
-    const refreshRateLimited = markOAuthRefreshRateLimit(accountManager, account.id, caught);
-    if (!refreshRateLimited && isOAuthCredentialError(message)) {
-      accountManager.markError(account.id, 'oauth_refresh_failed', 'OAuth token refresh failed');
+    usageObservationTracker.fail(observation);
+    if (!accountManager.accounts.includes(account)) {
+      return { account: account.id, ok: false, stale: true, error: message };
     }
+    const applyFailure = () => {
+      if (!accountManager.accounts.includes(account)) return;
+      const refreshRateLimited = markOAuthRefreshRateLimit(accountManager, account.id, caught);
+      if (!refreshRateLimited && isOAuthCredentialError(message)) {
+        accountManager.markError(account.id, 'oauth_refresh_failed', 'OAuth token refresh failed');
+      }
+    };
+    const deferred = usageObservationTracker.deferFailure(observation, applyFailure);
+    if (!deferred) applyFailure();
     return {
       account: account.id,
       ok: false,
+      ...(deferred ? { stale: true } : {}),
       error: message,
     };
   }
@@ -525,6 +1418,7 @@ async function forwardWithRotation({
   tokenRefresher,
   currentCredentialReader,
   currentProfileFetcher,
+  reactiveQuotaConfirmer,
   logger,
   upstreamIdleTimeoutMs,
   upstreamConnectTimeoutMs,
@@ -532,11 +1426,29 @@ async function forwardWithRotation({
   upstreamConnectRetryDelayMs,
 }) {
   const maxAttempts = Math.max(1, accountManager.accounts.length);
+  const attemptedAccountIds = new Set();
   let lastRetryableResponse = null;
+  let reactiveQuotaRetryUsed = false;
+  let reactiveQuotaSource = null;
+  let reactiveReplayTargets = null;
+  let reactiveReplayAuthorization = null;
 
   for (let attempt = 0; attempt < maxAttempts; attempt++) {
-    const account = accountManager.getActiveAccount();
+    if (req.aborted || res.destroyed) return;
+    const reactiveSelection = reactiveQuotaRetryUsed
+      ? accountManager.bestAvailableSwitchCandidate({
+        excludeCurrent: false,
+        allowedAccounts: new Set(reactiveReplayTargets?.keys() || []),
+      })
+      : null;
+    const account = reactiveQuotaRetryUsed
+      ? reactiveSelection?.account
+      : accountManager.getActiveAccount();
     if (!account) {
+      if (reactiveQuotaRetryUsed && lastRetryableResponse) {
+        sendBufferedResponse(res, lastRetryableResponse);
+        return;
+      }
       if (sendCurrentQuotaUnavailableResponse({
         req,
         res,
@@ -567,32 +1479,123 @@ async function forwardWithRotation({
       return;
     }
 
-    const secret = await resolveSecretForAccount({
-      account,
-      secretStore,
-      currentCredentialReader,
-      currentProfileFetcher,
-      logger,
-    });
+    if (
+      reactiveQuotaRetryUsed
+      && !validReactiveReplayTarget({
+        accountManager,
+        reactiveQuotaConfirmer,
+        authorization: reactiveReplayAuthorization,
+        source: reactiveQuotaSource,
+        targets: reactiveReplayTargets,
+        candidate: account,
+      })
+    ) {
+      if (lastRetryableResponse) sendBufferedResponse(res, lastRetryableResponse);
+      else sendUnavailableAccounts(res, accountManager);
+      return;
+    }
+
+    let secret;
+    try {
+      secret = reactiveQuotaRetryUsed
+        ? await resolveReactiveReplaySecret({
+          account,
+          secretStore,
+          currentCredentialReader,
+        })
+        : await resolveSecretForAccount({
+          account,
+          secretStore,
+          currentCredentialReader,
+          currentProfileFetcher,
+          logger,
+        });
+    } catch (error) {
+      if (reactiveQuotaRetryUsed && lastRetryableResponse) {
+        if (req.aborted || res.destroyed) return;
+        sendBufferedResponse(res, lastRetryableResponse);
+        return;
+      }
+      throw error;
+    }
+    if (req.aborted || res.destroyed) return;
+    if (!accountManager.accounts.includes(account)) {
+      if (reactiveQuotaRetryUsed && lastRetryableResponse) {
+        sendBufferedResponse(res, lastRetryableResponse);
+        return;
+      }
+      continue;
+    }
+    if (
+      reactiveQuotaRetryUsed
+      && !validReactiveReplayTarget({
+        accountManager,
+        reactiveQuotaConfirmer,
+        authorization: reactiveReplayAuthorization,
+        source: reactiveQuotaSource,
+        targets: reactiveReplayTargets,
+        candidate: account,
+        secret,
+      })
+    ) {
+      sendBufferedResponse(res, lastRetryableResponse);
+      return;
+    }
     if (!secret) {
       accountManager.markError(account.id, 'credential_missing', 'No stored credential for account');
       continue;
     }
 
-    let freshSecret;
-    try {
-      freshSecret = await refreshSecretIfExpiring({
-        account,
-        secret,
-        secretStore,
-        tokenRefresher,
-        logger,
-      });
-    } catch (caught) {
-      if (!markOAuthRefreshRateLimit(accountManager, account.id, caught)) {
-        accountManager.markError(account.id, 'oauth_refresh_failed', 'OAuth token refresh failed');
+    let freshSecret = secret;
+    if (!reactiveQuotaRetryUsed) {
+      try {
+        freshSecret = await refreshSecretIfExpiring({
+          account,
+          secret,
+          secretStore,
+          tokenRefresher,
+          logger,
+        });
+      } catch (caught) {
+        if (!accountManager.accounts.includes(account)) continue;
+        if (!markOAuthRefreshRateLimit(accountManager, account.id, caught)) {
+          accountManager.markError(account.id, 'oauth_refresh_failed', 'OAuth token refresh failed');
+        }
+        continue;
+      }
+    }
+
+    if (req.aborted || res.destroyed) return;
+    if (!accountManager.accounts.includes(account)) {
+      if (reactiveQuotaRetryUsed && lastRetryableResponse) {
+        sendBufferedResponse(res, lastRetryableResponse);
+        return;
       }
       continue;
+    }
+    if (
+      reactiveQuotaRetryUsed
+      && !validReactiveReplayTarget({
+        accountManager,
+        reactiveQuotaConfirmer,
+        authorization: reactiveReplayAuthorization,
+        source: reactiveQuotaSource,
+        targets: reactiveReplayTargets,
+        candidate: account,
+        secret: freshSecret,
+      })
+    ) {
+      sendBufferedResponse(res, lastRetryableResponse);
+      return;
+    }
+    if (attemptedAccountIds.has(account.id)) {
+      if (lastRetryableResponse) sendBufferedResponse(res, lastRetryableResponse);
+      else sendUnavailableAccounts(res, accountManager);
+      return;
+    }
+    attemptedAccountIds.add(account.id);
+    if (reactiveQuotaRetryUsed) {
+      accountManager.switchToCandidate(reactiveSelection, 'quota-threshold');
     }
 
     const result = await forwardOnce({
@@ -603,13 +1606,23 @@ async function forwardWithRotation({
       account,
       secret: freshSecret,
       accountManager,
+      reactiveQuotaConfirmer,
+      allowReactiveQuotaConfirmation: !reactiveQuotaRetryUsed,
+      allowQuotaRetry: !reactiveQuotaRetryUsed,
+      allowAuthRefreshRetry: !reactiveQuotaRetryUsed,
       logger,
       upstreamIdleTimeoutMs,
       upstreamConnectTimeoutMs,
       upstreamConnectRetries,
       upstreamConnectRetryDelayMs,
     });
+    if (!accountManager.accounts.includes(account)) {
+      finishStaleAccountResponse(res, result.passthroughResponse);
+      return;
+    }
     if (result.retryAfterRefresh) {
+      if (req.aborted || res.destroyed) return;
+      if (!accountManager.accounts.includes(account)) continue;
       let refreshedSecret;
       try {
         refreshedSecret = await refreshAndStoreSecret({
@@ -620,11 +1633,14 @@ async function forwardWithRotation({
           logger,
         });
       } catch (caught) {
+        if (!accountManager.accounts.includes(account)) continue;
         if (!markOAuthRefreshRateLimit(accountManager, account.id, caught)) {
           accountManager.markError(account.id, 'oauth_refresh_failed', 'OAuth token refresh failed');
         }
         continue;
       }
+      if (req.aborted || res.destroyed) return;
+      if (!accountManager.accounts.includes(account)) continue;
       const retryResult = await forwardOnce({
         req,
         res,
@@ -633,30 +1649,57 @@ async function forwardWithRotation({
         account,
         secret: refreshedSecret,
         accountManager,
+        reactiveQuotaConfirmer,
+        allowReactiveQuotaConfirmation: !reactiveQuotaRetryUsed,
+        allowQuotaRetry: !reactiveQuotaRetryUsed,
+        allowAuthRefreshRetry: !reactiveQuotaRetryUsed,
         logger,
         upstreamIdleTimeoutMs,
         upstreamConnectTimeoutMs,
         upstreamConnectRetries,
         upstreamConnectRetryDelayMs,
       });
+      if (!accountManager.accounts.includes(account)) {
+        finishStaleAccountResponse(res, retryResult.passthroughResponse);
+        return;
+      }
       if (retryResult.retryAfterRefresh) {
+        if (!accountManager.accounts.includes(account)) continue;
         accountManager.markError(account.id, 'authentication_error', 'OAuth token rejected');
         continue;
       }
       if (retryResult.retryNextAccount) {
+        if (retryResult.reactiveQuotaRetry) {
+          reactiveQuotaRetryUsed = true;
+          reactiveQuotaSource = retryResult.reactiveQuotaSource;
+          reactiveReplayTargets = retryResult.reactiveReplayTargets;
+          reactiveReplayAuthorization = retryResult.reactiveReplayAuthorization;
+        }
         lastRetryableResponse = retryResult.passthroughResponse || retryResult.syntheticResponse || lastRetryableResponse;
+        if (req.aborted || res.destroyed) return;
         continue;
       }
       return;
     }
     if (result.retryNextAccount) {
+      if (result.reactiveQuotaRetry) {
+        reactiveQuotaRetryUsed = true;
+        reactiveQuotaSource = result.reactiveQuotaSource;
+        reactiveReplayTargets = result.reactiveReplayTargets;
+        reactiveReplayAuthorization = result.reactiveReplayAuthorization;
+      }
       lastRetryableResponse = result.passthroughResponse || result.syntheticResponse || lastRetryableResponse;
+      if (req.aborted || res.destroyed) return;
       continue;
     }
     return;
   }
 
   if (!res.headersSent) {
+    if (reactiveQuotaRetryUsed && lastRetryableResponse) {
+      sendBufferedResponse(res, lastRetryableResponse);
+      return;
+    }
     if (sendCurrentQuotaUnavailableResponse({
       req,
       res,
@@ -720,6 +1763,7 @@ async function forwardCurrentUnavailableAccount({
     currentProfileFetcher,
     logger,
   });
+  if (req.aborted || res.destroyed || !accountManager.accounts.includes(account)) return false;
   if (!secret) return false;
 
   if (secret.liveClaudeCodeCredential && hasUsableAccessToken(secret)) {
@@ -739,6 +1783,7 @@ async function forwardCurrentUnavailableAccount({
   } catch {
     return false;
   }
+  if (req.aborted || res.destroyed || !accountManager.accounts.includes(account)) return false;
 
   await forwardOnce({
     req,
@@ -821,20 +1866,35 @@ async function resolveSecretForAccount({
   secretStore,
   currentCredentialReader,
   currentProfileFetcher,
+  signal = null,
+  liveCredentialLoader = null,
   logger,
 }) {
-  if (account.type === 'apikey') return secretStore.get(account.id);
+  throwIfOperationAborted(signal);
+  if (account.type === 'apikey') {
+    const secret = await secretStore.get(account.id);
+    throwIfOperationAborted(signal);
+    return secret;
+  }
   if (account.id === 'current' || account.credentialSource === 'claude-code-current') {
-    return liveClaudeCodeSecret(currentCredentialReader);
+    const secret = await liveClaudeCodeSecret(currentCredentialReader);
+    throwIfOperationAborted(signal);
+    return secret;
   }
 
   const stored = await secretStore.get(account.id);
+  throwIfOperationAborted(signal);
   if (!account.accountUuid) return stored;
 
-  const current = await liveClaudeCodeCredentialWithProfile({
-    currentCredentialReader,
-    currentProfileFetcher,
-  }).catch(() => null);
+  const current = await (liveCredentialLoader
+    ? liveCredentialLoader()
+    : liveClaudeCodeCredentialWithProfile({
+      currentCredentialReader,
+      currentProfileFetcher,
+      signal,
+    }))
+    .catch(() => null);
+  throwIfOperationAborted(signal);
   const matchesStoredCredential = Boolean(
     current?.secret
     && stored
@@ -849,12 +1909,22 @@ async function resolveSecretForAccount({
     stored,
     live: current.secret,
     secretStore,
+    signal,
     logger,
   });
+  throwIfOperationAborted(signal);
   return current.secret;
 }
 
-async function mirrorLiveClaudeCodeCredential({ account, stored, live, secretStore, logger }) {
+async function mirrorLiveClaudeCodeCredential({
+  account,
+  stored,
+  live,
+  secretStore,
+  signal = null,
+  logger,
+}) {
+  throwIfOperationAborted(signal);
   if (!live?.accessToken || !live.refreshToken) return;
   const mirrored = {
     ...(stored || {}),
@@ -868,6 +1938,7 @@ async function mirrorLiveClaudeCodeCredential({ account, stored, live, secretSto
 
   try {
     const compareAndSet = requireSecretStoreCompareAndSet(secretStore);
+    throwIfOperationAborted(signal);
     if (!await compareAndSet(account.id, stored, mirrored)) {
       logger?.(`${new Date().toISOString()} credential-sync-discarded account=${account.id} reason=credential-changed`);
       return;
@@ -939,7 +2010,9 @@ function invalidateLiveClaudeCodeCache() {
 async function liveClaudeCodeCredentialWithProfile({
   currentCredentialReader,
   currentProfileFetcher,
+  signal = null,
 }) {
+  throwIfOperationAborted(signal);
   const now = Date.now();
   if (
     liveClaudeCodeCache
@@ -947,16 +2020,19 @@ async function liveClaudeCodeCredentialWithProfile({
     && liveClaudeCodeCache.currentProfileFetcher === currentProfileFetcher
     && liveClaudeCodeCache.expiresAt > now
   ) {
+    throwIfOperationAborted(signal);
     return liveClaudeCodeCache.value;
   }
 
   const secret = await liveClaudeCodeSecret(currentCredentialReader);
+  throwIfOperationAborted(signal);
   let profile = null;
   if (secret.accessToken) {
     try {
-      profile = await currentProfileFetcher(secret.accessToken);
+      profile = await currentProfileFetcher(secret.accessToken, { signal });
     } catch {}
   }
+  throwIfOperationAborted(signal);
   const value = { secret, profile };
   liveClaudeCodeCache = {
     currentCredentialReader,
@@ -965,6 +2041,23 @@ async function liveClaudeCodeCredentialWithProfile({
     value,
   };
   return value;
+}
+
+function usageCredentialFingerprint(accessToken) {
+  return credentialFingerprint('oauth', accessToken);
+}
+
+function credentialFingerprint(type, credential) {
+  if (!credential) return null;
+  return createHash('sha256').update(JSON.stringify([type, credential])).digest('hex');
+}
+
+function throwIfOperationAborted(signal) {
+  if (!signal?.aborted) return;
+  const error = new Error('Operation aborted');
+  error.name = 'AbortError';
+  error.code = 'ABORT_ERR';
+  throw error;
 }
 
 async function forwardOnce({
@@ -976,16 +2069,25 @@ async function forwardOnce({
   secret,
   accountManager,
   passthroughErrors = false,
+  reactiveQuotaConfirmer = null,
+  allowReactiveQuotaConfirmation = false,
+  allowQuotaRetry = true,
+  allowAuthRefreshRetry = true,
   logger = null,
   upstreamIdleTimeoutMs,
   upstreamConnectTimeoutMs,
   upstreamConnectRetries,
   upstreamConnectRetryDelayMs,
 }) {
-  const target = new URL(req.url, upstream);
+  const target = configuredUpstreamTarget(req.url, upstream);
   const headers = buildUpstreamHeaders(req.headers, account, secret);
   const startedAt = Date.now();
   let outcome = 'ok';
+  let bufferedPassthrough = false;
+  let reactiveQuotaRetry = false;
+  let reactiveQuotaSource = null;
+  let reactiveReplayTargets = null;
+  let reactiveReplayAuthorization = null;
 
   let upstreamResponse;
   try {
@@ -998,16 +2100,46 @@ async function forwardOnce({
       connectTimeoutMs: upstreamConnectTimeoutMs,
       connectRetries: upstreamConnectRetries,
       connectRetryDelayMs: upstreamConnectRetryDelayMs,
+      clientRequest: req,
+      clientResponse: res,
       onRetry(error, attempt, maxAttempts) {
         logger?.(`${new Date().toISOString()} upstream-connect-retry account=${account.id} method=${req.method} path=${target.pathname} attempt=${attempt}/${maxAttempts} errorType=${error.code || error.name}`);
       },
       onResponse(upstreamRes) {
-        accountManager.updateQuota(account.id, upstreamRes.headers);
+        if (!accountManager.accounts.includes(account)) {
+          writeUpstreamResponseHead(res, upstreamRes);
+          return true;
+        }
+        const responseQuotaEvidence = unifiedQuotaHeaderEvidence(
+          upstreamRes.headers,
+          accountManager.switchThreshold,
+          accountManager.now(),
+        );
+        accountManager.updateQuota(account.id, upstreamRes.headers, {
+          atomicUnifiedWindows: upstreamRes.statusCode === 429,
+        });
 
         if (!passthroughErrors && upstreamRes.statusCode === 429) {
           const unavailableReason = accountManager.unavailableReason(account);
-          if (isUnifiedQuotaExhaustion(unavailableReason)) {
+          if (
+            allowQuotaRetry
+            && responseQuotaEvidence.confirmsExhaustion
+          ) {
             outcome = 'quota-retry';
+            return false;
+          }
+          if (
+            allowReactiveQuotaConfirmation
+            && reactiveQuotaConfirmer
+            && req.method === 'POST'
+            && target.pathname === '/v1/messages'
+            && account.type !== 'apikey'
+            && requestModelFamily(body) === 'fable'
+            && !responseQuotaEvidence.hasIncompleteExhaustion
+            && typeof secret?.accessToken === 'string'
+            && secret.accessToken.length > 0
+          ) {
+            outcome = 'reactive-quota-pending';
             return false;
           }
           outcome = 'rate-limit-passthrough';
@@ -1017,7 +2149,7 @@ async function forwardOnce({
         }
 
         if (!passthroughErrors && upstreamRes.statusCode === 401) {
-          if (canRefreshSecret(account, secret)) {
+          if (allowAuthRefreshRetry && canRefreshSecret(account, secret)) {
             outcome = 'auth-refresh-retry';
             return false;
           } else if (secret.liveClaudeCodeCredential) {
@@ -1029,11 +2161,7 @@ async function forwardOnce({
           }
         }
 
-        const responseHeaders = {};
-        for (const [key, value] of Object.entries(upstreamRes.headers)) {
-          if (!HOP_HEADERS.has(key.toLowerCase())) responseHeaders[key] = value;
-        }
-        res.writeHead(upstreamRes.statusCode || 200, responseHeaders);
+        writeUpstreamResponseHead(res, upstreamRes);
         return true;
       },
       onChunk(chunk) {
@@ -1041,17 +2169,22 @@ async function forwardOnce({
       },
     });
   } catch (error) {
+    if (error?.code === 'CLIENT_REQUEST_ABORTED' || req.aborted || res.destroyed) {
+      return { retryNextAccount: false };
+    }
     outcome = isUpstreamTimeout(error) ? 'upstream-timeout' : 'upstream-error';
-    recordProxyRequest({
-      accountManager,
-      logger,
-      account,
-      method: req.method,
-      path: target.pathname,
-      outcome,
-      durationMs: Date.now() - startedAt,
-      errorType: error.code || error.name,
-    });
+    if (accountManager.accounts.includes(account)) {
+      recordProxyRequest({
+        accountManager,
+        logger,
+        account,
+        method: req.method,
+        path: target.pathname,
+        outcome,
+        durationMs: Date.now() - startedAt,
+        errorType: error.code || error.name,
+      });
+    }
 
     if (!passthroughErrors && !res.headersSent) {
       sendBufferedResponse(res, syntheticUpstreamErrorResponse(error));
@@ -1060,33 +2193,153 @@ async function forwardOnce({
     throw error;
   }
 
-  recordProxyRequest({
-    accountManager,
-    logger,
-    account,
-    method: req.method,
-    path: target.pathname,
-    statusCode: upstreamResponse.statusCode,
-    requestId: headerValue(upstreamResponse.headers['request-id'])
-      || headerValue(upstreamResponse.headers['x-request-id']),
-    outcome: outcomeForResponse(outcome, upstreamResponse.statusCode),
-    durationMs: Date.now() - startedAt,
-  });
+  if (!accountManager.accounts.includes(account)) {
+    finishStaleAccountResponse(res, upstreamResponse);
+    return { retryNextAccount: false, passthroughResponse: upstreamResponse };
+  }
+
+  if (outcome === 'reactive-quota-pending') {
+    const confirmation = !req.aborted && !res.destroyed
+      ? await reactiveQuotaConfirmer.confirm({
+        account,
+        accessToken: secret.accessToken,
+        requestBody: body,
+        clientRequest: req,
+        clientResponse: res,
+      })
+      : { confirmed: false, replayTargets: new Map(), replayAuthorization: null };
+    if (!accountManager.accounts.includes(account)) {
+      finishStaleAccountResponse(res, upstreamResponse);
+      return { retryNextAccount: false, passthroughResponse: upstreamResponse };
+    }
+    if (confirmation.confirmed && !req.aborted && !res.destroyed) {
+      outcome = 'quota-retry';
+      reactiveQuotaRetry = true;
+      reactiveQuotaSource = account;
+      reactiveReplayTargets = confirmation.replayTargets;
+      reactiveReplayAuthorization = confirmation.replayAuthorization;
+    } else {
+      outcome = 'rate-limit-passthrough';
+      if (accountManager.accounts.includes(account)) {
+        const unavailableReason = accountManager.unavailableReason(account);
+        if (!unavailableReason) {
+          accountManager.markRateLimited(account.id, retryAfterSeconds(upstreamResponse.headers, 60));
+        }
+      }
+      bufferedPassthrough = true;
+    }
+  }
+
+  if (accountManager.accounts.includes(account)) {
+    recordProxyRequest({
+      accountManager,
+      logger,
+      account,
+      method: req.method,
+      path: target.pathname,
+      statusCode: upstreamResponse.statusCode,
+      requestId: headerValue(upstreamResponse.headers['request-id'])
+        || headerValue(upstreamResponse.headers['x-request-id']),
+      outcome: outcomeForResponse(outcome, upstreamResponse.statusCode),
+      durationMs: Date.now() - startedAt,
+    });
+  }
 
   if (!passthroughErrors && outcome === 'quota-retry') {
-    return { retryNextAccount: true, passthroughResponse: upstreamResponse };
+    return {
+      retryNextAccount: true,
+      passthroughResponse: upstreamResponse,
+      reactiveQuotaRetry,
+      reactiveQuotaSource,
+      reactiveReplayTargets,
+      reactiveReplayAuthorization,
+    };
   }
 
-  if (!passthroughErrors && upstreamResponse.statusCode === 401) {
-    if (canRefreshSecret(account, secret)) return { retryAfterRefresh: true };
+  if (bufferedPassthrough) {
+    if (!req.aborted && !res.destroyed) sendBufferedResponse(res, upstreamResponse);
+    return { retryNextAccount: false };
   }
 
-  if (upstreamResponse.body.length > 0) {
+  if (!passthroughErrors && outcome === 'auth-refresh-retry') {
+    return { retryAfterRefresh: true, passthroughResponse: upstreamResponse };
+  }
+
+  if (accountManager.accounts.includes(account) && upstreamResponse.body.length > 0) {
     extractUsage(upstreamResponse.body, account.id, accountManager);
   }
 
   if (!res.writableEnded) res.end();
   return { retryNextAccount: false };
+}
+
+function writeUpstreamResponseHead(res, upstreamRes) {
+  const responseHeaders = {};
+  for (const [key, value] of Object.entries(upstreamRes.headers)) {
+    if (!HOP_HEADERS.has(key.toLowerCase())) responseHeaders[key] = value;
+  }
+  res.writeHead(upstreamRes.statusCode || 200, responseHeaders);
+}
+
+function finishStaleAccountResponse(res, upstreamResponse) {
+  if (res.destroyed || res.writableEnded) return;
+  if (!res.headersSent && upstreamResponse) sendBufferedResponse(res, upstreamResponse);
+  else res.end();
+}
+
+function configuredUpstreamTarget(requestTarget, upstream) {
+  const inbound = new URL(requestTarget, 'http://claude-rotator.local');
+  const target = new URL(upstream);
+  target.pathname = inbound.pathname;
+  target.search = inbound.search;
+  target.hash = '';
+  return target;
+}
+
+function safeRequestPath(requestTarget) {
+  try {
+    return new URL(requestTarget, 'http://claude-rotator.local').pathname;
+  } catch {
+    return '<invalid-request-target>';
+  }
+}
+
+function assertLoopbackProxyHost(host) {
+  const normalized = String(host || '').trim().toLowerCase();
+  if (['127.0.0.1', '::1', 'localhost'].includes(normalized)) return;
+  throw new Error(`Proxy host must be loopback, received ${normalized || '<empty>'}`);
+}
+
+function isTrustedLocalHttpRequest(req) {
+  const hostAuthority = loopbackHostAuthority(req.headers.host);
+  if (!hostAuthority) return false;
+  if (String(req.headers['sec-fetch-site'] || '').toLowerCase() === 'cross-site') return false;
+  const origin = req.headers.origin;
+  if (!origin) return true;
+  try {
+    const parsed = new URL(origin);
+    return parsed.protocol === 'http:'
+      && isLoopbackHostname(parsed.hostname)
+      && parsed.host.toLowerCase() === hostAuthority;
+  } catch {
+    return false;
+  }
+}
+
+function loopbackHostAuthority(value) {
+  if (typeof value !== 'string' || value.length === 0) return null;
+  try {
+    const parsed = new URL(`http://${value}`);
+    return isLoopbackHostname(parsed.hostname) ? parsed.host.toLowerCase() : null;
+  } catch {
+    return null;
+  }
+}
+
+function isLoopbackHostname(hostname) {
+  return ['127.0.0.1', '::1', '[::1]', 'localhost'].includes(
+    String(hostname || '').trim().toLowerCase(),
+  );
 }
 
 function buildUpstreamHeaders(inputHeaders, account, secret) {
@@ -1128,6 +2381,8 @@ function requestUpstream({
   body,
   idleTimeoutMs,
   connectTimeoutMs,
+  clientRequest = null,
+  clientResponse = null,
   onResponse,
   onChunk,
 }) {
@@ -1139,13 +2394,26 @@ function requestUpstream({
     let connected = false;
     let responseStarted = false;
     let req = null;
+    const cleanupClientListeners = () => {
+      clientRequest?.removeListener('aborted', onClientAborted);
+      clientResponse?.removeListener('close', onClientResponseClose);
+    };
     const settle = (error, result) => {
       if (settled) return;
       settled = true;
       if (idleTimer) clearTimeout(idleTimer);
       if (connectTimer) clearTimeout(connectTimer);
+      cleanupClientListeners();
       if (error) reject(error);
       else resolve(result);
+    };
+    const onClientAborted = () => {
+      const error = clientRequestAbortedError();
+      req?.destroy(error);
+      settle(error);
+    };
+    const onClientResponseClose = () => {
+      if (!clientResponse?.writableEnded) onClientAborted();
     };
     const markConnected = () => {
       connected = true;
@@ -1185,12 +2453,26 @@ function requestUpstream({
       responseStarted = true;
       markConnected();
       resetIdleTimer();
-      const shouldStream = onResponse(upstreamRes);
       const chunks = [];
+      let shouldStream = false;
+      upstreamRes.on('error', settle);
+      try {
+        shouldStream = onResponse(upstreamRes);
+      } catch (error) {
+        upstreamRes.destroy(error);
+        settle(error);
+        return;
+      }
       upstreamRes.on('data', chunk => {
-        resetIdleTimer();
-        chunks.push(chunk);
-        if (shouldStream) onChunk(chunk);
+        if (settled) return;
+        try {
+          resetIdleTimer();
+          chunks.push(chunk);
+          if (shouldStream) onChunk(chunk);
+        } catch (error) {
+          upstreamRes.destroy(error);
+          settle(error);
+        }
       });
       upstreamRes.on('end', () => {
         settle(null, {
@@ -1204,7 +2486,6 @@ function requestUpstream({
         error.code = 'UPSTREAM_RESPONSE_ABORTED';
         settle(error);
       });
-      upstreamRes.on('error', settle);
     });
     req.on('socket', socket => {
       guardUpstreamSocket(socket);
@@ -1221,6 +2502,12 @@ function requestUpstream({
       }
       settle(error);
     });
+    clientRequest?.once('aborted', onClientAborted);
+    clientResponse?.once('close', onClientResponseClose);
+    if (clientRequest?.aborted || clientResponse?.destroyed) {
+      onClientAborted();
+      return;
+    }
     if (!['GET', 'HEAD'].includes(method) && body.length > 0) req.write(body);
     startConnectTimer();
     resetIdleTimer();
