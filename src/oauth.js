@@ -347,6 +347,7 @@ export async function fetchProfile(accessToken, options = {}) {
       ...oauthClientHeaders(),
       Authorization: `Bearer ${accessToken}`,
     },
+    signal: options.signal,
   }, options);
 
   if (!response.ok) {
@@ -373,6 +374,7 @@ export async function fetchUsage(accessToken, options = {}) {
       'anthropic-beta': OAUTH_BETA_HEADER,
       Accept: 'application/json',
     },
+    signal: options.signal,
   }, options);
 
   if (!response.ok) {
@@ -383,17 +385,64 @@ export async function fetchUsage(accessToken, options = {}) {
 }
 
 export function parseUsageResponse(data) {
-  const limits = Array.isArray(data.limits) ? data.limits : [];
-  const sessionLimit = limits.find(limit => limit?.kind === 'session');
-  const weeklyAllLimit = limits.find(limit => limit?.kind === 'weekly_all');
-
-  return {
-    five_hour: normalizeUsageBucket(data.five_hour) || normalizeUsageBucket(sessionLimit),
-    seven_day: normalizeUsageBucket(data.seven_day) || normalizeUsageBucket(weeklyAllLimit),
-    scoped_weekly: normalizeScopedWeeklyUsage(data, limits),
-    seven_day_sonnet: data.seven_day_sonnet || null,
-    extra_usage: data.extra_usage || null,
+  const source = data && typeof data === 'object' ? data : {};
+  const limits = Array.isArray(source.limits) ? source.limits : [];
+  const result = {
+    seven_day_sonnet: source.seven_day_sonnet || null,
+    extra_usage: source.extra_usage || null,
   };
+  const fiveHour = globalUsageObservation(source, 'five_hour', limits, 'session');
+  const sevenDay = globalUsageObservation(source, 'seven_day', limits, 'weekly_all');
+  const scopedWeekly = normalizeScopedWeeklyUsage(source, limits);
+  if (fiveHour.observed) result.five_hour = fiveHour.value;
+  if (sevenDay.observed) result.seven_day = sevenDay.value;
+  if (scopedWeekly.observed) result.scoped_weekly = scopedWeekly.value;
+  return result;
+}
+
+function globalUsageObservation(data, key, limits, structuredKind) {
+  const structured = structuredUsageObservation(limits, structuredKind);
+  const legacyObserved = Object.prototype.hasOwnProperty.call(data, key);
+  const legacy = legacyObserved ? normalizeObservedUsageBucket(data[key], true) : undefined;
+  if (legacyObserved) {
+    return {
+      observed: true,
+      value: preferredAuthoritativeUsageObservation(legacy, structured.value),
+    };
+  }
+  return structured.observed
+    ? { observed: true, value: structured.value }
+    : { observed: false, value: undefined };
+}
+
+function structuredUsageObservation(limits, kind) {
+  let observed = false;
+  let value;
+  for (const limit of limits) {
+    if (!limit || limit.kind !== kind) continue;
+    const next = normalizeObservedUsageBucket(limit);
+    value = observed ? preferredAuthoritativeUsageObservation(value, next) : next;
+    observed = true;
+  }
+  return { observed, value };
+}
+
+function normalizeObservedUsageBucket(bucket, explicitNullClears = false) {
+  if (bucket === null && explicitNullClears) return null;
+  return normalizeUsageBucket(bucket) || { utilization: null, resets_at: null };
+}
+
+function preferredAuthoritativeUsageObservation(primary, secondary) {
+  const primaryHasUtilization = Number.isFinite(primary?.utilization);
+  const secondaryHasUtilization = Number.isFinite(secondary?.utilization);
+  if (!primaryHasUtilization) return secondaryHasUtilization ? secondary : primary;
+  if (!secondaryHasUtilization || primary.utilization !== secondary.utilization) return primary;
+  const primaryReset = Date.parse(primary.resets_at);
+  const secondaryReset = Date.parse(secondary.resets_at);
+  if (!Number.isFinite(primaryReset) && Number.isFinite(secondaryReset)) {
+    return { ...primary, resets_at: secondary.resets_at };
+  }
+  return primary;
 }
 
 function normalizeUsageBucket(bucket) {
@@ -408,38 +457,80 @@ function normalizeUsageBucket(bucket) {
 
 function normalizeScopedWeeklyUsage(data, limits) {
   const scoped = [];
-  const seen = new Set();
+  const seen = new Map();
+  const structuredObserved = Array.isArray(data?.limits);
+  let legacyObserved = false;
 
   for (const limit of limits) {
     if (!limit || limit.kind !== 'weekly_scoped') continue;
     const model = limit.scope?.model || {};
     const label = normalizeScopedLabel(model.display_name || model.name || model.id || 'Scoped');
-    appendScopedWeeklyUsage(scoped, seen, label, limit);
+    appendScopedWeeklyUsage(scoped, seen, label, limit, model.id || label);
   }
 
   for (const key of Object.keys(data || {})) {
     if (!key.startsWith('seven_day_') || key === 'seven_day') continue;
+    legacyObserved = true;
     const bucket = data[key];
-    if (!bucket || typeof bucket !== 'object') continue;
     const label = labelFromLegacyScopedKey(key.slice('seven_day_'.length));
-    appendScopedWeeklyUsage(scoped, seen, label, bucket);
+    appendScopedWeeklyUsage(scoped, seen, label, bucket, label);
   }
 
-  return scoped;
+  return {
+    observed: structuredObserved || legacyObserved,
+    value: scoped,
+  };
 }
 
-function appendScopedWeeklyUsage(scoped, seen, label, bucket) {
-  const normalized = normalizeUsageBucket(bucket);
-  if (!normalized || typeof normalized.utilization !== 'number') return;
-  const key = normalizeScopedKey(label);
-  if (seen.has(key)) return;
-  seen.add(key);
-  scoped.push({
+function appendScopedWeeklyUsage(scoped, seen, label, bucket, identity) {
+  const normalized = normalizeUsageBucket(bucket) || {
+    utilization: null,
+    resets_at: null,
+  };
+  const key = scopedOutputKey(label, identity);
+  const next = {
     key,
     label,
-    utilization: normalized.utilization,
+    utilization: Number.isFinite(normalized.utilization)
+      ? normalized.utilization
+      : null,
     resets_at: normalized.resets_at,
-  });
+  };
+  const identityKey = normalizeScopedIdentity(key);
+  const existingIndex = seen.get(identityKey);
+  if (existingIndex == null) {
+    seen.set(identityKey, scoped.length);
+    scoped.push(next);
+    return;
+  }
+  scoped[existingIndex] = preferredAuthoritativeScopedObservation(
+    scoped[existingIndex],
+    next,
+  );
+}
+
+function preferredAuthoritativeScopedObservation(existing, next) {
+  const preferred = preferredAuthoritativeUsageObservation(existing, next);
+  if (preferred === next) return next;
+  if (preferred.resets_at !== existing.resets_at) {
+    return { ...existing, resets_at: preferred.resets_at };
+  }
+  return existing;
+}
+
+function normalizeScopedIdentity(value) {
+  const key = normalizeScopedKey(value);
+  if (['fable', 'fable_5', 'claude_fable_5'].includes(key)) return 'claude_fable_5';
+  return key;
+}
+
+function scopedOutputKey(label, identity) {
+  const labelKey = normalizeScopedKey(label);
+  const identityKey = normalizeScopedKey(identity || label);
+  const labelIsFable = normalizeScopedIdentity(labelKey) === 'claude_fable_5';
+  const identityIsFable = normalizeScopedIdentity(identityKey) === 'claude_fable_5';
+  if (labelIsFable !== identityIsFable) return identityKey;
+  return labelKey;
 }
 
 function labelFromLegacyScopedKey(value) {
@@ -595,6 +686,7 @@ async function requestEndpoint(endpoint, init, options = {}) {
     connectTimeoutMs: options.connectTimeoutMs ?? DEFAULT_OAUTH_CONNECT_TIMEOUT_MS,
     connectRetries: options.connectRetries ?? DEFAULT_OAUTH_CONNECT_RETRIES,
     connectRetryDelayMs: options.connectRetryDelayMs ?? DEFAULT_OAUTH_CONNECT_RETRY_DELAY_MS,
+    signal: init.signal,
   });
 }
 
@@ -602,11 +694,12 @@ async function requestHttpWithConnectRetries(endpoint, options = {}) {
   const retryCount = Math.max(0, Number(options.connectRetries) || 0);
   const maxAttempts = retryCount + 1;
   for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    throwIfAborted(options.signal);
     try {
       return await requestHttp(endpoint, options);
     } catch (error) {
       if (attempt >= maxAttempts || !isRetryableConnectError(error)) throw error;
-      await sleep(Math.max(0, Number(options.connectRetryDelayMs) || 0));
+      await sleep(Math.max(0, Number(options.connectRetryDelayMs) || 0), options.signal);
     }
   }
   throw new Error('unreachable OAuth retry state');
@@ -618,8 +711,13 @@ function requestHttp(endpoint, {
   body = null,
   timeoutMs = DEFAULT_OAUTH_REQUEST_TIMEOUT_MS,
   connectTimeoutMs = DEFAULT_OAUTH_CONNECT_TIMEOUT_MS,
+  signal = null,
 } = {}) {
   return new Promise((resolve, reject) => {
+    if (signal?.aborted) {
+      reject(oauthRequestAbortedError());
+      return;
+    }
     const target = new URL(endpoint);
     const client = target.protocol === 'http:' ? http : https;
     const chunks = [];
@@ -627,10 +725,12 @@ function requestHttp(endpoint, {
     let connected = false;
     let responseStarted = false;
     let connectTimer = null;
+    let onAbort = null;
     const settle = (error, result) => {
       if (settled) return;
       settled = true;
       if (connectTimer) clearTimeout(connectTimer);
+      if (onAbort) signal?.removeEventListener('abort', onAbort);
       if (error) reject(error);
       else resolve(result);
     };
@@ -685,6 +785,17 @@ function requestHttp(endpoint, {
       res.on('error', settle);
     });
 
+    onAbort = () => {
+      const error = oauthRequestAbortedError();
+      req.destroy(error);
+      settle(error);
+    };
+    signal?.addEventListener('abort', onAbort, { once: true });
+    if (signal?.aborted) {
+      onAbort();
+      return;
+    }
+
     if (timeoutMs > 0) {
       req.setTimeout(timeoutMs, () => {
         const error = new Error(`OAuth request timeout after ${timeoutMs}ms`);
@@ -713,6 +824,16 @@ function requestHttp(endpoint, {
   });
 }
 
+function oauthRequestAbortedError() {
+  const error = new Error('OAuth request aborted');
+  error.code = 'OAUTH_REQUEST_ABORTED';
+  return error;
+}
+
+function throwIfAborted(signal) {
+  if (signal?.aborted) throw oauthRequestAbortedError();
+}
+
 function isRetryableConnectError(error) {
   return Boolean(error?.connectPhase) && isConnectNetworkError(error);
 }
@@ -730,7 +851,20 @@ function isConnectNetworkError(error) {
   ].includes(error?.code);
 }
 
-async function sleep(ms) {
+async function sleep(ms, signal = null) {
   if (ms <= 0) return;
-  await new Promise(resolve => setTimeout(resolve, ms));
+  throwIfAborted(signal);
+  await new Promise((resolve, reject) => {
+    const timer = setTimeout(() => {
+      signal?.removeEventListener('abort', onAbort);
+      resolve();
+    }, ms);
+    const onAbort = () => {
+      clearTimeout(timer);
+      signal?.removeEventListener('abort', onAbort);
+      reject(oauthRequestAbortedError());
+    };
+    signal?.addEventListener('abort', onAbort, { once: true });
+    if (signal?.aborted) onAbort();
+  });
 }

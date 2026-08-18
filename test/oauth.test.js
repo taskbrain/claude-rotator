@@ -10,6 +10,7 @@ import {
   isOAuthTokenRefreshRateLimit,
   parseTokenResponse,
   refreshAccessToken,
+  fetchProfile,
   fetchUsage,
   DEFAULT_OAUTH_CONNECT_RETRIES,
   DEFAULT_OAUTH_CONNECT_RETRY_DELAY_MS,
@@ -517,6 +518,21 @@ describe('token refresh', () => {
 });
 
 describe('usage response parsing', () => {
+  it('passes the OAuth profile AbortSignal to an injected fetch implementation', async () => {
+    const controller = new AbortController();
+    let receivedSignal;
+
+    await fetchProfile('access1', {
+      signal: controller.signal,
+      fetchImpl: async (url, init) => {
+        receivedSignal = init.signal;
+        return jsonResponse(200, {});
+      },
+    });
+
+    assert.equal(receivedSignal, controller.signal);
+  });
+
   it('fetches OAuth usage through the native request helper by default', async () => {
     const calls = [];
     const usage = await fetchUsage('access1', {
@@ -541,6 +557,21 @@ describe('usage response parsing', () => {
     assert.equal(calls[0].options.headers['Accept-Encoding'], 'identity');
     assert.equal(usage.five_hour.utilization, 0.25);
     assert.equal(usage.seven_day.utilization, 0.5);
+  });
+
+  it('passes the OAuth usage AbortSignal to an injected fetch implementation', async () => {
+    const controller = new AbortController();
+    let receivedSignal;
+
+    await fetchUsage('access1', {
+      signal: controller.signal,
+      fetchImpl: async (url, init) => {
+        receivedSignal = init.signal;
+        return jsonResponse(200, {});
+      },
+    });
+
+    assert.equal(receivedSignal, controller.signal);
   });
 
   it('retries OAuth usage requests that fail before a connection is established', async () => {
@@ -594,6 +625,120 @@ describe('usage response parsing', () => {
     }
   });
 
+  it('aborts a native OAuth usage request after its response starts', async () => {
+    const originalRequest = https.request;
+    const controller = new AbortController();
+    let destroyedWith;
+    https.request = function patchedRequest(options, callback) {
+      const fakeRequest = new EventEmitter();
+      fakeRequest.setTimeout = () => fakeRequest;
+      fakeRequest.write = () => {};
+      fakeRequest.destroy = error => {
+        destroyedWith = error;
+        queueMicrotask(() => fakeRequest.emit('error', error));
+      };
+      fakeRequest.end = () => {
+        const response = new EventEmitter();
+        response.statusCode = 200;
+        response.headers = {};
+        callback(response);
+        response.emit('data', Buffer.from('{'));
+      };
+      return fakeRequest;
+    };
+
+    try {
+      const request = fetchUsage('access1', {
+        endpoint: 'https://api.anthropic.test/api/oauth/usage',
+        signal: controller.signal,
+        connectRetries: 3,
+      });
+      controller.abort();
+
+      await assert.rejects(
+        Promise.race([
+          request,
+          new Promise((_, reject) => setTimeout(
+            () => reject(new Error('OAuth usage request did not settle after abort')),
+            100,
+          )),
+        ]),
+        error => error.code === 'OAUTH_REQUEST_ABORTED',
+      );
+      assert.equal(destroyedWith?.code, 'OAUTH_REQUEST_ABORTED');
+    } finally {
+      https.request = originalRequest;
+    }
+  });
+
+  it('rejects without creating a native request when the OAuth usage signal is already aborted', async () => {
+    const originalRequest = https.request;
+    const controller = new AbortController();
+    let requests = 0;
+    https.request = () => {
+      requests += 1;
+      throw new Error('native request should not start');
+    };
+    controller.abort();
+
+    try {
+      await assert.rejects(
+        fetchUsage('access1', {
+          endpoint: 'https://api.anthropic.test/api/oauth/usage',
+          signal: controller.signal,
+        }),
+        error => error.code === 'OAUTH_REQUEST_ABORTED',
+      );
+      assert.equal(requests, 0);
+    } finally {
+      https.request = originalRequest;
+    }
+  });
+
+  it('stops an OAuth connection retry delay when the signal aborts', async () => {
+    const originalRequest = https.request;
+    const controller = new AbortController();
+    let requests = 0;
+    https.request = () => {
+      requests += 1;
+      const fakeRequest = new EventEmitter();
+      fakeRequest.setTimeout = () => fakeRequest;
+      fakeRequest.write = () => {};
+      fakeRequest.destroy = error => queueMicrotask(() => fakeRequest.emit('error', error));
+      fakeRequest.end = () => {
+        const error = new Error('connect ETIMEDOUT');
+        error.code = 'ETIMEDOUT';
+        queueMicrotask(() => fakeRequest.emit('error', error));
+      };
+      return fakeRequest;
+    };
+
+    try {
+      const request = fetchUsage('access1', {
+        endpoint: 'https://api.anthropic.test/api/oauth/usage',
+        signal: controller.signal,
+        connectRetries: 3,
+        connectRetryDelayMs: 1000,
+      });
+      await new Promise(resolve => setImmediate(resolve));
+      controller.abort();
+
+      await assert.rejects(
+        Promise.race([
+          request,
+          new Promise((_, reject) => setTimeout(
+            () => reject(new Error('OAuth retry delay did not stop after abort')),
+            100,
+          )),
+        ]),
+        error => error.code === 'OAUTH_REQUEST_ABORTED',
+      );
+      assert.equal(requests, 1);
+    } finally {
+      https.request = originalRequest;
+    }
+  });
+
   it('normalizes OAuth usage payloads', () => {
     const parsed = parseUsageResponse({
       five_hour: { utilization: 76, resets_at: '2026-06-04T09:00:00Z' },
@@ -603,6 +748,120 @@ describe('usage response parsing', () => {
     assert.equal(parsed.five_hour.utilization, 0.76);
     assert.equal(parsed.five_hour.resets_at, '2026-06-04T09:00:00Z');
     assert.equal(parsed.seven_day.utilization, 0.01);
+  });
+
+  it('distinguishes missing, explicit-null, and malformed global usage observations', () => {
+    const missing = parseUsageResponse({});
+    assert.equal(Object.hasOwn(missing, 'five_hour'), false);
+    assert.equal(Object.hasOwn(missing, 'seven_day'), false);
+
+    const explicitNull = parseUsageResponse({ five_hour: null, seven_day: null });
+    assert.equal(Object.hasOwn(explicitNull, 'five_hour'), true);
+    assert.equal(Object.hasOwn(explicitNull, 'seven_day'), true);
+    assert.equal(explicitNull.five_hour, null);
+    assert.equal(explicitNull.seven_day, null);
+
+    const explicitNullWithStructuredFallback = parseUsageResponse({
+      limits: [
+        { kind: 'session', percent: 40, resets_at: '2026-09-10T09:00:00Z' },
+        { kind: 'weekly_all', percent: 50, resets_at: '2026-09-11T09:00:00Z' },
+      ],
+      five_hour: null,
+      seven_day: null,
+    });
+    assert.deepEqual(explicitNullWithStructuredFallback.five_hour, {
+      utilization: 0.4,
+      resets_at: '2026-09-10T09:00:00Z',
+    });
+    assert.deepEqual(explicitNullWithStructuredFallback.seven_day, {
+      utilization: 0.5,
+      resets_at: '2026-09-11T09:00:00Z',
+    });
+
+    const malformed = parseUsageResponse({ five_hour: {}, seven_day: 'invalid' });
+    assert.deepEqual(malformed.five_hour, { utilization: null, resets_at: null });
+    assert.deepEqual(malformed.seven_day, { utilization: null, resets_at: null });
+  });
+
+  it('keeps valid legacy global fields authoritative when structured limits conflict', () => {
+    const parsed = parseUsageResponse({
+      limits: [
+        { kind: 'session', percent: 100, resets_at: '2026-09-08T09:00:00Z' },
+        { kind: 'weekly_all', percent: 20, resets_at: '2026-09-09T09:00:00Z' },
+      ],
+      five_hour: { utilization: 20, resets_at: '2026-09-10T09:00:00Z' },
+      seven_day: { utilization: 100, resets_at: '2026-09-11T09:00:00Z' },
+    });
+
+    assert.deepEqual(parsed.five_hour, {
+      utilization: 0.2,
+      resets_at: '2026-09-10T09:00:00Z',
+    });
+    assert.deepEqual(parsed.seven_day, {
+      utilization: 1,
+      resets_at: '2026-09-11T09:00:00Z',
+    });
+  });
+
+  it('uses structured globals to repair malformed legacy fields and complement matching resets', () => {
+    const parsed = parseUsageResponse({
+      limits: [
+        { kind: 'session', percent: 40, resets_at: '2026-09-10T09:00:00Z' },
+        { kind: 'weekly_all', percent: 50, resets_at: '2026-09-11T09:00:00Z' },
+      ],
+      five_hour: {},
+      seven_day: { utilization: 50 },
+    });
+
+    assert.deepEqual(parsed.five_hour, {
+      utilization: 0.4,
+      resets_at: '2026-09-10T09:00:00Z',
+    });
+    assert.deepEqual(parsed.seven_day, {
+      utilization: 0.5,
+      resets_at: '2026-09-11T09:00:00Z',
+    });
+  });
+
+  it('keeps a legacy global reset when matching structured evidence has a newer reset', () => {
+    const parsed = parseUsageResponse({
+      limits: [
+        { kind: 'session', percent: 100, resets_at: '2026-09-10T09:00:00Z' },
+        { kind: 'weekly_all', percent: 50, resets_at: '2026-09-11T09:00:00Z' },
+      ],
+      five_hour: { utilization: 100, resets_at: '2026-09-01T09:00:00Z' },
+      seven_day: { utilization: 50, resets_at: '2026-09-02T09:00:00Z' },
+    });
+
+    assert.equal(parsed.five_hour.resets_at, '2026-09-01T09:00:00Z');
+    assert.equal(parsed.seven_day.resets_at, '2026-09-02T09:00:00Z');
+  });
+
+  it('repairs a malformed first structured global limit without replacing a first valid one', () => {
+    const parsed = parseUsageResponse({
+      limits: [
+        { kind: 'session' },
+        { kind: 'session', percent: 60, resets_at: '2026-09-10T09:00:00Z' },
+        { kind: 'weekly_all', percent: 30, resets_at: '2026-09-11T09:00:00Z' },
+        { kind: 'weekly_all', percent: 90, resets_at: '2026-09-12T09:00:00Z' },
+      ],
+    });
+
+    assert.equal(parsed.five_hour.utilization, 0.6);
+    assert.equal(parsed.five_hour.resets_at, '2026-09-10T09:00:00Z');
+    assert.equal(parsed.seven_day.utilization, 0.3);
+    assert.equal(parsed.seven_day.resets_at, '2026-09-11T09:00:00Z');
+  });
+
+  it('only emits a scoped snapshot when structured or legacy scoped usage was observed', () => {
+    const missing = parseUsageResponse({});
+    const malformedLimits = parseUsageResponse({ limits: {} });
+    const explicitEmpty = parseUsageResponse({ limits: [] });
+
+    assert.equal(Object.hasOwn(missing, 'scoped_weekly'), false);
+    assert.equal(Object.hasOwn(malformedLimits, 'scoped_weekly'), false);
+    assert.equal(Object.hasOwn(explicitEmpty, 'scoped_weekly'), true);
+    assert.deepEqual(explicitEmpty.scoped_weekly, []);
   });
 
   it('normalizes structured scoped weekly limits from OAuth usage payloads', () => {
@@ -616,6 +875,12 @@ describe('usage response parsing', () => {
           resets_at: '2026-06-08T09:00:00Z',
           scope: { model: { display_name: 'Fable', id: 'claude-fable-5' } },
         },
+        {
+          kind: 'weekly_scoped',
+          percent: 23,
+          resets_at: '2026-06-09T09:00:00Z',
+          scope: { model: { display_name: 'Sonnet', id: 'claude-sonnet-4-5' } },
+        },
       ],
     });
 
@@ -628,7 +893,230 @@ describe('usage response parsing', () => {
         utilization: 0.12,
         resets_at: '2026-06-08T09:00:00Z',
       },
+      {
+        key: 'sonnet',
+        label: 'Sonnet',
+        utilization: 0.23,
+        resets_at: '2026-06-09T09:00:00Z',
+      },
     ]);
+  });
+
+  it('preserves malformed scoped observations so callers do not mistake them for an empty snapshot', () => {
+    const structured = parseUsageResponse({
+      limits: [{
+        kind: 'weekly_scoped',
+        scope: { model: { display_name: 'Fable', id: 'claude-fable-5' } },
+      }],
+    });
+    const legacy = parseUsageResponse({ seven_day_fable: {} });
+
+    const structuredSentinel = [{
+      key: 'fable',
+      label: 'Fable',
+      utilization: null,
+      resets_at: null,
+    }];
+    const legacySentinel = [{
+      key: 'fable',
+      label: 'Fable',
+      utilization: null,
+      resets_at: null,
+    }];
+    assert.deepEqual(structured.scoped_weekly, structuredSentinel);
+    assert.deepEqual(legacy.scoped_weekly, legacySentinel);
+  });
+
+  it('preserves the exact model id when a scoped Usage limit has no display name', () => {
+    const parsed = parseUsageResponse({
+      limits: [{
+        kind: 'weekly_scoped',
+        percent: 100,
+        resets_at: '2026-09-08T09:00:00Z',
+        scope: { model: { id: 'claude-fable-5' } },
+      }],
+    });
+
+    assert.deepEqual(parsed.scoped_weekly, [{
+      key: 'claude_fable_5',
+      label: 'claude-fable-5',
+      utilization: 1,
+      resets_at: '2026-09-08T09:00:00Z',
+    }]);
+  });
+
+  it('uses a structured model id as the scoped key even when its display name says Fable', () => {
+    const parsed = parseUsageResponse({
+      limits: [{
+        kind: 'weekly_scoped',
+        percent: 100,
+        resets_at: '2026-09-08T09:00:00Z',
+        scope: { model: { id: 'claude-not-fable-5', display_name: 'Fable' } },
+      }],
+    });
+
+    assert.deepEqual(parsed.scoped_weekly, [{
+      key: 'claude_not_fable_5',
+      label: 'Fable',
+      utilization: 1,
+      resets_at: '2026-09-08T09:00:00Z',
+    }]);
+  });
+
+  it('uses the exact Fable model id when its display name is not a canonical alias', () => {
+    const parsed = parseUsageResponse({
+      limits: [{
+        kind: 'weekly_scoped',
+        percent: 100,
+        resets_at: '2026-09-08T09:00:00Z',
+        scope: { model: { id: 'claude-fable-5', display_name: 'Fable Weekly' } },
+      }],
+    });
+
+    assert.deepEqual(parsed.scoped_weekly, [{
+      key: 'claude_fable_5',
+      label: 'Fable Weekly',
+      utilization: 1,
+      resets_at: '2026-09-08T09:00:00Z',
+    }]);
+  });
+
+  it('prefers valid scoped evidence over a duplicate malformed model observation in either order', () => {
+    const malformed = {
+      kind: 'weekly_scoped',
+      scope: { model: { display_name: 'Fable', id: 'claude-fable-5' } },
+    };
+    const valid = {
+      kind: 'weekly_scoped',
+      percent: 100,
+      resets_at: '2026-09-08T09:00:00Z',
+      scope: { model: { id: 'claude-fable-5' } },
+    };
+
+    for (const limits of [[malformed, valid], [valid, malformed]]) {
+      const parsed = parseUsageResponse({ limits });
+      assert.equal(parsed.scoped_weekly.length, 1);
+      assert.equal(parsed.scoped_weekly[0].utilization, 1);
+      assert.equal(parsed.scoped_weekly[0].resets_at, '2026-09-08T09:00:00Z');
+    }
+
+    const resetMissing = {
+      ...valid,
+      resets_at: undefined,
+    };
+    for (const limits of [[resetMissing, valid], [valid, resetMissing]]) {
+      const parsed = parseUsageResponse({ limits });
+      assert.equal(parsed.scoped_weekly.length, 1);
+      assert.equal(parsed.scoped_weekly[0].utilization, 1);
+      assert.equal(parsed.scoped_weekly[0].resets_at, '2026-09-08T09:00:00Z');
+    }
+  });
+
+  it('keeps the first valid structured scoped utilization when duplicate values conflict', () => {
+    for (const [firstPercent, secondPercent] of [[100, 20], [20, 100]]) {
+      const parsed = parseUsageResponse({
+        limits: [firstPercent, secondPercent].map((percent, index) => ({
+          kind: 'weekly_scoped',
+          percent,
+          resets_at: `2026-09-${String(index + 8).padStart(2, '0')}T09:00:00Z`,
+          scope: { model: { display_name: 'Fable', id: 'claude-fable-5' } },
+        })),
+      });
+
+      assert.equal(parsed.scoped_weekly.length, 1);
+      assert.equal(parsed.scoped_weekly[0].utilization, firstPercent / 100);
+      assert.equal(parsed.scoped_weekly[0].resets_at, '2026-09-08T09:00:00Z');
+    }
+  });
+
+  it('keeps structured scoped utilization authoritative over conflicting legacy fields', () => {
+    for (const [structuredPercent, legacyPercent] of [[100, 20], [20, 100]]) {
+      const parsed = parseUsageResponse({
+        limits: [{
+          kind: 'weekly_scoped',
+          percent: structuredPercent,
+          resets_at: '2026-09-08T09:00:00Z',
+          scope: { model: { display_name: 'Fable', id: 'claude-fable-5' } },
+        }],
+        seven_day_fable: {
+          utilization: legacyPercent,
+          resets_at: '2026-09-09T09:00:00Z',
+        },
+      });
+
+      assert.equal(parsed.scoped_weekly.length, 1);
+      assert.equal(parsed.scoped_weekly[0].utilization, structuredPercent / 100);
+      assert.equal(parsed.scoped_weekly[0].resets_at, '2026-09-08T09:00:00Z');
+    }
+  });
+
+  it('deduplicates a structured Sonnet model id against its legacy display-name key', () => {
+    const parsed = parseUsageResponse({
+      limits: [{
+        kind: 'weekly_scoped',
+        percent: 10,
+        resets_at: '2026-09-08T09:00:00Z',
+        scope: { model: { display_name: 'Sonnet', id: 'claude-sonnet-4-5' } },
+      }],
+      seven_day_sonnet: {
+        utilization: 90,
+        resets_at: '2026-09-09T09:00:00Z',
+      },
+    });
+
+    assert.deepEqual(parsed.scoped_weekly, [{
+      key: 'sonnet',
+      label: 'Sonnet',
+      utilization: 0.1,
+      resets_at: '2026-09-08T09:00:00Z',
+    }]);
+  });
+
+  it('repairs malformed structured scoped usage and complements a matching legacy reset', () => {
+    const repaired = parseUsageResponse({
+      limits: [{
+        kind: 'weekly_scoped',
+        scope: { model: { display_name: 'Fable', id: 'claude-fable-5' } },
+      }],
+      seven_day_fable: {
+        utilization: 100,
+        resets_at: '2026-09-09T09:00:00Z',
+      },
+    });
+    const complemented = parseUsageResponse({
+      limits: [{
+        kind: 'weekly_scoped',
+        percent: 100,
+        scope: { model: { display_name: 'Fable', id: 'claude-fable-5' } },
+      }],
+      seven_day_fable: {
+        utilization: 100,
+        resets_at: '2026-09-09T09:00:00Z',
+      },
+    });
+
+    assert.equal(repaired.scoped_weekly[0].utilization, 1);
+    assert.equal(repaired.scoped_weekly[0].resets_at, '2026-09-09T09:00:00Z');
+    assert.equal(complemented.scoped_weekly[0].utilization, 1);
+    assert.equal(complemented.scoped_weekly[0].resets_at, '2026-09-09T09:00:00Z');
+  });
+
+  it('keeps a structured scoped reset when matching legacy evidence has an older reset', () => {
+    const parsed = parseUsageResponse({
+      limits: [{
+        kind: 'weekly_scoped',
+        percent: 100,
+        resets_at: '2026-09-10T09:00:00Z',
+        scope: { model: { display_name: 'Fable', id: 'claude-fable-5' } },
+      }],
+      seven_day_fable: {
+        utilization: 100,
+        resets_at: '2026-09-01T09:00:00Z',
+      },
+    });
+
+    assert.equal(parsed.scoped_weekly[0].utilization, 1);
+    assert.equal(parsed.scoped_weekly[0].resets_at, '2026-09-10T09:00:00Z');
   });
 
   it('normalizes legacy flat model-specific weekly usage payloads', () => {
