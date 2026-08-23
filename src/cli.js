@@ -1,4 +1,4 @@
-import { execFile } from 'node:child_process';
+import { execFile, spawn } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
 import { constants as fsConstants } from 'node:fs';
 import { access, mkdir, rm, stat, writeFile } from 'node:fs/promises';
@@ -20,6 +20,7 @@ import {
 } from './native-claude-refresher.js';
 import {
   installLinuxNodeLauncher,
+  installMacosLifecycle,
   installSettings,
   MACOS_LAUNCH_AGENT_LABEL,
   renderLaunchAgentPlist,
@@ -27,19 +28,46 @@ import {
   renderSystemdUserService,
   removeInstallState,
   removeLinuxNodeLauncher,
+  serviceGenerationForLaunchAgent,
+  uninstallMacosLifecycle,
   uninstallSettings,
 } from './install.js';
-import { appConfigDir, backupDir, claudeSettingsPath, installStatePath, runtimeStatePath } from './paths.js';
+import {
+  assertMacosServiceLockHeld,
+  MACOS_SERVICE_LOCK_MARKER_ENV,
+  MACOS_SERVICE_LOCK_MARKER_VALUE,
+  prepareMacosServiceLock,
+  reconcileMacosMainService,
+  stopMacosMainService,
+} from './macos-service.js';
+import {
+  renderMacosWatchdogLaunchAgentPlist,
+  renderMacosWatchdogScript,
+} from './macos-watchdog.js';
+import {
+  appConfigDir,
+  backupDir,
+  claudeSettingsPath,
+  installStatePath,
+  macosServiceLockPath,
+  macosWatchdogHelperPath,
+  macosWatchdogMarkerPath,
+  macosWatchdogPlistPath,
+  runtimeStatePath,
+} from './paths.js';
 import { readJsonFile, writeJsonFile } from './json-file.js';
 
 const execFileAsync = promisify(execFile);
 const CURRENT_ACCOUNT_ID = 'current';
 const DEFAULT_SHUTDOWN_GRACE_MS = 5_000;
+const MACOS_HIDDEN_SERVICE_ACTION = '__macos-service-action';
 
 export async function runCli(argv = [], deps = {}) {
   const write = deps.write || (text => process.stdout.write(text));
   const error = deps.error || (text => process.stderr.write(text));
   const command = argv[0] || 'help';
+  const platform = deps.platform || process.platform;
+  const env = deps.env || process.env;
 
   try {
     if (command === 'help' || command === '--help' || command === '-h') {
@@ -66,13 +94,37 @@ export async function runCli(argv = [], deps = {}) {
       return 0;
     }
 
+    if (command === MACOS_HIDDEN_SERVICE_ACTION) {
+      if (platform !== 'darwin') throw new Error('Internal macOS service action is macOS-only');
+      assertMacosServiceLockHeld(env);
+      const actionArgv = sanitizeMacosServiceActionArgv(argv.slice(1));
+      if (actionArgv[0] === 'install') {
+        await (deps.installAction || installCommand)({ argv: actionArgv, write, deps });
+        return 0;
+      }
+      await (deps.uninstallAction || uninstallCommand)({ argv: actionArgv, write, deps });
+      return 0;
+    }
+
+    if ((command === 'install' || command === 'uninstall') && platform === 'darwin') {
+      return await (deps.runLockedMacosAction || runMacosCliActionWithLock)({
+        argv: sanitizeMacosServiceActionArgv(argv),
+        lockPath: macosServiceLockPath(env, deps.home || homedir()),
+        nodePath: deps.execPath || process.execPath,
+        cliPath: resolve(deps.cliPath || process.argv[1]),
+        env,
+        prepareLockImpl: deps.prepareLockImpl,
+        spawnImpl: deps.spawnImpl,
+      });
+    }
+
     if (command === 'install') {
-      await installCommand({ argv, write });
+      await (deps.installAction || installCommand)({ argv, write, deps });
       return 0;
     }
 
     if (command === 'uninstall') {
-      await uninstallCommand({ argv, write });
+      await (deps.uninstallAction || uninstallCommand)({ argv, write, deps });
       return 0;
     }
 
@@ -149,6 +201,65 @@ export async function runCli(argv = [], deps = {}) {
   }
 }
 
+export async function runMacosCliActionWithLock({
+  argv,
+  lockPath,
+  nodePath,
+  cliPath,
+  env = process.env,
+  prepareLockImpl = prepareMacosServiceLock,
+  spawnImpl = spawn,
+}) {
+  const safeArgv = sanitizeMacosServiceActionArgv(argv);
+  await prepareLockImpl({ lockPath });
+  let child;
+  try {
+    child = spawnImpl('/usr/bin/lockf', [
+      '-k',
+      lockPath,
+      nodePath,
+      cliPath,
+      MACOS_HIDDEN_SERVICE_ACTION,
+      ...safeArgv,
+    ], {
+      env: {
+        ...env,
+        [MACOS_SERVICE_LOCK_MARKER_ENV]: MACOS_SERVICE_LOCK_MARKER_VALUE,
+      },
+      stdio: 'inherit',
+    });
+  } catch {
+    throw new Error('Could not start the locked macOS service action');
+  }
+
+  return new Promise((resolveChild, rejectChild) => {
+    child.once('error', () => rejectChild(new Error('Could not start the locked macOS service action')));
+    child.once('exit', (code, signal) => {
+      if (Number.isInteger(code)) {
+        resolveChild(code);
+        return;
+      }
+      rejectChild(new Error(`Locked macOS service action ended by ${signal || 'unknown signal'}`));
+    });
+  });
+}
+
+function sanitizeMacosServiceActionArgv(argv) {
+  const action = argv[0];
+  const allowed = action === 'install'
+    ? ['--no-start', '--force']
+    : action === 'uninstall'
+      ? ['--purge-secrets', '--force']
+      : null;
+  if (!allowed) throw new Error('Unknown internal macOS service action');
+  const provided = argv.slice(1);
+  if (provided.some(argument => !allowed.includes(argument))) {
+    throw new Error('Invalid macOS service action arguments');
+  }
+  const selected = new Set(provided);
+  return [action, ...allowed.filter(argument => selected.has(argument))];
+}
+
 function refreshUsageWarning(account) {
   if (account.error) return account.error;
   if (account.skipped === 'credential-refresh-cooldown') {
@@ -215,6 +326,7 @@ async function runServer({ write }) {
     reloadAccounts: async () => (await loadOrCreateConfig()).accounts,
     logger: line => write(`${line}\n`),
     stateWriter: state => writeJsonFile(statePath, state),
+    serviceGeneration: process.env.CLAUDE_ROTATOR_SERVICE_GENERATION || null,
   });
   await new Promise(resolve => server.listen(config.proxy.port, config.proxy.host, resolve));
   write(`claude-rotator listening on ${proxyBaseUrl(config)}\n`);
@@ -264,16 +376,18 @@ export function closeServerWithDeadline(server, timeoutMs = DEFAULT_SHUTDOWN_GRA
   });
 }
 
-async function installCommand({ argv, write }) {
+async function installCommand({ argv, write, deps = {} }) {
+  const platform = deps.platform || process.platform;
+  const env = deps.env || process.env;
+  const home = deps.home || homedir();
   const config = await loadOrCreateConfig();
-  const home = homedir();
   const configPath = getConfigPath();
-  const statePath = installStatePath(process.env, home);
+  const statePath = installStatePath(env, home);
   const settingsPath = claudeSettingsPath(home);
   const force = argv.includes('--force');
   const noStart = argv.includes('--no-start');
   let claudePath = null;
-  if (['darwin', 'linux'].includes(process.platform)) {
+  if (['darwin', 'linux'].includes(platform)) {
     claudePath = await resolveNativeClaudeCommand();
     if (!isAbsolute(claudePath)) {
       throw new Error('Could not resolve an absolute Claude Code executable for the service');
@@ -283,10 +397,27 @@ async function installCommand({ argv, write }) {
       throw new Error('Claude Code executable for the service is not a regular file');
     }
   }
+  if (platform === 'darwin') {
+    await installMacosCommand({
+      argv,
+      write,
+      deps,
+      env,
+      home,
+      config,
+      configPath,
+      settingsPath,
+      statePath,
+      claudePath,
+      force,
+      noStart,
+    });
+    return;
+  }
   await installSettings({
     settingsPath,
     installStatePath: statePath,
-    backupDir: backupDir(process.env, home),
+    backupDir: backupDir(env, home),
     proxyBaseUrl: proxyBaseUrl(config),
     force,
   });
@@ -308,13 +439,28 @@ async function installCommand({ argv, write }) {
   }
 }
 
-async function uninstallCommand({ argv, write }) {
-  const home = homedir();
+async function uninstallCommand({ argv, write, deps = {} }) {
+  const platform = deps.platform || process.platform;
+  const env = deps.env || process.env;
+  const home = deps.home || homedir();
   const configPath = getConfigPath();
-  const statePath = installStatePath(process.env, home);
+  const statePath = installStatePath(env, home);
   const settingsPath = claudeSettingsPath(home);
   const force = argv.includes('--force');
   const purgeSecrets = argv.includes('--purge-secrets');
+  if (platform === 'darwin') {
+    await uninstallMacosLifecycle({
+      uid: deps.uid ?? (typeof process.getuid === 'function' ? process.getuid() : null),
+      env,
+      paths: macosLifecyclePaths({ env, home, settingsPath, statePath }),
+      force,
+      purgeSecrets,
+      execFileImpl: deps.execFileImpl || execFileAsync,
+      purgeSecretsImpl: async () => (deps.secretStoreFactory || createSecretStore)().purge(),
+    });
+    write('Uninstalled claude-rotator\n');
+    return;
+  }
   await stopService().catch(() => {});
   const result = await uninstallSettings({ settingsPath, installStatePath: statePath, force });
   if (result.conflict) throw new Error(result.reason);
@@ -322,6 +468,89 @@ async function uninstallCommand({ argv, write }) {
   await removeInstallState(statePath);
   if (purgeSecrets) await createSecretStore().purge();
   write('Uninstalled claude-rotator\n');
+}
+
+async function installMacosCommand({
+  write,
+  deps,
+  env,
+  home,
+  config,
+  configPath,
+  settingsPath,
+  statePath,
+  claudePath,
+  force,
+  noStart,
+}) {
+  const uid = deps.uid ?? (typeof process.getuid === 'function' ? process.getuid() : null);
+  const cliPath = resolve(deps.cliPath || process.argv[1]);
+  const servicePath = serviceEnvironmentPath(claudePath);
+  const generationOptions = {
+    nodePath: process.execPath,
+    cliPath,
+    configPath,
+    claudePath,
+    servicePath,
+  };
+  const serviceGeneration = serviceGenerationForLaunchAgent(generationOptions);
+  const paths = macosLifecyclePaths({ env, home, settingsPath, statePath });
+  const domain = `gui/${uid}`;
+  const artifacts = {
+    mainPlist: renderLaunchAgentPlist({ ...generationOptions, serviceGeneration }),
+    helper: renderMacosWatchdogScript({
+      markerPath: paths.markerPath,
+      installStatePath: paths.installStatePath,
+      mainPlistPath: paths.mainPlistPath,
+      domain,
+    }),
+    watchdogPlist: renderMacosWatchdogLaunchAgentPlist({
+      lockPath: macosServiceLockPath(env, home),
+      helperPath: paths.helperPath,
+    }),
+  };
+
+  await installMacosLifecycle({
+    uid,
+    env,
+    paths,
+    artifacts,
+    backupDir: backupDir(env, home),
+    proxyBaseUrl: proxyBaseUrl(config),
+    expectedServiceGeneration: serviceGeneration,
+    healthCheck: deps.healthCheck || readHealth,
+    force,
+    noStart,
+    execFileImpl: deps.execFileImpl || execFileAsync,
+  });
+  write(`Installed claude-rotator at ${proxyBaseUrl(config)}\n`);
+  if (noStart) write('Service start skipped because --no-start was set.\n');
+  else write('Service and WatchDock started\n');
+}
+
+function macosLifecyclePaths({ env, home, settingsPath, statePath }) {
+  return {
+    settingsPath,
+    installStatePath: statePath,
+    markerPath: macosWatchdogMarkerPath(env, home),
+    mainPlistPath: macosLaunchAgentPath(MACOS_LAUNCH_AGENT_LABEL, home),
+    watchdogPlistPath: macosWatchdogPlistPath(home),
+    helperPath: macosWatchdogHelperPath(env, home),
+  };
+}
+
+function serviceEnvironmentPath(claudePath) {
+  return [...new Set([
+    claudePath ? dirname(claudePath) : null,
+    dirname(process.execPath),
+    process.env.PATH,
+    '/opt/homebrew/bin',
+    '/usr/local/bin',
+    '/usr/bin',
+    '/bin',
+    '/usr/sbin',
+    '/sbin',
+  ].filter(Boolean))].join(':');
 }
 
 async function loginJsonCommand({ argv, write, deps }) {
@@ -764,68 +993,36 @@ export async function startService({
   uid = typeof process.getuid === 'function' ? process.getuid() : null,
   execFileImpl = execFileAsync,
   plistPath = macosLaunchAgentPath(MACOS_LAUNCH_AGENT_LABEL),
-  sleepImpl = sleep,
+  definitionChanged = false,
+  env = process.env,
 } = {}) {
   if (platform === 'darwin') {
-    const domain = uid == null ? 'gui/$(id -u)' : `gui/${uid}`;
-    const label = `${domain}/${MACOS_LAUNCH_AGENT_LABEL}`;
-    await execFileImpl('launchctl', ['bootout', label]).catch(() => {});
-    await sleepImpl(300);
-    try {
-      await execFileImpl('launchctl', ['bootstrap', domain, plistPath]);
-    } catch {
-      await sleepImpl(300);
-      try {
-        await execFileImpl('launchctl', ['bootstrap', domain, plistPath]);
-      } catch {
-        await execFileImpl('launchctl', ['load', '-w', plistPath]);
-      }
-    }
-    if (!(await isLaunchAgentRegistered(execFileImpl, label))) {
-      await sleepImpl(300);
-      if (!(await isLaunchAgentRegistered(execFileImpl, label))) {
-        await execFileImpl('launchctl', ['bootstrap', domain, plistPath]).catch(() => {});
-        await sleepImpl(300);
-      }
-      await execFileImpl('launchctl', ['print', label]);
-    }
-    await execFileImpl('launchctl', ['enable', label]).catch(() => {});
-    await execFileImpl('launchctl', ['kickstart', '-k', label]).catch(() => {});
-    await sleepImpl(5000);
-    if (!(await isLaunchAgentRegistered(execFileImpl, label))) {
-      await execFileImpl('launchctl', ['bootstrap', domain, plistPath]).catch(() => {});
-      await sleepImpl(300);
-      await execFileImpl('launchctl', ['print', label]);
-    }
-    return;
+    return reconcileMacosMainService({
+      uid,
+      plistPath,
+      definitionChanged,
+      env,
+      execFileImpl,
+    });
   }
   await execFileImpl('systemctl', ['--user', 'daemon-reload']);
   await execFileImpl('systemctl', ['--user', 'enable', '--now', 'claude-rotator.service']);
 }
 
-async function sleep(ms) {
-  await new Promise(resolve => setTimeout(resolve, ms));
-}
-
-async function isLaunchAgentRegistered(execFileImpl, label) {
-  try {
-    await execFileImpl('launchctl', ['print', label]);
-    return true;
-  } catch {
-    return false;
+async function stopService({
+  platform = process.platform,
+  uid = typeof process.getuid === 'function' ? process.getuid() : null,
+  env = process.env,
+  execFileImpl = execFileAsync,
+} = {}) {
+  if (platform === 'darwin') {
+    return stopMacosMainService({ uid, env, execFileImpl });
   }
+  await execFileImpl('systemctl', ['--user', 'disable', '--now', 'claude-rotator.service']);
 }
 
-async function stopService() {
-  if (process.platform === 'darwin') {
-    await execFileAsync('launchctl', ['bootout', `gui/${process.getuid()}`, macosLaunchAgentPath(MACOS_LAUNCH_AGENT_LABEL)]);
-    return;
-  }
-  await execFileAsync('systemctl', ['--user', 'disable', '--now', 'claude-rotator.service']);
-}
-
-function macosLaunchAgentPath(label) {
-  return join(homedir(), 'Library', 'LaunchAgents', `${label}.plist`);
+function macosLaunchAgentPath(label, home = homedir()) {
+  return join(home, 'Library', 'LaunchAgents', `${label}.plist`);
 }
 
 async function monitorLoop({ write, readStatus }) {
@@ -841,9 +1038,9 @@ async function readStatus() {
   return getJson(`http://${config.proxy.host}:${config.proxy.port}/internal/status`);
 }
 
-async function readHealth() {
+async function readHealth({ signal } = {}) {
   const config = await loadOrCreateConfig();
-  return getJson(`http://${config.proxy.host}:${config.proxy.port}/internal/health`);
+  return getJson(`http://${config.proxy.host}:${config.proxy.port}/internal/health`, { signal });
 }
 
 async function postJson(path, body) {
@@ -855,8 +1052,8 @@ async function postJson(path, body) {
   });
 }
 
-async function getJson(url) {
-  return requestJson(url, { method: 'GET' });
+async function getJson(url, { signal } = {}) {
+  return requestJson(url, { method: 'GET', signal });
 }
 
 async function requestJson(url, options) {
@@ -868,6 +1065,7 @@ async function requestJson(url, options) {
       path: `${target.pathname}${target.search}`,
       method: options.method,
       headers: options.headers || {},
+      signal: options.signal,
     }, res => {
       const chunks = [];
       res.on('data', chunk => chunks.push(chunk));

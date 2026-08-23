@@ -42,7 +42,10 @@ macOS では次の LaunchAgent が作られます。
 
 ```text
 ~/Library/LaunchAgents/io.github.claude-rotator.plist
+~/Library/LaunchAgents/io.github.claude-rotator.watchdog.plist
 ```
+
+WatchDock は15秒ごとに main LaunchAgent の登録を確認し、意図せず `bootout` された場合だけ再登録します。install／uninstall と同じ `lockf` を使うため、uninstall 中に main を復活させません。意図的に停止する場合は `claude-rotator uninstall` を使ってください。`install --no-start` は資産だけを配置し、Claude Code設定を変更せず、両方のLaunchAgentと復旧markerを無効のままにします。
 
 インストール時にClaude Codeの実行可能ファイルを絶対パスで解決し、macOS LaunchAgentとUbuntu systemd user serviceの `CLAUDE_ROTATOR_CLAUDE_BIN` と安全な `PATH` に固定します。Homebrew、nvm、asdf、Volta、custom npm prefixなどで管理された `claude` が対話shellでだけ見つかり、常駐サービスでは見つからない状態を防ぎます。実行場所を明示する場合は、インストール前に `CLAUDE_ROTATOR_CLAUDE_BIN=/absolute/path/to/claude` を設定してください。
 
@@ -370,8 +373,10 @@ claude-rotator install
 
 `install` updates only `env.ANTHROPIC_BASE_URL` in `~/.claude/settings.json`, records the previous value in `~/.config/claude-rotator/install-state.json`, and writes a service definition:
 
-- macOS: `~/Library/LaunchAgents/io.github.claude-rotator.plist`
+- macOS: `~/Library/LaunchAgents/io.github.claude-rotator.plist` and `io.github.claude-rotator.watchdog.plist`
 - Ubuntu/Linux: `~/.config/systemd/user/claude-rotator.service`
+
+On macOS, WatchDock checks the main LaunchAgent registration every 15 seconds and restores it only after an unintended `bootout`. It shares the installer lock, so it cannot resurrect the main job during uninstall. Use `claude-rotator uninstall` for an intentional stop. `install --no-start` writes the service assets but leaves Claude Code settings unchanged, both jobs unregistered, and recovery disabled.
 
 On macOS and Ubuntu/Linux, installation resolves Claude Code to an executable absolute path and records it as `CLAUDE_ROTATOR_CLAUDE_BIN`, together with the required service `PATH`. This keeps Homebrew, nvm, asdf, Volta, and custom npm-prefix installs available under launchd or systemd's minimal environment. Set `CLAUDE_ROTATOR_CLAUDE_BIN=/absolute/path/to/claude` before `claude-rotator install` to override discovery.
 

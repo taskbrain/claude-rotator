@@ -7,9 +7,12 @@ if (major < 18) {
 }
 
 const { setDefaultResultOrder } = await import('node:dns');
+const { fileURLToPath } = await import('node:url');
 setDefaultResultOrder('ipv4first');
 
 const { runCli } = await import('../src/cli.js');
 
-const code = await runCli(process.argv.slice(2));
+const code = await runCli(process.argv.slice(2), {
+  cliPath: fileURLToPath(import.meta.url),
+});
 process.exit(code);
