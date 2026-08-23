@@ -1038,9 +1038,9 @@ async function readStatus() {
   return getJson(`http://${config.proxy.host}:${config.proxy.port}/internal/status`);
 }
 
-async function readHealth() {
+async function readHealth({ signal } = {}) {
   const config = await loadOrCreateConfig();
-  return getJson(`http://${config.proxy.host}:${config.proxy.port}/internal/health`);
+  return getJson(`http://${config.proxy.host}:${config.proxy.port}/internal/health`, { signal });
 }
 
 async function postJson(path, body) {
@@ -1052,8 +1052,8 @@ async function postJson(path, body) {
   });
 }
 
-async function getJson(url) {
-  return requestJson(url, { method: 'GET' });
+async function getJson(url, { signal } = {}) {
+  return requestJson(url, { method: 'GET', signal });
 }
 
 async function requestJson(url, options) {
@@ -1065,6 +1065,7 @@ async function requestJson(url, options) {
       path: `${target.pathname}${target.search}`,
       method: options.method,
       headers: options.headers || {},
+      signal: options.signal,
     }, res => {
       const chunks = [];
       res.on('data', chunk => chunks.push(chunk));

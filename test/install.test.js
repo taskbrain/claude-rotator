@@ -1,7 +1,7 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 import { execFile } from 'node:child_process';
-import { lstat, mkdtemp, readFile, readlink, rm, stat, writeFile } from 'node:fs/promises';
+import { lstat, mkdir, mkdtemp, readFile, readlink, rm, stat, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { promisify } from 'node:util';
@@ -266,6 +266,64 @@ describe('macOS WatchDock lifecycle', () => {
     }
   });
 
+  it('bounds a non-responsive health check and rolls the install back', async () => {
+    const fixture = await createMacosLifecycleFixture();
+    let healthSignal;
+    let guardTimer;
+    try {
+      const outcome = await Promise.race([
+        installMacosLifecycle(fixture.installOptions({
+          healthTimeoutMs: 20,
+          healthCheck: ({ signal } = {}) => {
+            healthSignal = signal;
+            return new Promise(() => {});
+          },
+        })).then(
+          () => ({ type: 'resolved' }),
+          error => ({ type: 'rejected', error }),
+        ),
+        new Promise(resolve => {
+          guardTimer = setTimeout(() => resolve({ type: 'still-pending' }), 250);
+        }),
+      ]);
+      clearTimeout(guardTimer);
+
+      assert.equal(outcome.type, 'rejected');
+      assert.match(outcome.error.message, /did not become healthy/);
+      assert.equal(healthSignal.aborted, true);
+      assert.deepEqual(await readJsonFile(fixture.paths.settingsPath), { language: 'ja' });
+      assert.equal(await exists(fixture.paths.installStatePath), false);
+      assert.equal(await exists(fixture.paths.markerPath), false);
+      assert.deepEqual([...fixture.jobs], []);
+    } finally {
+      clearTimeout(guardTimer);
+      await fixture.cleanup();
+    }
+  });
+
+  it('continues rollback after one managed-file restore fails', async () => {
+    const fixture = await createMacosLifecycleFixture({ failWatchdogBootstrap: true });
+    try {
+      fixture.onWatchdogBootstrapFailure = async () => {
+        await rm(fixture.paths.watchdogPlistPath, { force: true });
+        await mkdir(fixture.paths.watchdogPlistPath);
+      };
+
+      await assert.rejects(
+        installMacosLifecycle(fixture.installOptions()),
+        /rollback failed/,
+      );
+
+      assert.deepEqual(await readJsonFile(fixture.paths.settingsPath), { language: 'ja' });
+      assert.equal(await exists(fixture.paths.installStatePath), false);
+      assert.equal(await exists(fixture.paths.markerPath), false);
+      assert.equal(await exists(fixture.paths.helperPath), false);
+      assert.equal(fixture.jobs.has(fixture.mainJob), false);
+    } finally {
+      await fixture.cleanup();
+    }
+  });
+
   it('does not mutate service state when uninstall finds a settings conflict', async () => {
     const fixture = await createInstalledMacosLifecycleFixture();
     try {
@@ -366,6 +424,7 @@ async function createMacosLifecycleFixture({ failWatchdogBootstrap = false } = {
     launchctlCalls,
     onBootout: async () => {},
     failWatchdogBootout: false,
+    onWatchdogBootstrapFailure: async () => {},
   };
   await writeJsonFile(paths.settingsPath, { language: 'ja' });
 
@@ -380,6 +439,7 @@ async function createMacosLifecycleFixture({ failWatchdogBootstrap = false } = {
     if (action === 'bootstrap') {
       const job = rest[1].includes('watchdog') ? watchdogJob : mainJob;
       if (failWatchdogBootstrap && job === watchdogJob) {
+        await fixture.onWatchdogBootstrapFailure();
         throw Object.assign(new Error('watchdog bootstrap failed'), { code: 5 });
       }
       jobs.add(job);

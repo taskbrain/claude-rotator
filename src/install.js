@@ -177,7 +177,7 @@ export async function installMacosLifecycle({
       execFileImpl,
     });
   } catch (error) {
-    await rollbackMacosLifecycle({
+    const rollbackErrors = await rollbackMacosLifecycle({
       uid,
       env,
       paths,
@@ -185,7 +185,15 @@ export async function installMacosLifecycle({
       registrations,
       execFileImpl,
     });
-    if (createdBackupPath) await rm(createdBackupPath, { force: true }).catch(() => {});
+    if (createdBackupPath) {
+      await attemptRollback(rollbackErrors, () => rm(createdBackupPath, { force: true }));
+    }
+    if (rollbackErrors.length > 0) {
+      throw new AggregateError(
+        [error, ...rollbackErrors],
+        `${error?.message || 'macOS install failed'}; rollback failed`,
+      );
+    }
     throw error;
   }
 }
@@ -257,9 +265,21 @@ export async function uninstallMacosLifecycle({
     await removeInstallState(paths.installStatePath);
     if (purgeSecrets) await purgeSecretsImpl();
   } catch (error) {
-    await restoreMacosLifecycleFiles({ paths, snapshots, env });
+    const rollbackErrors = await restoreMacosLifecycleFiles({ paths, snapshots, env });
     if (registrations) {
-      await restoreMacosRegistrations({ uid, env, paths, registrations, execFileImpl });
+      rollbackErrors.push(...await restoreMacosRegistrations({
+        uid,
+        env,
+        paths,
+        registrations,
+        execFileImpl,
+      }));
+    }
+    if (rollbackErrors.length > 0) {
+      throw new AggregateError(
+        [error, ...rollbackErrors],
+        `${error?.message || 'macOS uninstall failed'}; rollback failed`,
+      );
     }
     throw error;
   }
@@ -291,35 +311,59 @@ async function snapshotMacosRegistrations({ uid, env, execFileImpl }) {
 }
 
 async function rollbackMacosLifecycle({ uid, env, paths, snapshots, registrations, execFileImpl }) {
-  await rm(paths.markerPath, { force: true }).catch(() => {});
-  await stopMacosWatchdogService({ uid, env, execFileImpl }).catch(() => {});
-  await restoreMacosLifecycleFiles({ paths, snapshots, env });
-  await restoreMacosRegistrations({ uid, env, paths, registrations, execFileImpl });
+  const errors = [];
+  await attemptRollback(errors, () => rm(paths.markerPath, { force: true }));
+  await attemptRollback(errors, () => stopMacosWatchdogService({ uid, env, execFileImpl }));
+  errors.push(...await restoreMacosLifecycleFiles({ paths, snapshots, env }));
+  errors.push(...await restoreMacosRegistrations({
+    uid,
+    env,
+    paths,
+    registrations,
+    execFileImpl,
+  }));
+  return errors;
 }
 
 async function restoreMacosLifecycleFiles({ paths, snapshots, env }) {
+  const errors = [];
   for (const key of ['mainPlistPath', 'watchdogPlistPath', 'helperPath', 'settingsPath', 'installStatePath', 'markerPath']) {
-    await restoreMacosManagedFile({ path: paths[key], snapshot: snapshots[key], env });
+    await attemptRollback(errors, () => restoreMacosManagedFile({
+      path: paths[key],
+      snapshot: snapshots[key],
+      env,
+    }));
   }
+  return errors;
 }
 
 async function restoreMacosRegistrations({ uid, env, paths, registrations, execFileImpl }) {
-  await restoreMacosServiceRegistration({
+  const errors = [];
+  await attemptRollback(errors, () => restoreMacosServiceRegistration({
     uid,
     label: MACOS_MAIN_SERVICE_LABEL,
     plistPath: paths.mainPlistPath,
     registered: registrations.main,
     env,
     execFileImpl,
-  });
-  await restoreMacosServiceRegistration({
+  }));
+  await attemptRollback(errors, () => restoreMacosServiceRegistration({
     uid,
     label: MACOS_WATCHDOG_SERVICE_LABEL,
     plistPath: paths.watchdogPlistPath,
     registered: registrations.watchdog,
     env,
     execFileImpl,
-  });
+  }));
+  return errors;
+}
+
+async function attemptRollback(errors, operation) {
+  try {
+    await operation();
+  } catch (error) {
+    errors.push(error);
+  }
 }
 
 async function waitForMacosHealth({
@@ -332,7 +376,7 @@ async function waitForMacosHealth({
   const deadline = Date.now() + timeoutMs;
   do {
     try {
-      const health = await healthCheck();
+      const health = await runMacosHealthAttempt({ healthCheck, deadline });
       if (health?.ok === true && health.serviceGeneration === expectedServiceGeneration) return;
     } catch {
       // The service may still be starting.
@@ -341,6 +385,26 @@ async function waitForMacosHealth({
     await sleep(Math.min(intervalMs, Math.max(0, deadline - Date.now())));
   } while (Date.now() <= deadline);
   throw new Error('macOS service did not become healthy');
+}
+
+async function runMacosHealthAttempt({ healthCheck, deadline }) {
+  const remainingMs = Math.max(0, deadline - Date.now());
+  const controller = new AbortController();
+  let timer;
+  const timeout = new Promise((_, reject) => {
+    timer = setTimeout(() => {
+      controller.abort();
+      reject(new Error('macOS health attempt timed out'));
+    }, remainingMs);
+  });
+  try {
+    return await Promise.race([
+      Promise.resolve().then(() => healthCheck({ signal: controller.signal })),
+      timeout,
+    ]);
+  } finally {
+    clearTimeout(timer);
+  }
 }
 
 export function linuxNodeLauncherPath(configPath) {
