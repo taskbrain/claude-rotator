@@ -61,6 +61,7 @@ export function createProxyServer({
   logger = null,
   stateWriter = null,
   platform = process.platform,
+  serviceGeneration = null,
 }) {
   assertLoopbackProxyHost(config.proxy?.host || '127.0.0.1');
   const upstream = config.upstream || 'https://api.anthropic.com';
@@ -161,6 +162,7 @@ export function createProxyServer({
         sendJson(res, 200, {
           ok: true,
           currentAccount: accountManager.getStatus().currentAccount,
+          ...(serviceGeneration ? { serviceGeneration } : {}),
         });
         return;
       }

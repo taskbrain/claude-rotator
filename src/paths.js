@@ -48,3 +48,19 @@ export function claudeSettingsPath(home = homedir()) {
 export function linuxAccountsDir(env = process.env, home = homedir()) {
   return join(appDataDir(env, home), 'accounts');
 }
+
+export function macosServiceLockPath(env = process.env, home = homedir()) {
+  return join(appConfigDir(env, home), 'macos-service.lock');
+}
+
+export function macosWatchdogMarkerPath(env = process.env, home = homedir()) {
+  return join(appConfigDir(env, home), 'watchdog.json');
+}
+
+export function macosWatchdogHelperPath(env = process.env, home = homedir()) {
+  return join(appDataDir(env, home), 'macos-watchdog.sh');
+}
+
+export function macosWatchdogPlistPath(home = homedir()) {
+  return join(home, 'Library', 'LaunchAgents', 'io.github.claude-rotator.watchdog.plist');
+}

@@ -6830,12 +6830,14 @@ describe('createProxyServer', () => {
       accountManager,
       secretStore,
       config: { upstream: 'http://127.0.0.1:1' },
+      serviceGeneration: 'generation-1',
     }));
 
     const health = await requestJson(`${proxy.url}/internal/health`);
     const status = await requestJson(`${proxy.url}/internal/status`);
 
     assert.equal(health.body.ok, true);
+    assert.equal(health.body.serviceGeneration, 'generation-1');
     assert.equal(status.body.currentAccount, 'acct_1');
     assert.equal(JSON.stringify(status.body).includes('access-token-1'), false);
 

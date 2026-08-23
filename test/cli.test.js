@@ -1,7 +1,13 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
+import { EventEmitter } from 'node:events';
 
-import { ensureCredentialRevisions, runCli, startService } from '../src/cli.js';
+import {
+  ensureCredentialRevisions,
+  runCli,
+  runMacosCliActionWithLock,
+  startService,
+} from '../src/cli.js';
 
 describe('ensureCredentialRevisions', () => {
   it('assigns a non-secret baseline only to accounts missing a revision', () => {
@@ -34,6 +40,90 @@ describe('runCli', () => {
     assert.equal(code, 0);
     assert.match(io.output(), /claude-rotator install/);
     assert.match(io.output(), /claude-rotator monitor/);
+  });
+
+  it('routes public macOS install through the shared lock without forwarding unrelated arguments', async () => {
+    const io = createIo();
+    const calls = [];
+
+    const code = await runCli(['install', '--force'], {
+      ...io,
+      platform: 'darwin',
+      home: '/Users/alice',
+      env: {},
+      cliPath: '/app/bin/claude-rotator.js',
+      runLockedMacosAction: async options => {
+        calls.push(options);
+        return 0;
+      },
+    });
+
+    assert.equal(code, 0);
+    assert.equal(calls.length, 1);
+    assert.deepEqual(calls[0].argv, ['install', '--force']);
+    assert.equal(calls[0].lockPath, '/Users/alice/.config/claude-rotator/macos-service.lock');
+  });
+
+  it('reports a locked macOS child failure as a normal CLI failure', async () => {
+    const io = createIo();
+
+    const code = await runCli(['install'], {
+      ...io,
+      platform: 'darwin',
+      home: '/Users/alice',
+      env: {},
+      cliPath: '/app/bin/claude-rotator.js',
+      runLockedMacosAction: async () => { throw new Error('lock child failed'); },
+    });
+
+    assert.equal(code, 1);
+    assert.match(io.output(), /lock child failed/);
+  });
+
+  it('rejects the hidden macOS action unless the lock workflow marker is present', async () => {
+    const io = createIo();
+    let installCalls = 0;
+
+    const code = await runCli(['__macos-service-action', 'install'], {
+      ...io,
+      platform: 'darwin',
+      env: {},
+      installAction: async () => { installCalls += 1; },
+    });
+
+    assert.equal(code, 1);
+    assert.equal(installCalls, 0);
+    assert.match(io.output(), /shared lock/);
+  });
+
+  it('executes the hidden macOS action in the marked lock child', async () => {
+    const io = createIo();
+    const calls = [];
+
+    const code = await runCli(['__macos-service-action', 'install', '--no-start'], {
+      ...io,
+      platform: 'darwin',
+      env: { CLAUDE_ROTATOR_MACOS_SERVICE_LOCKED: '1' },
+      installAction: async options => { calls.push(options.argv); },
+    });
+
+    assert.equal(code, 0);
+    assert.deepEqual(calls, [['install', '--no-start']]);
+  });
+
+  it('keeps Linux install in-process', async () => {
+    const io = createIo();
+    let installCalls = 0;
+
+    const code = await runCli(['install', '--no-start'], {
+      ...io,
+      platform: 'linux',
+      installAction: async () => { installCalls += 1; },
+      runLockedMacosAction: async () => assert.fail('Linux must not use lockf'),
+    });
+
+    assert.equal(code, 0);
+    assert.equal(installCalls, 1);
   });
 
   it('prints status using injected status reader', async () => {
@@ -508,121 +598,84 @@ describe('runCli', () => {
   });
 });
 
+describe('runMacosCliActionWithLock', () => {
+  it('prepares the lock and re-execs the CLI through absolute lockf', async () => {
+    const calls = [];
+    const child = new EventEmitter();
+    const result = runMacosCliActionWithLock({
+      argv: ['uninstall', '--force'],
+      lockPath: '/Users/alice/.config/claude-rotator/macos-service.lock',
+      nodePath: '/usr/local/bin/node',
+      cliPath: '/app/bin/claude-rotator.js',
+      env: { PATH: '/usr/bin:/bin' },
+      prepareLockImpl: async options => calls.push(['prepare', options]),
+      spawnImpl: (command, args, options) => {
+        calls.push(['spawn', command, args, options]);
+        queueMicrotask(() => child.emit('exit', 0, null));
+        return child;
+      },
+    });
+
+    assert.equal(await result, 0);
+    assert.deepEqual(calls[0], ['prepare', {
+      lockPath: '/Users/alice/.config/claude-rotator/macos-service.lock',
+    }]);
+    assert.deepEqual(calls[1][0], 'spawn');
+    assert.equal(calls[1][1], '/usr/bin/lockf');
+    assert.deepEqual(calls[1][2], [
+      '-k',
+      '/Users/alice/.config/claude-rotator/macos-service.lock',
+      '/usr/local/bin/node',
+      '/app/bin/claude-rotator.js',
+      '__macos-service-action',
+      'uninstall',
+      '--force',
+    ]);
+    assert.equal(calls[1][3].env.CLAUDE_ROTATOR_MACOS_SERVICE_LOCKED, '1');
+    assert.equal(calls[1][3].stdio, 'inherit');
+  });
+});
+
 describe('startService', () => {
-  it('restarts a macOS LaunchAgent before kickstart', async () => {
+  it('requires the shared lock for macOS service changes', async () => {
     const calls = [];
 
-    await startService({
+    await assert.rejects(startService({
       platform: 'darwin',
       uid: 501,
       plistPath: '/Users/alice/Library/LaunchAgents/io.github.claude-rotator.plist',
-      sleepImpl: async () => {},
       execFileImpl: async (cmd, args) => {
         calls.push([cmd, args]);
       },
-    });
+    }), /shared lock/);
 
-    assert.deepEqual(calls, [
-      ['launchctl', ['bootout', 'gui/501/io.github.claude-rotator']],
-      ['launchctl', ['bootstrap', 'gui/501', '/Users/alice/Library/LaunchAgents/io.github.claude-rotator.plist']],
-      ['launchctl', ['print', 'gui/501/io.github.claude-rotator']],
-      ['launchctl', ['enable', 'gui/501/io.github.claude-rotator']],
-      ['launchctl', ['kickstart', '-k', 'gui/501/io.github.claude-rotator']],
-      ['launchctl', ['print', 'gui/501/io.github.claude-rotator']],
-    ]);
+    assert.deepEqual(calls, []);
   });
 
-  it('falls back to launchctl load when macOS bootstrap fails', async () => {
+  it('uses the verified macOS service reconciler while locked', async () => {
     const calls = [];
+    let registered = false;
 
     await startService({
       platform: 'darwin',
       uid: 501,
       plistPath: '/Users/alice/Library/LaunchAgents/io.github.claude-rotator.plist',
-      sleepImpl: async () => {},
+      definitionChanged: true,
+      env: { CLAUDE_ROTATOR_MACOS_SERVICE_LOCKED: '1' },
       execFileImpl: async (cmd, args) => {
         calls.push([cmd, args]);
-        if (args[0] === 'bootstrap') throw new Error('Bootstrap failed: 5');
+        assert.equal(cmd, '/bin/launchctl');
+        if (args[0] === 'print' && !registered) {
+          throw Object.assign(new Error('not found'), { code: 113 });
+        }
+        if (args[0] === 'bootstrap') registered = true;
       },
     });
 
     assert.deepEqual(calls, [
-      ['launchctl', ['bootout', 'gui/501/io.github.claude-rotator']],
-      ['launchctl', ['bootstrap', 'gui/501', '/Users/alice/Library/LaunchAgents/io.github.claude-rotator.plist']],
-      ['launchctl', ['bootstrap', 'gui/501', '/Users/alice/Library/LaunchAgents/io.github.claude-rotator.plist']],
-      ['launchctl', ['load', '-w', '/Users/alice/Library/LaunchAgents/io.github.claude-rotator.plist']],
-      ['launchctl', ['print', 'gui/501/io.github.claude-rotator']],
-      ['launchctl', ['enable', 'gui/501/io.github.claude-rotator']],
-      ['launchctl', ['kickstart', '-k', 'gui/501/io.github.claude-rotator']],
-      ['launchctl', ['print', 'gui/501/io.github.claude-rotator']],
-    ]);
-  });
-
-  it('retries bootstrap when load exits before registering the macOS service', async () => {
-    const calls = [];
-    let bootstrapCalls = 0;
-    let printCalls = 0;
-
-    await startService({
-      platform: 'darwin',
-      uid: 501,
-      plistPath: '/Users/alice/Library/LaunchAgents/io.github.claude-rotator.plist',
-      sleepImpl: async () => {},
-      execFileImpl: async (cmd, args) => {
-        calls.push([cmd, args]);
-        if (args[0] === 'bootstrap') {
-          bootstrapCalls += 1;
-          if (bootstrapCalls < 3) throw new Error('Bootstrap failed: 5');
-        }
-        if (args[0] === 'print') {
-          printCalls += 1;
-          if (printCalls < 3) throw new Error('service not found');
-        }
-      },
-    });
-
-    assert.deepEqual(calls, [
-      ['launchctl', ['bootout', 'gui/501/io.github.claude-rotator']],
-      ['launchctl', ['bootstrap', 'gui/501', '/Users/alice/Library/LaunchAgents/io.github.claude-rotator.plist']],
-      ['launchctl', ['bootstrap', 'gui/501', '/Users/alice/Library/LaunchAgents/io.github.claude-rotator.plist']],
-      ['launchctl', ['load', '-w', '/Users/alice/Library/LaunchAgents/io.github.claude-rotator.plist']],
-      ['launchctl', ['print', 'gui/501/io.github.claude-rotator']],
-      ['launchctl', ['print', 'gui/501/io.github.claude-rotator']],
-      ['launchctl', ['bootstrap', 'gui/501', '/Users/alice/Library/LaunchAgents/io.github.claude-rotator.plist']],
-      ['launchctl', ['print', 'gui/501/io.github.claude-rotator']],
-      ['launchctl', ['enable', 'gui/501/io.github.claude-rotator']],
-      ['launchctl', ['kickstart', '-k', 'gui/501/io.github.claude-rotator']],
-      ['launchctl', ['print', 'gui/501/io.github.claude-rotator']],
-    ]);
-  });
-
-  it('retries bootstrap when the macOS service disappears after kickstart', async () => {
-    const calls = [];
-    let printCalls = 0;
-
-    await startService({
-      platform: 'darwin',
-      uid: 501,
-      plistPath: '/Users/alice/Library/LaunchAgents/io.github.claude-rotator.plist',
-      sleepImpl: async () => {},
-      execFileImpl: async (cmd, args) => {
-        calls.push([cmd, args]);
-        if (args[0] === 'print') {
-          printCalls += 1;
-          if (printCalls === 2) throw new Error('service not found');
-        }
-      },
-    });
-
-    assert.deepEqual(calls, [
-      ['launchctl', ['bootout', 'gui/501/io.github.claude-rotator']],
-      ['launchctl', ['bootstrap', 'gui/501', '/Users/alice/Library/LaunchAgents/io.github.claude-rotator.plist']],
-      ['launchctl', ['print', 'gui/501/io.github.claude-rotator']],
-      ['launchctl', ['enable', 'gui/501/io.github.claude-rotator']],
-      ['launchctl', ['kickstart', '-k', 'gui/501/io.github.claude-rotator']],
-      ['launchctl', ['print', 'gui/501/io.github.claude-rotator']],
-      ['launchctl', ['bootstrap', 'gui/501', '/Users/alice/Library/LaunchAgents/io.github.claude-rotator.plist']],
-      ['launchctl', ['print', 'gui/501/io.github.claude-rotator']],
+      ['/bin/launchctl', ['print', 'gui/501/io.github.claude-rotator']],
+      ['/bin/launchctl', ['bootstrap', 'gui/501', '/Users/alice/Library/LaunchAgents/io.github.claude-rotator.plist']],
+      ['/bin/launchctl', ['print', 'gui/501/io.github.claude-rotator']],
     ]);
   });
 });

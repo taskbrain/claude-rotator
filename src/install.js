@@ -1,12 +1,29 @@
+import { createHash } from 'node:crypto';
 import { copyFile, mkdir, readFile, rm, symlink } from 'node:fs/promises';
 import { dirname, join } from 'node:path';
 
 import { mergeClaudeSettings, restoreClaudeSettings } from './config.js';
 import { fileSha256, readJsonFile, writeJsonFile } from './json-file.js';
+import {
+  assertMacosServiceLockHeld,
+  isMacosServiceRegistered,
+  MACOS_MAIN_SERVICE_LABEL,
+  MACOS_WATCHDOG_SERVICE_LABEL,
+  reconcileMacosMainService,
+  removeMacosManagedFile,
+  replaceMacosManagedFile,
+  restoreMacosManagedFile,
+  restoreMacosServiceRegistration,
+  snapshotMacosManagedFile,
+  startMacosWatchdogService,
+  stopMacosMainService,
+  stopMacosWatchdogService,
+} from './macos-service.js';
 
 export const MACOS_LAUNCH_AGENT_LABEL = 'io.github.claude-rotator';
 export const SERVICE_NODE_OPTIONS = '--dns-result-order=ipv4first';
 export const LINUX_NODE_LAUNCHER_NAME = 'claude-rotator';
+export const SERVICE_GENERATION_ENV = 'CLAUDE_ROTATOR_SERVICE_GENERATION';
 
 export async function installSettings({
   settingsPath,
@@ -57,6 +74,275 @@ export async function removeInstallState(installStatePath) {
   await rm(installStatePath, { force: true });
 }
 
+export async function installMacosLifecycle({
+  uid,
+  env = process.env,
+  paths,
+  artifacts,
+  backupDir,
+  proxyBaseUrl,
+  expectedServiceGeneration,
+  healthCheck,
+  force = false,
+  noStart = false,
+  execFileImpl,
+  healthTimeoutMs = 15_000,
+  healthPollIntervalMs = 100,
+  sleep = delay => new Promise(resolve => setTimeout(resolve, delay)),
+}) {
+  assertMacosServiceLockHeld(env);
+  const snapshots = await snapshotMacosLifecycleFiles(paths);
+  const previousInstallState = snapshots.installStatePath.exists
+    ? JSON.parse(snapshots.installStatePath.bytes.toString('utf8'))
+    : null;
+  const registrations = await snapshotMacosRegistrations({ uid, env, execFileImpl });
+  let createdBackupPath = null;
+
+  try {
+    await rm(paths.markerPath, { force: true });
+    await stopMacosWatchdogService({ uid, env, execFileImpl });
+    await replaceMacosManagedFile({
+      path: paths.mainPlistPath,
+      contents: artifacts.mainPlist,
+      mode: 0o600,
+      env,
+    });
+    await replaceMacosManagedFile({
+      path: paths.watchdogPlistPath,
+      contents: artifacts.watchdogPlist,
+      mode: 0o600,
+      env,
+    });
+    await replaceMacosManagedFile({
+      path: paths.helperPath,
+      contents: artifacts.helper,
+      mode: 0o700,
+      env,
+    });
+
+    if (noStart) {
+      await stopMacosMainService({ uid, env, execFileImpl });
+      if (previousInstallState) {
+        const result = await uninstallSettings({
+          settingsPath: paths.settingsPath,
+          installStatePath: paths.installStatePath,
+          force,
+        });
+        if (result.conflict) throw new Error(result.reason);
+        await removeInstallState(paths.installStatePath);
+      }
+      return;
+    }
+
+    const definitionChanged = !snapshots.mainPlistPath.exists
+      || !snapshots.mainPlistPath.bytes.equals(Buffer.from(artifacts.mainPlist));
+    await reconcileMacosMainService({
+      uid,
+      plistPath: paths.mainPlistPath,
+      definitionChanged,
+      env,
+      execFileImpl,
+    });
+    await waitForMacosHealth({
+      healthCheck,
+      expectedServiceGeneration,
+      timeoutMs: healthTimeoutMs,
+      intervalMs: healthPollIntervalMs,
+      sleep,
+    });
+    const installState = previousInstallState
+      ? await updateMacosInstalledSettings({
+        settingsPath: paths.settingsPath,
+        installStatePath: paths.installStatePath,
+        previousInstallState,
+        proxyBaseUrl,
+        force,
+      })
+      : await installSettings({
+        settingsPath: paths.settingsPath,
+        installStatePath: paths.installStatePath,
+        backupDir,
+        proxyBaseUrl,
+        force,
+      });
+    if (!previousInstallState) createdBackupPath = installState.backupPath;
+    await writeJsonFile(paths.markerPath, {
+      version: 1,
+      installStateSha256: await fileSha256(paths.installStatePath),
+    });
+    await startMacosWatchdogService({
+      uid,
+      plistPath: paths.watchdogPlistPath,
+      env,
+      execFileImpl,
+    });
+  } catch (error) {
+    await rollbackMacosLifecycle({
+      uid,
+      env,
+      paths,
+      snapshots,
+      registrations,
+      execFileImpl,
+    });
+    if (createdBackupPath) await rm(createdBackupPath, { force: true }).catch(() => {});
+    throw error;
+  }
+}
+
+async function updateMacosInstalledSettings({
+  settingsPath,
+  installStatePath,
+  previousInstallState,
+  proxyBaseUrl,
+  force,
+}) {
+  if (
+    previousInstallState.settingsPath !== settingsPath
+    || typeof previousInstallState.backupPath !== 'string'
+    || typeof previousInstallState.proxyBaseUrl !== 'string'
+  ) {
+    throw new Error('Existing macOS install state is invalid');
+  }
+  const settings = await readJsonFile(settingsPath, {});
+  const currentBaseUrl = settings.env?.ANTHROPIC_BASE_URL;
+  if (
+    currentBaseUrl
+    && currentBaseUrl !== previousInstallState.proxyBaseUrl
+    && currentBaseUrl !== proxyBaseUrl
+    && !force
+  ) {
+    throw new Error(`ANTHROPIC_BASE_URL changed after install: ${currentBaseUrl}`);
+  }
+  const merged = mergeClaudeSettings(settings, proxyBaseUrl);
+  await writeJsonFile(settingsPath, merged.settings);
+  const nextState = {
+    ...previousInstallState,
+    installedAt: new Date().toISOString(),
+    proxyBaseUrl,
+  };
+  await writeJsonFile(installStatePath, nextState);
+  return nextState;
+}
+
+export async function uninstallMacosLifecycle({
+  uid,
+  env = process.env,
+  paths,
+  force = false,
+  purgeSecrets = false,
+  execFileImpl,
+  purgeSecretsImpl = async () => {},
+}) {
+  assertMacosServiceLockHeld(env);
+  const snapshots = await snapshotMacosLifecycleFiles(paths);
+  if (snapshots.installStatePath.exists) {
+    const result = await uninstallSettings({
+      settingsPath: paths.settingsPath,
+      installStatePath: paths.installStatePath,
+      force,
+    });
+    if (result.conflict) throw new Error(result.reason);
+  }
+
+  let registrations;
+  try {
+    registrations = await snapshotMacosRegistrations({ uid, env, execFileImpl });
+    await rm(paths.markerPath, { force: true });
+    await stopMacosWatchdogService({ uid, env, execFileImpl });
+    await stopMacosMainService({ uid, env, execFileImpl });
+    for (const key of ['mainPlistPath', 'watchdogPlistPath', 'helperPath']) {
+      await removeMacosManagedFile({ path: paths[key], env });
+    }
+    await removeInstallState(paths.installStatePath);
+    if (purgeSecrets) await purgeSecretsImpl();
+  } catch (error) {
+    await restoreMacosLifecycleFiles({ paths, snapshots, env });
+    if (registrations) {
+      await restoreMacosRegistrations({ uid, env, paths, registrations, execFileImpl });
+    }
+    throw error;
+  }
+}
+
+async function snapshotMacosLifecycleFiles(paths) {
+  const entries = await Promise.all(
+    ['mainPlistPath', 'watchdogPlistPath', 'helperPath', 'markerPath', 'settingsPath', 'installStatePath']
+      .map(async key => [key, await snapshotMacosManagedFile(paths[key])]),
+  );
+  return Object.fromEntries(entries);
+}
+
+async function snapshotMacosRegistrations({ uid, env, execFileImpl }) {
+  return {
+    main: await isMacosServiceRegistered({
+      uid,
+      label: MACOS_MAIN_SERVICE_LABEL,
+      env,
+      execFileImpl,
+    }),
+    watchdog: await isMacosServiceRegistered({
+      uid,
+      label: MACOS_WATCHDOG_SERVICE_LABEL,
+      env,
+      execFileImpl,
+    }),
+  };
+}
+
+async function rollbackMacosLifecycle({ uid, env, paths, snapshots, registrations, execFileImpl }) {
+  await rm(paths.markerPath, { force: true }).catch(() => {});
+  await stopMacosWatchdogService({ uid, env, execFileImpl }).catch(() => {});
+  await restoreMacosLifecycleFiles({ paths, snapshots, env });
+  await restoreMacosRegistrations({ uid, env, paths, registrations, execFileImpl });
+}
+
+async function restoreMacosLifecycleFiles({ paths, snapshots, env }) {
+  for (const key of ['mainPlistPath', 'watchdogPlistPath', 'helperPath', 'settingsPath', 'installStatePath', 'markerPath']) {
+    await restoreMacosManagedFile({ path: paths[key], snapshot: snapshots[key], env });
+  }
+}
+
+async function restoreMacosRegistrations({ uid, env, paths, registrations, execFileImpl }) {
+  await restoreMacosServiceRegistration({
+    uid,
+    label: MACOS_MAIN_SERVICE_LABEL,
+    plistPath: paths.mainPlistPath,
+    registered: registrations.main,
+    env,
+    execFileImpl,
+  });
+  await restoreMacosServiceRegistration({
+    uid,
+    label: MACOS_WATCHDOG_SERVICE_LABEL,
+    plistPath: paths.watchdogPlistPath,
+    registered: registrations.watchdog,
+    env,
+    execFileImpl,
+  });
+}
+
+async function waitForMacosHealth({
+  healthCheck,
+  expectedServiceGeneration,
+  timeoutMs,
+  intervalMs,
+  sleep,
+}) {
+  const deadline = Date.now() + timeoutMs;
+  do {
+    try {
+      const health = await healthCheck();
+      if (health?.ok === true && health.serviceGeneration === expectedServiceGeneration) return;
+    } catch {
+      // The service may still be starting.
+    }
+    if (Date.now() >= deadline) break;
+    await sleep(Math.min(intervalMs, Math.max(0, deadline - Date.now())));
+  } while (Date.now() <= deadline);
+  throw new Error('macOS service did not become healthy');
+}
+
 export function linuxNodeLauncherPath(configPath) {
   return join(dirname(configPath), 'runtime', LINUX_NODE_LAUNCHER_NAME);
 }
@@ -79,6 +365,7 @@ export function renderLaunchAgentPlist({
   configPath,
   claudePath,
   servicePath,
+  serviceGeneration = null,
 }) {
   return `<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -102,7 +389,9 @@ export function renderLaunchAgentPlist({
     <string>${xmlEscape(claudePath)}</string>
     <key>PATH</key>
     <string>${xmlEscape(servicePath)}</string>
-  </dict>
+${serviceGeneration ? `    <key>${SERVICE_GENERATION_ENV}</key>
+    <string>${xmlEscape(serviceGeneration)}</string>
+` : ''}  </dict>
   <key>RunAtLoad</key>
   <true/>
   <key>KeepAlive</key>
@@ -114,6 +403,22 @@ export function renderLaunchAgentPlist({
 </dict>
 </plist>
 `;
+}
+
+export function serviceGenerationForLaunchAgent({
+  nodePath,
+  cliPath,
+  configPath,
+  claudePath,
+  servicePath,
+}) {
+  return createHash('sha256').update(JSON.stringify({
+    nodePath,
+    cliPath,
+    configPath,
+    claudePath,
+    servicePath,
+  })).digest('hex');
 }
 
 export function renderSystemdUserService({
@@ -157,10 +462,7 @@ export function renderServiceStartFailureMessage({
     return [
       `Service start failed: ${reason}`,
       'Try:',
-      `  launchctl bootout ${domain}/${MACOS_LAUNCH_AGENT_LABEL} 2>/dev/null || true`,
-      `  launchctl bootstrap ${domain} ~/Library/LaunchAgents/${MACOS_LAUNCH_AGENT_LABEL}.plist`,
-      `  launchctl load -w ~/Library/LaunchAgents/${MACOS_LAUNCH_AGENT_LABEL}.plist`,
-      `  launchctl kickstart -k ${domain}/${MACOS_LAUNCH_AGENT_LABEL}`,
+      '  claude-rotator install --force',
       `  launchctl print ${domain}/${MACOS_LAUNCH_AGENT_LABEL}`,
     ].join('\n');
   }

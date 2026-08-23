@@ -10,7 +10,15 @@ import {
   restoreClaudeSettings,
 } from '../src/config.js';
 import { writeJsonFile, readJsonFile, fileSha256 } from '../src/json-file.js';
-import { defaultConfigPath, expandHome, xdgConfigHome } from '../src/paths.js';
+import {
+  defaultConfigPath,
+  expandHome,
+  macosServiceLockPath,
+  macosWatchdogHelperPath,
+  macosWatchdogMarkerPath,
+  macosWatchdogPlistPath,
+  xdgConfigHome,
+} from '../src/paths.js';
 
 describe('path helpers', () => {
   it('resolves XDG config path and expands home', () => {
@@ -19,6 +27,30 @@ describe('path helpers', () => {
     assert.equal(xdgConfigHome(env, '/home/alice'), '/tmp/xdg');
     assert.equal(defaultConfigPath(env, '/home/alice'), '/tmp/xdg/claude-rotator/config.json');
     assert.equal(expandHome('~/settings.json', '/home/alice'), '/home/alice/settings.json');
+  });
+
+  it('keeps every WatchDock asset under the user-owned config, data, or LaunchAgents directory', () => {
+    const env = {
+      XDG_CONFIG_HOME: '/Users/alice/.config',
+      XDG_DATA_HOME: '/Users/alice/.local/share',
+    };
+
+    assert.equal(
+      macosServiceLockPath(env, '/Users/alice'),
+      '/Users/alice/.config/claude-rotator/macos-service.lock',
+    );
+    assert.equal(
+      macosWatchdogMarkerPath(env, '/Users/alice'),
+      '/Users/alice/.config/claude-rotator/watchdog.json',
+    );
+    assert.equal(
+      macosWatchdogHelperPath(env, '/Users/alice'),
+      '/Users/alice/.local/share/claude-rotator/macos-watchdog.sh',
+    );
+    assert.equal(
+      macosWatchdogPlistPath('/Users/alice'),
+      '/Users/alice/Library/LaunchAgents/io.github.claude-rotator.watchdog.plist',
+    );
   });
 });
 
