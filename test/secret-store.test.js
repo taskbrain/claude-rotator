@@ -208,6 +208,42 @@ describe('LinuxFileSecretStore', () => {
     );
   });
 
+  it('bounds lock acquisition with a monotonic clock even if the wall clock jumps backward', {
+    timeout: 2_000,
+  }, async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'claude-rotator-secrets-'));
+    const accountsDir = join(dir, 'accounts');
+    const lockPath = join(accountsDir, '.locks', 'acct_1.lock');
+    await mkdir(lockPath, { recursive: true, mode: 0o700 });
+    await writeFile(join(lockPath, 'owner.json'), JSON.stringify({
+      token: 'live-lock',
+      pid: process.pid,
+      hostname: hostname(),
+      acquiredAt: Date.now(),
+    }), { mode: 0o600 });
+
+    const wallClockBase = Date.now();
+    let wallClockCalls = 0;
+    const store = new LinuxFileSecretStore({
+      accountsDir,
+      lockAcquireTimeoutMs: 300,
+      lockRetryMs: 10,
+      // Simulates an NTP-style backward wall-clock jump: the first read
+      // captures "started at", every read after that is 60s in the past.
+      now: () => {
+        wallClockCalls += 1;
+        return wallClockCalls === 1 ? wallClockBase : wallClockBase - 60_000;
+      },
+    });
+
+    const startedAt = performance.now();
+    await assert.rejects(
+      () => store.delete('acct_1'),
+      error => error.code === 'SECRET_STORE_LOCK_TIMEOUT',
+    );
+    assert.ok(performance.now() - startedAt < 2_000);
+  });
+
   it('does not destroy a live account lock while purging secrets', async () => {
     const dir = await mkdtemp(join(tmpdir(), 'claude-rotator-secrets-'));
     const accountsDir = join(dir, 'accounts');
