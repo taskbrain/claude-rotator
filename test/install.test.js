@@ -248,7 +248,7 @@ describe('service file rendering', () => {
   });
 });
 
-describe('macOS WatchDock lifecycle', () => {
+describe('macOS watchdog lifecycle', () => {
   it('installs the main service before committing settings, marker, and watchdog', async () => {
     const fixture = await createMacosLifecycleFixture();
     try {

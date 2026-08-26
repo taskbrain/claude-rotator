@@ -37,7 +37,7 @@ describe('path helpers', () => {
     assert.equal(xdgDataHome(env, '/home/alice'), '/home/alice/.local/share');
   });
 
-  it('keeps every WatchDock asset under the user-owned config, data, or LaunchAgents directory', () => {
+  it('keeps every watchdog asset under the user-owned config, data, or LaunchAgents directory', () => {
     const env = {
       XDG_CONFIG_HOME: '/Users/alice/.config',
       XDG_DATA_HOME: '/Users/alice/.local/share',

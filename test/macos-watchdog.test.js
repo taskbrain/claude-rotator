@@ -15,7 +15,7 @@ import { fileSha256, writeJsonFile } from '../src/json-file.js';
 
 const execFileAsync = promisify(execFile);
 
-describe('macOS WatchDock helper', () => {
+describe('macOS watchdog helper', () => {
   it('does nothing when the desired-generation marker is absent or stale', async () => {
     const fixture = await createFixture();
     try {

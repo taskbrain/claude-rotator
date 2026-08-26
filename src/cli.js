@@ -549,7 +549,7 @@ async function installMacosCommand({
   });
   write(`Installed claude-rotator at ${proxyBaseUrl(config)}\n`);
   if (noStart) write('Service start skipped because --no-start was set.\n');
-  else write('Service and WatchDock started\n');
+  else write('Service and watchdog started\n');
 }
 
 function macosLifecyclePaths({ env, home, settingsPath, statePath }) {
