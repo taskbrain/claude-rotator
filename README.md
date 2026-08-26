@@ -30,6 +30,7 @@ npm レジストリでは配布していません（`package.json` は `"private
 - [トラブルシュート](#トラブルシュート)
 - [安全設計](#安全設計)
 - [開発](#開発)
+- [English](#english)
 
 ## なぜ作ったか
 
@@ -608,89 +609,606 @@ docker run --rm -v "$PWD":/app -w /app node:22-alpine npm run check
 
 ## English
 
-Local Claude Code account rotator for macOS and Linux.
+An unofficial, local-only proxy tool that automatically rotates multiple Claude Code accounts. Runs on macOS and Linux.
 
-`claude-rotator` runs a localhost Anthropic-compatible proxy and configures Claude Code to use it through `~/.claude/settings.json`. After installation, you continue launching Claude Code with the normal `claude` command.
+`claude-rotator` runs an Anthropic-compatible HTTP proxy that listens only on `127.0.0.1`, and points Claude Code's `~/.claude/settings.json` `ANTHROPIC_BASE_URL` at it. After installation you keep launching Claude Code with the ordinary `claude` command.
 
-The credential-bearing proxy is restricted to loopback. Requests with a non-loopback `Host` or cross-site browser metadata are rejected before forwarding. The proxy does not authenticate local clients, so it trusts every OS user and process on the same host that can connect to loopback. Run it only on a single-user or otherwise fully trusted host; a dedicated OS user alone does not isolate loopback TCP.
+**Zero dependencies** ([package.json](./package.json) has no `dependencies`; everything is built on Node.js's standard library). With no third-party packages in the supply chain, auditing the code by reading it stays cheap.
 
-### Important notes
+This package is not published to the npm registry (`package.json` sets `"private": true`). To use it, clone this repository and install it globally from the local checkout with `npm install -g .`.
+
+### Table of Contents
+
+- [Why](#why)
+- [What It Does](#what-it-does)
+- [How It Works](#how-it-works)
+- [Important Notes](#important-notes)
+- [Requirements](#requirements)
+- [Setup](#setup)
+- [Account Registration](#account-registration)
+- [Monitor](#monitor)
+- [Configuration and Environment Variables](#configuration-and-environment-variables)
+- [Logs and Rotation Diagnostics](#logs-and-rotation-diagnostics)
+- [Commands](#commands)
+- [Update](#update)
+- [Uninstall](#uninstall)
+- [Troubleshooting](#troubleshooting)
+- [Security Design](#security-design)
+- [Development](#development)
+
+### Why
+
+Claude Code tracks usage against two limits: a short-term one that resets every 5 hours (the "5-hour window") and a long-term one that resets every 7 days (the "7-day window"). Once either reaches 100%, that account stops returning responses.
+
+If you have more than one Claude account, you can keep working by switching from an account that has hit its limit to one that hasn't. Doing that by hand has problems, though:
+
+- You don't notice a limit was reached and keep running `claude`, hitting errors.
+- Even after noticing, switching means running `claude auth login` again for a different account.
+- You have to keep checking Anthropic's own status information to know when each account resets.
+
+`claude-rotator` solves this by putting a local proxy between Claude Code and the Anthropic API. The proxy periodically fetches each account's usage, and once the current account hits its limit, it automatically switches to another available account and resends the same request. Nothing about how you use or configure Claude Code itself changes.
+
+### What It Does
+
+- Keeps the normal `claude` command as-is, backed by the `claude-rotator` proxy behind the scenes
+- Watches 5h/7d usage and switches to the least-used known account once the current one reaches 100%
+- If every account is exhausted, re-picks the one with the soonest reset as the resume candidate
+- `claude-rotator monitor` lists every account's usage
+- Stores credentials in Keychain on macOS, and in a private-permission file on Linux
+- `claude-rotator uninstall` restores `~/.claude/settings.json`
+
+### How It Works
+
+```mermaid
+flowchart LR
+    CC["Claude Code<br/>(claude command)"] -->|"ANTHROPIC_BASE_URL"| P(("claude-rotator<br/>127.0.0.1:37891"))
+    P -->|"forwards with the<br/>active account's token"| API["api.anthropic.com"]
+    API -->|"200 OK"| CC
+    API -->|"429 (quota reached)"| P
+    P -->|"switches to the next<br/>available account, then retries"| API
+    U["OAuth Usage API"] -.->|"polls 5h/7d usage<br/>(default: every 15 min)"| P
+```
+
+1. `claude-rotator install` rewrites Claude Code's config file (`~/.claude/settings.json`) so `ANTHROPIC_BASE_URL` points at this proxy (default `http://127.0.0.1:37891`).
+2. When you run `claude`, the request first reaches the `claude-rotator` proxy listening on your own machine. The proxy rejects any `Host` header other than `127.0.0.1` and any cross-site request from a browser.
+3. The proxy attaches the OAuth token of the currently active account and forwards the request to `https://api.anthropic.com`.
+4. If Anthropic returns 429 (quota reached), or a periodic Usage API fetch shows the current account has reached 100%, the proxy automatically switches to whichever known account is most available and resends the same request.
+5. Each account's 5h/7d usage is fetched in the background every 15 minutes by default (`claude-rotator refresh-usage` fetches it immediately on demand).
+
+### Important Notes
 
 - This project is an **unofficial** tool for Anthropic / Claude Code. It is not affiliated with, endorsed by, or supported by Anthropic.
 - You are responsible for using it within your own agreement with Anthropic, the Anthropic Terms of Service, and any policies of your organization. You bear responsibility for any resulting violation.
 - This tool is provided under the [MIT License](./LICENSE) **with no warranty** ("AS IS").
 - Credentials are stored locally on each machine only, by design never saved to or sent from this repository. On shared machines or unencrypted disks, protect the storage location (macOS: Keychain / Ubuntu: local file) accordingly.
 
-### Install
+### Requirements
+
+- **Multiple Claude accounts are required.** This tool exists to switch from an account that has hit its limit to another one; with only a single account under contract there is nothing to rotate to, so there is no point installing it.
+- Node.js 18.10 or later
+- Claude Code itself must already be installed (`claude-rotator` is a proxy that reads and relays Claude Code's own credentials; it is not a replacement for Claude Code)
+- macOS: uses a LaunchAgent
+- Ubuntu: uses a systemd user service
+
+Claude Code usage is tracked as a "5-hour window" (a short-term limit that resets every 5 hours) and a "7-day window" (a long-term limit that resets every 7 days). See [Why](#why) for details.
+
+Credentials are stored per machine. If you use another Mac or Ubuntu machine, run `claude auth login` and `claude-rotator login` on that machine too, for each account.
+
+### Setup
+
+**Important**: `claude-rotator install` rewrites Claude Code's settings so that every subsequent request goes through this proxy. If not a single account is registered with the proxy at that point, Claude Code stops working. **Always register at least one account with `claude-rotator login` before running `install`.**
+
+#### macOS Installation
+
+Clone this repository and run the following from inside it. Since this package is not published to the npm registry (`package.json` sets `private: true`), an ordinary global install such as `npm install -g claude-rotator` will not work.
 
 ```bash
+git clone https://github.com/taskbrain/claude-rotator.git
+cd claude-rotator
 npm install -g .
-claude-rotator install
 ```
 
-`install` updates only `env.ANTHROPIC_BASE_URL` in `~/.claude/settings.json`, records the previous value in `~/.config/claude-rotator/install-state.json`, and writes a service definition:
-
-- macOS: `~/Library/LaunchAgents/io.github.claude-rotator.plist` and `io.github.claude-rotator.watchdog.plist`
-- Ubuntu/Linux: `~/.config/systemd/user/claude-rotator.service`
-
-On macOS, WatchDock checks the main LaunchAgent registration every 15 seconds and restores it only after an unintended `bootout`. It shares the installer lock, so it cannot resurrect the main job during uninstall. Use `claude-rotator uninstall` for an intentional stop. `install --no-start` writes the service assets but leaves Claude Code settings unchanged, both jobs unregistered, and recovery disabled.
-
-On macOS and Ubuntu/Linux, installation resolves Claude Code to an executable absolute path and records it as `CLAUDE_ROTATOR_CLAUDE_BIN`, together with the required service `PATH`. This keeps Homebrew, nvm, asdf, Volta, and custom npm-prefix installs available under launchd or systemd's minimal environment. Set `CLAUDE_ROTATOR_CLAUDE_BIN=/absolute/path/to/claude` before `claude-rotator install` to override discovery.
-
-Ubuntu uses a systemd user service:
-
-```bash
-systemctl --user status claude-rotator.service
-journalctl --user -u claude-rotator.service -f
-```
-
-If `systemctl --user` is unavailable in a headless session, enable linger and log in again:
-
-```bash
-loginctl enable-linger $USER
-```
-
-### Add Accounts
-
-The easiest workflow is to reuse the currently logged-in Claude Code account:
+First, log in to Claude Code as usual, then register that login with `claude-rotator`.
 
 ```bash
 claude auth login
 claude-rotator login
 ```
 
-`claude auth login` and `claude-rotator login` do not automatically switch the rotator's active account. They only change or import the Claude Code login. The account actually used for API requests is the `active` account shown by `claude-rotator status`.
-
-Credentials are machine-local. Run `claude auth login` and `claude-rotator login` on each macOS or Ubuntu machine that should use the rotator.
-
-You can still provide an explicit id/name:
+Once an account is registered, install the proxy.
 
 ```bash
-claude-rotator login --id account1 --name your-email@example.com
+claude-rotator install
+claude-rotator doctor
 ```
 
-`claude-rotator login --json ...` is an advanced command that passes the token JSON directly; use plain `claude-rotator login` for normal operation. When you do use it, pipe the JSON through stdin with `claude-rotator login --id <id> --name <email> --json -` instead of passing the value as a literal argument. Passing `--json <token-json>` directly leaves it visible to other users via `ps auxww` or `/proc/<pid>/cmdline` on Linux, and it also lands in your shell history.
+`install` updates only `env.ANTHROPIC_BASE_URL` in `~/.claude/settings.json`, and records the previous value in `~/.config/claude-rotator/install-state.json`.
+
+On macOS, the following LaunchAgents are created:
+
+```text
+~/Library/LaunchAgents/io.github.claude-rotator.plist
+~/Library/LaunchAgents/io.github.claude-rotator.watchdog.plist
+```
+
+The watchdog checks the main LaunchAgent's registration every 15 seconds and re-registers it only if it was unintentionally `bootout`. It uses the same `lockf` lock as install/uninstall, so it never revives the main job during an uninstall. Use `claude-rotator uninstall` for an intentional stop. `install --no-start` deploys the assets only — it does **not** touch Claude Code's settings, and leaves both LaunchAgents and the recovery marker disabled.
+
+At install time, Claude Code's executable is resolved to an absolute path and pinned as `CLAUDE_ROTATOR_CLAUDE_BIN`, together with a safe `PATH`, for both the macOS LaunchAgent and the Ubuntu systemd user service. This prevents a `claude` managed by Homebrew, nvm, asdf, Volta, or a custom npm prefix from being found only in an interactive shell and not by the background service. To pin the location explicitly, set `CLAUDE_ROTATOR_CLAUDE_BIN=/absolute/path/to/claude` before installing.
+
+Service operations:
+
+```bash
+launchctl print gui/$(id -u)/io.github.claude-rotator
+launchctl kickstart -k gui/$(id -u)/io.github.claude-rotator
+```
+
+#### Ubuntu Installation
+
+Clone this repository on the Ubuntu machine and run the following from inside it. As above, since this package is not published to the npm registry (`package.json` sets `private: true`), an ordinary global install is not possible.
+
+```bash
+git clone https://github.com/taskbrain/claude-rotator.git
+cd claude-rotator
+node --version
+npm install -g .
+```
+
+`node --version` must be `v18.10` or later.
+
+First, log in to Claude Code as usual, then register that login with `claude-rotator`.
+
+```bash
+claude auth login
+claude-rotator login
+```
+
+Once an account is registered, install the proxy.
+
+```bash
+claude-rotator install
+claude-rotator doctor
+```
+
+On Ubuntu, the following systemd user service is created:
+
+```text
+~/.config/systemd/user/claude-rotator.service
+```
+
+Service operations:
+
+```bash
+systemctl --user status claude-rotator.service
+systemctl --user restart claude-rotator.service
+journalctl --user -u claude-rotator.service -f
+```
+
+If `claude-rotator install` fails to start the service through `systemctl --user`, run the command it printed. In a headless / SSH session without a user systemd bus, you may also need:
+
+```bash
+loginctl enable-linger $USER
+systemctl --user daemon-reload
+systemctl --user enable --now claude-rotator.service
+```
+
+Note: `install --no-start` on Linux **still rewrites `~/.claude/settings.json`** and only skips starting the systemd service (unlike macOS, where `--no-start` leaves the settings alone). If you want to deploy the assets without touching the settings, run `claude-rotator uninstall` right after `--no-start` to restore them.
+
+Both the CLI and the macOS/Ubuntu service definitions prefer IPv4 DNS resolution, so things keep working even in environments where Node.js would otherwise pick an IPv6 route that black-holes. If an existing install's service is missing `NODE_OPTIONS=--dns-result-order=ipv4first`, update the repository and run `claude-rotator install --force`, or update and restart the service definition manually.
+
+The Ubuntu installer also creates a Node.js launcher for the systemd service at `~/.config/claude-rotator/runtime/claude-rotator`. This lets the rotator proxy be distinguished from ordinary Node.js workloads in setups where `earlyoom --prefer` broadly prioritizes killing `node` processes. This does not reserve memory, so if `journalctl -u earlyoom` keeps showing kill records, also check memory usage and earlyoom's `--avoid` / `--ignore` settings.
+
+### Account Registration
+
+[Setup](#setup) already registered your first account. To rotate between multiple accounts, register the others the same way.
+
+`claude-rotator login` reads the current Claude Code login and registers it, fetching the email automatically when possible.
+
+Important: `claude auth login` and `claude-rotator login` change or import the Claude Code side's current login — they do not by themselves switch which account is actually used for API requests. The account used for requests is whichever one `claude-rotator status` reports as `active`. Logging in as a different account and running `claude-rotator login` does not, on its own, change `active`.
+
+To save and rotate between several accounts individually, log in to Claude Code as each one and run `claude-rotator login` each time:
+
+```bash
+claude auth login
+claude-rotator login
+
+claude auth login
+claude-rotator login
+```
+
+You can also specify an explicit display name or id:
+
+```bash
+claude-rotator login --id account1 --name your-email-1@example.com
+```
+
+Verify registration:
+
+```bash
+claude-rotator accounts
+claude-rotator status
+claude-rotator doctor
+```
+
+`claude-rotator login --json ...` is an advanced command that passes the token JSON directly; use plain `claude-rotator login` for normal operation. When you do use it, pipe the JSON through stdin with `claude-rotator login --id <id> --name <email> --json -` instead of passing the value as a literal argument. Passing `--json <token-json>` directly on the command line leaves it visible to other users via `ps auxww` or `/proc/<pid>/cmdline` on Linux, and it also lands in your shell history.
+
+Duplicate prevention:
+
+- `current` is reserved for the live account and cannot be used with `login --id current` or `import-current --id current`.
+- `claude-rotator login` reads `accountUuid` from the profile, and updates the existing account if the same Claude account is already registered.
+- If the current Claude Code login has no refresh token, or cannot be verified against the profile API, `claude-rotator login` stops with an error instead of registering it under a placeholder id such as `account1`. `claude auth status` can report "logged in" even while the API-side OAuth token has expired; in that case, run `claude auth login` again and retry.
+- If an explicit `--id` collides with an existing account's `accountUuid`, the command errors out instead of creating a duplicate. Either reuse the existing id, or run `claude-rotator remove <account>` first to clean it up.
+
+Where credentials are stored:
+
+- macOS: Keychain (service name `claude-rotator:<id>`)
+- Ubuntu/Linux: `~/.local/share/claude-rotator/accounts/*.json`, directory mode `0700`, file mode `0600` (under `XDG_DATA_HOME` if you have set it)
+
+After saving, `login` notifies the running server to reload. Only run an OS-specific service restart command yourself if the server isn't running yet.
+
+Right after adding an account, also check its Usage API state:
+
+```bash
+claude-rotator refresh-usage
+claude-rotator status
+```
+
+If the newly added account's 5-hour or 7-day window is already at 100%, it shows as `exhausted` and will not be chosen as an automatic switch target.
+
+#### Using Only the Current Login on This Machine
+
+Instead of registering several accounts as fixed candidates, you can register just the Claude Code account currently logged in on this machine as a `current` account, which re-reads Claude Code's latest credentials on every request rather than a saved token snapshot. Because the proxy follows along whenever Claude Code's own token is refreshed, this approach is the safer choice on an Ubuntu machine used for day-to-day work by a single login.
+
+```bash
+claude auth login
+claude-rotator use-current --only
+```
+
+`current` is a live account that re-reads Claude Code's current login every time. If you log in to a different account in Claude Code, the account `current` points to changes along with it. Because of that, don't mix `current` into a setup that rotates between several fixed candidate accounts — use `claude-rotator login` above to register each account as a token snapshot instead. `--only` replaces the entire existing rotator account list with just `current`.
+
+#### Removing Accounts
+
+You can remove an account you no longer need, or a saved account that `doctor` reports as broken. By default this also deletes the saved credential.
+
+```bash
+claude-rotator remove old-account-id
+```
+
+To remove only the configuration entry and keep the saved credential:
+
+```bash
+claude-rotator remove old-account-id --keep-secret
+```
+
+With `--keep-secret`, the credential is left behind as an orphan in Keychain / the local file store (see [Uninstall](#uninstall)).
 
 ### Monitor
+
+Run this in a separate terminal:
 
 ```bash
 claude-rotator monitor
 ```
 
-### Diagnostics
+Example output (the same layout is shared by `claude-rotator monitor` and `claude-rotator status`; the actual account names, numbers, and times vary by environment):
 
-Recent proxy requests are shown in `claude-rotator status` / `claude-rotator monitor`, and the service writes metadata-only request logs to `~/.config/claude-rotator/server.log`. Once `server.log` exceeds 10MB, the service rotates it on the next log write, keeping the previous generation as `server.log.1`. Even when run manually with a non-TTY stdout, request logs are written directly to `server.log` itself rather than to stdout. Internal proxy errors are logged as `proxy-error method=... path=... error=...` without tokens or bodies. Automatic rotation happens when the current account reaches the configured 5h, 7d, or model-scoped weekly usage threshold. If the OAuth Usage API reports scoped weekly limits in `limits[]`, they appear as extra status rows such as `7d Fable`, `7d Sonnet`, or `7d Opus`, including reset times. If an OAuth request for the exact model ID `claude-fable-5` sends `POST /v1/messages` and receives a 429 without conclusive quota headers, the proxy rechecks the Usage API with that same access token for at most five seconds. It replays that client request to a known available account only when the fresh usage confirms a future-reset 100% global bucket or the requested Fable bucket. Reactive confirmation can cause at most one replay per client request; an unconfirmed limit, another model's exhaustion, or a failed/timed-out Usage request preserves the original upstream 429. Ambiguous 429s for other model IDs do not trigger this extra check. If an available account exists, the proxy usually chooses the lowest known `max(5h, 7d)` usage. When an available account has a 7d reset within the weekly priority window, the proxy prefers that account so expiring weekly quota can be consumed before reset; usage refresh can proactively move the active account even when the current account is not yet exhausted. The weekly priority window defaults to 36 hours and can be adjusted with `rotationPolicy.weeklyResetPriorityWindowMs` in `~/.config/claude-rotator/config.json`. If every candidate is exhausted, the proxy switches to the exhausted account with the earliest known reset and returns a local 429 for that shortest resume target. OAuth refresh failures, authentication errors, and temporary throttles do not rotate to exhausted accounts. OAuth usage is refreshed at startup, reload, first status read, every 15 minutes by default, and at reported reset times for exhausted accounts. Requests run one account at a time with 1.5 seconds between starts to reduce Usage API throttling. Set the `usagePolling` fields in `~/.config/claude-rotator/config.json` to adjust this behavior. Use `claude-rotator refresh-usage` to force an immediate recheck of all registered accounts, or `claude-rotator prepare-resume --json` from external resume tooling to switch to the earliest resume target before reinjection. If `server.log` repeatedly shows `outcome=upstream-error errorType=ETIMEDOUT` around 75 seconds, the proxy is receiving Claude Code requests but cannot complete the upstream request. The CLI and generated macOS LaunchAgent / Ubuntu systemd service prefer IPv4 DNS results to avoid Node.js preferring a broken IPv6 route. On Ubuntu, the installer also runs the service through a launcher named `claude-rotator`, separating the proxy from broad earlyoom rules that prefer terminating every `node` process.
+```text
+Claude Rotator                         active: account1@example.com
 
-OAuth access tokens become refresh candidates 30 minutes before expiry. On macOS and Ubuntu, saved accounts are refreshed by Claude Code itself inside isolated credential storage, without changing the user's normal Claude Code login. Claude Code OAuth metadata is preserved, refreshes are coalesced and serialized, and a rotated credential is atomically persisted before use without overwriting a concurrent relink. A transient native-refresh failure uses a fixed five-minute retry and does not grow to 15 or 60 minutes. An explicit provider `Retry-After` is honored without amplification, up to a 24-hour safety ceiling. Only the direct token-refresh fallback used on other platforms backs off missing-deadline failures through 1/2/4/8/15 minutes and then moves to a fixed hourly probe. Only a relink that actually changes an account credential clears that account's stale cooldown. Provider-side revocation and maximum token lifetime remain controlled by the OAuth provider.
+account1@example.com       active
+5h ███████░░░  76%  reset in 8h42m -> 06/07 18:00 JST
+7d ███████░░░  76%  reset in 2d9h -> 06/09 19:00 JST
+7d Fable █████░░░░░  50%  reset in 1d23h -> 06/09 09:00 JST
+requests: 128
 
-### Restore
+account2@example.com       exhausted
+reason: 5h quota exhausted; reset -> 06/07 20:00 JST
+5h ██████████ 100%  reset in 10h42m -> 06/07 20:00 JST
+7d ████░░░░░░  40%  reset in 2d23h -> 06/10 09:00 JST
+requests: 54
+
+Events
+06/07 12:43 JST request account1 POST /v1/messages -> 429 1203ms outcome=quota-retry req=req_xxx
+06/07 12:43 JST switched account1 -> account2 reason=quota-threshold
+```
+
+What each line means:
+
+- The `active:` field on the header line is the account currently used for API requests.
+- Each account gets one block, tagged `ready` / `active` / `exhausted` / `throttled`, or `error`. A `reason:` line explains why an account is unavailable.
+- The `5h` / `7d` rows show a progress bar (`█` / `░`, 10 characters), the usage ratio, and time remaining to reset plus the reset time itself. Usage shows as ` --%` when no data is available yet, and the reset field shows `no data yet` when there's no reset information.
+- If the Usage API returns model-scoped weekly limits (`limits[]`), an extra row appears, such as `7d Fable`.
+- `requests:` is the cumulative number of requests the proxy has forwarded for that account.
+- `Events` shows up to the 8 most recent switches, requests, and errors.
+
+Reset times and event times in `status` / `monitor` are always shown in Japan Standard Time (JST). Even for an account you haven't used yet, 5h/7d state is fetched from the OAuth Usage API at server startup, on account reload, on the first `status` read, and on every periodic poll. An account shows as `unknown` only when the Usage API could not be fetched; `unknown` accounts are never chosen as an automatic switch target, since it isn't confirmed that they're actually available.
+
+Because the OAuth Usage API tends to return 429s, usage fetches default to a 15-minute interval, one account at a time, with 1.5 seconds between the start of each request. Only change `usagePolling.intervalMs`, `usagePolling.concurrency`, and `usagePolling.requestSpacingMs` in [Configuration and Environment Variables](#configuration-and-environment-variables) if you actually need to. An interval that's too short, or concurrency that's too high, can also cause 429s on `claude-rotator refresh-usage`.
+
+OAuth access tokens become refresh candidates 30 minutes before expiry. Claude Code's OAuth scopes and the refresh token's expiry are preserved at save time. On macOS and Ubuntu, saved accounts delegate the refresh itself to Claude Code inside an isolated storage area that does not touch your normal Claude Code login, so you don't need to log in interactively again as long as the refresh token is still valid, even after the access token expires in a few hours. Concurrent refreshes of the same refresh token are coalesced into one, and refreshes for different accounts are serialized too. A new refresh token is persisted to Keychain or the Linux credential file, with an atomic compare-and-set that never overwrites a competing relogin, before it is ever used. A transient failure of the macOS/Ubuntu native refresh retries on a fixed five-minute schedule and does not grow to 15 or 60 minutes as failures repeat. An explicit `Retry-After` from the provider is honored without amplification, within a 24-hour safety ceiling that prevents a permanent stall from a bad value. Only the direct token-refresh path used where native refresh isn't available backs off a transient failure with no explicit deadline through 1/2/4/8/15 minutes per refresh token, then stops growing and settles into a fixed 60-minute health check. One account waiting does not stop other accounts from refreshing, and only a relink that actually changed the credential clears that account's stale wait state. A saved account whose Claude Code login and `accountUuid` still match mirrors the latest credential and OAuth metadata that Claude Code itself refreshed. `claude-rotator` cannot extend the lifetime of a token the provider has explicitly revoked.
+
+TTY-less environments (CI, piping through `| cat`, etc.) make `claude-rotator monitor` print once and exit automatically (the same as passing `--once` explicitly).
+
+### Configuration and Environment Variables
+
+The config file location is decided in this order:
+
+1. If the `CLAUDE_ROTATOR_CONFIG` environment variable is set to a file path, that path is used.
+2. Otherwise, `$XDG_CONFIG_HOME/claude-rotator/config.json` is used.
+3. If `XDG_CONFIG_HOME` is also unset, it falls back to `~/.config/claude-rotator/config.json` (macOS and Linux alike).
+
+Similarly, data such as account credentials is stored under `$XDG_DATA_HOME/claude-rotator` (or `~/.local/share/claude-rotator` if unset) — for example, Linux account snapshots and the macOS secret-store lock file.
+
+The default `config.json` (auto-generated on first run) looks like this:
+
+```json
+{
+  "proxy": {
+    "host": "127.0.0.1",
+    "port": 37891,
+    "upstreamIdleTimeoutMs": 180000,
+    "upstreamConnectTimeoutMs": 10000,
+    "upstreamConnectRetries": 3,
+    "upstreamConnectRetryDelayMs": 250
+  },
+  "upstream": "https://api.anthropic.com",
+  "switchThreshold": 1,
+  "rotationPolicy": {
+    "mode": "use-expiring-weekly",
+    "weeklyResetPriorityWindowMs": 129600000
+  },
+  "usagePolling": {
+    "enabled": true,
+    "intervalMs": 900000,
+    "concurrency": 1,
+    "requestSpacingMs": 1500
+  },
+  "accounts": []
+}
+```
+
+What the main keys mean:
+
+| Key | Default | Meaning |
+|---|---|---|
+| `proxy.host` / `proxy.port` | `127.0.0.1` / `37891` | The proxy's listen address and port. Setting `host` to anything other than loopback (`127.0.0.1` / `::1` / `localhost`) is an error |
+| `proxy.upstreamIdleTimeoutMs` | `180000` (3 min) | Idle timeout after which a stalled upstream response is treated as failed |
+| `proxy.upstreamConnectTimeoutMs` | `10000` (10 sec) | Timeout for establishing the TCP connection to upstream |
+| `proxy.upstreamConnectRetries` | `3` | Number of internal retries on the same account for a connection-establishment timeout / unreachable error |
+| `proxy.upstreamConnectRetryDelayMs` | `250` | Delay between the retries above |
+| `upstream` | `https://api.anthropic.com` | The Anthropic API the proxy forwards requests to |
+| `switchThreshold` | `1` (= 100%) | The usage ratio at which an account is considered unavailable |
+| `rotationPolicy.mode` | `use-expiring-weekly` | The switching algorithm's mode |
+| `rotationPolicy.weeklyResetPriorityWindowMs` | `129600000` (36 hours) | Grace period for prioritizing consumption of an account whose 7-day window is about to reset within this time |
+| `usagePolling.enabled` | `true` | Whether to poll the Usage API in the background |
+| `usagePolling.intervalMs` | `900000` (15 min) | Interval between polls |
+| `usagePolling.concurrency` | `1` | Number of accounts fetched concurrently |
+| `usagePolling.requestSpacingMs` | `1500` | Minimum delay between the start of each request (to reduce 429s) |
+| `accounts` | `[]` | Registered accounts. Normally added through the `claude-rotator login` CLI etc.; editing this directly is discouraged |
+
+### Logs and Rotation Diagnostics
+
+`status` / `monitor`'s Events show the most recent proxy requests:
+
+```text
+06/07 12:43 JST request account-one POST /v1/messages -> 429 1203ms outcome=quota-retry req=req_xxx
+06/07 12:43 JST switched account-one -> account-two reason=quota-threshold
+```
+
+See [Troubleshooting](#troubleshooting) for how to check the resident server's file log.
+
+The only fields written to the proxy request log are `account`, `method`, `path`, `status`, `durationMs`, `outcome`, `requestId`, and, on a timeout/network error, `errorType`. Internal proxy errors are logged as a short `proxy-error method=... path=... error=...` line. Tokens, the `Authorization` header, API keys, request bodies, and response bodies are never logged.
+
+Automatic switching happens when the current account's 5-hour window, 7-day window, or a model-scoped weekly window (such as Fable's) reaches 100%. When an available candidate exists, the proxy normally picks whichever account has the lowest known `max(5h, 7d)` usage. However, if a candidate's 7-day window is about to reset soon, that account is prioritized instead, so its weekly allowance can be used up before it resets. This weekly-reset priority can proactively move `active` right after a fresh Usage API fetch, even while the current account hasn't hit 100% yet. If the current account itself is quota-exhausted and every candidate is also at 100%, the proxy picks whichever exhausted account has the soonest reset time, and returns a limit message to Claude Code that lets it resume as soon as possible. The proxy never switches to an exhausted account because of an OAuth refresh failure, an authentication error, or a temporary throttle.
+
+When Claude Code sends `POST /v1/messages` for the exact model ID `claude-fable-5` and gets back a 429 without quota headers that confirm the reason, the proxy rechecks the Usage API with that same access token, for at most five seconds, for OAuth accounts. It only replays that same client request to the next account when the 5h/7d window, or the requested Fable weekly window, is actually at 100% and a future reset time plus a known available switch target were confirmed. This confirmation-based replay happens at most once per client request. If it cannot be confirmed, if only a different model's window is exhausted, or if the Usage API call itself fails or times out, the proxy passes the original upstream 429 straight through. This extra check never runs for an ambiguous 429 on any other model ID.
+
+The weekly-reset priority window defaults to within 36 hours of reset, and can be changed with `rotationPolicy.weeklyResetPriorityWindowMs` in [Configuration and Environment Variables](#configuration-and-environment-variables).
+
+Even when no account is available to switch to and the proxy returns a local 429, Claude Code still receives the same unified rate-limit headers it understands, treating a 5-hour exhaustion as a `session limit` and a 7-day exhaustion as a `weekly limit`. Rotator-specific detail is added under the JSON's `details.rotator_message`.
+
+The proxy never switches accounts for a retryable upstream 5xx/529, a response carrying `x-should-retry`, or an upstream idle timeout. It passes the upstream error body, or the proxy's own timeout error, straight through wherever possible instead.
+
+By default the Usage API is refetched on a 15-minute periodic poll, and again right after a window that had reached 100% is expected to reset. The interval can be changed with `usagePolling.intervalMs` in [Configuration and Environment Variables](#configuration-and-environment-variables). To force an immediate recheck of every registered account — for example, to confirm an early Claude Code-side reset or some other transient state change — run:
+
+```bash
+claude-rotator refresh-usage
+claude-rotator status
+```
+
+After `refresh-usage`, check `active` with `claude-rotator status`. The active account can change automatically if the fresh usage shows it's now at 100%, or if another available account's 7-day window is close to reset and should be prioritized. To change `active` deliberately, use `claude-rotator switch <account>`.
+
+OAuth usage refreshes use a native HTTP client rather than Node's `fetch`, so they aren't bound by fetch's 10-second connect timeout, and by default registered accounts are fetched one at a time. Each request has a 60-second idle timeout. A timeout or unreachable error before the HTTPS connection is established retries quickly, using the same `proxy.upstreamConnectTimeoutMs`, `proxy.upstreamConnectRetries`, and `proxy.upstreamConnectRetryDelayMs` the proxy itself uses.
+
+`usagePolling.concurrency` defaults to `1`. Only raise it if TCP connections from your network to Anthropic are reliably stable and you deliberately want to fetch several accounts at once.
+
+The most recent quota/usage state and the active account are persisted to `~/.config/claude-rotator/runtime-state.json`. This lets the service restore the last known status for switching decisions right after a restart, even if the Usage API isn't reachable yet. A quota whose reset time has already passed is discarded as stale when status is recomputed after restore.
+
+External reinjection tools such as `cc-auto-resume` can call the following before reinjecting, to have the rotator switch to whichever account can resume soonest and report when to reinject. It returns `action=ready` if an account is available, or `action=wait` with the soonest reset if every candidate is exhausted.
+
+```bash
+claude-rotator prepare-resume --json
+```
+
+To refetch the Usage API first, only when needed:
+
+```bash
+claude-rotator prepare-resume --refresh --json
+```
+
+### Commands
+
+```bash
+claude-rotator install [--no-start] [--force]
+claude-rotator uninstall [--purge-secrets] [--force]
+claude-rotator server
+claude-rotator status
+claude-rotator monitor
+claude-rotator switch <account>
+claude-rotator refresh-usage
+claude-rotator prepare-resume [--json] [--refresh]
+claude-rotator accounts
+claude-rotator login [--id <id>] [--name <email>]
+claude-rotator login --id <id> --name <email> --json -             (read token JSON from stdin; keeps it out of argv)
+claude-rotator login --id <id> --name <email> --json <token-json>  (token appears in ps output and shell history)
+claude-rotator use-current [--name <email>] [--only]
+claude-rotator remove <account> [--keep-secret]
+claude-rotator import-current --id <id> --name <email>
+claude-rotator doctor
+```
+
+This is the actual output of `claude-rotator --help`. In addition, though it isn't shown there, `claude-rotator monitor --once` also works (a non-TTY environment falls back to this behavior automatically).
+
+What each command does:
+
+| Command | Description |
+|---|---|
+| `install [--no-start] [--force]` | Registers the proxy service and rewrites `~/.claude/settings.json`. `--no-start` deploys the assets without starting the service (on macOS this also skips the settings change; on Linux the settings change still happens). `--force` ignores the `ANTHROPIC_BASE_URL` mismatch check and overwrites anyway |
+| `uninstall [--purge-secrets] [--force]` | Stops the proxy service and restores `~/.claude/settings.json` to its pre-install value. `--purge-secrets` also deletes the saved credentials of every registered account |
+| `server` | Runs the proxy server itself. The LaunchAgent / systemd service both run this command; running it directly is normally only useful for debugging, since `install` starts it automatically |
+| `status` | Prints the current active account and every account's usage once |
+| `monitor [--once]` | Re-renders the same content as `status` once per second. Without a TTY, or with `--once`, it prints once and exits |
+| `switch <account>` | Manually switches the active account |
+| `refresh-usage` | Immediately re-fetches the Usage API for every registered account |
+| `prepare-resume [--json] [--refresh]` | For external resume tooling: switches to whichever account can resume soonest and reports the resume time |
+| `accounts` | Lists every registered account's id, name, and type |
+| `login [--id <id>] [--name <email>]` | Reads the current Claude Code login and registers it as an account |
+| `use-current [--name <email>] [--only]` | Registers a `current` account that re-reads Claude Code's live login on every request instead of a saved snapshot (`--only` replaces the existing account list) |
+| `remove <account> [--keep-secret]` | Deletes a registered account. Without `--keep-secret`, the saved credential is deleted too |
+| `import-current --id <id> --name <email>` | Same as `login`, but takes over the current login while requiring an explicit id |
+| `doctor` | Checks connectivity to the server, and diagnoses account configuration inconsistencies (duplicate UUIDs, expired tokens, etc.) |
+
+### Update
+
+```bash
+git pull
+npm install -g .
+claude-rotator install
+```
+
+Re-running `npm install -g .` overwrites the globally installed `claude-rotator` command with the latest repository contents. Following it with `claude-rotator install` re-registers the service definition (LaunchAgent / systemd unit) if it changed. In the normal case, where `~/.claude/settings.json`'s `ANTHROPIC_BASE_URL` already points at this proxy, there's no conflict. `claude-rotator install --force` is only needed if things are in an unexpected state — for example, if `ANTHROPIC_BASE_URL` was edited by hand.
+
+If all you need is to restart the service, the OS-specific commands work just as well:
+
+```bash
+# macOS
+launchctl kickstart -k gui/$(id -u)/io.github.claude-rotator
+
+# Ubuntu
+systemctl --user restart claude-rotator.service
+```
+
+### Uninstall
+
+Disables the proxy and restores Claude Code's settings to their pre-install state.
 
 ```bash
 claude-rotator uninstall
 ```
 
-To also remove saved account credentials:
+To also delete the saved account credentials:
 
 ```bash
 claude-rotator uninstall --purge-secrets
 ```
+
+If `ANTHROPIC_BASE_URL` was changed to something else after install, `uninstall` reports a conflict rather than silently overwriting it, for safety. Use `--force` only when you intend to restore it anyway.
+
+The scope of `--purge-secrets` differs between macOS and Linux:
+
+- **Linux**: enumerates the `~/.local/share/claude-rotator/accounts/` directory and deletes every stored credential file it finds.
+- **macOS**: Keychain cannot be enumerated in full, so only the Keychain items corresponding to the account ids (plus `current`) currently listed in `config.json` are deleted. An item left orphaned in Keychain after `claude-rotator remove <account> --keep-secret` removed it from the config is not covered, and `--purge-secrets` does not delete it.
+
+#### Fully Removing Everything
+
+`uninstall` (even with `--purge-secrets`) leaves the following files behind:
+
+- `~/.config/claude-rotator/config.json` (registered accounts and settings)
+- `~/.config/claude-rotator/runtime-state.json` (the latest usage cache)
+- `~/.config/claude-rotator/server.log` / `server.err` (logs)
+- the global npm package itself, installed via `npm install -g .`
+
+To remove everything, run the following after `uninstall --purge-secrets` (substitute your own paths if you've set `XDG_CONFIG_HOME` / `XDG_DATA_HOME`):
+
+```bash
+rm -rf ~/.config/claude-rotator
+rm -rf ~/.local/share/claude-rotator
+npm uninstall -g claude-rotator
+```
+
+If macOS has orphaned Keychain items left over from `remove --keep-secret`, search Keychain Access.app for `claude-rotator:<account-id>` and delete them by hand, or run:
+
+```bash
+security delete-generic-password -a "<account-id>" -s "claude-rotator:<account-id>"
+```
+
+### Troubleshooting
+
+Start with `claude-rotator doctor`. Besides checking connectivity to the server, it warns — without ever printing a secret — about things like:
+
+```bash
+claude-rotator doctor
+```
+
+- the same Claude account UUID registered more than once
+- `current`'s display name or UUID no longer matching the live Claude Code login
+- a missing stored OAuth credential, or a profile fetch that fails with 401 or similar
+
+If a saved access token has expired, `doctor` refreshes it with the refresh token before checking the profile.
+
+#### Checking Logs
+
+The resident server's file log can be checked the same way on both macOS and Ubuntu:
+
+```bash
+tail -f ~/.config/claude-rotator/server.log
+tail -f ~/.config/claude-rotator/server.err
+```
+
+Once `server.log` exceeds 10MB, the service rotates it on the next log write, keeping the previous generation as `server.log.1`. Even when run manually with a non-TTY stdout, request logs are written directly to `server.log` itself rather than to stdout.
+
+#### Diagnosing Connection Timeouts
+
+If `server.log` repeatedly shows `ETIMEDOUT` like this, and Claude Code itself is showing `Retrying in ...` or `inference gateway (127.0.0.1:37891)`, the stuck connection is between the rotator and the upstream API — not between Claude Code and the rotator.
+
+```text
+proxy account=... method=POST path=/v1/messages status=- durationMs=75000 outcome=upstream-error errorType=ETIMEDOUT
+```
+
+The rotator retries quickly, on the same account, for a timeout / unreachable error that happens before the TCP connection to upstream is established. It does not automatically retry a failure that happens after the connection was established, or after the upstream response has already started, to avoid sending duplicate requests. The retry behavior can be tuned with `proxy.upstreamConnectTimeoutMs`, `proxy.upstreamConnectRetries`, and `proxy.upstreamConnectRetryDelayMs` in [Configuration and Environment Variables](#configuration-and-environment-variables).
+
+If `curl -I --connect-timeout 10 https://api.anthropic.com/`, or a plain TCP connectivity check to the Anthropic API, also times out, while other sites such as Google load fine, the problem is your local network, VPN, firewall, or ISP route — not the rotator. Since `nc`'s timeout flag differs by OS, use `nc -vz -w 3 160.79.104.10 443` on Ubuntu and `nc -vz -G 3 160.79.104.10 443` on macOS. In particular, if a home router's DoS protection has a low `TCP-SYN Flood` threshold or a low per-host TCP-SYN rate limit, Claude Code's parallel requests and retries can cause outbound SYNs toward Anthropic to be dropped intermittently. While isolating the problem, try temporarily disabling the router's TCP-SYN-related DoS protection, or raising its threshold, and check whether the `nc` success rate improves. Leaving the firewall disabled permanently is not recommended.
+
+If `refresh-usage` fails for every account with `fetch failed`, `OAuth connection timeout`, or `OAuth request timeout`, the failure may be in establishing the HTTPS connection to the Usage API rather than in the credentials themselves. If the warning shows a cause like `UND_ERR_CONNECT_TIMEOUT` or `ETIMEDOUT`, check reachability to the same host directly. If `curl` also times out, the issue is again your local network, VPN, firewall, or ISP route rather than the rotator's own configuration.
+
+```bash
+curl -I --connect-timeout 10 --max-time 20 https://api.anthropic.com/api/oauth/usage
+```
+
+### Security Design
+
+- The proxy binds only to loopback, and rejects any non-loopback `Host` and any cross-site browser request.
+- The proxy does not authenticate local clients, so it trusts every OS user and process on the same host that can connect to loopback. Run it only on a single-user or otherwise fully trusted host; a dedicated OS user alone does not isolate loopback TCP.
+- Tokens, the `Authorization` header, and API keys are never logged.
+- Request and response bodies are not logged by default.
+- A restore manifest and settings backup are created at install time.
+
+See [SECURITY.md](./SECURITY.md) for how to report vulnerabilities and what's in scope.
+
+### Development
+
+```bash
+npm test
+npm run lint
+```
+
+On macOS, some tests that write to the real Keychain are skipped by default. Add `CLAUDE_ROTATOR_REAL_KEYCHAIN=1 npm test` to run them, though this may pop up a Keychain authentication dialog (the macOS CI job enables this automatically).
+
+Local development works on Node `v18.10` and later. If you want to check macOS/Ubuntu-independent behavior in development, also run the Docker command below to verify against Node 22.
+
+Docker verification:
+
+```bash
+docker run --rm -v "$PWD":/app -w /app node:22-alpine npm run check
+```
+
+`npm run check` runs `npm run lint` followed by `npm test`.
