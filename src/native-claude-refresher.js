@@ -172,13 +172,24 @@ export async function refreshWithNativeClaudeCode(refreshToken, context = {}, {
     if (remainingNativeCommandTimeout(refreshDeadline, deadlineNow) == null) {
       throw nativeRefreshCommandFailedError();
     }
+    // Arm the durable handoff fence before the child can possibly receive the
+    // refresh token. If this process dies anywhere after this point (e.g. the
+    // spawned child completes an exchange while the service itself is
+    // killed), the persisted intent is what stops the stale stored secret
+    // from being reused. A spawn failure that never assigns a pid is instead
+    // handled below by explicitly retracting this fence, so it does not park
+    // the account for a failure that never put the token at risk.
+    await context.beforeHandoff?.();
     const loginTimeoutMs = remainingNativeCommandTimeout(refreshDeadline, deadlineNow);
     if (loginTimeoutMs == null) {
-      // Nothing has been spawned and the durable handoff fence has not been
-      // armed yet (it only arms once a child is actually confirmed spawned,
-      // below), so this is a plain, recoverable failure to start in time.
-      throw nativeRefreshCommandFailedError();
+      // The durable handoff fence may already be armed, so fail closed even
+      // though no child can now be started safely inside the deadline.
+      throw new NativeClaudeRefreshError(
+        'Native Claude OAuth credential refresh outcome is unknown',
+        'NATIVE_REFRESH_OUTCOME_UNKNOWN',
+      );
     }
+    let executeError = null;
     try {
       await executeNativeRefresh({
         command: configuredCommand,
@@ -191,19 +202,30 @@ export async function refreshWithNativeClaudeCode(refreshToken, context = {}, {
           CLAUDE_CODE_OAUTH_REFRESH_TOKEN: previous.refreshToken,
           CLAUDE_CODE_OAUTH_SCOPES: previous.scopes.join(' '),
         },
-        // The durable refresh-intent fence must arm only once the child is
-        // actually confirmed spawned (a real pid exists), i.e. only once the
-        // refresh token could actually have reached a process outside ours.
-        // Arming it any earlier (e.g. before attempting to spawn) would park
-        // the account on a plain ENOENT/EACCES spawn failure even though the
-        // refresh token never left this process.
-        afterSpawn: async childPid => {
-          await context.beforeHandoff?.();
-          await context.protectChildPid?.(childPid);
-        },
+        afterSpawn: context.protectChildPid,
         afterClose: context.clearChildPid,
       });
-    } catch {}
+    } catch (caught) {
+      executeError = caught;
+    }
+    if (executeError && !executeError.nativeChildSpawned) {
+      // No pid was ever assigned, so the refresh token provably never
+      // reached a process outside this one. Retract the fence armed above
+      // instead of leaving the account parked for a plain local failure
+      // (e.g. the claude binary is missing or inaccessible).
+      await runCleanupStep(
+        () => context.retractHandoff?.(),
+        onCleanupError,
+        'Could not retract the native Claude refresh handoff fence',
+      );
+    }
+    if (executeError?.code === 'NATIVE_REFRESH_COMMAND_UNAVAILABLE') {
+      // A local "claude binary missing/inaccessible" failure is not a
+      // credential problem; surface it as-is instead of collapsing it into
+      // NATIVE_REFRESH_OUTCOME_UNKNOWN below, which would mark every account
+      // sharing this environment as needing a manual relink.
+      throw executeError;
+    }
 
     try {
       const refreshed = await credentialStorage.read('refreshed');
@@ -677,14 +699,20 @@ async function executeNativeRefresh({
       afterClose,
     });
   } catch (error) {
-    if (error instanceof NativeClaudeRefreshError) throw error;
+    // Preserved across every wrapped error so refreshWithNativeClaudeCode can
+    // tell whether the refresh token ever actually reached a child process.
+    const nativeChildSpawned = Boolean(error?.nativeChildSpawned);
+    if (error instanceof NativeClaudeRefreshError) {
+      error.nativeChildSpawned = nativeChildSpawned;
+      throw error;
+    }
     if (['ENOENT', 'EACCES'].includes(error?.code)) {
-      throw new NativeClaudeRefreshError(
+      throw Object.assign(new NativeClaudeRefreshError(
         'Native Claude is not available for OAuth credential refresh',
         'NATIVE_REFRESH_COMMAND_UNAVAILABLE',
-      );
+      ), { nativeChildSpawned });
     }
-    throw nativeRefreshCommandFailedError();
+    throw Object.assign(nativeRefreshCommandFailedError(), { nativeChildSpawned });
   }
 }
 
@@ -739,8 +767,15 @@ export function executeNativeClaudeCommand(command, args, {
       if (settled) return;
       settled = true;
       clearTimers();
-      if (error) reject(error);
-      else resolve(value);
+      if (error) {
+        // Lets callers tell "the OS never assigned this child a pid" (the
+        // refresh token provably never reached a process outside ours) apart
+        // from every other failure, regardless of which path produced it.
+        if (typeof error === 'object' && error !== null && !('nativeChildSpawned' in error)) {
+          error.nativeChildSpawned = Number.isInteger(child.pid);
+        }
+        reject(error);
+      } else resolve(value);
     };
     const finishAfterClose = (code, signal) => {
       if (!childClosed || !lifecycleSettled || (terminationError && !terminationFenced)) return;

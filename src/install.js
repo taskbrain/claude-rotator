@@ -310,7 +310,7 @@ async function updateMacosInstalledSettings({
     && currentAuthToken !== gatewayAuthToken
     && !force
   ) {
-    throw new Error(`ANTHROPIC_AUTH_TOKEN changed after install: ${currentAuthToken}`);
+    throw new Error('ANTHROPIC_AUTH_TOKEN changed after install');
   }
   const merged = mergeClaudeSettings(settings, proxyBaseUrl, gatewayAuthToken);
   await writeJsonFile(settingsPath, merged.settings);

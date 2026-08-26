@@ -206,8 +206,15 @@ export function createProxyServer({
           const accounts = await reloadAccounts();
           accountManager.replaceAccounts(accounts);
         }
-        operationalStateCheck = checkPersistedRefreshIntents();
-        await operationalStateCheck;
+        // Reconcile in the background instead of awaiting it (or replacing
+        // the shared operationalStateCheck gate other requests await): each
+        // account's reconcile can block on that account's file lock for up
+        // to its full acquire timeout, and every other in-flight request
+        // (including /internal/status and proxied /v1/messages calls) would
+        // otherwise stall behind this single reload until it finishes.
+        checkPersistedRefreshIntents().catch(error => {
+          logger?.(`${new Date().toISOString()} reload-reconcile result=failed error=${shortErrorMessage(error)}`);
+        });
         if (usagePollingEnabled(config)) {
           await usageScheduler.refreshNow({ afterCurrent: true });
         }
@@ -1945,6 +1952,7 @@ function tokenRefreshContext(account, secret, transaction = {}) {
     subscriptionType: secret.subscriptionType,
     rateLimitTier: secret.rateLimitTier,
     beforeHandoff: transaction.beforeHandoff,
+    retractHandoff: transaction.retractHandoff,
     protectChildPid: transaction.protectChildPid,
     clearChildPid: transaction.clearChildPid,
   };
