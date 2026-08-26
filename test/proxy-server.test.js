@@ -3096,6 +3096,35 @@ describe('createProxyServer', () => {
     assert.deepEqual(upstreamSeen, ['Bearer access-token-1']);
   });
 
+  it('logs an observable line when a scheduled usage refresh fails', async () => {
+    const logLines = [];
+    const secretStore = new MemorySecretStore();
+    await secretStore.set('acct_1', { accessToken: 'access-token-1' });
+    const accountManager = new AccountManager({
+      accounts: [{ id: 'acct_1', type: 'oauth' }],
+    });
+    const proxy = await listen(createProxyServer({
+      accountManager,
+      secretStore,
+      config: { upstream: 'http://127.0.0.1:1', usagePolling: { enabled: false } },
+      usageFetcher: async () => {
+        throw new Error('Usage fetch failed (429): rate limited');
+      },
+      logger: line => logLines.push(line),
+    }));
+    cleanupAfterTest(async () => {
+      await close(proxy.server);
+    });
+
+    const response = await requestJson(`${proxy.url}/internal/refresh-usage`, { method: 'POST' });
+
+    assert.equal(response.status, 200);
+    assert.match(
+      logLines.join('\n'),
+      /usage-refresh account=acct_1 result=failed error=Usage fetch failed \(429\)/,
+    );
+  });
+
   it('does not let an older scheduled Usage 401 mark error after a newer reactive observation starts', async () => {
     const upstreamSeen = [];
     const upstream = await listen(http.createServer((req, res) => {

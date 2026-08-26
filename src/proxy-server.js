@@ -1371,6 +1371,7 @@ async function refreshAccountUsage({
     };
   } catch (caught) {
     const message = shortErrorMessage(caught);
+    logger?.(`${new Date().toISOString()} usage-refresh account=${account.id} result=failed error=${message}`);
     usageObservationTracker.fail(observation);
     if (!accountManager.accounts.includes(account)) {
       return { account: account.id, ok: false, stale: true, error: message };
