@@ -600,6 +600,7 @@ async function installMacosCommand({
     nodePath: process.execPath,
     cliPath,
     configPath,
+    claudeConfigDir: dirname(settingsPath),
     claudePath,
     servicePath,
     ...serviceXdgOverrides(env),

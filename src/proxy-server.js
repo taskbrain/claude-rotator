@@ -130,6 +130,7 @@ export function createProxyServer({
     usageFetcher,
     usageRequestOptions,
     usageObservationTracker,
+    allowLiveClaudeCodeCredentials,
     timeoutMs: positiveTimeoutOrDefault(
       reactiveQuotaConfirmTimeoutMs,
       REACTIVE_QUOTA_CONFIRM_TIMEOUT_MS,
@@ -167,7 +168,12 @@ export function createProxyServer({
         });
         return;
       }
-      await operationalStateCheck;
+      // /internal/health must stay a cheap liveness probe: reconciling
+      // persisted refresh intents (below) can take up to the account lock's
+      // full acquire timeout per account, which would otherwise make
+      // install/reinstall's bounded health poll (see waitForMacosHealth)
+      // time out and roll back the install whenever any account's lock is
+      // briefly held by a concurrent refresh.
       if (req.method === 'GET' && req.url === '/internal/health') {
         sendJson(res, 200, {
           ok: true,
@@ -176,6 +182,7 @@ export function createProxyServer({
         });
         return;
       }
+      await operationalStateCheck;
 
       if (req.method === 'GET' && req.url === '/internal/status') {
         if (usagePollingEnabled(config) && !usageScheduler.hasAttempted()) {
@@ -661,6 +668,7 @@ function createReactiveQuotaConfirmer({
   usageFetcher,
   usageRequestOptions,
   usageObservationTracker,
+  allowLiveClaudeCodeCredentials = true,
   timeoutMs,
   logger,
 }) {
@@ -708,6 +716,7 @@ function createReactiveQuotaConfirmer({
             account,
             secretStore,
             currentCredentialReader,
+            allowLiveClaudeCodeCredentials,
             signal: entry.abortController.signal,
           }),
         ]);
@@ -1208,6 +1217,7 @@ async function snapshotKnownAvailableAlternates({
   account,
   secretStore,
   currentCredentialReader,
+  allowLiveClaudeCodeCredentials = true,
   signal = null,
 }) {
   throwIfOperationAborted(signal);
@@ -1226,6 +1236,7 @@ async function snapshotKnownAvailableAlternates({
       account: candidate,
       secretStore,
       currentCredentialReader,
+      allowLiveClaudeCodeCredentials,
       signal,
     });
     throwIfOperationAborted(signal);
@@ -1242,12 +1253,19 @@ async function resolveReactiveReplaySecret({
   account,
   secretStore,
   currentCredentialReader,
+  allowLiveClaudeCodeCredentials = true,
   signal = null,
 }) {
   throwIfOperationAborted(signal);
-  const secret = account.id === 'current' || account.credentialSource === 'claude-code-current'
-    ? await liveClaudeCodeSecret(currentCredentialReader)
-    : await secretStore.get(account.id);
+  if (account.id === 'current' || account.credentialSource === 'claude-code-current') {
+    if (!allowLiveClaudeCodeCredentials) {
+      throw new Error('Live current account is unavailable while Claude login is overridden');
+    }
+    const secret = await liveClaudeCodeSecret(currentCredentialReader);
+    throwIfOperationAborted(signal);
+    return secret;
+  }
+  const secret = await getOperationalSecret(secretStore, account.id);
   throwIfOperationAborted(signal);
   return secret;
 }
@@ -1585,6 +1603,7 @@ async function forwardWithRotation({
           account,
           secretStore,
           currentCredentialReader,
+          allowLiveClaudeCodeCredentials,
         })
         : await resolveSecretForAccount({
           account,

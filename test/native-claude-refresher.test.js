@@ -366,20 +366,23 @@ describe('native Claude credential refresher', () => {
     assert.equal(handoffCalls, 0);
   });
 
-  it('fails closed without spawning login if the budget expires while arming handoff', async () => {
-    let deadlineTime = 1_000;
+  it('fails locally without spawning login or arming the handoff fence if the budget expires just before spawn', async () => {
     let handoffCalls = 0;
     let commandCalls = 0;
+    let deadlineCalls = 0;
 
+    // The handoff fence no longer arms before a spawn is attempted (see the
+    // "arms the handoff fence only after the child actually spawns" test),
+    // so there is no more "arming took too long" step that can burn the
+    // remaining budget. This simulates the budget running out between the
+    // two remaining-timeout checks that bracket the (now hook-free) gap
+    // before the actual spawn attempt.
     await assert.rejects(
       refreshWithNativeClaudeCodeImpl(
         OLD_REFRESH_TOKEN,
         {
           ...previousContext(),
-          beforeHandoff: async () => {
-            handoffCalls += 1;
-            deadlineTime += 600;
-          },
+          beforeHandoff: async () => { handoffCalls += 1; },
         },
         {
           platform: 'linux',
@@ -387,15 +390,20 @@ describe('native Claude credential refresher', () => {
           tempRoot: testRoot,
           timeoutMs: 2_500,
           now: () => NOW,
-          deadlineNow: () => deadlineTime,
+          deadlineNow: () => {
+            deadlineCalls += 1;
+            return deadlineCalls <= 2 ? 1_000 : 1_000_000;
+          },
           execFileImpl: async () => { commandCalls += 1; },
         },
       ),
-      isRetrylessOutcomeUnknown,
+      error => error.code === 'NATIVE_REFRESH_COMMAND_FAILED'
+        && error.retryAfterMs === DEFAULT_NATIVE_CLAUDE_REFRESH_RETRY_AFTER_MS
+        && error.retryAfterSource === 'fixed',
     );
 
     assert.equal(commandCalls, 0);
-    assert.equal(handoffCalls, 1);
+    assert.equal(handoffCalls, 0);
   });
 
   it('refreshes on macOS through an isolated temporary Keychain service without argv secrets', async () => {
@@ -456,6 +464,53 @@ describe('native Claude credential refresher', () => {
     assert.equal(refreshed.expiresAt, NEW_EXPIRES_AT);
     assert.equal(keychain.items.size, 0);
     assert.equal(keychain.calls.some(call => call.args[0] === '-i'), false);
+  });
+
+  it('reads a successful refresh from the plaintext fallback when the macOS Keychain write silently failed', async () => {
+    const keychain = createFakeKeychainExecutor();
+    let plaintextPath;
+
+    const refreshed = await refreshWithNativeClaudeCode(
+      OLD_REFRESH_TOKEN,
+      previousContext(),
+      {
+        command: 'claude',
+        platform: 'darwin',
+        tempRoot: testRoot,
+        env: {
+          HOME: join(testRoot, 'global-home'),
+          USER: 'mac.fallback-user',
+          PATH: process.env.PATH,
+        },
+        keychainExecImpl: keychain.exec,
+        now: () => NOW,
+        execFileImpl: async (command, args, options) => {
+          // Claude Code 2.1.246 falls back to a plaintext credential file
+          // inside CLAUDE_SECURESTORAGE_CONFIG_DIR when the Keychain WRITE
+          // itself fails (e.g. Keychain unavailable under launchd). Simulate
+          // that here: never touch the fake Keychain, only write the file.
+          plaintextPath = join(options.env.CLAUDE_SECURESTORAGE_CONFIG_DIR, '.credentials.json');
+          await writeFile(plaintextPath, `${JSON.stringify({
+            claudeAiOauth: {
+              accessToken: NEW_ACCESS_TOKEN,
+              refreshToken: NEW_REFRESH_TOKEN,
+              expiresAt: NEW_EXPIRES_AT,
+            },
+          })}\n`, { encoding: 'utf8', mode: 0o600 });
+        },
+      },
+    );
+
+    assert.equal(refreshed.accessToken, NEW_ACCESS_TOKEN);
+    assert.equal(refreshed.refreshToken, NEW_REFRESH_TOKEN);
+    assert.equal(refreshed.expiresAt, NEW_EXPIRES_AT);
+    // Nothing was ever seeded into (or read successfully from) the Keychain.
+    assert.equal(keychain.items.size, 0);
+    assert.equal(keychain.calls.some(call => call.args[0] === '-i'), false);
+    // The plaintext fallback must be read-once-and-wiped, exactly like the
+    // Linux isolated credential file, so the refreshed token does not
+    // linger on disk after this call returns.
+    await assert.rejects(access(plaintextPath), error => error.code === 'ENOENT');
   });
 
   it('round-trips an isolated credential through the real macOS Keychain adapter', {
@@ -552,13 +607,12 @@ describe('native Claude credential refresher', () => {
     assert.equal(refreshed.refreshTokenExpiresAt, 1_900_000_000_000);
   });
 
-  it('awaits handoff before auth-login and forwards the child PID lease hooks', async () => {
+  it('arms the handoff fence only after the child actually spawns, then forwards the PID lease hooks', async () => {
     const events = [];
     let releaseHandoff;
     let signalHandoffStarted;
     const handoffGate = new Promise(resolve => { releaseHandoff = resolve; });
     const handoffStarted = new Promise(resolve => { signalHandoffStarted = resolve; });
-    let loginStarted = false;
     const refresh = refreshWithNativeClaudeCodeImpl(
       OLD_REFRESH_TOKEN,
       {
@@ -578,7 +632,8 @@ describe('native Claude credential refresher', () => {
         tempRoot: testRoot,
         execFileImpl: async (_command, args, options) => {
           assert.deepEqual(args, DEFAULT_NATIVE_CLAUDE_REFRESH_ARGS);
-          loginStarted = true;
+          // The child is spawned (and could, from here on, actually receive
+          // the refresh token) before the durable handoff fence arms.
           events.push('login');
           await options.afterSpawn(4321);
           await writeCredential(join(options.env.CLAUDE_CONFIG_DIR, '.credentials.json'), {
@@ -593,17 +648,51 @@ describe('native Claude credential refresher', () => {
     );
 
     await handoffStarted;
-    assert.equal(loginStarted, false);
-    assert.deepEqual(events, ['handoff-start']);
+    assert.deepEqual(events, ['login', 'handoff-start']);
     releaseHandoff();
     await refresh;
     assert.deepEqual(events, [
+      'login',
       'handoff-start',
       'handoff-finished',
-      'login',
       'protect-4321',
       'clear-4321',
     ]);
+  });
+
+  it('never arms the handoff fence when the native command fails to spawn at all', async () => {
+    let handoffCalls = 0;
+    let protectCalls = 0;
+
+    await assert.rejects(
+      refreshWithNativeClaudeCodeImpl(
+        OLD_REFRESH_TOKEN,
+        {
+          ...previousContext(),
+          beforeHandoff: async () => { handoffCalls += 1; },
+          protectChildPid: async () => { protectCalls += 1; },
+        },
+        {
+          platform: 'linux',
+          command: 'claude',
+          tempRoot: testRoot,
+          execFileImpl: async () => {
+            // No pid was ever assigned: afterSpawn must not be invoked, so
+            // neither the durable fence nor the PID lease should arm. This
+            // is the exact scenario the fence-timing fix protects: a plain
+            // ENOENT/EACCES spawn failure must not permanently park the
+            // account, because the refresh token never left this process.
+            const error = new Error('spawn ENOENT');
+            error.code = 'ENOENT';
+            throw error;
+          },
+        },
+      ),
+      isRetrylessOutcomeUnknown,
+    );
+
+    assert.equal(handoffCalls, 0);
+    assert.equal(protectCalls, 0);
   });
 
   it('links an actually spawned native child to one PID lease until close', async () => {
@@ -756,6 +845,9 @@ describe('native Claude credential refresher', () => {
         tempRoot: testRoot,
         execFileImpl: async (command, args, options) => {
           environments.push({ args, env: options.env });
+          // The child actually spawns (so the fence arms) before the CLI
+          // itself rejects the unsupported flag.
+          await options.afterSpawn(4321);
           throw Object.assign(new Error('unknown option --claudeai'), { code: 1 });
         },
       }),

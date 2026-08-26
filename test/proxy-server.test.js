@@ -4376,12 +4376,6 @@ describe('createProxyServer', () => {
     await secretStore.set('acct_2', { accessToken: 'access-token-2' });
     let markUsageStarted;
     const usageStarted = new Promise(resolve => { markUsageStarted = resolve; });
-    const originalGet = secretStore.get.bind(secretStore);
-    secretStore.get = async accountId => {
-      if (accountId !== 'acct_2') return originalGet(accountId);
-      await usageStarted;
-      throw new Error('target secret read failed');
-    };
     const accountManager = new AccountManager({
       accounts: [
         { id: 'acct_1', type: 'oauth' },
@@ -4412,6 +4406,19 @@ describe('createProxyServer', () => {
       await close(proxy.server);
       await close(upstream.server);
     });
+    // Let startup reconciliation (operationalStateCheck) read every account's
+    // real operational secret before installing a mock that hangs until the
+    // reactive Usage fetch starts; otherwise reconcile would deadlock waiting
+    // on the request it is itself blocking.
+    await requestJson(`${proxy.url}/internal/health`, { timeoutMs: 1_000 });
+    const originalGet = secretStore.get.bind(secretStore);
+    const readAccountTwoAfterUsageStarted = async accountId => {
+      if (accountId !== 'acct_2') return originalGet(accountId);
+      await usageStarted;
+      throw new Error('target secret read failed');
+    };
+    secretStore.get = readAccountTwoAfterUsageStarted;
+    secretStore.getOperational = readAccountTwoAfterUsageStarted;
 
     const response = await requestJson(`${proxy.url}/v1/messages`, {
       method: 'POST', body: JSON.stringify({ model: 'claude-fable-5' }), timeoutMs: 1_000,
@@ -4896,7 +4903,7 @@ describe('createProxyServer', () => {
     const originalGetSecret = secretStore.get.bind(secretStore);
     let targetSecretReads = 0;
     let secretChangeApplied = false;
-    secretStore.get = async accountId => {
+    const readAccountTwoWithMutationOnFirstRead = async accountId => {
       const secret = await originalGetSecret(accountId);
       if (accountId === 'acct_2') {
         targetSecretReads += 1;
@@ -4940,6 +4947,11 @@ describe('createProxyServer', () => {
       await close(proxy.server);
       await close(upstream.server);
     });
+    // Let startup reconciliation read every account's real operational secret
+    // before installing a mock that mutates acct_2 on its first read.
+    await requestJson(`${proxy.url}/internal/health`, { timeoutMs: 1_000 });
+    secretStore.get = readAccountTwoWithMutationOnFirstRead;
+    secretStore.getOperational = readAccountTwoWithMutationOnFirstRead;
 
     const response = await requestJson(`${proxy.url}/v1/messages`, {
       method: 'POST', body: JSON.stringify({ model: 'claude-fable-5' }),
@@ -4995,13 +5007,15 @@ describe('createProxyServer', () => {
     await secretStore.set('acct_2', { accessToken: 'access-token-2' });
     const originalGetSecret = secretStore.get.bind(secretStore);
     let targetSecretReads = 0;
-    secretStore.get = async accountId => {
+    const readAccountTwoFailingOnSecondRead = async accountId => {
       if (accountId === 'acct_2') {
         targetSecretReads += 1;
         if (targetSecretReads === 2) throw new Error('final reactive target read failed');
       }
       return originalGetSecret(accountId);
     };
+    secretStore.get = readAccountTwoFailingOnSecondRead;
+    secretStore.getOperational = readAccountTwoFailingOnSecondRead;
     const accountManager = new AccountManager({
       accounts: [
         { id: 'acct_1', type: 'oauth' },
@@ -5046,6 +5060,90 @@ describe('createProxyServer', () => {
       body: originalBody,
       marker: 'target-read-failed',
       targetSecretReads: 2,
+      usageCalls: 1,
+      upstreamSeen: ['Bearer access-token-1'],
+    });
+  });
+
+  it('excludes a parked candidate account from the reactive replay path instead of reusing its stale secret', async () => {
+    const upstreamSeen = [];
+    const originalBody = {
+      type: 'error', error: { type: 'rate_limit_error', message: 'fable exhausted, only alternate is parked' },
+    };
+    const upstream = await listen(http.createServer((req, res) => {
+      upstreamSeen.push(req.headers.authorization);
+      res.writeHead(429, {
+        'Content-Type': 'application/json',
+        'x-reactive-test': 'parked-alternate-excluded',
+      });
+      res.end(JSON.stringify(originalBody));
+    }));
+    const secretStore = new MemorySecretStore();
+    await secretStore.set('acct_1', { accessToken: 'access-token-1' });
+    await secretStore.set('acct_2', {
+      accessToken: 'access-token-2',
+      refreshToken: 'refresh-token-2',
+    });
+    const accountManager = new AccountManager({
+      accounts: [
+        { id: 'acct_1', type: 'oauth' },
+        { id: 'acct_2', type: 'oauth' },
+      ],
+    });
+    accountManager.updateQuota('acct_2', {
+      'anthropic-ratelimit-unified-5h-utilization': '0.1',
+    });
+    let usageCalls = 0;
+    const proxy = await listen(createProxyServer({
+      accountManager,
+      secretStore,
+      config: { upstream: upstream.url, usagePolling: { enabled: false } },
+      usageFetcher: async () => {
+        usageCalls += 1;
+        return {
+          scoped_weekly: [{
+            key: 'fable', label: 'Fable', utilization: 1, resets_at: futureReset(),
+          }],
+        };
+      },
+    }));
+    cleanupAfterTest(async () => {
+      await close(proxy.server);
+      await close(upstream.server);
+    });
+    // Let startup reconciliation settle first, then park acct_2 (durable
+    // "handed_off" refresh-intent, mirroring an ambiguous native refresh
+    // handoff) after the server is already serving. accountManager still
+    // considers acct_2 quota-available; only secretStore knows it is parked.
+    await requestJson(`${proxy.url}/internal/health`, { timeoutMs: 1_000 });
+    await assert.rejects(
+      secretStore.refreshIfUnchanged(
+        'acct_2',
+        await secretStore.get('acct_2'),
+        async (_current, transaction) => {
+          await transaction.beforeHandoff();
+          throw Object.assign(new Error('ambiguous handoff'), {
+            code: 'NATIVE_REFRESH_OUTCOME_UNKNOWN',
+          });
+        },
+      ),
+      error => error.code === 'NATIVE_REFRESH_OUTCOME_UNKNOWN',
+    );
+
+    const response = await requestJson(`${proxy.url}/v1/messages`, {
+      method: 'POST', body: JSON.stringify({ model: 'claude-fable-5' }), timeoutMs: 1_000,
+    });
+
+    assert.deepEqual({
+      status: response.status,
+      body: response.body,
+      marker: response.headers['x-reactive-test'],
+      usageCalls,
+      upstreamSeen,
+    }, {
+      status: 429,
+      body: originalBody,
+      marker: 'parked-alternate-excluded',
       usageCalls: 1,
       upstreamSeen: ['Bearer access-token-1'],
     });
@@ -5171,7 +5269,7 @@ describe('createProxyServer', () => {
     let targetSecretReads = 0;
     let releaseTargetSecret;
     const targetSecretGate = new Promise(resolve => { releaseTargetSecret = resolve; });
-    secretStore.get = async accountId => {
+    const readAccountTwoGatedByTargetSecret = async accountId => {
       const secret = await originalGetSecret(accountId);
       if (accountId === 'acct_2') {
         targetSecretReads += 1;
@@ -5211,6 +5309,11 @@ describe('createProxyServer', () => {
       await close(proxy.server);
       await close(upstream.server);
     });
+    // Let startup reconciliation read every account's real operational secret
+    // before installing a mock that gates on acct_2's target-secret read.
+    await requestJson(`${proxy.url}/internal/health`, { timeoutMs: 1_000 });
+    secretStore.get = readAccountTwoGatedByTargetSecret;
+    secretStore.getOperational = readAccountTwoGatedByTargetSecret;
 
     const responsePending = requestJson(`${proxy.url}/v1/messages`, {
       method: 'POST',
@@ -5273,7 +5376,7 @@ describe('createProxyServer', () => {
     let targetSecretReads = 0;
     let releaseTargetSecret;
     const targetSecretGate = new Promise(resolve => { releaseTargetSecret = resolve; });
-    secretStore.get = async accountId => {
+    const readAccountTwoGatedByTargetSecret = async accountId => {
       const secret = await originalGetSecret(accountId);
       if (accountId === 'acct_2') {
         targetSecretReads += 1;
@@ -5319,6 +5422,11 @@ describe('createProxyServer', () => {
       await close(proxy.server);
       await close(upstream.server);
     });
+    // Let startup reconciliation read every account's real operational secret
+    // before installing a mock that gates on acct_2's target-secret read.
+    await requestJson(`${proxy.url}/internal/health`, { timeoutMs: 1_000 });
+    secretStore.get = readAccountTwoGatedByTargetSecret;
+    secretStore.getOperational = readAccountTwoGatedByTargetSecret;
 
     const responsePending = requestJson(`${proxy.url}/v1/messages`, {
       method: 'POST',
@@ -7270,6 +7378,41 @@ describe('createProxyServer', () => {
     assert.equal(startup.body.accounts[0].unavailableReason.type, 'oauth_refresh_failed');
     assert.equal(reload.body.accounts[0].unavailableReason.type, 'oauth_refresh_failed');
     assert.equal(JSON.stringify([startup.body, reload.body]).includes('startup-refresh-fixture'), false);
+  });
+
+  it('responds to /internal/health immediately even while startup reconciliation is stuck on an account lock', async () => {
+    const secretStore = new MemorySecretStore();
+    await secretStore.set('acct_1', { accessToken: 'access-token-1' });
+    let releaseReconcile;
+    const reconcileGate = new Promise(resolve => { releaseReconcile = resolve; });
+    const originalGetOperational = secretStore.getOperational.bind(secretStore);
+    secretStore.getOperational = async accountId => {
+      await reconcileGate;
+      return originalGetOperational(accountId);
+    };
+    const accountManager = new AccountManager({
+      accounts: [{ id: 'acct_1', type: 'oauth' }],
+    });
+    const proxy = await listen(createProxyServer({
+      accountManager,
+      secretStore,
+      config: { upstream: 'http://127.0.0.1:1', usagePolling: { enabled: false } },
+    }));
+    cleanupAfterTest(async () => {
+      releaseReconcile();
+      await close(proxy.server);
+    });
+
+    // Startup reconciliation (operationalStateCheck) is stuck reading
+    // acct_1's operational secret (as it would be if the account lock were
+    // held by a concurrent refresh). /internal/health must not wait for it
+    // -- install/reinstall's bounded health poll would otherwise time out
+    // and roll back a routine install whenever a refresh happens to be in
+    // flight, even though the server itself is up and serving.
+    const health = await requestJson(`${proxy.url}/internal/health`, { timeoutMs: 1_000 });
+
+    assert.equal(health.status, 200);
+    assert.equal(health.body.ok, true);
   });
 
   it('refreshes OAuth usage accounts serially by default', async () => {

@@ -439,6 +439,32 @@ describe('service file rendering', () => {
     assert.notEqual(withXdg, withDifferentXdg);
   });
 
+  it('changes the LaunchAgent service generation when claudeConfigDir changes', () => {
+    const base = {
+      nodePath: '/opt/homebrew/bin/node',
+      cliPath: '/repo/bin/claude-rotator.js',
+      configPath: '/home/alice/.config/claude-rotator/config.json',
+      claudePath: '/opt/homebrew/bin/claude',
+      servicePath: '/opt/homebrew/bin:/usr/bin:/bin',
+    };
+
+    // A stale-but-still-healthy old process must never be mistaken for a
+    // freshly restarted one just because CLAUDE_CONFIG_DIR is the only
+    // plist environment variable that changed.
+    const withoutClaudeConfigDir = serviceGenerationForLaunchAgent(base);
+    const withClaudeConfigDir = serviceGenerationForLaunchAgent({
+      ...base,
+      claudeConfigDir: '/home/alice/.claude',
+    });
+    const withDifferentClaudeConfigDir = serviceGenerationForLaunchAgent({
+      ...base,
+      claudeConfigDir: '/home/alice/custom-claude',
+    });
+
+    assert.notEqual(withoutClaudeConfigDir, withClaudeConfigDir);
+    assert.notEqual(withClaudeConfigDir, withDifferentClaudeConfigDir);
+  });
+
   it('quotes and escapes special characters in every systemd Environment assignment', () => {
     const service = renderSystemdUserService({
       nodePath: '/usr/bin/node',
@@ -540,6 +566,53 @@ describe('macOS watchdog lifecycle', () => {
       );
       await uninstallMacosLifecycle(fixture.uninstallOptions());
       assert.deepEqual(await readJsonFile(fixture.paths.settingsPath), { language: 'ja' });
+    } finally {
+      await fixture.cleanup();
+    }
+  });
+
+  it('writes the gateway settings before (re)starting the main service, not after', async () => {
+    const fixture = await createMacosLifecycleFixture();
+    try {
+      const baseOptions = fixture.installOptions();
+      let settingsAtMainServiceStart = null;
+      const observingExecFileImpl = async (command, args) => {
+        const [action, , plistPath] = args;
+        if (action === 'bootstrap' && !String(plistPath).includes('watchdog')) {
+          // The instant the main LaunchAgent is (re)started is the instant a
+          // freshly booted claude-rotator process would read
+          // ~/.claude/settings.json to decide allowLiveClaudeCodeCredentials.
+          settingsAtMainServiceStart = await readJsonFile(fixture.paths.settingsPath, null);
+        }
+        return baseOptions.execFileImpl(command, args);
+      };
+
+      await installMacosLifecycle({ ...baseOptions, execFileImpl: observingExecFileImpl });
+
+      assert.notEqual(settingsAtMainServiceStart, null);
+      assert.equal(settingsAtMainServiceStart.env?.ANTHROPIC_AUTH_TOKEN, LOCAL_GATEWAY_AUTH_TOKEN);
+      assert.equal(settingsAtMainServiceStart.env?.ANTHROPIC_BASE_URL, fixture.proxyBaseUrl);
+    } finally {
+      await fixture.cleanup();
+    }
+  });
+
+  it('rejects a reinstall that would silently replace a hand-set ANTHROPIC_AUTH_TOKEN', async () => {
+    const fixture = await createInstalledMacosLifecycleFixture();
+    try {
+      const tamperedSettings = await readJsonFile(fixture.paths.settingsPath);
+      tamperedSettings.env.ANTHROPIC_AUTH_TOKEN = 'manually-set-real-credential';
+      await writeJsonFile(fixture.paths.settingsPath, tamperedSettings);
+
+      await assert.rejects(
+        installMacosLifecycle(fixture.installOptions()),
+        /ANTHROPIC_AUTH_TOKEN changed after install/,
+      );
+
+      assert.equal(
+        (await readJsonFile(fixture.paths.settingsPath)).env.ANTHROPIC_AUTH_TOKEN,
+        'manually-set-real-credential',
+      );
     } finally {
       await fixture.cleanup();
     }

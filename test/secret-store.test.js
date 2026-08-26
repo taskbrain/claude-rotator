@@ -190,6 +190,59 @@ describe('LinuxFileSecretStore', () => {
     assert.deepEqual(await first.get('acct_1'), rotatedSecret);
   });
 
+  it('exchanges the refresh token only once when two store instances race to refresh the same account', async () => {
+    // Mirrors the "server" (long-lived proxy process) and "doctor" (a
+    // separate CLI invocation) both racing to refresh the same OAuth
+    // account through the durable refreshIfUnchanged transaction that
+    // production code actually uses (refreshAndStoreSecret), not the
+    // simpler updateIfUnchanged CAS API exercised above.
+    const dir = await mkdtemp(join(tmpdir(), 'claude-rotator-secrets-'));
+    const accountsDir = join(dir, 'accounts');
+    const server = new LinuxFileSecretStore({ accountsDir });
+    const doctor = new LinuxFileSecretStore({ accountsDir });
+    const original = {
+      accessToken: 'stale-access',
+      refreshToken: 'refresh-token-1',
+      expiresAt: 1000,
+    };
+    const rotated = {
+      accessToken: 'rotated-access',
+      refreshToken: 'refresh-token-2',
+      expiresAt: 200000,
+    };
+    await server.set('acct_1', original);
+
+    let exchangeCalls = 0;
+    let releaseServerExchange;
+    let signalServerExchangeStarted;
+    const serverExchangeGate = new Promise(resolve => { releaseServerExchange = resolve; });
+    const serverExchangeStarted = new Promise(resolve => { signalServerExchangeStarted = resolve; });
+    const serverRefresh = server.refreshIfUnchanged('acct_1', original, async (current, transaction) => {
+      exchangeCalls += 1;
+      await transaction.beforeHandoff();
+      signalServerExchangeStarted();
+      await serverExchangeGate;
+      return { ...current, ...rotated };
+    });
+    await serverExchangeStarted;
+    const doctorRefresh = doctor.refreshIfUnchanged('acct_1', original, async () => {
+      exchangeCalls += 1;
+      return assert.fail('a concurrent refresh must not exchange the same refresh token twice');
+    });
+    releaseServerExchange();
+
+    const [serverResult, doctorResult] = await Promise.all([serverRefresh, doctorRefresh]);
+
+    assert.equal(exchangeCalls, 1);
+    assert.equal(serverResult.secret.accessToken, 'rotated-access');
+    // doctor observed the already-rotated credential once it acquired the
+    // lock behind server, instead of exchanging the (now stale) refresh
+    // token a second time.
+    assert.equal(doctorResult.updated, false);
+    assert.equal(doctorResult.secret.accessToken, 'rotated-access');
+    assert.deepEqual(await server.get('acct_1'), rotated);
+  });
+
   it('waits beyond five virtual seconds for a Linux refresh transaction and invokes one updater', async () => {
     const dir = await mkdtemp(join(tmpdir(), 'claude-rotator-linux-long-lock-'));
     const accountsDir = join(dir, 'accounts');
