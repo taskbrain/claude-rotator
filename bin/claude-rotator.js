@@ -15,4 +15,4 @@ const { runCli } = await import('../src/cli.js');
 const code = await runCli(process.argv.slice(2), {
   cliPath: fileURLToPath(import.meta.url),
 });
-process.exit(code);
+process.exitCode = code;
