@@ -82,8 +82,8 @@ export function renderMacosWatchdogLaunchAgentPlist({ lockPath, helperPath }) {
 `;
 }
 
-function shellQuote(value) {
-  return `'${String(value).replaceAll("'", "'\\\"'\\\"'")}'`;
+export function shellQuote(value) {
+  return `'${String(value).replaceAll("'", "'\\''")}'`;
 }
 
 function xmlEscape(value) {

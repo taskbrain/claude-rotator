@@ -15,7 +15,10 @@ Claude Code の複数アカウントをローカル proxy 経由で切り替え�
 
 ## 利用上の注意
 
-このプロジェクトは Anthropic / Claude Code の非公式ツールです。利用しているサービス、契約、組織ポリシーの範囲内で使ってください。認証情報は各 PC のローカルにのみ保存され、リポジトリに保存・送信しない設計ですが、共有 PC や暗号化されていないディスクでは保存先の保護に注意してください。
+- 本プロジェクトは Anthropic / Claude Code の**非公式**ツールです。Anthropic とは無関係であり、Anthropic による保証・サポートはありません。
+- 利用者は、自身と Anthropic の契約、Anthropic の利用規約、および所属組織のポリシーの範囲内で使う責任を負います。規約・ポリシー違反が生じた場合の責任は利用者にあります。
+- 本ツールは [MIT ライセンス](./LICENSE) の下で**無保証（AS IS）**で提供されます。
+- 認証情報は各 PC のローカルにのみ保存され、リポジトリに保存・送信しない設計です。ただし共有 PC や暗号化されていないディスクでは、保存先（macOS: Keychain / Ubuntu: ローカルファイル）の保護に注意してください。
 
 ## 動作環境
 
@@ -367,6 +370,13 @@ Local Claude Code account rotator for macOS and Linux.
 `claude-rotator` runs a localhost Anthropic-compatible proxy and configures Claude Code to use it through `~/.claude/settings.json`. After installation, you continue launching Claude Code with the normal `claude` command.
 
 The credential-bearing proxy is restricted to loopback. Requests with a non-loopback `Host` or cross-site browser metadata are rejected before forwarding. The proxy does not authenticate local clients, so it trusts every OS user and process on the same host that can connect to loopback. Run it only on a single-user or otherwise fully trusted host; a dedicated OS user alone does not isolate loopback TCP.
+
+### Important notes
+
+- This project is an **unofficial** tool for Anthropic / Claude Code. It is not affiliated with, endorsed by, or supported by Anthropic.
+- You are responsible for using it within your own agreement with Anthropic, the Anthropic Terms of Service, and any policies of your organization. You bear responsibility for any resulting violation.
+- This tool is provided under the [MIT License](./LICENSE) **with no warranty** ("AS IS").
+- Credentials are stored locally on each machine only, by design never saved to or sent from this repository. On shared machines or unencrypted disks, protect the storage location (macOS: Keychain / Ubuntu: local file) accordingly.
 
 ### Install
 
