@@ -171,7 +171,7 @@ export async function runCli(argv = [], deps = {}) {
     }
 
     if (command === 'doctor') {
-      return doctorCommand({ write, deps });
+      return await doctorCommand({ write, deps });
     }
 
     if (command === 'login') {

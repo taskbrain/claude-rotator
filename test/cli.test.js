@@ -601,6 +601,19 @@ describe('runCli', () => {
     assert.equal(refreshCalls, 0);
     assert.match(io.output(), /Secret store does not support atomic compare-and-set/);
   });
+
+  it('reports a doctor health-check failure as a normal CLI failure', async () => {
+    const io = createIo();
+
+    const code = await runCli(['doctor'], {
+      ...io,
+      readHealth: async () => { throw new Error('connect ECONNREFUSED 127.0.0.1:37891'); },
+      loadConfig: async () => ({ accounts: [] }),
+    });
+
+    assert.equal(code, 1);
+    assert.match(io.output(), /connect ECONNREFUSED 127\.0\.0\.1:37891/);
+  });
 });
 
 describe('uninstall --purge-secrets account id targeting', () => {
