@@ -7,10 +7,12 @@ import { dirname, join } from 'node:path';
 
 import {
   ensureCredentialRevisions,
+  removeServiceFile,
   runCli,
   runMacosCliActionWithLock,
   startService,
 } from '../src/cli.js';
+import { MACOS_LAUNCH_AGENT_LABEL } from '../src/install.js';
 
 describe('ensureCredentialRevisions', () => {
   it('assigns a non-secret baseline only to accounts missing a revision', () => {
@@ -598,6 +600,139 @@ describe('runCli', () => {
     assert.equal(code, 0);
     assert.equal(refreshCalls, 0);
     assert.match(io.output(), /Secret store does not support atomic compare-and-set/);
+  });
+});
+
+describe('uninstall --purge-secrets account id targeting', () => {
+  // Regression coverage for the macOS Keychain purge silently deleting nothing:
+  // `uninstall --purge-secrets` must forward the configured account ids (plus
+  // the "current" account) to secretStore.purge(ids), on both the darwin and
+  // non-darwin code paths, instead of calling purge() with no arguments.
+  const noopExecFileImpl = async (command, args) => {
+    if (args[0] === 'print') throw Object.assign(new Error('not found'), { code: 113 });
+    return { stdout: '', stderr: '' };
+  };
+
+  async function writeConfigWithAccounts(configPath) {
+    await mkdir(dirname(configPath), { recursive: true });
+    await writeFile(configPath, JSON.stringify({
+      accounts: [
+        { id: 'acct_1', name: 'a@example.com', type: 'oauth' },
+        { id: 'acct_2', name: 'b@example.com', type: 'oauth' },
+      ],
+    }), 'utf8');
+  }
+
+  function createPurgeSpy() {
+    const calls = [];
+    const secretStoreFactory = () => ({
+      purge: async ids => { calls.push(ids); },
+    });
+    return { calls, secretStoreFactory };
+  }
+
+  it('darwin: purges the configured account ids plus the current account', async () => {
+    const io = createIo();
+    const sandbox = await mkdtemp(join(tmpdir(), 'claude-rotator-cli-uninstall-purge-darwin-'));
+    try {
+      const home = join(sandbox, 'home');
+      const xdgConfig = join(sandbox, 'xdg-config');
+      const xdgData = join(sandbox, 'xdg-data');
+      const configPath = join(xdgConfig, 'claude-rotator', 'config.json');
+      await writeConfigWithAccounts(configPath);
+      const { calls, secretStoreFactory } = createPurgeSpy();
+
+      const code = await runCli(['__macos-service-action', 'uninstall', '--purge-secrets'], {
+        ...io,
+        platform: 'darwin',
+        home,
+        env: {
+          CLAUDE_ROTATOR_MACOS_SERVICE_LOCKED: '1',
+          XDG_CONFIG_HOME: xdgConfig,
+          XDG_DATA_HOME: xdgData,
+        },
+        execFileImpl: noopExecFileImpl,
+        secretStoreFactory,
+      });
+
+      assert.equal(code, 0);
+      assert.equal(calls.length, 1);
+      assert.deepEqual(calls[0], ['acct_1', 'acct_2', 'current']);
+    } finally {
+      await rm(sandbox, { recursive: true, force: true });
+    }
+  });
+
+  it('darwin: does not purge when --purge-secrets is omitted', async () => {
+    const io = createIo();
+    const sandbox = await mkdtemp(join(tmpdir(), 'claude-rotator-cli-uninstall-no-purge-darwin-'));
+    try {
+      const home = join(sandbox, 'home');
+      const xdgConfig = join(sandbox, 'xdg-config');
+      const xdgData = join(sandbox, 'xdg-data');
+      const configPath = join(xdgConfig, 'claude-rotator', 'config.json');
+      await writeConfigWithAccounts(configPath);
+      const { calls, secretStoreFactory } = createPurgeSpy();
+
+      const code = await runCli(['__macos-service-action', 'uninstall'], {
+        ...io,
+        platform: 'darwin',
+        home,
+        env: {
+          CLAUDE_ROTATOR_MACOS_SERVICE_LOCKED: '1',
+          XDG_CONFIG_HOME: xdgConfig,
+          XDG_DATA_HOME: xdgData,
+        },
+        execFileImpl: noopExecFileImpl,
+        secretStoreFactory,
+      });
+
+      assert.equal(code, 0);
+      assert.equal(calls.length, 0);
+    } finally {
+      await rm(sandbox, { recursive: true, force: true });
+    }
+  });
+
+  it('non-darwin (linux): purges the configured account ids plus the current account', async () => {
+    const io = createIo();
+    const sandbox = await mkdtemp(join(tmpdir(), 'claude-rotator-cli-uninstall-purge-linux-'));
+    const originalHome = process.env.HOME;
+    try {
+      const home = join(sandbox, 'home');
+      const xdgConfig = join(sandbox, 'xdg-config');
+      const xdgData = join(sandbox, 'xdg-data');
+      const configPath = join(xdgConfig, 'claude-rotator', 'config.json');
+      await writeConfigWithAccounts(configPath);
+      // uninstallSettings() reads installStatePath eagerly with no ENOENT
+      // fallback, so a prior "install" state must exist for the restore step
+      // to no-op cleanly instead of throwing.
+      await writeFile(join(xdgConfig, 'claude-rotator', 'install-state.json'), '{}', 'utf8');
+      const { calls, secretStoreFactory } = createPurgeSpy();
+
+      // removeServiceFile() (called by uninstallCommand's non-darwin branch)
+      // removes the macOS LaunchAgent plist via a path built from the real
+      // os.homedir() rather than the injected `home` (a pre-existing gap,
+      // out of scope here). Sandbox real HOME for this test only so that
+      // unrelated real files on this machine are never touched.
+      process.env.HOME = home;
+
+      const code = await runCli(['uninstall', '--purge-secrets'], {
+        ...io,
+        platform: 'linux',
+        home,
+        env: { XDG_CONFIG_HOME: xdgConfig, XDG_DATA_HOME: xdgData },
+        secretStoreFactory,
+      });
+
+      assert.equal(code, 0);
+      assert.equal(calls.length, 1);
+      assert.deepEqual(calls[0], ['acct_1', 'acct_2', 'current']);
+    } finally {
+      if (originalHome === undefined) delete process.env.HOME;
+      else process.env.HOME = originalHome;
+      await rm(sandbox, { recursive: true, force: true });
+    }
   });
 });
 

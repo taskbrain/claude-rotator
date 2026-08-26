@@ -8,7 +8,7 @@ import { dirname, isAbsolute, join, resolve } from 'node:path';
 import { isDeepStrictEqual, promisify } from 'node:util';
 
 import { AccountManager } from './account-manager.js';
-import { createDefaultConfig, getConfigPath, loadOrCreateConfig, proxyBaseUrl, saveConfig } from './config.js';
+import { createDefaultConfig, getConfigPath, loadConfig, loadOrCreateConfig, proxyBaseUrl, saveConfig } from './config.js';
 import { createProxyServer, defaultTokenRefresher } from './proxy-server.js';
 import { createServerLogWriter } from './log-rotation.js';
 import { createSecretStore } from './secret-store.js';
@@ -450,15 +450,22 @@ async function installCommand({ argv, write, deps = {} }) {
   }
 }
 
+async function purgeTargetAccountIds(configPath) {
+  const config = await loadConfig(configPath).catch(() => null);
+  const ids = (config?.accounts || []).map(account => account.id).filter(Boolean);
+  return [...new Set([...ids, CURRENT_ACCOUNT_ID])];
+}
+
 async function uninstallCommand({ argv, write, deps = {} }) {
   const platform = deps.platform || process.platform;
   const env = deps.env || process.env;
   const home = deps.home || homedir();
-  const configPath = getConfigPath();
+  const configPath = getConfigPath(env);
   const statePath = installStatePath(env, home);
   const settingsPath = claudeSettingsPath(home);
   const force = argv.includes('--force');
   const purgeSecrets = argv.includes('--purge-secrets');
+  const purgeAccountIds = purgeSecrets ? await purgeTargetAccountIds(configPath) : [];
   if (platform === 'darwin') {
     await uninstallMacosLifecycle({
       uid: deps.uid ?? (typeof process.getuid === 'function' ? process.getuid() : null),
@@ -467,7 +474,8 @@ async function uninstallCommand({ argv, write, deps = {} }) {
       force,
       purgeSecrets,
       execFileImpl: deps.execFileImpl || execFileAsync,
-      purgeSecretsImpl: async () => (deps.secretStoreFactory || createSecretStore)().purge(),
+      purgeSecretsImpl: async () => (deps.secretStoreFactory || createSecretStore)({ platform, env, home })
+        .purge(purgeAccountIds),
     });
     write('Uninstalled claude-rotator\n');
     return;
@@ -477,7 +485,9 @@ async function uninstallCommand({ argv, write, deps = {} }) {
   if (result.conflict) throw new Error(result.reason);
   await removeServiceFile({ configPath, env, home });
   await removeInstallState(statePath);
-  if (purgeSecrets) await createSecretStore().purge();
+  if (purgeSecrets) {
+    await (deps.secretStoreFactory || createSecretStore)({ platform, env, home }).purge(purgeAccountIds);
+  }
   write('Uninstalled claude-rotator\n');
 }
 
