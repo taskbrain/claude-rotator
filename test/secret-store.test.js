@@ -1,6 +1,8 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdir, mkdtemp, rm, stat, writeFile } from 'node:fs/promises';
+import { fork } from 'node:child_process';
+import { once } from 'node:events';
+import { mkdir, mkdtemp, readFile, rm, stat, writeFile } from 'node:fs/promises';
 import { hostname, tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -11,6 +13,40 @@ import {
   createSecretStore,
   secretStoreProcessIdentity,
 } from '../src/secret-store.js';
+import { executeNativeClaudeCommand } from '../src/native-claude-refresher.js';
+import { refreshAccessToken } from '../src/oauth.js';
+import { createFileBackedFakeKeychainOptions } from '../fixtures/file-backed-fake-keychain.js';
+
+function createFakeKeychainStoreOptions(lockDir) {
+  const keychain = new Map();
+  return {
+    lockDir,
+    execFileImpl: async (command, args, options = {}) => {
+      assert.equal(command, 'security');
+      if (args[0] === '-i') {
+        await options.beforeInput?.(process.pid);
+        const accountId = options.input.match(/ -a "([^"]+)"/)?.[1];
+        assert.ok(accountId);
+        if (options.input.startsWith('delete-generic-password ')) {
+          keychain.delete(accountId);
+        } else {
+          const payloadHex = options.input.match(/ -X "([0-9a-f]+)"/)?.[1];
+          assert.ok(payloadHex);
+          keychain.set(accountId, Buffer.from(payloadHex, 'hex').toString('utf8'));
+        }
+        await options.afterClose?.(process.pid);
+        return { stdout: '' };
+      }
+      const accountId = args[args.indexOf('-a') + 1];
+      if (!keychain.has(accountId)) {
+        const error = new Error('not found');
+        error.code = 44;
+        throw error;
+      }
+      return { stdout: `${keychain.get(accountId)}\n` };
+    },
+  };
+}
 
 // Touches the real macOS Keychain (via the `security` CLI), which triggers OS
 // authentication prompts on a developer machine. Skipped by default; CI opts
@@ -77,6 +113,10 @@ describe('LinuxFileSecretStore', () => {
       () => store.set('../escape', { accessToken: 'access' }),
       /Invalid account id/,
     );
+    await assert.rejects(
+      () => store.set('..', { accessToken: 'access' }),
+      /Invalid account id/,
+    );
   });
 
   it('allows only one compare-and-set winner across store instances', async () => {
@@ -103,6 +143,464 @@ describe('LinuxFileSecretStore', () => {
       JSON.stringify(nextA),
       JSON.stringify(nextB),
     ].includes(JSON.stringify(await first.get('acct_1'))));
+  });
+
+  it('serializes refresh updates across store instances and returns the rotated credential', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'claude-rotator-secrets-'));
+    const accountsDir = join(dir, 'accounts');
+    const first = new LinuxFileSecretStore({ accountsDir });
+    const second = new LinuxFileSecretStore({ accountsDir });
+    const expiredSecret = {
+      accessToken: 'expired-access',
+      refreshToken: 'refresh-token-1',
+      expiresAt: 1000,
+    };
+    const rotatedSecret = {
+      accessToken: 'rotated-access',
+      refreshToken: 'refresh-token-2',
+      expiresAt: 200000,
+    };
+    await first.set('acct_1', expiredSecret);
+
+    let exchangeCalls = 0;
+    let releaseFirstUpdater;
+    let firstUpdaterEntered;
+    const firstUpdaterGate = new Promise(resolve => { releaseFirstUpdater = resolve; });
+    const firstUpdaterStarted = new Promise(resolve => { firstUpdaterEntered = resolve; });
+    const firstUpdate = first.updateIfUnchanged('acct_1', expiredSecret, async current => {
+      exchangeCalls += 1;
+      firstUpdaterEntered();
+      await firstUpdaterGate;
+      return { ...current, ...rotatedSecret };
+    });
+    await firstUpdaterStarted;
+    const secondUpdate = second.updateIfUnchanged('acct_1', expiredSecret, async () => {
+      exchangeCalls += 1;
+      return assert.fail('stale updater must not be called');
+    });
+    releaseFirstUpdater();
+
+    const results = await Promise.all([firstUpdate, secondUpdate]);
+
+    assert.equal(exchangeCalls, 1);
+    assert.deepEqual(results.map(result => result.secret.accessToken), [
+      'rotated-access',
+      'rotated-access',
+    ]);
+    assert.deepEqual(await first.get('acct_1'), rotatedSecret);
+  });
+
+  it('waits beyond five virtual seconds for a Linux refresh transaction and invokes one updater', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'claude-rotator-linux-long-lock-'));
+    const accountsDir = join(dir, 'accounts');
+    let virtualNow = 0;
+    let releaseFirstUpdater;
+    const firstUpdaterGate = new Promise(resolve => { releaseFirstUpdater = resolve; });
+    const first = new LinuxFileSecretStore({ accountsDir, now: () => virtualNow });
+    const second = new LinuxFileSecretStore({
+      accountsDir,
+      now: () => virtualNow,
+      lockRetryMs: 250,
+      sleepImpl: async milliseconds => {
+        virtualNow += milliseconds;
+        if (virtualNow >= 5_250) releaseFirstUpdater();
+        await new Promise(resolve => setImmediate(resolve));
+      },
+    });
+    const original = { accessToken: 'linux-original', refreshToken: 'linux-refresh' };
+    const committed = { ...original, accessToken: 'linux-committed' };
+    await first.set('acct_1', original);
+    let updaterCalls = 0;
+    let signalUpdaterStarted;
+    const updaterStarted = new Promise(resolve => { signalUpdaterStarted = resolve; });
+    const firstUpdate = first.updateIfUnchanged('acct_1', original, async () => {
+      updaterCalls += 1;
+      signalUpdaterStarted();
+      await firstUpdaterGate;
+      return committed;
+    });
+    await updaterStarted;
+    const secondUpdate = second.updateIfUnchanged('acct_1', original, async () => {
+      updaterCalls += 1;
+      return assert.fail('stale Linux updater must not run');
+    });
+
+    const [firstResult, secondResult] = await Promise.all([firstUpdate, secondUpdate]);
+
+    assert.equal(virtualNow > 5_000, true);
+    assert.equal(updaterCalls, 1);
+    assert.deepEqual(firstResult.secret, committed);
+    assert.deepEqual(secondResult.secret, committed);
+  });
+
+  it('leaves the original credential intact and releases the lock when an updater fails', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'claude-rotator-secrets-'));
+    const accountsDir = join(dir, 'accounts');
+    const first = new LinuxFileSecretStore({ accountsDir });
+    const second = new LinuxFileSecretStore({ accountsDir });
+    const original = { accessToken: 'original-access', refreshToken: 'refresh-token-1' };
+    const replacement = { accessToken: 'replacement-access', refreshToken: 'refresh-token-2' };
+    await first.set('acct_1', original);
+
+    await assert.rejects(
+      () => first.updateIfUnchanged('acct_1', original, async () => {
+        throw new Error('refresh failed');
+      }),
+      /refresh failed/,
+    );
+    assert.deepEqual(await first.get('acct_1'), original);
+
+    assert.deepEqual(
+      await second.updateIfUnchanged('acct_1', original, async () => replacement),
+      { updated: true, secret: replacement },
+    );
+    assert.deepEqual(await first.get('acct_1'), replacement);
+  });
+
+  it('persists a private non-secret handoff marker and parks a newly constructed store', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'claude-rotator-refresh-intent-'));
+    const accountsDir = join(dir, 'accounts');
+    const markerPath = join(accountsDir, '.locks', 'acct_1.refresh-intent.json');
+    const original = {
+      accessToken: 'fixture-access-must-not-leak',
+      refreshToken: 'fixture-refresh-must-not-leak',
+      expiresAt: 1,
+    };
+    const first = new LinuxFileSecretStore({ accountsDir });
+    assert.equal(typeof first.refreshIfUnchanged, 'function');
+    assert.equal(typeof first.getOperational, 'function');
+    await first.set('acct_1', original);
+    let exchangeCalls = 0;
+
+    await assert.rejects(
+      () => first.refreshIfUnchanged('acct_1', original, async (current, transaction) => {
+        exchangeCalls += 1;
+        assert.deepEqual(current, original);
+        assert.equal(typeof transaction.beforeHandoff, 'function');
+        await transaction.beforeHandoff();
+        throw Object.assign(new Error(`unsafe driver detail ${original.refreshToken}`), {
+          code: 'DRIVER_RETRYABLE_FAILURE',
+          retryAfterMs: 60_000,
+          retryAfterSource: 'fixed',
+        });
+      }),
+      error => error.code === 'NATIVE_REFRESH_OUTCOME_UNKNOWN'
+        && error.retryAfterMs === null
+        && error.retryAfterSource === null
+        && !error.message.includes(original.accessToken)
+        && !error.message.includes(original.refreshToken),
+    );
+
+    const marker = await readFile(markerPath, 'utf8');
+    assert.equal(marker.length < 4_096, true);
+    assert.equal(marker.includes(original.accessToken), false);
+    assert.equal(marker.includes(original.refreshToken), false);
+    assert.equal((await stat(markerPath)).mode & 0o777, 0o600);
+    assert.equal((await stat(join(accountsDir, '.locks'))).mode & 0o777, 0o700);
+    assert.equal(JSON.parse(marker).phase, 'handed_off');
+
+    const second = new LinuxFileSecretStore({ accountsDir });
+    await assert.rejects(
+      () => second.getOperational('acct_1'),
+      error => error.code === 'NATIVE_REFRESH_OUTCOME_UNKNOWN'
+        && !error.message.includes(original.accessToken)
+        && !error.message.includes(original.refreshToken),
+    );
+    await assert.rejects(
+      () => second.refreshIfUnchanged('acct_1', original, async () => {
+        exchangeCalls += 1;
+        return assert.fail('a parked credential must not be handed off again');
+      }),
+      error => error.code === 'NATIVE_REFRESH_OUTCOME_UNKNOWN',
+    );
+    assert.equal(exchangeCalls, 1);
+  });
+
+  it('reconciles a committed target after a crash between credential write and marker deletion', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'claude-rotator-refresh-commit-'));
+    const accountsDir = join(dir, 'accounts');
+    const markerPath = join(accountsDir, '.locks', 'acct_1.refresh-intent.json');
+    const original = {
+      accessToken: 'source-access-fixture',
+      refreshToken: 'source-refresh-fixture',
+      expiresAt: 1,
+    };
+    const target = {
+      accessToken: 'target-access-fixture',
+      refreshToken: 'target-refresh-fixture',
+      expiresAt: 4_102_444_800_000,
+    };
+    const crashing = new LinuxFileSecretStore({ accountsDir });
+    assert.equal(typeof crashing.refreshIfUnchanged, 'function');
+    assert.equal(typeof crashing.getOperational, 'function');
+    await crashing.set('acct_1', original);
+    const setUnlocked = crashing.setUnlocked.bind(crashing);
+    crashing.setUnlocked = async (accountId, secret) => {
+      await setUnlocked(accountId, secret);
+      throw new Error('simulated process death after credential write');
+    };
+
+    await assert.rejects(
+      () => crashing.refreshIfUnchanged('acct_1', original, async (current, transaction) => {
+        await transaction.beforeHandoff();
+        return { ...current, ...target };
+      }),
+      error => error.code === 'NATIVE_REFRESH_OUTCOME_UNKNOWN'
+        && error.retryAfterMs === null
+        && !error.message.includes(original.refreshToken)
+        && !error.message.includes(target.refreshToken),
+    );
+    const committingMarker = await readFile(markerPath, 'utf8');
+    assert.equal(JSON.parse(committingMarker).phase, 'committing');
+    assert.equal(committingMarker.includes(target.accessToken), false);
+    assert.equal(committingMarker.includes(target.refreshToken), false);
+
+    const recovered = new LinuxFileSecretStore({ accountsDir });
+    assert.deepEqual(await recovered.getOperational('acct_1'), target);
+    await assert.rejects(stat(markerPath), { code: 'ENOENT' });
+  });
+
+  it('keeps a malformed direct 200 response parked without a second token handoff', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'claude-rotator-invalid-direct-refresh-'));
+    const accountsDir = join(dir, 'accounts');
+    const original = {
+      accessToken: 'direct-invalid-access-fixture',
+      refreshToken: 'direct-invalid-refresh-fixture',
+      expiresAt: 1,
+      scopes: ['user:profile', 'user:inference'],
+    };
+    const first = new LinuxFileSecretStore({ accountsDir });
+    await first.set('acct_1', original);
+    let requestCalls = 0;
+    const exchange = async (current, transaction) => ({
+      ...current,
+      ...(await refreshAccessToken(current.refreshToken, {
+        ...current,
+        beforeHandoff: transaction.beforeHandoff,
+        fetchImpl: async () => {
+          requestCalls += 1;
+          return {
+            ok: true,
+            status: 200,
+            headers: new Headers(),
+            json: async () => ({}),
+          };
+        },
+        now: () => 1_000,
+      })),
+    });
+
+    await assert.rejects(
+      () => first.refreshIfUnchanged('acct_1', original, exchange),
+      error => error.code === 'NATIVE_REFRESH_OUTCOME_UNKNOWN',
+    );
+    const storedAfterFirstAttempt = await first.get('acct_1');
+    const recovered = new LinuxFileSecretStore({ accountsDir });
+    await assert.rejects(
+      () => recovered.refreshIfUnchanged('acct_1', storedAfterFirstAttempt, exchange),
+      error => error.code === 'NATIVE_REFRESH_OUTCOME_UNKNOWN',
+    );
+
+    assert.equal(requestCalls, 1);
+    assert.deepEqual(await recovered.get('acct_1'), original);
+  });
+
+  it('does not persist a non-JSON refresh target as commit proof', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'claude-rotator-invalid-refresh-target-'));
+    const accountsDir = join(dir, 'accounts');
+    const original = {
+      accessToken: 'invalid-target-access-fixture',
+      refreshToken: 'invalid-target-refresh-fixture',
+      expiresAt: 1,
+    };
+    const store = new LinuxFileSecretStore({ accountsDir });
+    await store.set('acct_1', original);
+
+    await assert.rejects(
+      () => store.refreshIfUnchanged('acct_1', original, async (current, transaction) => {
+        await transaction.beforeHandoff();
+        return {
+          ...current,
+          accessToken: undefined,
+          expiresAt: 4_102_444_800_000,
+        };
+      }),
+      error => error.code === 'NATIVE_REFRESH_OUTCOME_UNKNOWN',
+    );
+
+    assert.deepEqual(await store.get('acct_1'), original);
+    await assert.rejects(
+      () => new LinuxFileSecretStore({ accountsDir }).getOperational('acct_1'),
+      error => error.code === 'NATIVE_REFRESH_OUTCOME_UNKNOWN',
+    );
+  });
+
+  it('only an explicit replacement with a genuinely new refresh token clears a handoff marker', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'claude-rotator-refresh-relink-'));
+    const accountsDir = join(dir, 'accounts');
+    const original = {
+      accessToken: 'original-access-fixture',
+      refreshToken: 'original-refresh-fixture',
+      expiresAt: 1,
+    };
+    const store = new LinuxFileSecretStore({ accountsDir });
+    assert.equal(typeof store.refreshIfUnchanged, 'function');
+    assert.equal(typeof store.replaceLinkedCredential, 'function');
+    await store.set('acct_1', original);
+    await assert.rejects(
+      () => store.refreshIfUnchanged('acct_1', original, async (current, transaction) => {
+        await transaction.beforeHandoff();
+        throw Object.assign(new Error('ambiguous handoff'), {
+          code: 'NATIVE_REFRESH_OUTCOME_UNKNOWN',
+        });
+      }),
+      error => error.code === 'NATIVE_REFRESH_OUTCOME_UNKNOWN',
+    );
+
+    await assert.rejects(
+      () => store.replaceLinkedCredential('acct_1', {
+        ...original,
+        accessToken: 'rewritten-access-fixture',
+      }),
+      error => error.code === 'NATIVE_REFRESH_OUTCOME_UNKNOWN',
+    );
+    await assert.rejects(
+      () => store.getOperational('acct_1'),
+      error => error.code === 'NATIVE_REFRESH_OUTCOME_UNKNOWN',
+    );
+    await assert.rejects(
+      () => store.compareAndSet('acct_1', original, {
+        ...original,
+        accessToken: 'live-mirror-rewrite-fixture',
+      }),
+      error => error.code === 'NATIVE_REFRESH_OUTCOME_UNKNOWN',
+    );
+
+    const replacement = {
+      accessToken: 'replacement-access-fixture',
+      refreshToken: 'replacement-refresh-fixture',
+      expiresAt: 4_102_444_800_000,
+    };
+    await store.replaceLinkedCredential('acct_1', replacement);
+    assert.deepEqual(await store.getOperational('acct_1'), replacement);
+  });
+
+  it('fails closed on corrupt and unknown-phase refresh markers without exposing credentials', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'claude-rotator-corrupt-refresh-marker-'));
+    const accountsDir = join(dir, 'accounts');
+    const markerPath = join(accountsDir, '.locks', 'acct_1.refresh-intent.json');
+    const secret = {
+      accessToken: 'corrupt-marker-access-fixture',
+      refreshToken: 'corrupt-marker-refresh-fixture',
+    };
+    const store = new LinuxFileSecretStore({ accountsDir });
+    await store.set('acct_1', secret);
+
+    for (const marker of ['{', JSON.stringify({ version: 1, phase: 'unknown' })]) {
+      await writeFile(markerPath, marker, { mode: 0o600 });
+      await assert.rejects(
+        () => new LinuxFileSecretStore({ accountsDir }).getOperational('acct_1'),
+        error => error.code === 'NATIVE_REFRESH_OUTCOME_UNKNOWN'
+          && !error.message.includes(secret.accessToken)
+          && !error.message.includes(secret.refreshToken),
+      );
+    }
+  });
+
+  it('clears a handed-off marker for a proven provider 429 cooldown', async () => {
+    const store = new MemorySecretStore();
+    const original = {
+      accessToken: 'rate-limit-access-fixture',
+      refreshToken: 'rate-limit-refresh-fixture',
+    };
+    await store.set('acct_1', original);
+
+    await assert.rejects(
+      () => store.refreshIfUnchanged('acct_1', original, async (_current, transaction) => {
+        await transaction.beforeHandoff();
+        const error = new Error('provider cooldown');
+        error.name = 'OAuthTokenRefreshError';
+        error.status = 429;
+        error.retryAfterMs = 60_000;
+        throw error;
+      }),
+      error => error.name === 'OAuthTokenRefreshError' && error.status === 429,
+    );
+
+    assert.deepEqual(await store.getOperational('acct_1'), original);
+  });
+
+  it('keeps a persisted handoff marker authoritative after the lock owner is killed', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'claude-rotator-refresh-owner-death-'));
+    const accountsDir = join(dir, 'accounts');
+    const original = {
+      accessToken: 'owner-death-access-fixture',
+      refreshToken: 'owner-death-refresh-fixture',
+      expiresAt: 1,
+    };
+    const store = new LinuxFileSecretStore({ accountsDir });
+    await store.set('acct_1', original);
+    const worker = fork(
+      new URL('../fixtures/secret-store-handoff-worker.js', import.meta.url),
+      [accountsDir, 'acct_1'],
+      { stdio: ['ignore', 'ignore', 'ignore', 'ipc'] },
+    );
+    const [message] = await Promise.race([
+      once(worker, 'message'),
+      once(worker, 'exit').then(([code, signal]) => [{ type: 'worker-exit', code, signal }]),
+    ]);
+    assert.deepEqual(message, { type: 'handed-off' });
+    worker.kill('SIGKILL');
+    await once(worker, 'exit');
+
+    const recovered = new LinuxFileSecretStore({
+      accountsDir,
+      lockAcquireTimeoutMs: 1_000,
+      lockRetryMs: 1,
+    });
+    let exchangeCalls = 0;
+    await assert.rejects(
+      () => recovered.refreshIfUnchanged('acct_1', original, async () => {
+        exchangeCalls += 1;
+        return assert.fail('dead-owner recovery must not repeat the handoff');
+      }),
+      error => error.code === 'NATIVE_REFRESH_OUTCOME_UNKNOWN',
+    );
+    assert.equal(exchangeCalls, 0);
+  });
+
+  it('keeps the marker authoritative after a leased native child closes and before commit', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'claude-rotator-native-child-marker-'));
+    const accountsDir = join(dir, 'accounts');
+    const markerPath = join(accountsDir, '.locks', 'acct_1.refresh-intent.json');
+    const original = {
+      accessToken: 'native-child-access-fixture',
+      refreshToken: 'native-child-refresh-fixture',
+      expiresAt: 1,
+    };
+    const store = new LinuxFileSecretStore({ accountsDir });
+    await store.set('acct_1', original);
+
+    await assert.rejects(
+      () => store.refreshIfUnchanged('acct_1', original, async (_current, transaction) => {
+        await transaction.beforeHandoff();
+        await executeNativeClaudeCommand(process.execPath, ['-e', ''], {
+          timeoutMs: 5_000,
+          afterSpawn: transaction.protectChildPid,
+          afterClose: transaction.clearChildPid,
+        });
+        assert.equal(JSON.parse(await readFile(markerPath, 'utf8')).phase, 'handed_off');
+        throw Object.assign(new Error('crash window after native child close'), {
+          code: 'NATIVE_REFRESH_OUTCOME_UNKNOWN',
+        });
+      }),
+      error => error.code === 'NATIVE_REFRESH_OUTCOME_UNKNOWN',
+    );
+
+    await assert.rejects(
+      () => new LinuxFileSecretStore({ accountsDir }).getOperational('acct_1'),
+      error => error.code === 'NATIVE_REFRESH_OUTCOME_UNKNOWN',
+    );
   });
 
   it('does not preempt a paused live CAS writer when another clock is far ahead', async () => {
@@ -251,6 +749,33 @@ describe('LinuxFileSecretStore', () => {
       error => error.code === 'SECRET_STORE_LOCK_TIMEOUT',
     );
     assert.ok(performance.now() - startedAt < 2_000);
+  });
+
+  it('times out deterministically at the finite 90-second default lock bound', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'claude-rotator-default-lock-bound-'));
+    const accountsDir = join(dir, 'accounts');
+    const lockPath = join(accountsDir, '.locks', 'acct_1.lock');
+    await mkdir(lockPath, { recursive: true, mode: 0o700 });
+    await writeFile(join(lockPath, 'owner.json'), JSON.stringify({
+      token: 'live-default-bound-lock',
+      pid: process.pid,
+      hostname: hostname(),
+      acquiredAt: 0,
+    }), { mode: 0o600 });
+    let virtualNow = 0;
+    const store = new LinuxFileSecretStore({
+      accountsDir,
+      now: () => virtualNow,
+      monotonicNow: () => virtualNow,
+      lockRetryMs: 1_000,
+      sleepImpl: async milliseconds => { virtualNow += milliseconds; },
+    });
+
+    await assert.rejects(
+      () => store.delete('acct_1'),
+      error => error.code === 'SECRET_STORE_LOCK_TIMEOUT',
+    );
+    assert.equal(virtualNow, 90_000);
   });
 
   it('does not destroy a live account lock while purging secrets', async () => {
@@ -504,6 +1029,148 @@ describe('MacOSKeychainSecretStore', () => {
       'find-generic-password',
     ]);
     assert.equal((await first.get('acct_1')).accessToken, 'access-from-set');
+  });
+
+  it('waits beyond five virtual seconds for fake-Keychain contention and invokes one updater', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'claude-rotator-keychain-long-lock-'));
+    const lockDir = join(dir, 'locks');
+    const shared = createFakeKeychainStoreOptions(lockDir);
+    let virtualNow = 0;
+    let releaseFirstUpdater;
+    const firstUpdaterGate = new Promise(resolve => { releaseFirstUpdater = resolve; });
+    const first = new MacOSKeychainSecretStore({ ...shared, now: () => virtualNow });
+    const second = new MacOSKeychainSecretStore({
+      ...shared,
+      now: () => virtualNow,
+      lockRetryMs: 250,
+      sleepImpl: async milliseconds => {
+        virtualNow += milliseconds;
+        if (virtualNow >= 5_250) releaseFirstUpdater();
+        await new Promise(resolve => setImmediate(resolve));
+      },
+    });
+    const original = { accessToken: 'mac-original', refreshToken: 'mac-refresh' };
+    const committed = { ...original, accessToken: 'mac-committed' };
+    await first.set('acct_1', original);
+    let updaterCalls = 0;
+    let signalUpdaterStarted;
+    const updaterStarted = new Promise(resolve => { signalUpdaterStarted = resolve; });
+    const firstUpdate = first.updateIfUnchanged('acct_1', original, async () => {
+      updaterCalls += 1;
+      signalUpdaterStarted();
+      await firstUpdaterGate;
+      return committed;
+    });
+    await updaterStarted;
+    const secondUpdate = second.updateIfUnchanged('acct_1', original, async () => {
+      updaterCalls += 1;
+      return assert.fail('stale fake-Keychain updater must not run');
+    });
+
+    const [firstResult, secondResult] = await Promise.all([firstUpdate, secondUpdate]);
+
+    assert.equal(virtualNow > 5_000, true);
+    assert.equal(updaterCalls, 1);
+    assert.deepEqual(firstResult.secret, committed);
+    assert.deepEqual(secondResult.secret, committed);
+  });
+
+  it('parks the same handed-off refresh token across fake-Keychain store instances', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'claude-rotator-keychain-refresh-intent-'));
+    const lockDir = join(dir, 'locks');
+    const markerPath = join(lockDir, 'acct_1.refresh-intent.json');
+    const options = createFakeKeychainStoreOptions(lockDir);
+    const first = new MacOSKeychainSecretStore(options);
+    assert.equal(typeof first.refreshIfUnchanged, 'function');
+    assert.equal(typeof first.getOperational, 'function');
+    const original = {
+      accessToken: 'mac-access-fixture-must-not-leak',
+      refreshToken: 'mac-refresh-fixture-must-not-leak',
+      expiresAt: 1,
+    };
+    await first.set('acct_1', original);
+    let exchangeCalls = 0;
+
+    await assert.rejects(
+      () => first.refreshIfUnchanged('acct_1', original, async (_current, transaction) => {
+        exchangeCalls += 1;
+        await transaction.beforeHandoff();
+        throw Object.assign(new Error('ambiguous fake-Keychain handoff'), {
+          code: 'NATIVE_REFRESH_OUTCOME_UNKNOWN',
+        });
+      }),
+      error => error.code === 'NATIVE_REFRESH_OUTCOME_UNKNOWN',
+    );
+    const marker = await readFile(markerPath, 'utf8');
+    assert.equal(marker.includes(original.accessToken), false);
+    assert.equal(marker.includes(original.refreshToken), false);
+
+    const second = new MacOSKeychainSecretStore(options);
+    await assert.rejects(
+      () => second.getOperational('acct_1'),
+      error => error.code === 'NATIVE_REFRESH_OUTCOME_UNKNOWN',
+    );
+    await assert.rejects(
+      () => second.refreshIfUnchanged('acct_1', original, async () => {
+        exchangeCalls += 1;
+        return assert.fail('a parked fake-Keychain token must not be handed off again');
+      }),
+      error => error.code === 'NATIVE_REFRESH_OUTCOME_UNKNOWN',
+    );
+    assert.equal(exchangeCalls, 1);
+  });
+
+  it('keeps a fake-Keychain handoff parked after its lock owner is killed', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'claude-rotator-keychain-owner-death-'));
+    const lockDir = join(dir, 'locks');
+    const keychainPath = join(dir, 'keychain.json');
+    const accountId = 'acct_1';
+    const original = {
+      accessToken: 'mac-owner-death-access-fixture',
+      refreshToken: 'mac-owner-death-refresh-fixture',
+      expiresAt: 1,
+    };
+    const first = new MacOSKeychainSecretStore(
+      createFileBackedFakeKeychainOptions(lockDir, keychainPath),
+    );
+    await first.set(accountId, original);
+    const worker = fork(
+      new URL('../fixtures/macos-secret-store-handoff-worker.js', import.meta.url),
+      [lockDir, keychainPath, accountId],
+      { stdio: ['ignore', 'ignore', 'ignore', 'ipc'] },
+    );
+
+    try {
+      const [message] = await Promise.race([
+        once(worker, 'message'),
+        once(worker, 'exit').then(([code, signal]) => [{
+          type: 'worker-exit',
+          code,
+          signal,
+        }]),
+      ]);
+      assert.deepEqual(message, { type: 'handed-off' });
+      worker.kill('SIGKILL');
+      await once(worker, 'exit');
+
+      const recovered = new MacOSKeychainSecretStore({
+        ...createFileBackedFakeKeychainOptions(lockDir, keychainPath),
+        lockAcquireTimeoutMs: 1_000,
+        lockRetryMs: 1,
+      });
+      let exchangeCalls = 0;
+      await assert.rejects(
+        () => recovered.refreshIfUnchanged(accountId, original, async () => {
+          exchangeCalls += 1;
+          return assert.fail('dead fake-Keychain owner must not repeat the handoff');
+        }),
+        error => error.code === 'NATIVE_REFRESH_OUTCOME_UNKNOWN',
+      );
+      assert.equal(exchangeCalls, 0);
+      assert.deepEqual(await recovered.get(accountId), original);
+    } finally {
+      if (worker.exitCode == null && worker.signalCode == null) worker.kill('SIGKILL');
+    }
   });
 
   it('round-trips a fake credential through the real macOS Keychain', {

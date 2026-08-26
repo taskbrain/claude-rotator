@@ -40,7 +40,7 @@ export class AccountManager {
     }
 
     const reason = this.unavailableReason(current);
-    if (current?.status === 'error' || reason?.type === 'oauth_refresh_rate_limit') {
+    if (current?.status === 'error' || isCredentialRefreshCooldown(reason)) {
       const next = this.selectBestAvailableSwitchTarget(modelFamily);
       if (next) {
         next.status = 'active';
@@ -169,6 +169,16 @@ export class AccountManager {
     });
   }
 
+  markCredentialRefreshDeferred(accountId, retryAfterSeconds, { retryAfterSource = null } = {}) {
+    this.markTemporaryUnavailable(accountId, retryAfterSeconds, {
+      type: 'oauth_refresh_retry',
+      ...(retryAfterSource ? { retryAfterSource } : {}),
+    }, {
+      eventType: 'credential-refresh-deferred',
+      retryAfterSeconds,
+    });
+  }
+
   markTemporaryUnavailable(accountId, retryAfterSeconds, reason, event = {}) {
     const account = this.find(accountId);
     const retryAfterMs = Math.max(0, Number(retryAfterSeconds) || 0) * 1000;
@@ -199,7 +209,7 @@ export class AccountManager {
 
   markAuthenticated(accountOrId) {
     const account = typeof accountOrId === 'string' ? this.find(accountOrId) : accountOrId;
-    const credentialThrottled = account.temporaryUnavailableReason?.type === 'oauth_refresh_rate_limit';
+    const credentialThrottled = isCredentialRefreshCooldown(account.temporaryUnavailableReason);
     account.errorReason = null;
     if (credentialThrottled) {
       account.rateLimitedUntil = null;
@@ -355,7 +365,7 @@ export class AccountManager {
 
   normalizeRestoredCredentialCooldown(account) {
     const reason = account.temporaryUnavailableReason;
-    if (reason?.type !== 'oauth_refresh_rate_limit') return;
+    if (!isCredentialRefreshCooldown(reason)) return;
     if (!account.rateLimitedUntil) return;
     const remainingMs = account.rateLimitedUntil - this.now();
     const maximumRestoredCooldownMs = restoredCredentialCooldownLimitMs(
@@ -884,6 +894,11 @@ export function quotaUnavailableReasonForModelFamily(quota, threshold, modelFami
 export function isUnifiedQuotaExhaustion(reason) {
   return reason?.type === 'quota_exhausted'
     && (['5h', '7d'].includes(reason.window) || String(reason.window || '').startsWith('7d '));
+}
+
+export function isCredentialRefreshCooldown(reason) {
+  return reason?.type === 'oauth_refresh_rate_limit'
+    || reason?.type === 'oauth_refresh_retry';
 }
 
 /**

@@ -1,4 +1,4 @@
-import { execFile, spawn } from 'node:child_process';
+import { spawn } from 'node:child_process';
 import { constants as fsConstants } from 'node:fs';
 import {
   access,
@@ -7,54 +7,34 @@ import {
   mkdir,
   mkdtemp,
   open,
+  realpath,
   rm,
   writeFile,
 } from 'node:fs/promises';
 import { tmpdir, userInfo } from 'node:os';
-import { delimiter, join, resolve } from 'node:path';
-import { promisify } from 'node:util';
-import { createHash } from 'node:crypto';
+import { delimiter, isAbsolute, join, resolve } from 'node:path';
+import { performance } from 'node:perf_hooks';
 
+import { claudeKeychainServiceName } from './claude-keychain.js';
 import { parseClaudeCredentials } from './claude-credentials.js';
-
-const execFileAsync = promisify(execFile);
+import { CLAUDE_AI_OAUTH_SCOPES, OAUTH_CLIENT_ID } from './oauth.js';
 
 export const DEFAULT_NATIVE_CLAUDE_REFRESH_TIMEOUT_MS = 30_000;
 export const DEFAULT_NATIVE_CLAUDE_REFRESH_RETRY_AFTER_MS = 5 * 60 * 1000;
 export const DEFAULT_NATIVE_CLAUDE_REFRESH_ARGS = Object.freeze([
-  '-p',
-  'Reply only OK',
-  '--model',
-  'haiku',
-  '--max-turns',
-  '1',
-  '--no-session-persistence',
-  '--disable-slash-commands',
-  '--tools',
-  '',
-  '--setting-sources=',
-  '--settings',
-  '{}',
-  '--strict-mcp-config',
-  '--mcp-config',
-  '{"mcpServers":{}}',
-  '--no-chrome',
-  '--system-prompt',
-  'Reply exactly OK. Do not use tools.',
-  '--output-format',
-  'json',
+  'auth',
+  'login',
+  '--claudeai',
 ]);
-
 const TEMP_DIRECTORY_PREFIX = 'claude-rotator-native-refresh-';
 const PRIVATE_DIRECTORY_MODE = 0o700;
 const PRIVATE_FILE_MODE = 0o600;
 const MAX_COMMAND_OUTPUT_BYTES = 64 * 1024;
 const MAX_CREDENTIAL_BYTES = 64 * 1024;
-const LOOPBACK_UPSTREAM = 'http://127.0.0.1:9';
-const KEYCHAIN_SERVICE_PREFIX = 'Claude Code-credentials-';
 const SAFE_KEYCHAIN_ACCOUNT_RE = /^[a-zA-Z0-9._-]+$/;
 const FALLBACK_KEYCHAIN_ACCOUNT = 'claude-code-user';
 const DEFAULT_KEYCHAIN_TIMEOUT_MS = 5_000;
+const NATIVE_CLAUDE_TERMINATION_GRACE_MS = 2_000;
 
 export class NativeClaudeRefreshError extends Error {
   constructor(message, code, {
@@ -80,8 +60,9 @@ export function createNativeClaudeRefresher(options = {}) {
 export async function refreshWithNativeClaudeCode(refreshToken, context = {}, {
   command = undefined,
   args = DEFAULT_NATIVE_CLAUDE_REFRESH_ARGS,
-  execFileImpl = execFileAsync,
+  execFileImpl = executeNativeClaudeCommand,
   accessImpl = access,
+  realpathImpl = realpath,
   openImpl = open,
   keychainExecImpl = executeSecurityCommand,
   userInfoImpl = userInfo,
@@ -90,16 +71,23 @@ export async function refreshWithNativeClaudeCode(refreshToken, context = {}, {
   tempRoot = undefined,
   env = process.env,
   now = Date.now,
+  deadlineNow = () => performance.now(),
   removeImpl = rm,
   onCleanupError = () => {},
 } = {}) {
+  const configuredTimeoutMs = normalizeTimeout(timeoutMs);
+  const refreshDeadline = normalizeDeadlineNow(deadlineNow) + configuredTimeoutMs;
   const currentTime = normalizeNow(now);
   const previous = validatePreviousCredential(refreshToken, context, currentTime);
-  const configuredTimeoutMs = normalizeTimeout(timeoutMs);
-  const configuredCommand = await resolveNativeClaudeCommand({
+  const resolvedCommand = await resolveNativeClaudeCommand({
     command,
     env,
     accessImpl,
+  });
+  const configuredCommand = await pinNativeClaudeCommand({
+    command: resolvedCommand,
+    accessImpl,
+    realpathImpl,
   });
   const commandArgs = validateCommand(configuredCommand, args, execFileImpl);
   if (
@@ -151,9 +139,6 @@ export async function refreshWithNativeClaudeCode(refreshToken, context = {}, {
       createPrivateDirectory(workDir),
     ]);
 
-    // Force native Claude's preflight refresh even when this refresh was triggered by an
-    // upstream 401 before the stored access-token expiry window.
-    const forcedSeedExpiry = Math.max(1, currentTime - 1);
     const managedSettingsPath = join(sandbox, 'managed-settings.json');
     await writeFile(managedSettingsPath, '{}\n', {
       encoding: 'utf8',
@@ -161,6 +146,9 @@ export async function refreshWithNativeClaudeCode(refreshToken, context = {}, {
       mode: PRIVATE_FILE_MODE,
     });
     const keychainAccount = nativeClaudeKeychainAccount(env, userInfoImpl);
+    const nativeHomeDir = platform === 'darwin'
+      ? nativeClaudeKeychainHome(env, userInfoImpl)
+      : homeDir;
     credentialStorage = createNativeClaudeCredentialStorage({
       platform,
       configDir,
@@ -169,40 +157,47 @@ export async function refreshWithNativeClaudeCode(refreshToken, context = {}, {
       openImpl,
       timeoutMs: Math.min(configuredTimeoutMs, DEFAULT_KEYCHAIN_TIMEOUT_MS),
     });
-    await credentialStorage.seed(credentialDocument({
-      ...previous,
-      expiresAt: forcedSeedExpiry,
-    }));
-    await assertSeedCredential(
-      await credentialStorage.read('seed'),
-      refreshToken,
-      forcedSeedExpiry,
-    );
-
-    let executionFailure = null;
+    const environment = isolatedEnvironment({
+      source: env,
+      configDir,
+      homeDir: nativeHomeDir,
+      xdgConfigDir,
+      xdgCacheDir,
+      xdgDataDir,
+      xdgStateDir,
+      tempDir,
+      sandbox,
+      user: platform === 'darwin' ? keychainAccount : undefined,
+    });
+    if (remainingNativeCommandTimeout(refreshDeadline, deadlineNow) == null) {
+      throw nativeRefreshCommandFailedError();
+    }
+    await context.beforeHandoff?.();
+    const loginTimeoutMs = remainingNativeCommandTimeout(refreshDeadline, deadlineNow);
+    if (loginTimeoutMs == null) {
+      // The durable handoff fence may already be armed, so fail closed even
+      // though no child can now be started safely inside the deadline.
+      throw new NativeClaudeRefreshError(
+        'Native Claude OAuth credential refresh outcome is unknown',
+        'NATIVE_REFRESH_OUTCOME_UNKNOWN',
+      );
+    }
     try {
       await executeNativeRefresh({
         command: configuredCommand,
         args: commandArgs,
         execFileImpl,
-        timeoutMs: configuredTimeoutMs,
+        timeoutMs: loginTimeoutMs,
         cwd: workDir,
-        env: isolatedEnvironment({
-          source: env,
-          configDir,
-          homeDir,
-          xdgConfigDir,
-          xdgCacheDir,
-          xdgDataDir,
-          xdgStateDir,
-          tempDir,
-          sandbox,
-          user: platform === 'darwin' ? keychainAccount : undefined,
-        }),
+        env: {
+          ...environment,
+          CLAUDE_CODE_OAUTH_REFRESH_TOKEN: previous.refreshToken,
+          CLAUDE_CODE_OAUTH_SCOPES: previous.scopes.join(' '),
+        },
+        afterSpawn: context.protectChildPid,
+        afterClose: context.clearChildPid,
       });
-    } catch (error) {
-      executionFailure = error;
-    }
+    } catch {}
 
     try {
       const refreshed = await credentialStorage.read('refreshed');
@@ -210,15 +205,18 @@ export async function refreshWithNativeClaudeCode(refreshToken, context = {}, {
         previous,
         refreshed,
         normalizeNow(now),
-        forcedSeedExpiry,
       );
-    } catch (error) {
-      if (executionFailure) throw executionFailure;
-      throw error;
+    } catch {
+      throw new NativeClaudeRefreshError(
+        'Native Claude OAuth credential refresh outcome is unknown',
+        'NATIVE_REFRESH_OUTCOME_UNKNOWN',
+      );
     }
   } catch (error) {
     primaryError = error;
   } finally {
+    // Credential reads, child-lease clearing, and cleanup are safety fences: they
+    // stay awaited even after the execution deadline so no secret or child is orphaned.
     if (credentialStorage) {
       await runCleanupStep(
         () => credentialStorage.cleanup(),
@@ -272,6 +270,19 @@ function validatePreviousCredential(refreshToken, context, now) {
   }
 
   const metadata = optionalCredentialMetadata(context);
+  if (
+    Object.prototype.hasOwnProperty.call(context || {}, 'clientId')
+    && context.clientId != null
+    && context.clientId !== OAUTH_CLIENT_ID
+  ) {
+    throw new NativeClaudeRefreshError(
+      'Native Claude refresh does not support a non-first-party OAuth client',
+      'NATIVE_REFRESH_UNSUPPORTED_CLIENT',
+    );
+  }
+  if (!metadata.scopes) {
+    metadata.scopes = [...CLAUDE_AI_OAUTH_SCOPES];
+  }
   if (metadata.refreshTokenExpiresAt != null && metadata.refreshTokenExpiresAt <= now) {
     throw new NativeClaudeRefreshError(
       'The stored OAuth refresh credential has expired and must be linked again',
@@ -299,30 +310,9 @@ function optionalCredentialMetadata(source) {
   return metadata;
 }
 
-function credentialDocument(credential) {
-  return {
-    accessToken: credential.accessToken,
-    refreshToken: credential.refreshToken,
-    expiresAt: credential.expiresAt,
-    ...optionalCredentialMetadata(credential),
-  };
-}
-
 async function createPrivateDirectory(path) {
   await mkdir(path, { recursive: true, mode: PRIVATE_DIRECTORY_MODE });
   await chmod(path, PRIVATE_DIRECTORY_MODE);
-}
-
-async function assertSeedCredential(seeded, refreshToken, forcedSeedExpiry) {
-  if (
-    seeded.refreshToken !== refreshToken
-    || normalizedTimestamp(seeded.expiresAt) !== forcedSeedExpiry
-  ) {
-    throw new NativeClaudeRefreshError(
-      'Isolated native Claude credential does not match the requested credential',
-      'NATIVE_REFRESH_INPUT_MISMATCH',
-    );
-  }
 }
 
 export function createNativeClaudeCredentialStorage({
@@ -450,9 +440,7 @@ export function nativeClaudeKeychainServiceName(configDir) {
       'NATIVE_REFRESH_INVALID_INPUT',
     );
   }
-  const normalized = configDir.normalize('NFC');
-  const suffix = createHash('sha256').update(normalized).digest('hex').slice(0, 8);
-  return `${KEYCHAIN_SERVICE_PREFIX}${suffix}`;
+  return claudeKeychainServiceName(configDir);
 }
 
 export function nativeClaudeKeychainAccount(env = process.env, userInfoImpl = userInfo) {
@@ -465,6 +453,24 @@ export function nativeClaudeKeychainAccount(env = process.env, userInfoImpl = us
   return SAFE_KEYCHAIN_ACCOUNT_RE.test(candidate || '')
     ? candidate
     : FALLBACK_KEYCHAIN_ACCOUNT;
+}
+
+function nativeClaudeKeychainHome(env, userInfoImpl) {
+  let candidate = env?.HOME;
+  if (!isNonEmptyString(candidate)) {
+    try {
+      candidate = userInfoImpl().homedir;
+    } catch {
+      candidate = null;
+    }
+  }
+  if (!isNonEmptyString(candidate) || !isAbsolute(candidate)) {
+    throw new NativeClaudeRefreshError(
+      'Native Claude Keychain home directory configuration is invalid',
+      'NATIVE_REFRESH_INVALID_INPUT',
+    );
+  }
+  return resolve(candidate);
 }
 
 async function readLinuxCredentialFile(credentialPath, { openImpl, errorCode }) {
@@ -599,8 +605,6 @@ function isolatedEnvironment({
     XDG_STATE_HOME: xdgStateDir,
     TMPDIR: tempDir,
     CLAUDE_TMPDIR: tempDir,
-    ANTHROPIC_BASE_URL: LOOPBACK_UPSTREAM,
-    API_TIMEOUT_MS: '1000',
     CLAUDE_CODE_MAX_RETRIES: '0',
     CLAUDE_CODE_DISABLE_CLAUDE_MDS: '1',
     CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: '1',
@@ -630,36 +634,20 @@ async function executeNativeRefresh({
   timeoutMs,
   cwd,
   env,
+  afterSpawn = null,
+  afterClose = null,
 }) {
-  let timer = null;
-  const abortController = new AbortController();
-  const nativeExecution = Promise.resolve().then(() => execFileImpl(
-    command,
-    [...args],
-    {
+  try {
+    await execFileImpl(command, [...args], {
       cwd,
       env,
       encoding: 'utf8',
-      timeout: timeoutMs,
-      killSignal: 'SIGKILL',
-      signal: abortController.signal,
+      timeoutMs,
       maxBuffer: MAX_COMMAND_OUTPUT_BYTES,
       windowsHide: true,
-    },
-  ));
-  const timeout = new Promise((resolve, reject) => {
-    timer = setTimeout(() => {
-      abortController.abort();
-      reject(new NativeClaudeRefreshError(
-        'Native Claude credential refresh timed out',
-        'NATIVE_REFRESH_TIMEOUT',
-        nativeRetryMetadata(),
-      ));
-    }, timeoutMs);
-  });
-
-  try {
-    await Promise.race([nativeExecution, timeout]);
+      afterSpawn,
+      afterClose,
+    });
   } catch (error) {
     if (error instanceof NativeClaudeRefreshError) throw error;
     if (['ENOENT', 'EACCES'].includes(error?.code)) {
@@ -668,14 +656,146 @@ async function executeNativeRefresh({
         'NATIVE_REFRESH_COMMAND_UNAVAILABLE',
       );
     }
-    throw new NativeClaudeRefreshError(
-      'Native Claude credential refresh command failed',
-      'NATIVE_REFRESH_COMMAND_FAILED',
-      nativeRetryMetadata(),
-    );
-  } finally {
-    if (timer) clearTimeout(timer);
+    throw nativeRefreshCommandFailedError();
   }
+}
+
+export function executeNativeClaudeCommand(command, args, {
+  timeoutMs = DEFAULT_NATIVE_CLAUDE_REFRESH_TIMEOUT_MS,
+  cwd = undefined,
+  env = undefined,
+  encoding = 'utf8',
+  maxBuffer = MAX_COMMAND_OUTPUT_BYTES,
+  windowsHide = true,
+  afterSpawn = null,
+  afterClose = null,
+} = {}) {
+  const timeout = normalizeTimeout(timeoutMs);
+  const outputLimit = Math.min(MAX_COMMAND_OUTPUT_BYTES, Math.max(1, Number(maxBuffer) || 0));
+  return new Promise((resolve, reject) => {
+    let settled = false;
+    let timeoutTimer = null;
+    let graceTimer = null;
+    let terminationError = null;
+    let childError = null;
+    let childClosed = false;
+    let lifecycleSettled = false;
+    let terminationFenced = false;
+    let outputBytes = 0;
+    const stdoutChunks = [];
+    const stderrChunks = [];
+    const child = spawn(command, [...args], {
+      cwd,
+      env,
+      shell: false,
+      detached: process.platform !== 'win32',
+      stdio: ['ignore', 'pipe', 'pipe'],
+      windowsHide,
+    });
+    let spawnHook;
+    try {
+      spawnHook = typeof afterSpawn === 'function' && Number.isInteger(child.pid)
+        ? Promise.resolve(afterSpawn(child.pid))
+        : Promise.resolve();
+    } catch (error) {
+      spawnHook = Promise.reject(error);
+    }
+
+    const clearTimers = () => {
+      if (timeoutTimer) clearTimeout(timeoutTimer);
+      if (graceTimer) clearTimeout(graceTimer);
+      timeoutTimer = null;
+      graceTimer = null;
+    };
+    const finish = (error, value) => {
+      if (settled) return;
+      settled = true;
+      clearTimers();
+      if (error) reject(error);
+      else resolve(value);
+    };
+    const finishAfterClose = (code, signal) => {
+      if (!childClosed || !lifecycleSettled || (terminationError && !terminationFenced)) return;
+      if (terminationError) {
+        finish(terminationError);
+        return;
+      }
+      if (childError) {
+        finish(childError);
+        return;
+      }
+      const stdout = Buffer.concat(stdoutChunks).toString(encoding);
+      const stderr = Buffer.concat(stderrChunks).toString(encoding);
+      if (code === 0) {
+        finish(null, { stdout, stderr });
+        return;
+      }
+      const error = new Error('Native Claude command failed');
+      error.code = code ?? signal;
+      error.stdout = stdout;
+      error.stderr = stderr;
+      finish(error);
+    };
+    const signalProcessGroup = signal => {
+      if (!Number.isInteger(child.pid)) return;
+      try {
+        if (process.platform === 'win32') child.kill(signal);
+        else process.kill(-child.pid, signal);
+      } catch {
+        try { child.kill(signal); } catch {}
+      }
+    };
+    const terminate = error => {
+      if (terminationError || settled) return;
+      terminationError = error;
+      signalProcessGroup('SIGTERM');
+      graceTimer = setTimeout(() => {
+        signalProcessGroup('SIGKILL');
+        terminationFenced = true;
+        finishAfterClose();
+      }, NATIVE_CLAUDE_TERMINATION_GRACE_MS);
+    };
+    spawnHook.catch(error => {
+      childError ||= error;
+      terminate(error);
+    });
+    const append = (chunks, chunk) => {
+      if (terminationError) return;
+      outputBytes += Buffer.byteLength(chunk);
+      if (outputBytes > outputLimit) {
+        stdoutChunks.length = 0;
+        stderrChunks.length = 0;
+        const error = new Error('Native Claude command output exceeded the safe limit');
+        error.code = 'ENOBUFS';
+        terminate(error);
+        return;
+      }
+      chunks.push(Buffer.from(chunk));
+    };
+
+    child.stdout.on('data', chunk => append(stdoutChunks, chunk));
+    child.stderr.on('data', chunk => append(stderrChunks, chunk));
+    child.on('error', error => {
+      childError ||= error;
+    });
+    child.on('close', (code, signal) => {
+      childClosed = true;
+      Promise.resolve(spawnHook).catch(() => {}).then(async () => {
+        try {
+          if (typeof afterClose === 'function') await afterClose(child.pid);
+        } catch (error) {
+          childError ||= error;
+        }
+        lifecycleSettled = true;
+        finishAfterClose(code, signal);
+      });
+    });
+    timeoutTimer = setTimeout(() => {
+      const error = new Error('Native Claude command timed out');
+      error.code = 'ETIMEDOUT';
+      terminate(error);
+    }, timeout);
+  });
 }
 
 function validateCommand(command, args, execFileImpl) {
@@ -693,7 +813,7 @@ function validateCommand(command, args, execFileImpl) {
   return [...args];
 }
 
-function validateRefreshedCredential(previous, refreshed, now, forcedSeedExpiry) {
+function validateRefreshedCredential(previous, refreshed, now) {
   if (!isNonEmptyString(refreshed.accessToken) || !isNonEmptyString(refreshed.refreshToken)) {
     throw new NativeClaudeRefreshError(
       'Native Claude did not produce complete OAuth credentials',
@@ -704,7 +824,7 @@ function validateRefreshedCredential(previous, refreshed, now, forcedSeedExpiry)
   if (
     refreshed.accessToken === previous.accessToken
     && refreshed.refreshToken === previous.refreshToken
-    && expiresAt === forcedSeedExpiry
+    && expiresAt === previous.expiresAt
   ) {
     throw new NativeClaudeRefreshError(
       'Native Claude did not refresh the OAuth credential',
@@ -771,6 +891,16 @@ function normalizeTimeout(value) {
   return Math.max(1, Math.floor(parsed));
 }
 
+function remainingNativeCommandTimeout(deadline, deadlineNow, maximum = Infinity) {
+  // The command timer fires before process termination; reserve the complete
+  // SIGTERM-to-SIGKILL grace so the child lifecycle stays inside the deadline.
+  const executionBudgetMs = Math.floor(
+    deadline - normalizeDeadlineNow(deadlineNow) - NATIVE_CLAUDE_TERMINATION_GRACE_MS,
+  );
+  if (executionBudgetMs < 1) return null;
+  return Math.min(executionBudgetMs, maximum);
+}
+
 function normalizeNow(now) {
   if (typeof now !== 'function') {
     throw new NativeClaudeRefreshError(
@@ -782,6 +912,23 @@ function normalizeNow(now) {
   if (!Number.isFinite(value) || value <= 0) {
     throw new NativeClaudeRefreshError(
       'Native Claude refresh clock returned an invalid timestamp',
+      'NATIVE_REFRESH_INVALID_INPUT',
+    );
+  }
+  return value;
+}
+
+function normalizeDeadlineNow(deadlineNow) {
+  if (typeof deadlineNow !== 'function') {
+    throw new NativeClaudeRefreshError(
+      'Native Claude refresh deadline clock configuration is invalid',
+      'NATIVE_REFRESH_INVALID_INPUT',
+    );
+  }
+  const value = Number(deadlineNow());
+  if (!Number.isFinite(value) || value < 0) {
+    throw new NativeClaudeRefreshError(
+      'Native Claude refresh deadline clock returned an invalid timestamp',
       'NATIVE_REFRESH_INVALID_INPUT',
     );
   }
@@ -826,6 +973,27 @@ export async function resolveNativeClaudeCommand({
     }
   }
   return 'claude';
+}
+
+async function pinNativeClaudeCommand({ command, accessImpl, realpathImpl }) {
+  if (!isAbsolute(command)) return command;
+  if (typeof accessImpl !== 'function' || typeof realpathImpl !== 'function') {
+    throw new NativeClaudeRefreshError(
+      'Native Claude command resolver configuration is invalid',
+      'NATIVE_REFRESH_INVALID_INPUT',
+    );
+  }
+  try {
+    await accessImpl(command, fsConstants.X_OK);
+    const pinned = await realpathImpl(command);
+    await accessImpl(pinned, fsConstants.X_OK);
+    return pinned;
+  } catch {
+    throw new NativeClaudeRefreshError(
+      'Native Claude is not available for OAuth credential refresh',
+      'NATIVE_REFRESH_COMMAND_UNAVAILABLE',
+    );
+  }
 }
 
 export async function resolveNativeTempRoot({
@@ -971,6 +1139,14 @@ function nativeRetryMetadata() {
     retryAfterMs: DEFAULT_NATIVE_CLAUDE_REFRESH_RETRY_AFTER_MS,
     retryAfterSource: 'fixed',
   };
+}
+
+function nativeRefreshCommandFailedError() {
+  return new NativeClaudeRefreshError(
+    'Native Claude credential refresh command failed',
+    'NATIVE_REFRESH_COMMAND_FAILED',
+    nativeRetryMetadata(),
+  );
 }
 
 function normalizedTimestamp(value) {

@@ -1,5 +1,5 @@
 import { homedir } from 'node:os';
-import { isAbsolute, join } from 'node:path';
+import { isAbsolute, join, resolve } from 'node:path';
 
 export const APP_NAME = 'claude-rotator';
 
@@ -43,8 +43,12 @@ export function backupDir(env = process.env, home = homedir()) {
   return join(appConfigDir(env, home), 'backups');
 }
 
-export function claudeSettingsPath(home = homedir()) {
-  return join(home, '.claude', 'settings.json');
+export function claudeConfigDir(env = process.env, home = homedir()) {
+  return resolve(expandHome(env.CLAUDE_CONFIG_DIR || join(home, '.claude'), home));
+}
+
+export function claudeSettingsPath(home = homedir(), env = process.env) {
+  return join(claudeConfigDir(env, home), 'settings.json');
 }
 
 export function linuxAccountsDir(env = process.env, home = homedir()) {

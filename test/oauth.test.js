@@ -304,11 +304,61 @@ describe('token refresh', () => {
       await assert.rejects(
         coordinated('refresh-1'),
         error => error.retryAfterMs === 5 * 60 * 1000
-          && isOAuthTokenRefreshRateLimit(error),
+          && !isOAuthTokenRefreshRateLimit(error),
       );
       now += 5 * 60 * 1000 + 1;
     }
     assert.equal(calls, 8);
+  });
+
+  it('keeps deferred native refresh retries distinct from provider rate limits', async () => {
+    let now = 1000;
+    const coordinated = createSingleFlightTokenRefresher(async () => {
+      throw Object.assign(new Error('native refresh failed'), {
+        code: 'NATIVE_REFRESH_COMMAND_FAILED',
+        retryAfterMs: 5 * 60 * 1000,
+        retryAfterSource: 'fixed',
+      });
+    }, { now: () => now });
+
+    await assert.rejects(
+      coordinated('refresh-1'),
+      error => error.code === 'NATIVE_REFRESH_COMMAND_FAILED'
+        && error.status == null
+        && error.retryAfterMs === 5 * 60 * 1000
+        && error.retryAfterSource === 'fixed'
+        && !isOAuthTokenRefreshRateLimit(error),
+    );
+    await assert.rejects(
+      coordinated('refresh-1'),
+      error => error.deferred === true
+        && error.code === 'NATIVE_REFRESH_COMMAND_FAILED'
+        && error.status == null
+        && error.retryAfterMs === 5 * 60 * 1000
+        && error.retryAfterSource === 'fixed'
+        && !isOAuthTokenRefreshRateLimit(error),
+    );
+  });
+
+  it('keeps deferred provider 429 refresh retries classified as rate limits', async () => {
+    let now = 1000;
+    const coordinated = createSingleFlightTokenRefresher(async () => {
+      throw new OAuthTokenRefreshError({
+        status: 429,
+        code: 'rate_limit_error',
+        retryAfterMs: 60_000,
+        retryAfterSource: 'provider',
+      });
+    }, { now: () => now });
+
+    await assert.rejects(coordinated('refresh-1'), isOAuthTokenRefreshRateLimit);
+    await assert.rejects(
+      coordinated('refresh-1'),
+      error => error.deferred === true
+        && error.retryAfterMs === 60_000
+        && error.retryAfterSource === 'provider'
+        && isOAuthTokenRefreshRateLimit(error),
+    );
   });
 
   it('reports only the remaining cooldown to late callers', async () => {
@@ -448,6 +498,89 @@ describe('token refresh', () => {
     assert.equal(calls[0].options.headers['User-Agent'], OAUTH_USER_AGENT);
     assert.equal(calls[0].options.headers['Accept-Encoding'], 'identity');
     assert.equal(calls[0].options.headers['Content-Length'], Buffer.byteLength(calls[0].options.body));
+  });
+
+  it('awaits the refresh-intent handoff before starting the token request', async () => {
+    const events = [];
+    let releaseHandoff;
+    const handoffGate = new Promise(resolve => { releaseHandoff = resolve; });
+    const refresh = refreshAccessToken('handoff-refresh-fixture', {
+      beforeHandoff: async () => {
+        events.push('handoff-start');
+        await handoffGate;
+        events.push('handoff-finished');
+      },
+      fetchImpl: async () => {
+        events.push('request-started');
+        return jsonResponse(200, { access_token: 'access2', expires_in: 3600 });
+      },
+      now: () => 1000,
+    });
+
+    await new Promise(resolve => setImmediate(resolve));
+    assert.deepEqual(events, ['handoff-start']);
+    releaseHandoff();
+    await refresh;
+    assert.deepEqual(events, ['handoff-start', 'handoff-finished', 'request-started']);
+  });
+
+  it('classifies a post-handoff direct HTTP failure as retryless outcome unknown', async () => {
+    let handoffCalls = 0;
+
+    await assert.rejects(
+      refreshAccessToken('direct-refresh-fixture', {
+        beforeHandoff: async () => { handoffCalls += 1; },
+        fetchImpl: async () => {
+          throw new Error('socket outcome is ambiguous');
+        },
+      }),
+      error => error.code === 'NATIVE_REFRESH_OUTCOME_UNKNOWN'
+        && error.retryAfterMs === null
+        && error.retryAfterSource === null
+        && !error.message.includes('direct-refresh-fixture'),
+    );
+    assert.equal(handoffCalls, 1);
+  });
+
+  it('rejects malformed or regressed direct refresh credentials after handoff', async () => {
+    const now = 1_780_580_000_000;
+    const previousExpiresAt = now + 3_600_000;
+    const cases = [
+      {},
+      { access_token: 'access-2', refresh_token: 42, expires_in: 7200 },
+      { access_token: 'access-2', expires_at: now - 1 },
+      { access_token: 'access-2', expires_in: 1800 },
+      { access_token: 'access-2', expires_in: 7200, scope: 'user:profile' },
+    ];
+
+    for (const responseBody of cases) {
+      await assert.rejects(
+        refreshAccessToken('direct-refresh-fixture', {
+          accessToken: 'access-1',
+          expiresAt: previousExpiresAt,
+          scopes: ['user:profile', 'user:inference'],
+          beforeHandoff: async () => {},
+          fetchImpl: async () => jsonResponse(200, responseBody),
+          now: () => now,
+        }),
+        error => error.code === 'NATIVE_REFRESH_OUTCOME_UNKNOWN'
+          && error.retryAfterMs === null
+          && error.retryAfterSource === null,
+      );
+    }
+  });
+
+  it('preserves a known provider 429 after the pre-handoff hook', async () => {
+    let handoffCalls = 0;
+
+    await assert.rejects(
+      refreshAccessToken('rate-limit-refresh-fixture', {
+        beforeHandoff: async () => { handoffCalls += 1; },
+        fetchImpl: async () => jsonResponse(429, { error: 'rate_limit_error' }),
+      }),
+      error => error instanceof OAuthTokenRefreshError && error.status === 429,
+    );
+    assert.equal(handoffCalls, 1);
   });
 
   it('uses imported OAuth scopes and client id when refreshing', async () => {

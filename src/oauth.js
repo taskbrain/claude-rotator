@@ -49,13 +49,17 @@ export class OAuthTokenRefreshError extends Error {
   }
 }
 
+function refreshOutcomeUnknownError() {
+  const error = new Error('OAuth credential refresh outcome is unknown; relink this account');
+  error.name = 'OAuthRefreshOutcomeUnknownError';
+  error.code = 'NATIVE_REFRESH_OUTCOME_UNKNOWN';
+  error.retryAfterMs = null;
+  error.retryAfterSource = null;
+  return error;
+}
+
 export function isOAuthTokenRefreshRateLimit(error) {
-  return (error instanceof OAuthTokenRefreshError && error.status === 429)
-    || (
-      error?.retryAfterSource === 'fixed'
-      && Number.isFinite(Number(error?.retryAfterMs))
-      && Number(error.retryAfterMs) > 0
-    );
+  return error instanceof OAuthTokenRefreshError && error.status === 429;
 }
 
 export function normalizeExpiresAt(expiresAt) {
@@ -230,12 +234,21 @@ function boundedRetryAfterMs(value, maxDelayMs) {
 }
 
 function deferredRefreshError(source, retryAfterMs) {
-  const error = new OAuthTokenRefreshError({
-    status: source?.status || 429,
-    code: source?.oauthCode || 'rate_limit_error',
-    retryAfterMs: Math.max(1, Math.ceil(retryAfterMs)),
-    retryAfterSource: source?.retryAfterSource || null,
-  });
+  const error = source instanceof OAuthTokenRefreshError
+    ? new OAuthTokenRefreshError({
+      status: source.status,
+      code: source.oauthCode,
+      retryAfterMs: Math.max(1, Math.ceil(retryAfterMs)),
+      retryAfterSource: source.retryAfterSource,
+    })
+    : Object.assign(new Error(source?.message || 'Token refresh deferred'), {
+      name: source?.name || 'Error',
+      ...(source?.code ? { code: source.code } : {}),
+      ...(source?.status != null ? { status: source.status } : {}),
+      ...(source?.oauthCode ? { oauthCode: source.oauthCode } : {}),
+      retryAfterMs: Math.max(1, Math.ceil(retryAfterMs)),
+      retryAfterSource: source?.retryAfterSource || null,
+    });
   error.deferred = true;
   return error;
 }
@@ -304,36 +317,80 @@ export async function refreshAccessToken(refreshToken, options = {}) {
     client_id: options.clientId || OAUTH_CLIENT_ID,
     scope: refreshScopes.join(' '),
   });
-  const response = await requestEndpoint(endpoint, {
-    method: 'POST',
-    headers: {
-      ...oauthClientHeaders(),
-      'Content-Type': 'application/json',
-      'Accept': 'application/json, text/plain, */*',
-      'Content-Length': Buffer.byteLength(body),
-    },
-    body,
-  }, options);
+  let handedOff = false;
+  try {
+    await options.beforeHandoff?.();
+    handedOff = true;
+    const response = await requestEndpoint(endpoint, {
+      method: 'POST',
+      headers: {
+        ...oauthClientHeaders(),
+        'Content-Type': 'application/json',
+        'Accept': 'application/json, text/plain, */*',
+        'Content-Length': Buffer.byteLength(body),
+      },
+      body,
+    }, options);
 
-  if (!response.ok) {
-    const body = await response.text();
-    const retryAfter = response.status === 429
-      ? oauthRetryAfter(response.headers, body, now())
-      : { retryAfterMs: null, retryAfterSource: null };
-    throw new OAuthTokenRefreshError({
-      status: response.status,
-      code: oauthErrorCode(body),
-      ...retryAfter,
+    if (!response.ok) {
+      const responseBody = await response.text();
+      if (response.status !== 429) throw refreshOutcomeUnknownError();
+      const retryAfter = oauthRetryAfter(response.headers, responseBody, now());
+      throw new OAuthTokenRefreshError({
+        status: response.status,
+        code: oauthErrorCode(responseBody),
+        ...retryAfter,
+      });
+    }
+
+    const completedAt = Number(now());
+    const refreshed = parseTokenResponse(await response.json(), refreshToken, completedAt, {
+      scopes: refreshScopes,
+      refreshTokenExpiresAt: options.refreshTokenExpiresAt,
+      clientId: options.clientId,
+      subscriptionType: options.subscriptionType,
+      rateLimitTier: options.rateLimitTier,
     });
+    return validateDirectRefreshCredential(refreshed, {
+      expiresAt: options.expiresAt,
+      scopes: refreshScopes,
+    }, completedAt);
+  } catch (error) {
+    if (
+      !handedOff
+      || isOAuthTokenRefreshRateLimit(error)
+      || error?.code === 'NATIVE_REFRESH_OUTCOME_UNKNOWN'
+    ) throw error;
+    throw refreshOutcomeUnknownError();
   }
+}
 
-  return parseTokenResponse(await response.json(), refreshToken, now(), {
-    scopes: refreshScopes,
-    refreshTokenExpiresAt: options.refreshTokenExpiresAt,
-    clientId: options.clientId,
-    subscriptionType: options.subscriptionType,
-    rateLimitTier: options.rateLimitTier,
-  });
+function validateDirectRefreshCredential(refreshed, previous, now) {
+  const expiresAt = Number(refreshed?.expiresAt);
+  const previousExpiresAt = normalizeExpiresAt(previous?.expiresAt);
+  const refreshedScopes = normalizeOAuthScopes(refreshed?.scopes);
+  const previousScopes = normalizeOAuthScopes(previous?.scopes);
+  const refreshTokenExpiresAt = refreshed?.refreshTokenExpiresAt == null
+    ? null
+    : Number(refreshed.refreshTokenExpiresAt);
+  if (
+    typeof refreshed?.accessToken !== 'string'
+    || refreshed.accessToken.length === 0
+    || typeof refreshed.refreshToken !== 'string'
+    || refreshed.refreshToken.length === 0
+    || !Number.isFinite(now)
+    || !Number.isFinite(expiresAt)
+    || expiresAt <= now
+    || (Number.isFinite(previousExpiresAt) && expiresAt < previousExpiresAt)
+    || previousScopes.some(scope => !refreshedScopes.includes(scope))
+    || (
+      refreshed?.refreshTokenExpiresAt != null
+      && (!Number.isFinite(refreshTokenExpiresAt) || refreshTokenExpiresAt <= now)
+    )
+  ) {
+    throw refreshOutcomeUnknownError();
+  }
+  return { ...refreshed, expiresAt };
 }
 
 function normalizeOAuthScopes(value) {

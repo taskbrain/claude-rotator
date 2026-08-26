@@ -6,11 +6,16 @@ import { join } from 'node:path';
 
 import {
   createDefaultConfig,
+  LOCAL_GATEWAY_AUTH_TOKEN,
   mergeClaudeSettings,
+  proxyBaseUrl,
+  proxyListenHost,
   restoreClaudeSettings,
 } from '../src/config.js';
 import { writeJsonFile, readJsonFile, fileSha256 } from '../src/json-file.js';
 import {
+  claudeConfigDir,
+  claudeSettingsPath,
   defaultConfigPath,
   expandHome,
   macosServiceLockPath,
@@ -60,6 +65,16 @@ describe('path helpers', () => {
       '/Users/alice/Library/LaunchAgents/io.github.claude-rotator.watchdog.plist',
     );
   });
+
+  it('honors CLAUDE_CONFIG_DIR for Claude settings paths', () => {
+    const env = { CLAUDE_CONFIG_DIR: '~/custom-claude' };
+
+    assert.equal(claudeConfigDir(env, '/home/alice'), '/home/alice/custom-claude');
+    assert.equal(
+      claudeSettingsPath('/home/alice', env),
+      '/home/alice/custom-claude/settings.json',
+    );
+  });
 });
 
 describe('json file helpers', () => {
@@ -95,10 +110,32 @@ describe('config defaults', () => {
     assert.equal(config.usagePolling.concurrency, 1);
     assert.equal(config.usagePolling.requestSpacingMs, 1500);
   });
+
+  it('falls back to IPv4 loopback when proxy.host is missing', () => {
+    const config = { proxy: { port: 37891 } };
+
+    assert.equal(proxyListenHost(config), '127.0.0.1');
+    assert.equal(proxyBaseUrl(config), 'http://127.0.0.1:37891');
+  });
+
+  it('formats IPv6 loopback and rejects non-loopback proxy hosts', () => {
+    assert.equal(
+      proxyBaseUrl({ proxy: { host: '::1', port: 37891 } }),
+      'http://[::1]:37891',
+    );
+    assert.throws(
+      () => proxyListenHost({ proxy: { host: '0.0.0.0' } }),
+      /must be a loopback address/,
+    );
+    assert.throws(
+      () => proxyListenHost({ proxy: { host: '192.168.1.10' } }),
+      /must be a loopback address/,
+    );
+  });
 });
 
 describe('Claude settings merge and restore', () => {
-  it('adds ANTHROPIC_BASE_URL while preserving existing env values', () => {
+  it('adds the local gateway URL and auth token while preserving existing env values', () => {
     const original = {
       language: 'ja',
       env: {
@@ -109,25 +146,30 @@ describe('Claude settings merge and restore', () => {
     const result = mergeClaudeSettings(original, 'http://127.0.0.1:37891');
 
     assert.deepEqual(result.previousBaseUrl, { existed: false, value: undefined });
+    assert.deepEqual(result.previousAuthToken, { existed: false, value: undefined });
     assert.deepEqual(result.settings, {
       language: 'ja',
       env: {
         FOO: 'bar',
         ANTHROPIC_BASE_URL: 'http://127.0.0.1:37891',
+        ANTHROPIC_AUTH_TOKEN: LOCAL_GATEWAY_AUTH_TOKEN,
       },
     });
   });
 
-  it('restores a previously missing ANTHROPIC_BASE_URL by removing it', () => {
+  it('restores previously missing gateway settings by removing them', () => {
     const installed = {
       env: {
         FOO: 'bar',
         ANTHROPIC_BASE_URL: 'http://127.0.0.1:37891',
+        ANTHROPIC_AUTH_TOKEN: LOCAL_GATEWAY_AUTH_TOKEN,
       },
     };
     const installState = {
       proxyBaseUrl: 'http://127.0.0.1:37891',
+      gatewayAuthToken: LOCAL_GATEWAY_AUTH_TOKEN,
       previousBaseUrl: { existed: false },
+      previousAuthToken: { existed: false },
     };
 
     const result = restoreClaudeSettings(installed, installState);
@@ -150,6 +192,27 @@ describe('Claude settings merge and restore', () => {
     const result = restoreClaudeSettings(changed, installState);
 
     assert.equal(result.conflict, true);
+    assert.deepEqual(result.settings, changed);
+  });
+
+  it('refuses to restore when ANTHROPIC_AUTH_TOKEN was changed by someone else', () => {
+    const changed = {
+      env: {
+        ANTHROPIC_BASE_URL: 'http://127.0.0.1:37891',
+        ANTHROPIC_AUTH_TOKEN: 'user-managed-token',
+      },
+    };
+    const installState = {
+      proxyBaseUrl: 'http://127.0.0.1:37891',
+      gatewayAuthToken: LOCAL_GATEWAY_AUTH_TOKEN,
+      previousBaseUrl: { existed: false },
+      previousAuthToken: { existed: false },
+    };
+
+    const result = restoreClaudeSettings(changed, installState);
+
+    assert.equal(result.conflict, true);
+    assert.match(result.reason, /ANTHROPIC_AUTH_TOKEN/);
     assert.deepEqual(result.settings, changed);
   });
 });

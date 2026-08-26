@@ -88,7 +88,7 @@ flowchart LR
 
 Claude Code の利用量は「5時間枠」（5時間ごとにリセットされる短期の上限）と「7日枠」（7日ごとにリセットされる長期の上限）の2種類で管理されています。詳細は [なぜ作ったか](#なぜ作ったか) を参照してください。
 
-認証情報は PC ごとのローカル保存です。別の Mac / Ubuntu PC で使う場合、その PC でも各アカウントの `claude auth login` と `claude-rotator login` を実行してください。
+認証情報は PC ごとのローカル保存です。別の Mac / Ubuntu PC で使う場合、その PC でも各アカウントの `claude auth login --claudeai` と `claude-rotator login` を実行してください。
 
 ## セットアップ
 
@@ -118,7 +118,13 @@ claude-rotator install
 claude-rotator doctor
 ```
 
-`install` は `~/.claude/settings.json` の `env.ANTHROPIC_BASE_URL` だけを更新し、変更前の状態を `~/.config/claude-rotator/install-state.json` に保存します。
+`install` は通常 `~/.claude/settings.json`（`CLAUDE_CONFIG_DIR` 設定時はその配下）の `env.ANTHROPIC_BASE_URL` と `env.ANTHROPIC_AUTH_TOKEN` をローカル gateway 用に更新し、変更前の状態を `~/.config/claude-rotator/install-state.json` に保存します。設定する auth token は Anthropic の認証情報ではない固定プレースホルダーです。Claude Code CLI のローカル `/login` が期限切れでも proxy へ到達できるようにするためだけに使い、proxy は upstream へ送る前に選択アカウントの認証情報（OAuth token または API key）へ必ず置き換えます。OAuth アカウントでは、gateway credential 利用時に Claude Code が送らない OAuth capability も proxy が upstream header へ補います。
+
+既に起動中の Claude Code は起動時の認証設定を保持することがあるため、install / reinstall 後は各セッションを安全なタイミングで終了して起動し直してください。gateway credential が有効な間は、Claude.ai identity を直接必要とする voice dictation などの機能は利用できません。Remote Control は custom `ANTHROPIC_BASE_URL` の時点ですでに利用できません。
+
+この認証モデルは同一PC内だけを信頼境界とします。proxy は `127.0.0.1`、`localhost`、`::1` 以外への bind を起動時に拒否します。固定プレースホルダーをネットワーク上のクライアント認証として使用しないでください。VS Code 拡張は CLI と設定経路が異なり、拡張自身には `claudeCode.environmentVariables` が必要なため、この install 手順の対象は Claude Code CLI です。
+
+Bedrock、Vertex、Foundry、Anthropic AWS、Anthropic Google Cloud、Mantle の provider 選択変数は Anthropic gateway と異なる通信形式を選ぶため、user settings または起動環境に残っている場合は install/server が起動を拒否します。先に該当する `CLAUDE_CODE_USE_*` を解除してください。
 
 macOS では次の LaunchAgent が作られます。
 
@@ -128,6 +134,8 @@ macOS では次の LaunchAgent が作られます。
 ```
 
 watchdog は15秒ごとに main LaunchAgent の登録を確認し、意図せず `bootout` された場合だけ再登録します。install／uninstall と同じ `lockf` を使うため、uninstall 中に main を復活させません。意図的に停止する場合は `claude-rotator uninstall` を使ってください。`install --no-start` は資産だけを配置し、**Claude Code の設定は変更せず**、両方の LaunchAgent と復旧 marker を無効のままにします。
+
+生成するmacOS LaunchAgentは `ProcessType=Interactive` を指定します。OAuth更新では公式の `claude auth login --claudeai` の完了を同期的に待つためです。launchdの既定daemon分類では、新しく更新されたClaude Codeバイナリのcold startが強く抑制され、auth-login更新処理がtimeoutすることがあります。この指定はUIを開く設定ではなく、ローカルproxyの対話リクエストを待たせないための実行分類です。
 
 インストール時に Claude Code の実行可能ファイルを絶対パスで解決し、macOS LaunchAgent と Ubuntu systemd user service の `CLAUDE_ROTATOR_CLAUDE_BIN` と安全な `PATH` に固定します。Homebrew、nvm、asdf、Volta、custom npm prefix などで管理された `claude` が対話 shell でだけ見つかり、常駐サービスでは見つからない状態を防ぎます。実行場所を明示する場合は、インストール前に `CLAUDE_ROTATOR_CLAUDE_BIN=/absolute/path/to/claude` を設定してください。
 
@@ -199,15 +207,18 @@ Ubuntu の installer は systemd サービス用に `~/.config/claude-rotator/ru
 
 `claude-rotator login` は現在の Claude Code ログインを読み取り、可能であれば email を自動取得して登録します。
 
-重要: `claude auth login` や `claude-rotator login` は、Claude Code 側の現在ログインを変更したり、そのログインを rotator の候補一覧へ取り込んだりする操作です。実際に API リクエストで使われるアカウントは `claude-rotator status` の `active` で決まります。別アカウントでログインして `claude-rotator login` しても、それだけでは active は切り替わりません。
+重要: `claude auth login --claudeai` や `claude-rotator login` は、Claude Code 側の現在ログインを変更したり、そのログインを rotator の候補一覧へ取り込んだりする操作です。実際に API リクエストで使われるアカウントは `claude-rotator status` の `active` で決まります。別アカウントでログインして `claude-rotator login` しても、それだけでは active は切り替わりません。
 
+インストール中の通常セッションは gateway auth が `/login` より優先されるため、`claude auth status` は rotator 内の active account を示しません。gateway の base URL と認証元変数は対話セッションの `/status` で確認できます。アカウントを再取り込みするときは、明示的に `claude auth login --claudeai` を完了してから `claude-rotator login` を実行し、取り込み結果は `claude-rotator accounts` または `claude-rotator status` で確認してください。
+
+`use-current` は、gateway credential や API key など `/login` より優先される認証を一切設定せず、proxy を手動運用する場合だけの互換モードです。通常の `install` では gateway auth が `/login` より優先され、Claude Code 自身が保存済み `/login` を更新しなくなるため使用できません。通常運用では `claude-rotator login` で各アカウントを保存してください。旧 `current` を移行する場合は、先に `claude-rotator remove current` を実行してから `claude auth login --claudeai` と `claude-rotator login` を順に実行します。互換モードの自動検査対象は shell 環境と user settings です。project / local / managed settings の実効認証は Claude Code の `/status` でも確認し、override があれば使用しないでください。
 複数アカウントを個別に保存して切り替える場合は、各アカウントで Claude Code にログインしてから `claude-rotator login` を実行します。
 
 ```bash
-claude auth login
+claude auth login --claudeai
 claude-rotator login
 
-claude auth login
+claude auth login --claudeai
 claude-rotator login
 ```
 
@@ -231,7 +242,7 @@ claude-rotator doctor
 
 - `current` は live account 専用 ID です。`login --id current` や `import-current --id current` では使えません。
 - `claude-rotator login` は profile から `accountUuid` を取得し、同じ Claude アカウントが既に登録済みなら既存 account を更新します。
-- `claude-rotator login` は、現在の Claude Code 認証に refresh token がない場合や profile API で検証できない場合、`account1` のような仮 ID で登録せずにエラーで停止します。`claude auth status` が logged in を返しても API 用 OAuth token が失効している場合があるため、その場合は `claude auth login` をやり直してから再実行してください。
+- `claude-rotator login` は、現在の Claude Code 認証に refresh token がない場合や profile API で検証できない場合、`account1` のような仮 ID で登録せずにエラーで停止します。`claude auth status` が logged in を返しても API 用 OAuth token が失効している場合があるため、その場合は `claude auth login --claudeai` をやり直してから再実行してください。
 - 明示した `--id` が既存の `accountUuid` と衝突する場合は、重複登録せずにエラーを出します。既存 ID を使うか、先に `claude-rotator remove <account>` で整理してください。
 
 認証情報の保存先:
@@ -322,7 +333,7 @@ TTY が無い環境（CI、`| cat` 経由など）で `claude-rotator monitor` �
 
 OAuth Usage API は 429 を返しやすいため、usage 取得はデフォルトで 15 分間隔、1アカウントずつ、各リクエストの開始間隔 1.5 秒で実行します。必要な場合だけ [設定ファイルと環境変数](#設定ファイルと環境変数) の `usagePolling.intervalMs`、`usagePolling.concurrency`、`usagePolling.requestSpacingMs` を変更してください。短すぎる間隔や高い concurrency は `claude-rotator refresh-usage` でも 429 の原因になります。
 
-OAuth access token は期限の30分前から自動更新対象になります。保存時に Claude Code の OAuth scope と refresh token の期限を保持します。macOS / Ubuntu の保存アカウントは、通常の Claude Code ログインを変更しない隔離領域で Claude Code 本体へ更新を委譲するため、access token が数時間で切れても refresh token が有効な間は対話ログイン不要です。同じ refresh token に対する同時更新は1回へ集約し、異なるアカウントの更新も直列化します。新しい refresh token は、競合する再ログインを上書きしない原子的比較更新で、使用前に Keychain または Linux の credential file へ保存します。macOS / Ubuntu の native 更新が一時失敗した場合の再試行は5分固定で、失敗回数に応じて15分や60分へ増幅しません。provider が明示した `Retry-After` は増幅せず、異常値による永久停止を避ける24時間の安全上限内で尊重します。native 更新を使わない環境の direct token 更新だけは、明示値が無い一時失敗を refresh token 単位で1/2/4/8/15分まで backoff し、その後は指数を増やさず固定60分の疎通確認へ移ります。1アカウントの待機は他アカウントの更新を停止せず、実際に credential が変わった再リンクだけがそのアカウントの古い待機状態を解除します。現在の Claude Code ログインと `accountUuid` が一致する保存アカウントには、Claude Code が更新した最新 credential と OAuth metadata をミラーします。provider 側で明示的に revocation された token の期限自体を rotator から延長することはできません。
+OAuth access token は期限の30分前から自動更新対象になります。保存時に Claude Code の OAuth scope と refresh token の期限を保持します。macOS / Ubuntu の保存アカウントは、通常のClaude Codeログインを変更しない隔離領域で Claude Code 本体へ更新を委譲します。各試行は現在の installer path を解決するため、バージョン許可リストなしに新しくインストールされた Claude Code を使用します。解決した実行ファイルは `realpath` でその試行中だけ固定します。token handoff直前にdurable refresh intentを永続化し、公式の `CLAUDE_CODE_OAUTH_REFRESH_TOKEN` と `CLAUDE_CODE_OAUTH_SCOPES` を子プロセス環境に設定して `claude auth login --claudeai` を正確に1回だけ実行します。helpやversionによる別のruntime capability checkは行いません。token は引数、設定、ログには書きませんが、同一ユーザーで動くローカルプロセスは短命な子プロセスの環境を観測できる場合があるため、その信頼境界内でのみ実行してください。macOSでは login Keychain を正しく解決するため実ユーザーの `HOME` だけを維持し、Claude設定、専用Keychain service、XDG、作業・一時ディレクトリは隔離します。旧版から取り込んだ first-party credential に scope が無い場合は現在の Claude Code 公式5 scopeを補完しますが、refresh token期限を推測したりcustom OAuth clientへ適用したりはしません。同じ refresh token に対する同時更新は1回へ集約し、異なるアカウントの更新も直列化します。新しい refresh token は、競合する再ログインを上書きしない原子的比較更新で、使用前に Keychain またはLinuxのcredential fileへ保存します。token handoff後は他のrefresh driverへfallbackしません。Claude Code が未対応のcommandとして拒否した場合を含め、Claude Code の終了後に隔離credentialを読み取れず結果が不明な場合は、アカウントを `oauth_refresh_failed` としてparkし、`claude auth login --claudeai` でそのアカウントを再認証してから `claude-rotator login` を実行して復旧してください。native更新のtoken handoff前のローカル一時失敗は固定5分の `oauth_refresh_retry` cooldownで、providerが返した429は `oauth_refresh_rate_limit` として別に扱います。providerが明示した `Retry-After` は増幅せず、異常値による永久停止を避ける24時間の安全上限内で尊重します。native更新を使わない環境のdirect token更新だけは、明示値が無い一時失敗をrefresh token単位で1/2/4/8/15分までbackoffし、その後は指数を増やさず固定60分の疎通確認へ移ります。1アカウントの待機は他アカウントの更新を停止せず、実際にcredentialが変わった再リンクだけがそのアカウントの古い待機状態を解除します。installしたgatewayモードでは、通常の `/login` と一致する保存アカウントもRotatorが所有して更新し、未更新の `/login` から古いcredentialをミラーしません。live credentialのミラーはgateway credentialを使わない手動互換モードだけです。provider側で明示的にrevocationされたtokenの期限自体をrotatorから延長することはできません。
 
 ## 設定ファイルと環境変数
 
@@ -507,7 +518,7 @@ claude-rotator uninstall
 claude-rotator uninstall --purge-secrets
 ```
 
-`ANTHROPIC_BASE_URL` がインストール後に別の値へ変更されていた場合、`uninstall` は安全のため自動上書きせず conflict を報告します。意図的に戻す場合のみ `--force` を使ってください。
+`ANTHROPIC_BASE_URL` または `ANTHROPIC_AUTH_TOKEN` がインストール後に別の値へ変更されていた場合、`uninstall` は安全のためサービスを停止せず、設定も自動上書きせずに conflict を報告します。意図的に戻す場合のみ `--force` を使ってください。
 
 `--purge-secrets` の削除範囲は macOS と Linux で異なります。
 
@@ -580,7 +591,7 @@ curl -I --connect-timeout 10 --max-time 20 https://api.anthropic.com/api/oauth/u
 
 ## 安全設計
 
-- proxy は loopback のみに bind し、loopback 以外の `Host` と cross-site browser request を拒否します
+- proxy は loopback のみに bind し、loopback 以外の `Host` と cross-site browser request を拒否します。非loopback設定では fail closed します
 - ローカルクライアント認証は行わないため、loopback へ接続できる同一ホスト上のすべての OS ユーザー / プロセスを信頼します。単一ユーザー、または同一ホスト上の全主体を信頼できる環境でのみ実行してください。専用 OS ユーザーだけでは loopback TCP を隔離できません
 - token / Authorization header / API key はログに出しません
 - request body / response body はデフォルトでログに出しません
@@ -597,12 +608,13 @@ npm run lint
 
 macOS では、実際の Keychain に書き込む一部のテストがデフォルトで skip されます。`CLAUDE_ROTATOR_REAL_KEYCHAIN=1 npm test` を付けると実行できますが、Keychain の認証ダイアログが表示される場合があります（CI の macOS ジョブでは自動的に有効化されます）。
 
-ローカル Node は `v18.10` 以上で動作します。開発時に macOS / Ubuntu の差分を避けて確認したい場合は、下の Docker コマンドで Node 22 の検証も実行してください。
+ローカル Node は `v18.10` 以上で動作します。開発時は CI と同じ Node 20 / 22 の両方を Docker で確認してください。
 
 Docker での検証:
 
 ```bash
-docker run --rm -v "$PWD":/app -w /app node:22-alpine npm run check
+docker run --rm --network=none -v "$PWD":/app:ro -w /app node:20-alpine npm run check
+docker run --rm --network=none -v "$PWD":/app:ro -w /app node:22-alpine npm run check
 ```
 
 ---
@@ -710,12 +722,56 @@ npm install -g .
 
 First, log in to Claude Code as usual, then register that login with `claude-rotator`.
 
+`install` configures both `env.ANTHROPIC_BASE_URL` and `env.ANTHROPIC_AUTH_TOKEN` in `~/.claude/settings.json` (or the directory selected by `CLAUDE_CONFIG_DIR`), records their previous values in `~/.config/claude-rotator/install-state.json`, and writes a service definition. The auth token is a fixed, non-secret local-gateway placeholder, not an Anthropic credential. It only lets Claude Code reach the proxy when its local `/login` has expired; the proxy always replaces it with the selected account credential before forwarding upstream. For OAuth accounts, the proxy also adds the OAuth capability that Claude Code omits when a gateway credential is active while preserving every client-provided beta capability.
+
+Restart existing Claude Code sessions after install or reinstall so they pick up the gateway credential. While a gateway credential is active, features that require a direct Claude.ai identity, such as voice dictation, are unavailable. Remote Control is already unavailable when a custom `ANTHROPIC_BASE_URL` is active.
+
+This trust model is local-machine only. The proxy refuses to bind anywhere except `127.0.0.1`, `localhost`, or `::1`; the fixed placeholder is not network client authentication. This installation path targets Claude Code CLI. The VS Code extension uses its own `claudeCode.environmentVariables` setting.
+
+Provider selectors for Bedrock, Vertex, Foundry, Anthropic AWS, Anthropic Google Cloud, and Mantle choose a protocol that is incompatible with an Anthropic gateway. Install/server therefore fails closed when a corresponding `CLAUDE_CODE_USE_*` value remains in user settings or the service environment.
+
+- macOS: `~/Library/LaunchAgents/io.github.claude-rotator.plist` and `io.github.claude-rotator.watchdog.plist`
+- Ubuntu/Linux: `~/.config/systemd/user/claude-rotator.service`
+
+On macOS, WatchDock checks the main LaunchAgent registration every 15 seconds and restores it only after an unintended `bootout`. It shares the installer lock, so it cannot resurrect the main job during uninstall. Use `claude-rotator uninstall` for an intentional stop. `install --no-start` writes the service assets but leaves Claude Code settings unchanged, both jobs unregistered, and recovery disabled.
+
+The generated macOS LaunchAgent uses `ProcessType=Interactive` because OAuth refresh synchronously waits for the official `claude auth login --claudeai` flow to finish. launchd's default daemon resource limits can excessively delay a newly upgraded Claude Code binary's cold start and make the auth-login refresh command time out. This classification does not request a UI; it keeps the local proxy responsive to interactive requests.
+
+On macOS and Ubuntu/Linux, installation resolves Claude Code to an executable absolute path and records it as `CLAUDE_ROTATOR_CLAUDE_BIN`, together with the required service `PATH`. This keeps Homebrew, nvm, asdf, Volta, and custom npm-prefix installs available under launchd or systemd's minimal environment. Set `CLAUDE_ROTATOR_CLAUDE_BIN=/absolute/path/to/claude` before `claude-rotator install` to override discovery.
+
+Ubuntu uses a systemd user service:
+
 ```bash
-claude auth login
+systemctl --user status claude-rotator.service
+journalctl --user -u claude-rotator.service -f
+```
+
+If `systemctl --user` is unavailable in a headless session, enable linger and log in again:
+
+```bash
+loginctl enable-linger $USER
+```
+
+### Add Accounts
+
+The easiest workflow is to reuse the currently logged-in Claude Code account:
+
+```bash
+claude auth login --claudeai
 claude-rotator login
 ```
 
 Once an account is registered, install the proxy.
+
+`claude auth login --claudeai` and `claude-rotator login` do not automatically switch the rotator's active account. They only change or import the Claude Code login. The account actually used for API requests is the `active` account shown by `claude-rotator status`.
+
+While installed, gateway authentication takes precedence over `/login`, so `claude auth status` does not identify the rotator's active account. Use `/status` in an interactive session to confirm the gateway base URL and credential source. To relink an account, explicitly complete `claude auth login --claudeai`, run `claude-rotator login`, and verify the result with `claude-rotator accounts` or `claude-rotator status`.
+
+`use-current` is only compatible with a manually operated proxy that has no credential source taking precedence over `/login`. A normal installation rejects it because gateway authentication leaves the saved `/login` unused and therefore not refreshed. Use stored accounts imported with `claude-rotator login` for installed operation. To migrate a legacy `current` entry, run `claude-rotator remove current` first, then `claude auth login --claudeai` and `claude-rotator login`. Its automatic check covers the shell environment and user settings; also inspect Claude Code `/status` and do not use this mode when project, local, or managed settings provide an override.
+
+Credentials are machine-local. Run `claude auth login --claudeai` and `claude-rotator login` on each macOS or Ubuntu machine that should use the rotator.
+
+You can still provide an explicit id/name:
 
 ```bash
 claude-rotator install
@@ -899,6 +955,8 @@ account1@example.com       active
 7d ███████░░░  76%  reset in 2d9h -> 06/09 19:00 JST
 7d Fable █████░░░░░  50%  reset in 1d23h -> 06/09 09:00 JST
 requests: 128
+
+OAuth access tokens become refresh candidates 30 minutes before expiry. On macOS and Ubuntu, saved accounts are refreshed by Claude Code itself inside isolated credential storage, without changing the user's normal Claude Code login. Each attempt resolves the current installer path, so newly installed Claude Code versions are used without a version allowlist, and `realpath`-pins one executable for that attempt. Immediately before token handoff it persists a durable refresh intent, then passes the official `CLAUDE_CODE_OAUTH_REFRESH_TOKEN` and `CLAUDE_CODE_OAUTH_SCOPES` variables in the child environment to exactly one `claude auth login --claudeai` command. It does not run a separate runtime capability check based on help or version output. Tokens are never command arguments, configuration, or logs, but same-user local processes can potentially inspect a short-lived child environment; run this only within that trust boundary. On macOS only the real user `HOME` is retained so `security` can resolve the login Keychain; the Claude config, dedicated Keychain service, XDG, work, and temporary directories remain isolated. Current first-party Claude Code scopes are backfilled for legacy saved credentials that omit scopes, without guessing refresh-token expiry or modifying custom OAuth clients. In installed gateway mode, every saved account remains rotator-owned even when it matches the normal `/login`; stale live credentials are not mirrored back. Claude Code OAuth metadata is preserved, refreshes are coalesced and serialized, and a rotated credential is atomically persisted before use without overwriting a concurrent relink. There is no fallback to another refresh driver after the token handoff. If Claude Code rejects an unsupported command, exits, or leaves no readable isolated credential, the outcome is unknown and the account is parked as `oauth_refresh_failed`; recover it by re-authenticating that account with `claude auth login --claudeai` and then running `claude-rotator login`. A transient native-refresh failure before token handoff uses the fixed five-minute `oauth_refresh_retry` cooldown, distinct from provider 429, which is recorded as `oauth_refresh_rate_limit`. An explicit provider `Retry-After` is honored without amplification, up to a 24-hour safety ceiling. Only the direct token-refresh fallback used on other platforms backs off missing-deadline failures through 1/2/4/8/15 minutes and then moves to a fixed hourly probe. Only a relink that actually changes an account credential clears that account's stale cooldown. Provider-side revocation and maximum token lifetime remain controlled by the OAuth provider.
 
 account2@example.com       exhausted
 reason: 5h quota exhausted; reset -> 06/07 20:00 JST
@@ -1111,7 +1169,7 @@ To also delete the saved account credentials:
 claude-rotator uninstall --purge-secrets
 ```
 
-If `ANTHROPIC_BASE_URL` was changed to something else after install, `uninstall` reports a conflict rather than silently overwriting it, for safety. Use `--force` only when you intend to restore it anyway.
+If either managed gateway setting changed after installation, uninstall reports a conflict without stopping the service or overwriting that setting. Use `--force` only when the restoration is intentional.
 
 The scope of `--purge-secrets` differs between macOS and Linux:
 
