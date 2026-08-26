@@ -10,6 +10,7 @@ import { isDeepStrictEqual, promisify } from 'node:util';
 import { AccountManager } from './account-manager.js';
 import { createDefaultConfig, getConfigPath, loadOrCreateConfig, proxyBaseUrl, saveConfig } from './config.js';
 import { createProxyServer, defaultTokenRefresher } from './proxy-server.js';
+import { maybeRotateLog } from './log-rotation.js';
 import { createSecretStore } from './secret-store.js';
 import { renderStatus } from './monitor.js';
 import { readCurrentClaudeCredentials } from './claude-credentials.js';
@@ -319,12 +320,16 @@ async function runServer({ write }) {
     return null;
   });
   if (savedState) accountManager.restoreState(savedState);
+  const logPath = join(dirname(getConfigPath()), 'server.log');
   const server = createProxyServer({
     accountManager,
     secretStore,
     config,
     reloadAccounts: async () => (await loadOrCreateConfig()).accounts,
-    logger: line => write(`${line}\n`),
+    logger: line => {
+      if (!process.stdout.isTTY) maybeRotateLog({ logPath });
+      write(`${line}\n`);
+    },
     stateWriter: state => writeJsonFile(statePath, state),
     serviceGeneration: process.env.CLAUDE_ROTATOR_SERVICE_GENERATION || null,
   });
