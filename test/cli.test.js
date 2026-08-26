@@ -1,6 +1,9 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 import { EventEmitter } from 'node:events';
+import { mkdir, mkdtemp, readFile, rm, stat, writeFile } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { dirname, join } from 'node:path';
 
 import {
   ensureCredentialRevisions,
@@ -677,6 +680,98 @@ describe('startService', () => {
       ['/bin/launchctl', ['bootstrap', 'gui/501', '/Users/alice/Library/LaunchAgents/io.github.claude-rotator.plist']],
       ['/bin/launchctl', ['print', 'gui/501/io.github.claude-rotator']],
     ]);
+  });
+});
+
+describe('installServiceFile / removeServiceFile XDG wiring (regression)', () => {
+  // Guards against reverting src/cli.js's env/home threading while leaving
+  // install.js's XDG-aware renderers untouched: without the wiring, this
+  // test fails even though renderSystemdUserService/renderLaunchAgentPlist
+  // unit tests (test/install.test.js) still pass on their own.
+  //
+  // installServiceFile/removeServiceFile branch on the REAL process.platform
+  // and fall back to the REAL home directory, which would touch this
+  // machine's actual ~/Library/LaunchAgents and ~/.config files if left
+  // unguarded. Every call below runs with process.platform and process.env.HOME
+  // temporarily overridden to an isolated sandbox, restored in a finally block.
+  async function withSandboxedHomeAndPlatform(platform, home, fn) {
+    const originalPlatform = process.platform;
+    const originalHome = process.env.HOME;
+    Object.defineProperty(process, 'platform', { value: platform, configurable: true });
+    process.env.HOME = home;
+    try {
+      await fn();
+    } finally {
+      Object.defineProperty(process, 'platform', { value: originalPlatform, configurable: true });
+      if (originalHome === undefined) delete process.env.HOME;
+      else process.env.HOME = originalHome;
+    }
+  }
+
+  it('embeds XDG_CONFIG_HOME/XDG_DATA_HOME into the systemd unit written by installServiceFile', async () => {
+    const { installServiceFile } = await import('../src/cli.js');
+    assert.equal(typeof installServiceFile, 'function', 'installServiceFile must be exported for this wiring test');
+
+    const sandbox = await mkdtemp(join(tmpdir(), 'claude-rotator-cli-xdg-install-'));
+    try {
+      const home = join(sandbox, 'home');
+      const xdgConfig = join(sandbox, 'xdg-config');
+      const xdgData = join(sandbox, 'xdg-data');
+      const configPath = join(xdgConfig, 'claude-rotator', 'config.json');
+      const claudePath = join(sandbox, 'bin', 'claude');
+      const env = { XDG_CONFIG_HOME: xdgConfig, XDG_DATA_HOME: xdgData };
+
+      await withSandboxedHomeAndPlatform('linux', home, async () => {
+        await installServiceFile({ configPath, claudePath, env, home });
+      });
+
+      const unitPath = join(xdgConfig, 'systemd', 'user', 'claude-rotator.service');
+      const unit = await readFile(unitPath, 'utf8');
+      assert.ok(
+        unit.includes(`Environment=XDG_CONFIG_HOME=${xdgConfig}`),
+        'systemd unit must embed XDG_CONFIG_HOME from the install-time environment',
+      );
+      assert.ok(
+        unit.includes(`Environment=XDG_DATA_HOME=${xdgData}`),
+        'systemd unit must embed XDG_DATA_HOME from the install-time environment',
+      );
+    } finally {
+      await rm(sandbox, { recursive: true, force: true });
+    }
+  });
+
+  it('removes a legacy ~/.config/systemd/user unit left behind when XDG_CONFIG_HOME differs', async () => {
+    const { removeServiceFile } = await import('../src/cli.js');
+    assert.equal(typeof removeServiceFile, 'function', 'removeServiceFile must be exported for this wiring test');
+
+    const sandbox = await mkdtemp(join(tmpdir(), 'claude-rotator-cli-xdg-uninstall-'));
+    try {
+      const home = join(sandbox, 'home');
+      const xdgConfig = join(sandbox, 'xdg-config');
+      const xdgData = join(sandbox, 'xdg-data');
+      const configPath = join(xdgConfig, 'claude-rotator', 'config.json');
+      const env = { XDG_CONFIG_HOME: xdgConfig, XDG_DATA_HOME: xdgData };
+
+      const legacyUnitPath = join(home, '.config', 'systemd', 'user', 'claude-rotator.service');
+      const xdgUnitPath = join(xdgConfig, 'systemd', 'user', 'claude-rotator.service');
+      await mkdir(dirname(legacyUnitPath), { recursive: true });
+      await writeFile(legacyUnitPath, 'legacy unit from a pre-XDG install', 'utf8');
+      await mkdir(dirname(xdgUnitPath), { recursive: true });
+      await writeFile(xdgUnitPath, 'current XDG-scoped unit', 'utf8');
+
+      await withSandboxedHomeAndPlatform('linux', home, async () => {
+        await removeServiceFile({ configPath, env, home });
+      });
+
+      await assert.rejects(
+        stat(legacyUnitPath),
+        { code: 'ENOENT' },
+        'the legacy unit at the pre-XDG default path must be removed on uninstall',
+      );
+      await assert.rejects(stat(xdgUnitPath), { code: 'ENOENT' });
+    } finally {
+      await rm(sandbox, { recursive: true, force: true });
+    }
   });
 });
 

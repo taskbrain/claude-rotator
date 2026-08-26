@@ -162,6 +162,61 @@ describe('service file rendering', () => {
     assert.match(service, /TimeoutStopSec=10/);
     assert.match(service, /StandardOutput=append:\/home\/alice\/.config\/claude-rotator\/server\.log/);
     assert.match(service, /StandardError=append:\/home\/alice\/.config\/claude-rotator\/server\.err/);
+    assert.doesNotMatch(service, /XDG_CONFIG_HOME/);
+    assert.doesNotMatch(service, /XDG_DATA_HOME/);
+  });
+
+  it('embeds custom XDG paths into the LaunchAgent plist and systemd unit when set', () => {
+    const plist = renderLaunchAgentPlist({
+      nodePath: '/opt/homebrew/bin/node',
+      cliPath: '/repo/bin/claude-rotator.js',
+      configPath: '/home/alice/xdg-config/claude-rotator/config.json',
+      claudePath: '/opt/homebrew/bin/claude',
+      servicePath: '/opt/homebrew/bin:/usr/bin:/bin',
+      xdgConfigHome: '/home/alice/xdg-config',
+      xdgDataHome: '/home/alice/xdg-data',
+    });
+
+    assert.match(plist, /<key>XDG_CONFIG_HOME<\/key>\s*<string>\/home\/alice\/xdg-config<\/string>/);
+    assert.match(plist, /<key>XDG_DATA_HOME<\/key>\s*<string>\/home\/alice\/xdg-data<\/string>/);
+
+    const service = renderSystemdUserService({
+      nodePath: '/home/alice/xdg-config/claude-rotator/runtime/claude-rotator',
+      cliPath: '/repo/bin/claude-rotator.js',
+      configPath: '/home/alice/xdg-config/claude-rotator/config.json',
+      claudePath: '/home/alice/.nvm/versions/node/v20/bin/claude',
+      servicePath: '/home/alice/.nvm/versions/node/v20/bin:/usr/local/bin:/usr/bin:/bin',
+      xdgConfigHome: '/home/alice/xdg-config',
+      xdgDataHome: '/home/alice/xdg-data',
+    });
+
+    assert.match(service, /Environment=XDG_CONFIG_HOME=\/home\/alice\/xdg-config/);
+    assert.match(service, /Environment=XDG_DATA_HOME=\/home\/alice\/xdg-data/);
+  });
+
+  it('changes the LaunchAgent service generation when XDG paths change', () => {
+    const base = {
+      nodePath: '/opt/homebrew/bin/node',
+      cliPath: '/repo/bin/claude-rotator.js',
+      configPath: '/home/alice/.config/claude-rotator/config.json',
+      claudePath: '/opt/homebrew/bin/claude',
+      servicePath: '/opt/homebrew/bin:/usr/bin:/bin',
+    };
+
+    const withoutXdg = serviceGenerationForLaunchAgent(base);
+    const withXdg = serviceGenerationForLaunchAgent({
+      ...base,
+      xdgConfigHome: '/home/alice/xdg-config',
+      xdgDataHome: '/home/alice/xdg-data',
+    });
+    const withDifferentXdg = serviceGenerationForLaunchAgent({
+      ...base,
+      xdgConfigHome: '/home/alice/other-config',
+      xdgDataHome: '/home/alice/xdg-data',
+    });
+
+    assert.notEqual(withoutXdg, withXdg);
+    assert.notEqual(withXdg, withDifferentXdg);
   });
 
   it('renders Ubuntu recovery commands when systemd user service start fails', () => {

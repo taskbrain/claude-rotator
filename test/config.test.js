@@ -18,6 +18,7 @@ import {
   macosWatchdogMarkerPath,
   macosWatchdogPlistPath,
   xdgConfigHome,
+  xdgDataHome,
 } from '../src/paths.js';
 
 describe('path helpers', () => {
@@ -27,6 +28,13 @@ describe('path helpers', () => {
     assert.equal(xdgConfigHome(env, '/home/alice'), '/tmp/xdg');
     assert.equal(defaultConfigPath(env, '/home/alice'), '/tmp/xdg/claude-rotator/config.json');
     assert.equal(expandHome('~/settings.json', '/home/alice'), '/home/alice/settings.json');
+  });
+
+  it('ignores relative XDG overrides and falls back to the default home-based path', () => {
+    const env = { XDG_CONFIG_HOME: 'relative/config', XDG_DATA_HOME: 'relative/data' };
+
+    assert.equal(xdgConfigHome(env, '/home/alice'), '/home/alice/.config');
+    assert.equal(xdgDataHome(env, '/home/alice'), '/home/alice/.local/share');
   });
 
   it('keeps every WatchDock asset under the user-owned config, data, or LaunchAgents directory', () => {
