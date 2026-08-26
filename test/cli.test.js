@@ -4,13 +4,16 @@ import { EventEmitter } from 'node:events';
 import { mkdir, mkdtemp, readFile, rm, stat, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
+import { Readable } from 'node:stream';
 
 import {
   ensureCredentialRevisions,
+  removeServiceFile,
   runCli,
   runMacosCliActionWithLock,
   startService,
 } from '../src/cli.js';
+import { MACOS_LAUNCH_AGENT_LABEL } from '../src/install.js';
 
 describe('ensureCredentialRevisions', () => {
   it('assigns a non-secret baseline only to accounts missing a revision', () => {
@@ -390,6 +393,103 @@ describe('runCli', () => {
     assert.match(io.output(), /already registered as person-example-com/);
   });
 
+  it('reads the token JSON from stdin when --json is -, keeping it out of argv', async () => {
+    const io = createIo();
+    let savedConfig = null;
+    const stored = [];
+
+    const code = await runCli(
+      ['login', '--id', 'acct_1', '--name', 'person@example.com', '--json', '-'],
+      {
+        ...io,
+        stdin: Readable.from(['{"accessToken":"access-1","refreshToken":"refresh-1"}']),
+        loadConfig: async () => ({ accounts: [] }),
+        saveConfig: async config => { savedConfig = config; },
+        secretStore: {
+          get: async () => null,
+          set: async (id, secret) => { stored.push({ id, secret }); },
+        },
+        reloadServer: async () => {},
+      },
+    );
+
+    assert.equal(code, 0);
+    assert.deepEqual(stored, [{ id: 'acct_1', secret: { accessToken: 'access-1', refreshToken: 'refresh-1' } }]);
+    assert.equal(savedConfig.accounts[0].id, 'acct_1');
+    assert.match(io.output(), /Added person@example\.com/);
+  });
+
+  it('refuses login --json - immediately when stdin is a terminal, instead of hanging', async () => {
+    const io = createIo();
+
+    const code = await runCli(
+      ['login', '--id', 'acct_1', '--name', 'person@example.com', '--json', '-'],
+      {
+        ...io,
+        stdin: { isTTY: true },
+      },
+    );
+
+    assert.equal(code, 1);
+    assert.match(io.output(), /stdin is a terminal/);
+  });
+
+  it('refuses login --json - when stdin has no token JSON', async () => {
+    const io = createIo();
+
+    const code = await runCli(
+      ['login', '--id', 'acct_1', '--name', 'person@example.com', '--json', '-'],
+      {
+        ...io,
+        stdin: Readable.from([]),
+      },
+    );
+
+    assert.equal(code, 1);
+    assert.match(io.output(), /received no token JSON on stdin/);
+  });
+
+  it('does not leak the token JSON in the parse error message', async () => {
+    const io = createIo();
+
+    const code = await runCli(
+      ['login', '--id', 'acct_1', '--name', 'person@example.com', '--json', '-'],
+      {
+        ...io,
+        stdin: Readable.from(['sk-ant-oat01-SECRET']),
+      },
+    );
+
+    assert.equal(code, 1);
+    assert.doesNotMatch(io.output(), /sk-ant/);
+    assert.match(io.output(), /Could not parse the token JSON/);
+  });
+
+  it('still accepts a literal token JSON via --json for backward compatibility', async () => {
+    const io = createIo();
+    const secretStore = new MemorySecretStore();
+    let savedConfig = null;
+
+    const code = await runCli(
+      [
+        'login', '--id', 'acct_1', '--name', 'person@example.com',
+        '--json', '{"accessToken":"access-1","refreshToken":"refresh-1"}',
+      ],
+      {
+        ...io,
+        loadConfig: async () => ({ accounts: [] }),
+        saveConfig: async config => { savedConfig = config; },
+        secretStore,
+        reloadServer: async () => {},
+      },
+    );
+
+    assert.equal(code, 0);
+    assert.deepEqual(await secretStore.get('acct_1'), { accessToken: 'access-1', refreshToken: 'refresh-1' });
+    assert.equal(savedConfig.accounts[0].id, 'acct_1');
+    assert.match(io.output(), /Added person@example\.com/);
+  });
+
   it('removes an account and its stored secret by default', async () => {
     const io = createIo();
     let savedConfig = null;
@@ -598,6 +698,147 @@ describe('runCli', () => {
     assert.equal(code, 0);
     assert.equal(refreshCalls, 0);
     assert.match(io.output(), /Secret store does not support atomic compare-and-set/);
+  });
+
+  it('reports a doctor health-check failure as a normal CLI failure', async () => {
+    const io = createIo();
+
+    const code = await runCli(['doctor'], {
+      ...io,
+      readHealth: async () => { throw new Error('connect ECONNREFUSED 127.0.0.1:37891'); },
+      loadConfig: async () => ({ accounts: [] }),
+    });
+
+    assert.equal(code, 1);
+    assert.match(io.output(), /connect ECONNREFUSED 127\.0\.0\.1:37891/);
+  });
+});
+
+describe('uninstall --purge-secrets account id targeting', () => {
+  // Regression coverage for the macOS Keychain purge silently deleting nothing:
+  // `uninstall --purge-secrets` must forward the configured account ids (plus
+  // the "current" account) to secretStore.purge(ids), on both the darwin and
+  // non-darwin code paths, instead of calling purge() with no arguments.
+  const noopExecFileImpl = async (command, args) => {
+    if (args[0] === 'print') throw Object.assign(new Error('not found'), { code: 113 });
+    return { stdout: '', stderr: '' };
+  };
+
+  async function writeConfigWithAccounts(configPath) {
+    await mkdir(dirname(configPath), { recursive: true });
+    await writeFile(configPath, JSON.stringify({
+      accounts: [
+        { id: 'acct_1', name: 'a@example.com', type: 'oauth' },
+        { id: 'acct_2', name: 'b@example.com', type: 'oauth' },
+      ],
+    }), 'utf8');
+  }
+
+  function createPurgeSpy() {
+    const calls = [];
+    const secretStoreFactory = () => ({
+      purge: async ids => { calls.push(ids); },
+    });
+    return { calls, secretStoreFactory };
+  }
+
+  it('darwin: purges the configured account ids plus the current account', async () => {
+    const io = createIo();
+    const sandbox = await mkdtemp(join(tmpdir(), 'claude-rotator-cli-uninstall-purge-darwin-'));
+    try {
+      const home = join(sandbox, 'home');
+      const xdgConfig = join(sandbox, 'xdg-config');
+      const xdgData = join(sandbox, 'xdg-data');
+      const configPath = join(xdgConfig, 'claude-rotator', 'config.json');
+      await writeConfigWithAccounts(configPath);
+      const { calls, secretStoreFactory } = createPurgeSpy();
+
+      const code = await runCli(['__macos-service-action', 'uninstall', '--purge-secrets'], {
+        ...io,
+        platform: 'darwin',
+        home,
+        env: {
+          CLAUDE_ROTATOR_MACOS_SERVICE_LOCKED: '1',
+          XDG_CONFIG_HOME: xdgConfig,
+          XDG_DATA_HOME: xdgData,
+        },
+        execFileImpl: noopExecFileImpl,
+        secretStoreFactory,
+      });
+
+      assert.equal(code, 0);
+      assert.equal(calls.length, 1);
+      assert.deepEqual(calls[0], ['acct_1', 'acct_2', 'current']);
+    } finally {
+      await rm(sandbox, { recursive: true, force: true });
+    }
+  });
+
+  it('darwin: does not purge when --purge-secrets is omitted', async () => {
+    const io = createIo();
+    const sandbox = await mkdtemp(join(tmpdir(), 'claude-rotator-cli-uninstall-no-purge-darwin-'));
+    try {
+      const home = join(sandbox, 'home');
+      const xdgConfig = join(sandbox, 'xdg-config');
+      const xdgData = join(sandbox, 'xdg-data');
+      const configPath = join(xdgConfig, 'claude-rotator', 'config.json');
+      await writeConfigWithAccounts(configPath);
+      const { calls, secretStoreFactory } = createPurgeSpy();
+
+      const code = await runCli(['__macos-service-action', 'uninstall'], {
+        ...io,
+        platform: 'darwin',
+        home,
+        env: {
+          CLAUDE_ROTATOR_MACOS_SERVICE_LOCKED: '1',
+          XDG_CONFIG_HOME: xdgConfig,
+          XDG_DATA_HOME: xdgData,
+        },
+        execFileImpl: noopExecFileImpl,
+        secretStoreFactory,
+      });
+
+      assert.equal(code, 0);
+      assert.equal(calls.length, 0);
+    } finally {
+      await rm(sandbox, { recursive: true, force: true });
+    }
+  });
+
+  it('non-darwin (linux): purges the configured account ids plus the current account', async () => {
+    const io = createIo();
+    const sandbox = await mkdtemp(join(tmpdir(), 'claude-rotator-cli-uninstall-purge-linux-'));
+    try {
+      const home = join(sandbox, 'home');
+      const xdgConfig = join(sandbox, 'xdg-config');
+      const xdgData = join(sandbox, 'xdg-data');
+      const configPath = join(xdgConfig, 'claude-rotator', 'config.json');
+      await writeConfigWithAccounts(configPath);
+      // uninstallSettings() reads installStatePath eagerly with no ENOENT
+      // fallback, so a prior "install" state must exist for the restore step
+      // to no-op cleanly instead of throwing.
+      await writeFile(join(xdgConfig, 'claude-rotator', 'install-state.json'), '{}', 'utf8');
+      const { calls, secretStoreFactory } = createPurgeSpy();
+
+      // removeServiceFile() (called by uninstallCommand's non-darwin branch)
+      // threads the `home` passed below straight into macosLaunchAgentPath()
+      // and never falls back to the real os.homedir(), so no real-HOME
+      // sandboxing is needed here (see the dedicated "removeServiceFile only
+      // deletes ... never under process.env.HOME" regression test below).
+      const code = await runCli(['uninstall', '--purge-secrets'], {
+        ...io,
+        platform: 'linux',
+        home,
+        env: { XDG_CONFIG_HOME: xdgConfig, XDG_DATA_HOME: xdgData },
+        secretStoreFactory,
+      });
+
+      assert.equal(code, 0);
+      assert.equal(calls.length, 1);
+      assert.deepEqual(calls[0], ['acct_1', 'acct_2', 'current']);
+    } finally {
+      await rm(sandbox, { recursive: true, force: true });
+    }
   });
 });
 

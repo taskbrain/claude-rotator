@@ -2,10 +2,32 @@
   "name": "claude-rotator",
   "version": "0.1.0",
   "description": "Local Claude Code account rotator proxy for macOS and Linux.",
+  "keywords": [
+    "claude",
+    "claude-code",
+    "proxy",
+    "account-rotation",
+    "oauth"
+  ],
+  "homepage": "https://github.com/taskbrain/claude-rotator#readme",
+  "bugs": "https://github.com/taskbrain/claude-rotator/issues",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/taskbrain/claude-rotator.git"
+  },
+  "license": "MIT",
+  "author": "Claude Rotator contributors",
+  "private": true,
   "type": "module",
   "bin": {
     "claude-rotator": "bin/claude-rotator.js"
   },
+  "files": [
+    "bin",
+    "src",
+    "README.md",
+    "LICENSE"
+  ],
   "scripts": {
     "test": "node --test",
     "lint": "node scripts/lint.js",
@@ -13,6 +35,5 @@
   },
   "engines": {
     "node": ">=18.10.0"
-  },
-  "license": "MIT"
+  }
 }

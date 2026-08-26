@@ -9,6 +9,7 @@ import { promisify } from 'node:util';
 import {
   renderMacosWatchdogLaunchAgentPlist,
   renderMacosWatchdogScript,
+  shellQuote,
 } from '../src/macos-watchdog.js';
 import { fileSha256, writeJsonFile } from '../src/json-file.js';
 
@@ -77,6 +78,45 @@ describe('macOS WatchDock helper', () => {
       await rm(dir, { recursive: true, force: true });
     }
   });
+
+  it('renders a syntax-valid helper when paths contain a single quote', async () => {
+    const helper = renderMacosWatchdogScript({
+      markerPath: "/tmp/o'brien/watchdog.json",
+      installStatePath: '/tmp/install-state.json',
+      mainPlistPath: '/tmp/main.plist',
+      domain: 'gui/501',
+    });
+
+    const dir = await mkdtemp(join(tmpdir(), 'claude-rotator-watchdog-quote-'));
+    const helperPath = join(dir, 'watchdog.sh');
+    try {
+      await writeFile(helperPath, helper, { mode: 0o700 });
+      await execFileAsync('/bin/sh', ['-n', helperPath]);
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('treats a single-quote payload as a literal value, not a command substitution', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'claude-rotator-watchdog-injection-'));
+    const canaryPath = join(dir, `should-not-exist-${process.pid}`);
+    const payloadMarkerPath = `${dir}/x'$(touch ${canaryPath})'y`;
+    const helper = renderMacosWatchdogScript({
+      markerPath: payloadMarkerPath,
+      installStatePath: '/tmp/install-state.json',
+      mainPlistPath: '/tmp/main.plist',
+      domain: 'gui/501',
+    });
+
+    const helperPath = join(dir, 'watchdog.sh');
+    try {
+      await writeFile(helperPath, helper, { mode: 0o700 });
+      await execFileAsync('/bin/sh', [helperPath]);
+      await assert.rejects(readFile(canaryPath));
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
 });
 
 async function createFixture() {
@@ -137,8 +177,4 @@ exit 2
 async function writeExecutable(path, body) {
   await writeFile(path, body, { mode: 0o700 });
   await chmod(path, 0o700);
-}
-
-function shellQuote(value) {
-  return `'${String(value).replaceAll("'", "'\\\"'\\\"'")}'`;
 }
