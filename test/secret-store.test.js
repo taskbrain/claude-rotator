@@ -12,6 +12,15 @@ import {
   secretStoreProcessIdentity,
 } from '../src/secret-store.js';
 
+// Touches the real macOS Keychain (via the `security` CLI), which triggers OS
+// authentication prompts on a developer machine. Skipped by default; CI opts
+// in via CLAUDE_ROTATOR_REAL_KEYCHAIN=1 (see .github/workflows/ci.yml).
+const REAL_KEYCHAIN_SKIP_REASON = process.platform !== 'darwin'
+  ? 'darwin only'
+  : (process.env.CLAUDE_ROTATOR_REAL_KEYCHAIN === '1'
+    ? false
+    : 'set CLAUDE_ROTATOR_REAL_KEYCHAIN=1 to run tests that touch the real macOS Keychain');
+
 describe('MemorySecretStore', () => {
   it('stores, lists, and removes secrets without exposing internals', async () => {
     const store = new MemorySecretStore();
@@ -498,7 +507,7 @@ describe('MacOSKeychainSecretStore', () => {
   });
 
   it('round-trips a fake credential through the real macOS Keychain', {
-    skip: process.platform !== 'darwin',
+    skip: REAL_KEYCHAIN_SKIP_REASON,
   }, async () => {
     const dir = await mkdtemp(join(tmpdir(), 'claude-rotator-keychain-integration-'));
     const accountId = `ci-${process.pid}-${Date.now()}`;

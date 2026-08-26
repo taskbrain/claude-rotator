@@ -38,4 +38,9 @@ jobs:
           node-version: ${{ matrix.node }}
 
       - name: Run lint and tests
+        env:
+          # Only macOS runners get a disposable Keychain; opt in there so the
+          # real-Keychain integration tests still run in CI. Left unset (empty)
+          # on ubuntu, where `security` doesn't exist, so those tests stay skipped.
+          CLAUDE_ROTATOR_REAL_KEYCHAIN: ${{ matrix.os == 'macos-latest' && '1' || '' }}
         run: npm run check

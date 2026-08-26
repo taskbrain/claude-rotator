@@ -348,6 +348,8 @@ npm test
 npm run lint
 ```
 
+macOS では、実際の Keychain に書き込む一部のテストがデフォルトで skip されます。`CLAUDE_ROTATOR_REAL_KEYCHAIN=1 npm test` を付けると実行できますが、Keychain の認証ダイアログが表示される場合があります（CI の macOS ジョブでは自動的に有効化されます）。
+
 ローカル Node は `v18.10` 以上で動作します。開発時に macOS / Ubuntu の差分を避けて確認したい場合は、下の Docker コマンドで Node 22 の検証も実行してください。
 
 Docker での検証:

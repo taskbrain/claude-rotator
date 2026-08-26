@@ -41,6 +41,15 @@ const NOW = 1_700_000_000_000;
 const OLD_EXPIRES_AT = 1_800_000_000_000;
 const NEW_EXPIRES_AT = OLD_EXPIRES_AT + 60 * 60 * 1000;
 
+// Touches the real macOS Keychain (via the `security` CLI), which triggers OS
+// authentication prompts on a developer machine. Skipped by default; CI opts
+// in via CLAUDE_ROTATOR_REAL_KEYCHAIN=1 (see .github/workflows/ci.yml).
+const REAL_KEYCHAIN_SKIP_REASON = process.platform !== 'darwin'
+  ? 'darwin only'
+  : (process.env.CLAUDE_ROTATOR_REAL_KEYCHAIN === '1'
+    ? false
+    : 'set CLAUDE_ROTATOR_REAL_KEYCHAIN=1 to run tests that touch the real macOS Keychain');
+
 function refreshWithNativeClaudeCode(refreshToken, previousCredential, options = {}) {
   return refreshWithNativeClaudeCodeImpl(refreshToken, previousCredential, {
     platform: 'linux',
@@ -337,7 +346,7 @@ describe('native Claude credential refresher', () => {
   });
 
   it('round-trips an isolated credential through the real macOS Keychain adapter', {
-    skip: process.platform !== 'darwin',
+    skip: REAL_KEYCHAIN_SKIP_REASON,
   }, async () => {
     const configDir = join(testRoot, 'native-keychain-config');
     const account = `ci-${process.pid}-${Date.now()}`;
