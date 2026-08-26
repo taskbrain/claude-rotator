@@ -3,6 +3,7 @@ import { randomUUID } from 'node:crypto';
 import { chmod, mkdir, readdir, readFile, rename, rm, stat, writeFile } from 'node:fs/promises';
 import { hostname } from 'node:os';
 import { join } from 'node:path';
+import { performance } from 'node:perf_hooks';
 import { isDeepStrictEqual, promisify } from 'node:util';
 
 import { appDataDir, linuxAccountsDir } from './paths.js';
@@ -41,6 +42,7 @@ class AccountFileLock {
     retryMs = DEFAULT_LOCK_RETRY_MS,
     staleMs = DEFAULT_LOCK_STALE_MS,
     now = () => Date.now(),
+    monotonicNow = () => performance.now(),
     sleepImpl = ms => new Promise(resolve => setTimeout(resolve, ms)),
     hostnameImpl = hostname,
     processIdentityImpl = processIdentity,
@@ -50,6 +52,7 @@ class AccountFileLock {
     this.retryMs = retryMs;
     this.staleMs = staleMs;
     this.now = now;
+    this.monotonicNow = monotonicNow;
     this.sleepImpl = sleepImpl;
     this.hostname = hostnameImpl();
     this.processIdentityImpl = processIdentityImpl;
@@ -70,7 +73,7 @@ class AccountFileLock {
     await mkdir(this.lockDir, { recursive: true, mode: 0o700 });
     await chmod(this.lockDir, 0o700);
     const lockPath = join(this.lockDir, `${accountId}.lock`);
-    const startedAt = this.now();
+    const startedAt = this.monotonicNow();
     const ownerProcessIdentity = await this.localProcessIdentity();
 
     while (true) {
@@ -171,7 +174,7 @@ class AccountFileLock {
   }
 
   async waitForRetry(accountId, startedAt) {
-    const elapsedMs = this.now() - startedAt;
+    const elapsedMs = this.monotonicNow() - startedAt;
     if (elapsedMs >= this.acquireTimeoutMs) throw lockTimeoutError(accountId);
     await this.sleepImpl(Math.min(this.retryMs, this.acquireTimeoutMs - elapsedMs));
   }
