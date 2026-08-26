@@ -976,7 +976,7 @@ export async function installServiceFile({ configPath, claudePath = null, env = 
   ].filter(Boolean))].join(':');
   const xdgOverrides = serviceXdgOverrides(env);
   if (process.platform === 'darwin') {
-    const path = macosLaunchAgentPath(MACOS_LAUNCH_AGENT_LABEL);
+    const path = macosLaunchAgentPath(MACOS_LAUNCH_AGENT_LABEL, home);
     await mkdir(dirname(path), { recursive: true });
     await writeFile(path, renderLaunchAgentPlist({
       nodePath: process.execPath,
@@ -1006,7 +1006,7 @@ export async function installServiceFile({ configPath, claudePath = null, env = 
 }
 
 export async function removeServiceFile({ configPath, env = process.env, home = homedir() }) {
-  await rm(macosLaunchAgentPath(MACOS_LAUNCH_AGENT_LABEL), { force: true });
+  await rm(macosLaunchAgentPath(MACOS_LAUNCH_AGENT_LABEL, home), { force: true });
   const xdgServicePath = join(xdgConfigHome(env, home), 'systemd', 'user', 'claude-rotator.service');
   await rm(xdgServicePath, { force: true });
   const legacyServicePath = join(home, '.config', 'systemd', 'user', 'claude-rotator.service');

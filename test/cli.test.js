@@ -773,6 +773,87 @@ describe('installServiceFile / removeServiceFile XDG wiring (regression)', () =>
       await rm(sandbox, { recursive: true, force: true });
     }
   });
+
+  // Regression for a real incident: removeServiceFile/installServiceFile used
+  // to build the macOS LaunchAgent path via macosLaunchAgentPath(label) with
+  // NO `home` argument, so it silently fell back to the real homedir() even
+  // when the caller passed an explicit `home`. Because homedir() itself
+  // resolves through process.env.HOME on POSIX, we must never let the
+  // function's explicit `home` argument collide with process.env.HOME in
+  // this test, or a still-buggy implementation would coincidentally target
+  // the same directory and the regression would go undetected.
+  //
+  // So `process.env.HOME` is pointed at a "decoy" temp directory (standing
+  // in for what would be the real home) that is DIFFERENT from the `home`
+  // argument explicitly passed to the function under test. A fixed
+  // implementation only ever touches the explicit `home` argument's
+  // directory; a buggy one reaches for the decoy via the overridden
+  // homedir(). Neither directory is the real $HOME.
+  it('removeServiceFile only deletes the LaunchAgent plist under the explicit home, never under process.env.HOME', async () => {
+    const { removeServiceFile } = await import('../src/cli.js');
+
+    const sandbox = await mkdtemp(join(tmpdir(), 'claude-rotator-cli-launchagent-remove-'));
+    try {
+      const decoyHome = join(sandbox, 'decoy-home'); // stands in for the real $HOME
+      const explicitHome = join(sandbox, 'explicit-home'); // the `home` passed to removeServiceFile
+      const configPath = join(explicitHome, '.config', 'claude-rotator', 'config.json');
+
+      const decoyPlistPath = join(decoyHome, 'Library', 'LaunchAgents', 'io.github.claude-rotator.plist');
+      const explicitPlistPath = join(explicitHome, 'Library', 'LaunchAgents', 'io.github.claude-rotator.plist');
+      await mkdir(dirname(decoyPlistPath), { recursive: true });
+      await writeFile(decoyPlistPath, 'decoy plist: must survive', 'utf8');
+      await mkdir(dirname(explicitPlistPath), { recursive: true });
+      await writeFile(explicitPlistPath, 'explicit-home plist: must be removed', 'utf8');
+
+      await withSandboxedHomeAndPlatform('darwin', decoyHome, async () => {
+        await removeServiceFile({ configPath, env: {}, home: explicitHome });
+      });
+
+      await assert.rejects(
+        stat(explicitPlistPath),
+        { code: 'ENOENT' },
+        'removeServiceFile must delete the LaunchAgent plist under the explicit home it was given',
+      );
+      await assert.equal(
+        await readFile(decoyPlistPath, 'utf8'),
+        'decoy plist: must survive',
+        'removeServiceFile must NOT touch a LaunchAgent plist reachable only via process.env.HOME/homedir()',
+      );
+    } finally {
+      await rm(sandbox, { recursive: true, force: true });
+    }
+  });
+
+  it('installServiceFile only writes the LaunchAgent plist under the explicit home, never under process.env.HOME', async () => {
+    const { installServiceFile } = await import('../src/cli.js');
+
+    const sandbox = await mkdtemp(join(tmpdir(), 'claude-rotator-cli-launchagent-install-'));
+    try {
+      const decoyHome = join(sandbox, 'decoy-home'); // stands in for the real $HOME
+      const explicitHome = join(sandbox, 'explicit-home'); // the `home` passed to installServiceFile
+      const configPath = join(explicitHome, '.config', 'claude-rotator', 'config.json');
+
+      const decoyPlistPath = join(decoyHome, 'Library', 'LaunchAgents', 'io.github.claude-rotator.plist');
+      const explicitPlistPath = join(explicitHome, 'Library', 'LaunchAgents', 'io.github.claude-rotator.plist');
+
+      await withSandboxedHomeAndPlatform('darwin', decoyHome, async () => {
+        await installServiceFile({ configPath, env: {}, home: explicitHome });
+      });
+
+      const written = await readFile(explicitPlistPath, 'utf8');
+      assert.ok(
+        written.includes('io.github.claude-rotator'),
+        'installServiceFile must write the LaunchAgent plist under the explicit home it was given',
+      );
+      await assert.rejects(
+        stat(decoyPlistPath),
+        { code: 'ENOENT' },
+        'installServiceFile must NOT write a LaunchAgent plist reachable only via process.env.HOME/homedir()',
+      );
+    } finally {
+      await rm(sandbox, { recursive: true, force: true });
+    }
+  });
 });
 
 function createIo() {
