@@ -1,5 +1,5 @@
 import { homedir } from 'node:os';
-import { join } from 'node:path';
+import { isAbsolute, join } from 'node:path';
 
 export const APP_NAME = 'claude-rotator';
 
@@ -10,11 +10,13 @@ export function expandHome(path, home = homedir()) {
 }
 
 export function xdgConfigHome(env = process.env, home = homedir()) {
-  return env.XDG_CONFIG_HOME || join(home, '.config');
+  if (env.XDG_CONFIG_HOME && isAbsolute(env.XDG_CONFIG_HOME)) return env.XDG_CONFIG_HOME;
+  return join(home, '.config');
 }
 
 export function xdgDataHome(env = process.env, home = homedir()) {
-  return env.XDG_DATA_HOME || join(home, '.local', 'share');
+  if (env.XDG_DATA_HOME && isAbsolute(env.XDG_DATA_HOME)) return env.XDG_DATA_HOME;
+  return join(home, '.local', 'share');
 }
 
 export function appConfigDir(env = process.env, home = homedir()) {

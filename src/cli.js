@@ -54,6 +54,7 @@ import {
   macosWatchdogMarkerPath,
   macosWatchdogPlistPath,
   runtimeStatePath,
+  xdgConfigHome,
 } from './paths.js';
 import { readJsonFile, writeJsonFile } from './json-file.js';
 
@@ -421,7 +422,7 @@ async function installCommand({ argv, write, deps = {} }) {
     proxyBaseUrl: proxyBaseUrl(config),
     force,
   });
-  await installServiceFile({ configPath, claudePath });
+  await installServiceFile({ configPath, claudePath, env, home });
   write(`Installed claude-rotator at ${proxyBaseUrl(config)}\n`);
   if (noStart) {
     write('Service start skipped because --no-start was set.\n');
@@ -464,7 +465,7 @@ async function uninstallCommand({ argv, write, deps = {} }) {
   await stopService().catch(() => {});
   const result = await uninstallSettings({ settingsPath, installStatePath: statePath, force });
   if (result.conflict) throw new Error(result.reason);
-  await removeServiceFile({ configPath });
+  await removeServiceFile({ configPath, env, home });
   await removeInstallState(statePath);
   if (purgeSecrets) await createSecretStore().purge();
   write('Uninstalled claude-rotator\n');
@@ -492,6 +493,7 @@ async function installMacosCommand({
     configPath,
     claudePath,
     servicePath,
+    ...serviceXdgOverrides(env),
   };
   const serviceGeneration = serviceGenerationForLaunchAgent(generationOptions);
   const paths = macosLifecyclePaths({ env, home, settingsPath, statePath });
@@ -536,6 +538,13 @@ function macosLifecyclePaths({ env, home, settingsPath, statePath }) {
     mainPlistPath: macosLaunchAgentPath(MACOS_LAUNCH_AGENT_LABEL, home),
     watchdogPlistPath: macosWatchdogPlistPath(home),
     helperPath: macosWatchdogHelperPath(env, home),
+  };
+}
+
+function serviceXdgOverrides(env) {
+  return {
+    xdgConfigHome: env.XDG_CONFIG_HOME && isAbsolute(env.XDG_CONFIG_HOME) ? env.XDG_CONFIG_HOME : null,
+    xdgDataHome: env.XDG_DATA_HOME && isAbsolute(env.XDG_DATA_HOME) ? env.XDG_DATA_HOME : null,
   };
 }
 
@@ -943,7 +952,7 @@ function nextAccountId(config) {
   return `account${Date.now()}`;
 }
 
-async function installServiceFile({ configPath, claudePath = null }) {
+export async function installServiceFile({ configPath, claudePath = null, env = process.env, home = homedir() }) {
   const cliPath = resolve(process.argv[1]);
   const servicePath = [...new Set([
     claudePath ? dirname(claudePath) : null,
@@ -955,6 +964,7 @@ async function installServiceFile({ configPath, claudePath = null }) {
     '/usr/sbin',
     '/sbin',
   ].filter(Boolean))].join(':');
+  const xdgOverrides = serviceXdgOverrides(env);
   if (process.platform === 'darwin') {
     const path = macosLaunchAgentPath(MACOS_LAUNCH_AGENT_LABEL);
     await mkdir(dirname(path), { recursive: true });
@@ -964,6 +974,7 @@ async function installServiceFile({ configPath, claudePath = null }) {
       configPath,
       claudePath,
       servicePath,
+      ...xdgOverrides,
     }), 'utf8');
     return;
   }
@@ -974,17 +985,24 @@ async function installServiceFile({ configPath, claudePath = null }) {
     configPath,
     claudePath,
     servicePath,
+    ...xdgOverrides,
   });
-  const path = join(appConfigDir(), 'claude-rotator.service');
+  const path = join(appConfigDir(env, home), 'claude-rotator.service');
   await mkdir(dirname(path), { recursive: true });
   await writeFile(path, service, 'utf8');
-  await mkdir(join(homedir(), '.config', 'systemd', 'user'), { recursive: true });
-  await writeFile(join(homedir(), '.config', 'systemd', 'user', 'claude-rotator.service'), service, 'utf8');
+  const systemdUserDir = join(xdgConfigHome(env, home), 'systemd', 'user');
+  await mkdir(systemdUserDir, { recursive: true });
+  await writeFile(join(systemdUserDir, 'claude-rotator.service'), service, 'utf8');
 }
 
-async function removeServiceFile({ configPath }) {
+export async function removeServiceFile({ configPath, env = process.env, home = homedir() }) {
   await rm(macosLaunchAgentPath(MACOS_LAUNCH_AGENT_LABEL), { force: true });
-  await rm(join(homedir(), '.config', 'systemd', 'user', 'claude-rotator.service'), { force: true });
+  const xdgServicePath = join(xdgConfigHome(env, home), 'systemd', 'user', 'claude-rotator.service');
+  await rm(xdgServicePath, { force: true });
+  const legacyServicePath = join(home, '.config', 'systemd', 'user', 'claude-rotator.service');
+  if (legacyServicePath !== xdgServicePath) {
+    await rm(legacyServicePath, { force: true });
+  }
   await removeLinuxNodeLauncher(configPath);
 }
 

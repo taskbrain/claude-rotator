@@ -430,7 +430,17 @@ export function renderLaunchAgentPlist({
   claudePath,
   servicePath,
   serviceGeneration = null,
+  xdgConfigHome = null,
+  xdgDataHome = null,
 }) {
+  const xdgEnvEntries = [
+    xdgConfigHome ? `    <key>XDG_CONFIG_HOME</key>
+    <string>${xmlEscape(xdgConfigHome)}</string>
+` : '',
+    xdgDataHome ? `    <key>XDG_DATA_HOME</key>
+    <string>${xmlEscape(xdgDataHome)}</string>
+` : '',
+  ].join('');
   return `<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
@@ -453,7 +463,7 @@ export function renderLaunchAgentPlist({
     <string>${xmlEscape(claudePath)}</string>
     <key>PATH</key>
     <string>${xmlEscape(servicePath)}</string>
-${serviceGeneration ? `    <key>${SERVICE_GENERATION_ENV}</key>
+${xdgEnvEntries}${serviceGeneration ? `    <key>${SERVICE_GENERATION_ENV}</key>
     <string>${xmlEscape(serviceGeneration)}</string>
 ` : ''}  </dict>
   <key>RunAtLoad</key>
@@ -475,6 +485,8 @@ export function serviceGenerationForLaunchAgent({
   configPath,
   claudePath,
   servicePath,
+  xdgConfigHome = null,
+  xdgDataHome = null,
 }) {
   return createHash('sha256').update(JSON.stringify({
     nodePath,
@@ -482,6 +494,8 @@ export function serviceGenerationForLaunchAgent({
     configPath,
     claudePath,
     servicePath,
+    xdgConfigHome,
+    xdgDataHome,
   })).digest('hex');
 }
 
@@ -491,8 +505,14 @@ export function renderSystemdUserService({
   configPath,
   claudePath,
   servicePath,
+  xdgConfigHome = null,
+  xdgDataHome = null,
 }) {
   const configDir = dirname(configPath);
+  const xdgEnvLines = [
+    xdgConfigHome ? `Environment=XDG_CONFIG_HOME=${systemdEscape(xdgConfigHome)}\n` : '',
+    xdgDataHome ? `Environment=XDG_DATA_HOME=${systemdEscape(xdgDataHome)}\n` : '',
+  ].join('');
   return `[Unit]
 Description=Claude Rotator proxy
 After=network-online.target
@@ -503,7 +523,7 @@ Environment=CLAUDE_ROTATOR_CONFIG=${systemdEscape(configPath)}
 Environment=NODE_OPTIONS=${systemdEscape(SERVICE_NODE_OPTIONS)}
 Environment=CLAUDE_ROTATOR_CLAUDE_BIN=${systemdEscape(claudePath)}
 Environment=PATH=${systemdEscape(servicePath)}
-ExecStart=${systemdEscape(nodePath)} ${systemdEscape(cliPath)} server
+${xdgEnvLines}ExecStart=${systemdEscape(nodePath)} ${systemdEscape(cliPath)} server
 Restart=always
 RestartSec=3
 TimeoutStopSec=10
