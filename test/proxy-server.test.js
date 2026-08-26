@@ -7415,6 +7415,73 @@ describe('createProxyServer', () => {
     assert.equal(health.body.ok, true);
   });
 
+  it('does not stall /internal/status or proxied requests behind a reload stuck reconciling a held account lock', async () => {
+    const upstream = await listen(http.createServer((_req, res) => {
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ ok: true }));
+    }));
+    const secretStore = new MemorySecretStore();
+    // acct_1 simulates the account whose lock a concurrent refresh holds;
+    // acct_2 is the account actually serving traffic, so a proxied request
+    // only reflects the shared reconcile gate, not acct_1's own stuck lock.
+    await secretStore.set('acct_1', { accessToken: 'access-token-1' });
+    await secretStore.set('acct_2', { accessToken: 'access-token-2' });
+    const accountManager = new AccountManager({
+      accounts: [
+        { id: 'acct_2', type: 'oauth' },
+        { id: 'acct_1', type: 'oauth' },
+      ],
+      currentAccountId: 'acct_2',
+    });
+    const proxy = await listen(createProxyServer({
+      accountManager,
+      secretStore,
+      config: { upstream: upstream.url, usagePolling: { enabled: false } },
+      reloadAccounts: async () => accountManager.accounts,
+    }));
+    let releaseReconcile;
+    const reconcileGate = new Promise(resolve => { releaseReconcile = resolve; });
+    cleanupAfterTest(async () => {
+      releaseReconcile();
+      await close(proxy.server);
+      await close(upstream.server);
+    });
+
+    // Let the real startup reconciliation (unrelated to this test) settle
+    // first, then make only acct_1's operational read hang -- as it would
+    // while its account lock is held by a concurrent refresh -- for the
+    // reload triggered below.
+    await requestJson(`${proxy.url}/internal/status`, { timeoutMs: 1_000 });
+    const originalGetOperational = secretStore.getOperational.bind(secretStore);
+    secretStore.getOperational = async accountId => {
+      if (accountId === 'acct_1') await reconcileGate;
+      return originalGetOperational(accountId);
+    };
+
+    const reload = await requestJson(`${proxy.url}/internal/reload`, {
+      method: 'POST', timeoutMs: 1_000,
+    });
+    // The reload response itself must not wait for the (now-stuck)
+    // reconciliation it kicks off in the background.
+    assert.equal(reload.status, 200);
+
+    // Neither /internal/status nor a proxied request (through the
+    // unaffected acct_2) may be stuck behind reload's still-pending
+    // background reconcile of acct_1: only /internal/reload itself may ever
+    // replace the shared operationalStateCheck gate, and it must not do so
+    // anymore.
+    const [status, forwarded] = await Promise.all([
+      requestJson(`${proxy.url}/internal/status`, { timeoutMs: 1_000 }),
+      requestJson(`${proxy.url}/v1/messages`, {
+        method: 'POST', body: JSON.stringify({ model: 'sonnet' }), timeoutMs: 1_000,
+      }),
+    ]);
+
+    assert.equal(status.status, 200);
+    assert.equal(forwarded.status, 200);
+    assert.deepEqual(forwarded.body, { ok: true });
+  });
+
   it('refreshes OAuth usage accounts serially by default', async () => {
     const secretStore = new MemorySecretStore();
     await secretStore.set('acct_1', { accessToken: 'access-token-1' });

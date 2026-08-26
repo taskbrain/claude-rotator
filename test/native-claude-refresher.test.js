@@ -35,6 +35,7 @@ import {
   resolveNativeTempRoot,
 } from '../src/native-claude-refresher.js';
 import { CLAUDE_AI_OAUTH_SCOPES, OAUTH_CLIENT_ID } from '../src/oauth.js';
+import { LinuxFileSecretStore } from '../src/secret-store.js';
 
 const OLD_ACCESS_TOKEN = 'old-access-token-secret';
 const OLD_REFRESH_TOKEN = 'old-refresh-token-secret';
@@ -366,23 +367,25 @@ describe('native Claude credential refresher', () => {
     assert.equal(handoffCalls, 0);
   });
 
-  it('fails locally without spawning login or arming the handoff fence if the budget expires just before spawn', async () => {
+  it('fails closed without spawning login if the budget expires while arming handoff', async () => {
+    let deadlineTime = 1_000;
     let handoffCalls = 0;
     let commandCalls = 0;
-    let deadlineCalls = 0;
 
-    // The handoff fence no longer arms before a spawn is attempted (see the
-    // "arms the handoff fence only after the child actually spawns" test),
-    // so there is no more "arming took too long" step that can burn the
-    // remaining budget. This simulates the budget running out between the
-    // two remaining-timeout checks that bracket the (now hook-free) gap
-    // before the actual spawn attempt.
+    // The durable handoff fence arms before the spawn attempt (see "arms the
+    // handoff fence before the native child ever spawns" below), so once
+    // arming itself consumes the remaining budget, the fence is already up
+    // and the outcome must fail closed instead of returning a plain
+    // recoverable error.
     await assert.rejects(
       refreshWithNativeClaudeCodeImpl(
         OLD_REFRESH_TOKEN,
         {
           ...previousContext(),
-          beforeHandoff: async () => { handoffCalls += 1; },
+          beforeHandoff: async () => {
+            handoffCalls += 1;
+            deadlineTime += 600;
+          },
         },
         {
           platform: 'linux',
@@ -390,20 +393,15 @@ describe('native Claude credential refresher', () => {
           tempRoot: testRoot,
           timeoutMs: 2_500,
           now: () => NOW,
-          deadlineNow: () => {
-            deadlineCalls += 1;
-            return deadlineCalls <= 2 ? 1_000 : 1_000_000;
-          },
+          deadlineNow: () => deadlineTime,
           execFileImpl: async () => { commandCalls += 1; },
         },
       ),
-      error => error.code === 'NATIVE_REFRESH_COMMAND_FAILED'
-        && error.retryAfterMs === DEFAULT_NATIVE_CLAUDE_REFRESH_RETRY_AFTER_MS
-        && error.retryAfterSource === 'fixed',
+      isRetrylessOutcomeUnknown,
     );
 
     assert.equal(commandCalls, 0);
-    assert.equal(handoffCalls, 0);
+    assert.equal(handoffCalls, 1);
   });
 
   it('refreshes on macOS through an isolated temporary Keychain service without argv secrets', async () => {
@@ -607,12 +605,13 @@ describe('native Claude credential refresher', () => {
     assert.equal(refreshed.refreshTokenExpiresAt, 1_900_000_000_000);
   });
 
-  it('arms the handoff fence only after the child actually spawns, then forwards the PID lease hooks', async () => {
+  it('awaits handoff before auth-login and forwards the child PID lease hooks', async () => {
     const events = [];
     let releaseHandoff;
     let signalHandoffStarted;
     const handoffGate = new Promise(resolve => { releaseHandoff = resolve; });
     const handoffStarted = new Promise(resolve => { signalHandoffStarted = resolve; });
+    let loginStarted = false;
     const refresh = refreshWithNativeClaudeCodeImpl(
       OLD_REFRESH_TOKEN,
       {
@@ -632,8 +631,7 @@ describe('native Claude credential refresher', () => {
         tempRoot: testRoot,
         execFileImpl: async (_command, args, options) => {
           assert.deepEqual(args, DEFAULT_NATIVE_CLAUDE_REFRESH_ARGS);
-          // The child is spawned (and could, from here on, actually receive
-          // the refresh token) before the durable handoff fence arms.
+          loginStarted = true;
           events.push('login');
           await options.afterSpawn(4321);
           await writeCredential(join(options.env.CLAUDE_CONFIG_DIR, '.credentials.json'), {
@@ -648,20 +646,22 @@ describe('native Claude credential refresher', () => {
     );
 
     await handoffStarted;
-    assert.deepEqual(events, ['login', 'handoff-start']);
+    assert.equal(loginStarted, false);
+    assert.deepEqual(events, ['handoff-start']);
     releaseHandoff();
     await refresh;
     assert.deepEqual(events, [
-      'login',
       'handoff-start',
       'handoff-finished',
+      'login',
       'protect-4321',
       'clear-4321',
     ]);
   });
 
-  it('never arms the handoff fence when the native command fails to spawn at all', async () => {
+  it('retracts the handoff fence instead of leaving it armed when the native command never spawns a pid', async () => {
     let handoffCalls = 0;
+    let retractCalls = 0;
     let protectCalls = 0;
 
     await assert.rejects(
@@ -670,6 +670,7 @@ describe('native Claude credential refresher', () => {
         {
           ...previousContext(),
           beforeHandoff: async () => { handoffCalls += 1; },
+          retractHandoff: async () => { retractCalls += 1; },
           protectChildPid: async () => { protectCalls += 1; },
         },
         {
@@ -677,22 +678,148 @@ describe('native Claude credential refresher', () => {
           command: 'claude',
           tempRoot: testRoot,
           execFileImpl: async () => {
-            // No pid was ever assigned: afterSpawn must not be invoked, so
-            // neither the durable fence nor the PID lease should arm. This
-            // is the exact scenario the fence-timing fix protects: a plain
-            // ENOENT/EACCES spawn failure must not permanently park the
-            // account, because the refresh token never left this process.
+            // No pid was ever assigned: afterSpawn must not be invoked (so
+            // the PID lease never arms), but beforeHandoff has already run
+            // before this call. A plain ENOENT/EACCES spawn failure must not
+            // permanently park the account -- the refresh token never left
+            // this process -- so the fence armed above must be retracted.
             const error = new Error('spawn ENOENT');
             error.code = 'ENOENT';
             throw error;
           },
         },
       ),
-      isRetrylessOutcomeUnknown,
+      error => error.code === 'NATIVE_REFRESH_COMMAND_UNAVAILABLE',
     );
 
-    assert.equal(handoffCalls, 0);
+    assert.equal(handoffCalls, 1);
     assert.equal(protectCalls, 0);
+    assert.equal(retractCalls, 1);
+  });
+
+  it('surfaces NATIVE_REFRESH_COMMAND_UNAVAILABLE for a genuinely missing claude binary instead of collapsing it into a permanent park', async () => {
+    // Uses the real spawn path (default execFileImpl = executeNativeClaudeCommand)
+    // with a command name that cannot exist on PATH, so the OS itself
+    // produces the ENOENT -- not a mock -- exercising the exact "claude
+    // binary missing/inaccessible" local failure this guards. Every account
+    // sharing this environment would otherwise be misreported as needing a
+    // manual relink (NATIVE_REFRESH_OUTCOME_UNKNOWN) for what is really just
+    // a PATH/installation problem.
+    await assert.rejects(
+      refreshWithNativeClaudeCodeImpl(
+        OLD_REFRESH_TOKEN,
+        {
+          ...previousContext(),
+          beforeHandoff: async () => {},
+          retractHandoff: async () => {},
+        },
+        {
+          platform: 'linux',
+          command: 'claude-rotator-test-definitely-missing-binary',
+          tempRoot: testRoot,
+        },
+      ),
+      error => error.code === 'NATIVE_REFRESH_COMMAND_UNAVAILABLE',
+    );
+  });
+
+  it('persists the durable handoff intent through the real secret-store transaction before the native child ever spawns', async () => {
+    const accountsDir = join(testRoot, 'accounts');
+    const secretStore = new LinuxFileSecretStore({ accountsDir });
+    const intentPath = join(accountsDir, '.locks', 'acct_1.refresh-intent.json');
+    const original = {
+      accessToken: OLD_ACCESS_TOKEN,
+      refreshToken: OLD_REFRESH_TOKEN,
+      expiresAt: OLD_EXPIRES_AT,
+    };
+    await secretStore.set('acct_1', original);
+
+    let intentExistedBeforeSpawn = null;
+    const result = await secretStore.refreshIfUnchanged('acct_1', original, async (current, transaction) => ({
+      ...current,
+      ...(await refreshWithNativeClaudeCodeImpl(current.refreshToken, {
+        ...previousContext(),
+        accessToken: current.accessToken,
+        refreshToken: current.refreshToken,
+        expiresAt: current.expiresAt,
+        beforeHandoff: transaction.beforeHandoff,
+        retractHandoff: transaction.retractHandoff,
+        protectChildPid: transaction.protectChildPid,
+        clearChildPid: transaction.clearChildPid,
+      }, {
+        platform: 'linux',
+        command: 'claude',
+        tempRoot: testRoot,
+        execFileImpl: async (_command, _args, options) => {
+          intentExistedBeforeSpawn = await pathExists(intentPath);
+          // A real, live pid is required here: this goes through the actual
+          // secret-store account-lock child-pid lease, which verifies the
+          // pid corresponds to a running process.
+          await options.afterSpawn(process.pid);
+          await writeCredential(join(options.env.CLAUDE_CONFIG_DIR, '.credentials.json'), {
+            accessToken: NEW_ACCESS_TOKEN,
+            refreshToken: NEW_REFRESH_TOKEN,
+            expiresAt: NEW_EXPIRES_AT,
+          });
+          await options.afterClose(process.pid);
+          return { stdout: '', stderr: '' };
+        },
+      })),
+    }));
+
+    // Fixes the window this test guards: if this process died anywhere
+    // between the child actually spawning and the transaction committing,
+    // the durable intent already on disk -- not the (about to become stale)
+    // stored secret -- is what would prevent the old refresh token from
+    // being reused.
+    assert.equal(intentExistedBeforeSpawn, true);
+    assert.equal(result.updated, true);
+    assert.equal(result.secret.accessToken, NEW_ACCESS_TOKEN);
+    // A cleanly committed transaction leaves no dangling intent behind.
+    await assert.rejects(stat(intentPath), { code: 'ENOENT' });
+  });
+
+  it('leaves no durable intent behind through the real secret-store transaction when the native command never spawns a pid', async () => {
+    const accountsDir = join(testRoot, 'accounts');
+    const secretStore = new LinuxFileSecretStore({ accountsDir });
+    const intentPath = join(accountsDir, '.locks', 'acct_1.refresh-intent.json');
+    const original = {
+      accessToken: OLD_ACCESS_TOKEN,
+      refreshToken: OLD_REFRESH_TOKEN,
+      expiresAt: OLD_EXPIRES_AT,
+    };
+    await secretStore.set('acct_1', original);
+
+    await assert.rejects(
+      secretStore.refreshIfUnchanged('acct_1', original, async (current, transaction) => ({
+        ...current,
+        ...(await refreshWithNativeClaudeCodeImpl(current.refreshToken, {
+          ...previousContext(),
+          accessToken: current.accessToken,
+          refreshToken: current.refreshToken,
+          expiresAt: current.expiresAt,
+          beforeHandoff: transaction.beforeHandoff,
+          retractHandoff: transaction.retractHandoff,
+          protectChildPid: transaction.protectChildPid,
+          clearChildPid: transaction.clearChildPid,
+        }, {
+          platform: 'linux',
+          command: 'claude',
+          tempRoot: testRoot,
+          execFileImpl: async () => {
+            const error = new Error('spawn ENOENT');
+            error.code = 'ENOENT';
+            throw error;
+          },
+        })),
+      })),
+      error => error.code === 'NATIVE_REFRESH_COMMAND_UNAVAILABLE',
+    );
+
+    // The intent must not persist: nothing was ever handed to a child, so
+    // the account must not be parked awaiting a manual relink.
+    await assert.rejects(stat(intentPath), { code: 'ENOENT' });
+    assert.deepEqual(await secretStore.get('acct_1'), original);
   });
 
   it('links an actually spawned native child to one PID lease until close', async () => {
@@ -839,15 +966,17 @@ describe('native Claude credential refresher', () => {
       refreshWithNativeClaudeCodeImpl(OLD_REFRESH_TOKEN, {
         ...previousContext(),
         beforeHandoff: async () => { handoffCalls += 1; },
+        protectChildPid: async () => {},
       }, {
         platform: 'linux',
         command: 'claude',
         tempRoot: testRoot,
         execFileImpl: async (command, args, options) => {
           environments.push({ args, env: options.env });
-          // The child actually spawns (so the fence arms) before the CLI
-          // itself rejects the unsupported flag.
-          await options.afterSpawn(4321);
+          // The child actually spawns (so a pid is assigned, and the already
+          // -armed fence stays armed) before the CLI itself rejects the
+          // unsupported flag.
+          await options.afterSpawn(process.pid);
           throw Object.assign(new Error('unknown option --claudeai'), { code: 1 });
         },
       }),
@@ -1426,6 +1555,16 @@ async function writeCredential(path, credential) {
     encoding: 'utf8',
     mode: 0o600,
   });
+}
+
+async function pathExists(path) {
+  try {
+    await stat(path);
+    return true;
+  } catch (error) {
+    if (error.code === 'ENOENT') return false;
+    throw error;
+  }
 }
 
 function keychainItemKey(account, service) {

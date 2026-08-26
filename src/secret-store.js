@@ -763,9 +763,29 @@ function createRefreshTransaction({ accountId, currentSecret, intents, lease }) 
     return armPromise;
   };
 
+  // Only for the case where the fence was armed (beforeHandoff wrote the
+  // durable intent) but the handoff itself never actually reached a child
+  // process (no pid was ever assigned, so the refresh token provably never
+  // left this process). Retracting here avoids permanently parking the
+  // account for a plain local spawn failure, without reopening the window
+  // beforeHandoff exists to close (an in-flight or already-spawned child
+  // must never have its intent retracted while it could still be exchanging
+  // the token).
+  const retractHandoff = async () => {
+    try {
+      await armPromise;
+    } catch {
+      return;
+    }
+    if (intent == null) return;
+    await intents.remove(accountId);
+    intent = null;
+  };
+
   return {
     hooks: {
       beforeHandoff,
+      retractHandoff,
       async protectChildPid(childPid) {
         await beforeHandoff();
         if (lease) await lease.protectChildPid(childPid);
