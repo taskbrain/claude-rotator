@@ -23,7 +23,7 @@ it('flushes large prepare-resume JSON when stdout is a pipe', async () => {
   // Node.js stdout pipes buffer around 64KiB (65536 bytes) before backpressure
   // kicks in. Use a payload well beyond that so a truncation bug is detectable.
   const largeStatus = {
-    currentAccount: 'earthfreedom-gmail-com',
+    currentAccount: 'alice-example-com',
     accounts: Array.from({ length: 4000 }, (_, index) => ({
       id: `account-${index}`,
       name: `account-${index}@example.com`,
@@ -42,8 +42,8 @@ it('flushes large prepare-resume JSON when stdout is a pipe', async () => {
     ok: true,
     action: 'ready',
     reason: 'available',
-    account: 'earthfreedom-gmail-com',
-    accountName: 'earthfreedom@gmail.com',
+    account: 'alice-example-com',
+    accountName: 'alice@example.com',
     switched: false,
     resumeAtEpoch: 1783375173,
     status: largeStatus,
@@ -73,7 +73,7 @@ it('flushes large prepare-resume JSON when stdout is a pipe', async () => {
     assert.equal(result.code, 0, result.stderr);
     const expected = `${JSON.stringify(response)}\n`;
     assert.equal(result.stdout.length, expected.length);
-    assert.equal(JSON.parse(result.stdout).account, 'earthfreedom-gmail-com');
+    assert.equal(JSON.parse(result.stdout).account, 'alice-example-com');
     assert.deepEqual(JSON.parse(result.stdout).status.events.length, 4000);
   } finally {
     await close(server);
