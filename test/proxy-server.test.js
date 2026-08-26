@@ -132,6 +132,9 @@ describe('createProxyServer', () => {
       accountManager,
       secretStore,
       config: { upstream: upstream.url, usagePolling: { enabled: false } },
+      currentCredentialReader: async () => {
+        throw new Error('live Claude Code credential lookup should not run in this test');
+      },
     }));
     cleanupAfterTest(async () => {
       releaseResponse?.();
@@ -210,6 +213,9 @@ describe('createProxyServer', () => {
       accountManager,
       secretStore,
       config: { upstream: upstream.url, usagePolling: { enabled: false } },
+      currentCredentialReader: async () => {
+        throw new Error('live Claude Code credential lookup should not run in this test');
+      },
     }));
     cleanupAfterTest(async () => {
       releaseBody?.();
@@ -265,6 +271,9 @@ describe('createProxyServer', () => {
       accountManager,
       secretStore,
       config: { upstream: upstream.url, usagePolling: { enabled: false } },
+      currentCredentialReader: async () => {
+        throw new Error('live Claude Code credential lookup should not run in this test');
+      },
     }));
     cleanupAfterTest(async () => {
       releaseResponse?.();
