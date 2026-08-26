@@ -1,7 +1,7 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 import { execFile } from 'node:child_process';
-import { lstat, mkdir, mkdtemp, readFile, readlink, rm, stat, writeFile } from 'node:fs/promises';
+import { chmod, lstat, mkdir, mkdtemp, readFile, readlink, rm, stat, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { promisify } from 'node:util';
@@ -19,6 +19,7 @@ import {
   serviceGenerationForLaunchAgent,
   uninstallMacosLifecycle,
 } from '../src/install.js';
+import { LOCAL_GATEWAY_AUTH_TOKEN } from '../src/config.js';
 import { fileSha256, readJsonFile, writeJsonFile } from '../src/json-file.js';
 
 const execFileAsync = promisify(execFile);
@@ -30,6 +31,7 @@ describe('installSettings and uninstallSettings', () => {
     const installStatePath = join(dir, 'install-state.json');
     const backupDir = join(dir, 'backups');
     await writeJsonFile(settingsPath, { language: 'ja', env: { FOO: 'bar' } });
+    await chmod(settingsPath, 0o644);
 
     const install = await installSettings({
       settingsPath,
@@ -45,15 +47,19 @@ describe('installSettings and uninstallSettings', () => {
       env: {
         FOO: 'bar',
         ANTHROPIC_BASE_URL: 'http://127.0.0.1:37891',
+        ANTHROPIC_AUTH_TOKEN: LOCAL_GATEWAY_AUTH_TOKEN,
       },
     });
-    assert.equal((await readJsonFile(installStatePath)).proxyBaseUrl, 'http://127.0.0.1:37891');
+    const savedInstallState = await readJsonFile(installStatePath);
+    assert.equal(savedInstallState.proxyBaseUrl, 'http://127.0.0.1:37891');
+    assert.equal(savedInstallState.gatewayAuthToken, LOCAL_GATEWAY_AUTH_TOKEN);
 
     const uninstall = await uninstallSettings({ settingsPath, installStatePath });
 
     assert.equal(uninstall.conflict, false);
     assert.deepEqual(await readJsonFile(settingsPath), { language: 'ja', env: { FOO: 'bar' } });
     assert.equal(await readFile(install.backupPath, 'utf8'), '{\n  "language": "ja",\n  "env": {\n    "FOO": "bar"\n  }\n}\n');
+    assert.equal((await stat(install.backupPath)).mode & 0o777, 0o600);
   });
 
   it('refuses uninstall restore when base URL was changed after install', async () => {
@@ -76,6 +82,201 @@ describe('installSettings and uninstallSettings', () => {
     assert.equal((await readJsonFile(settingsPath)).env.ANTHROPIC_BASE_URL, 'http://127.0.0.1:9999');
   });
 
+  it('refuses to replace an existing gateway auth token without force', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'claude-rotator-install-'));
+    const settingsPath = join(dir, '.claude', 'settings.json');
+    const installStatePath = join(dir, 'install-state.json');
+    const backupDir = join(dir, 'backups');
+    await writeJsonFile(settingsPath, {
+      env: { ANTHROPIC_AUTH_TOKEN: 'user-managed-token' },
+    });
+
+    await assert.rejects(installSettings({
+      settingsPath,
+      installStatePath,
+      backupDir,
+      proxyBaseUrl: 'http://127.0.0.1:37891',
+    }), /ANTHROPIC_AUTH_TOKEN already exists/);
+  });
+
+  it('preserves the original settings provenance across a forced reinstall', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'claude-rotator-install-'));
+    const settingsPath = join(dir, '.claude', 'settings.json');
+    const installStatePath = join(dir, 'install-state.json');
+    const backupDir = join(dir, 'backups');
+    await writeJsonFile(settingsPath, { language: 'ja' });
+
+    await installSettings({
+      settingsPath,
+      installStatePath,
+      backupDir,
+      proxyBaseUrl: 'http://127.0.0.1:37891',
+    });
+    await installSettings({
+      settingsPath,
+      installStatePath,
+      backupDir,
+      proxyBaseUrl: 'http://127.0.0.1:37891',
+      force: true,
+    });
+
+    const savedInstallState = await readJsonFile(installStatePath);
+    assert.deepEqual(savedInstallState.previousBaseUrl, { existed: false });
+    assert.deepEqual(savedInstallState.previousAuthToken, { existed: false });
+
+    const uninstall = await uninstallSettings({ settingsPath, installStatePath });
+    assert.equal(uninstall.conflict, false);
+    assert.deepEqual(await readJsonFile(settingsPath), { language: 'ja' });
+  });
+
+  it('preserves each original gateway setting across URL and token changes', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'claude-rotator-install-'));
+    const settingsPath = join(dir, '.claude', 'settings.json');
+    const installStatePath = join(dir, 'install-state.json');
+    const backupDir = join(dir, 'backups');
+    const original = {
+      env: {
+        ANTHROPIC_BASE_URL: 'https://original-gateway.example',
+        ANTHROPIC_AUTH_TOKEN: 'original-user-token',
+      },
+    };
+    await writeJsonFile(settingsPath, original);
+
+    await installSettings({
+      settingsPath,
+      installStatePath,
+      backupDir,
+      proxyBaseUrl: 'http://127.0.0.1:37891',
+      force: true,
+    });
+    await installSettings({
+      settingsPath,
+      installStatePath,
+      backupDir,
+      proxyBaseUrl: 'http://127.0.0.1:47891',
+      gatewayAuthToken: 'claude-rotator-local-gateway-v2',
+      force: true,
+    });
+
+    const savedInstallState = await readJsonFile(installStatePath);
+    assert.deepEqual(savedInstallState.previousBaseUrl, {
+      existed: true,
+      value: 'https://original-gateway.example',
+    });
+    assert.deepEqual(savedInstallState.previousAuthToken, {
+      existed: true,
+      value: 'original-user-token',
+    });
+
+    const uninstall = await uninstallSettings({ settingsPath, installStatePath });
+    assert.equal(uninstall.conflict, false);
+    assert.deepEqual(await readJsonFile(settingsPath), original);
+  });
+
+  it('migrates a legacy install state and removes the newly added auth placeholder', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'claude-rotator-install-'));
+    const settingsPath = join(dir, '.claude', 'settings.json');
+    const installStatePath = join(dir, 'install-state.json');
+    const backupDir = join(dir, 'backups');
+    await writeJsonFile(settingsPath, {
+      language: 'ja',
+      env: { ANTHROPIC_BASE_URL: 'http://127.0.0.1:37891' },
+    });
+    await writeJsonFile(installStatePath, {
+      settingsPath,
+      proxyBaseUrl: 'http://127.0.0.1:37891',
+      previousBaseUrl: {
+        existed: true,
+        value: 'https://original-gateway.example',
+      },
+    });
+
+    await installSettings({
+      settingsPath,
+      installStatePath,
+      backupDir,
+      proxyBaseUrl: 'http://127.0.0.1:37891',
+    });
+
+    const uninstall = await uninstallSettings({ settingsPath, installStatePath });
+    assert.equal(uninstall.conflict, false);
+    assert.deepEqual(await readJsonFile(settingsPath), {
+      language: 'ja',
+      env: { ANTHROPIC_BASE_URL: 'https://original-gateway.example' },
+    });
+  });
+
+  it('allows uninstall cleanup to resume after settings were already restored', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'claude-rotator-install-'));
+    const settingsPath = join(dir, '.claude', 'settings.json');
+    const installStatePath = join(dir, 'install-state.json');
+    const backupDir = join(dir, 'backups');
+    await writeJsonFile(settingsPath, { language: 'ja', env: { FOO: 'bar' } });
+
+    await installSettings({
+      settingsPath,
+      installStatePath,
+      backupDir,
+      proxyBaseUrl: 'http://127.0.0.1:37891',
+    });
+    await uninstallSettings({ settingsPath, installStatePath });
+    const alreadyRestored = await uninstallSettings({ settingsPath, installStatePath });
+
+    assert.equal(alreadyRestored.conflict, false);
+    assert.equal(alreadyRestored.alreadyRestored, true);
+    assert.deepEqual(await readJsonFile(settingsPath), {
+      language: 'ja',
+      env: { FOO: 'bar' },
+    });
+  });
+
+  it('uses the settings path recorded by the install when CLAUDE_CONFIG_DIR changes', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'claude-rotator-install-'));
+    const managedSettingsPath = join(dir, 'managed', 'settings.json');
+    const otherSettingsPath = join(dir, 'other', 'settings.json');
+    const installStatePath = join(dir, 'install-state.json');
+    const backupDir = join(dir, 'backups');
+    await writeJsonFile(managedSettingsPath, { language: 'ja' });
+    await writeJsonFile(otherSettingsPath, { language: 'en' });
+
+    await installSettings({
+      settingsPath: managedSettingsPath,
+      installStatePath,
+      backupDir,
+      proxyBaseUrl: 'http://127.0.0.1:37891',
+    });
+    const result = await uninstallSettings({
+      settingsPath: otherSettingsPath,
+      installStatePath,
+    });
+
+    assert.equal(result.conflict, false);
+    assert.deepEqual(await readJsonFile(managedSettingsPath), { language: 'ja' });
+    assert.deepEqual(await readJsonFile(otherSettingsPath), { language: 'en' });
+  });
+
+  it('refuses to manage a second Claude settings path before uninstall', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'claude-rotator-install-'));
+    const firstSettingsPath = join(dir, 'first', 'settings.json');
+    const secondSettingsPath = join(dir, 'second', 'settings.json');
+    const installStatePath = join(dir, 'install-state.json');
+    const backupDir = join(dir, 'backups');
+
+    await installSettings({
+      settingsPath: firstSettingsPath,
+      installStatePath,
+      backupDir,
+      proxyBaseUrl: 'http://127.0.0.1:37891',
+    });
+
+    await assert.rejects(installSettings({
+      settingsPath: secondSettingsPath,
+      installStatePath,
+      backupDir,
+      proxyBaseUrl: 'http://127.0.0.1:37891',
+      force: true,
+    }), /already manages a different Claude settings file/);
+  });
 });
 
 describe('service file rendering', () => {
@@ -108,6 +309,7 @@ describe('service file rendering', () => {
       nodePath: '/opt/homebrew/bin/node',
       cliPath: '/repo/bin/claude-rotator.js',
       configPath: '/home/alice/.config/claude-rotator/config.json',
+      claudeConfigDir: '/home/alice/.claude',
       claudePath: '/opt/homebrew/bin/claude',
       servicePath: '/opt/homebrew/bin:/usr/bin:/bin',
       serviceGeneration,
@@ -116,6 +318,8 @@ describe('service file rendering', () => {
     assert.match(plist, /io\.github\.claude-rotator/);
     assert.match(plist, /<string>server<\/string>/);
     assert.match(plist, /<key>CLAUDE_ROTATOR_CONFIG<\/key>/);
+    assert.match(plist, /<key>CLAUDE_CONFIG_DIR<\/key>/);
+    assert.match(plist, /<string>\/home\/alice\/\.claude<\/string>/);
     assert.match(plist, /<string>\/home\/alice\/.config\/claude-rotator\/config.json<\/string>/);
     assert.match(plist, /<key>NODE_OPTIONS<\/key>/);
     assert.match(plist, /<string>--dns-result-order=ipv4first<\/string>/);
@@ -125,6 +329,10 @@ describe('service file rendering', () => {
     assert.match(plist, /<string>\/opt\/homebrew\/bin:\/usr\/bin:\/bin<\/string>/);
     assert.match(plist, /<key>CLAUDE_ROTATOR_SERVICE_GENERATION<\/key>/);
     assert.match(plist, new RegExp(`<string>${serviceGeneration}<\\/string>`));
+    assert.match(
+      plist,
+      /<key>ProcessType<\/key>\s*<string>Interactive<\/string>/,
+    );
   });
 
   it('renders a LaunchAgent accepted by macOS plutil', {
@@ -136,12 +344,17 @@ describe('service file rendering', () => {
       nodePath: '/opt/homebrew/bin/node',
       cliPath: '/repo/bin/claude-rotator.js',
       configPath: '/Users/alice/.config/claude-rotator/config.json',
+      claudeConfigDir: '/Users/alice/.claude',
       claudePath: '/opt/homebrew/bin/claude',
       servicePath: '/opt/homebrew/bin:/usr/bin:/bin',
     }), 'utf8');
 
     const { stdout } = await execFileAsync('plutil', ['-lint', path]);
     assert.match(stdout, /OK/);
+    const { stdout: processType } = await execFileAsync('plutil', [
+      '-extract', 'ProcessType', 'raw', '-o', '-', path,
+    ]);
+    assert.equal(processType.trim(), 'Interactive');
   });
 
   it('renders a Linux systemd user service', () => {
@@ -150,15 +363,22 @@ describe('service file rendering', () => {
       nodePath: linuxNodeLauncherPath(configPath),
       cliPath: '/repo/bin/claude-rotator.js',
       configPath,
+      claudeConfigDir: '/home/alice/.claude',
       claudePath: '/home/alice/.nvm/versions/node/v20/bin/claude',
       servicePath: '/home/alice/.nvm/versions/node/v20/bin:/usr/local/bin:/usr/bin:/bin',
     });
 
     assert.match(service, /ExecStart=\/home\/alice\/\.config\/claude-rotator\/runtime\/claude-rotator \/repo\/bin\/claude-rotator\.js server/);
-    assert.match(service, /Environment=CLAUDE_ROTATOR_CONFIG=\/home\/alice\/.config\/claude-rotator\/config.json/);
-    assert.match(service, /Environment=NODE_OPTIONS=--dns-result-order=ipv4first/);
-    assert.match(service, /Environment=CLAUDE_ROTATOR_CLAUDE_BIN=\/home\/alice\/.nvm\/versions\/node\/v20\/bin\/claude/);
-    assert.match(service, /Environment=PATH=\/home\/alice\/.nvm\/versions\/node\/v20\/bin:\/usr\/local\/bin:\/usr\/bin:\/bin/);
+    assert.deepEqual(
+      service.split('\n').filter((line) => line.startsWith('Environment=')),
+      [
+        'Environment="CLAUDE_ROTATOR_CONFIG=/home/alice/.config/claude-rotator/config.json"',
+        'Environment="CLAUDE_CONFIG_DIR=/home/alice/.claude"',
+        'Environment="NODE_OPTIONS=--dns-result-order=ipv4first"',
+        'Environment="CLAUDE_ROTATOR_CLAUDE_BIN=/home/alice/.nvm/versions/node/v20/bin/claude"',
+        'Environment="PATH=/home/alice/.nvm/versions/node/v20/bin:/usr/local/bin:/usr/bin:/bin"',
+      ],
+    );
     assert.match(service, /TimeoutStopSec=10/);
     assert.match(service, /StandardOutput=append:\/home\/alice\/.config\/claude-rotator\/server\.log/);
     assert.match(service, /StandardError=append:\/home\/alice\/.config\/claude-rotator\/server\.err/);
@@ -217,6 +437,28 @@ describe('service file rendering', () => {
 
     assert.notEqual(withoutXdg, withXdg);
     assert.notEqual(withXdg, withDifferentXdg);
+  });
+
+  it('quotes and escapes special characters in every systemd Environment assignment', () => {
+    const service = renderSystemdUserService({
+      nodePath: '/usr/bin/node',
+      cliPath: '/repo/bin/claude-rotator.js',
+      configPath: String.raw`/home/alice/Config Root/"main"\100%/config.json`,
+      claudeConfigDir: String.raw`/home/alice/Claude Data/"primary"\200%`,
+      claudePath: String.raw`/home/alice/Bin Set/"claude"\300%`,
+      servicePath: String.raw`/home/alice/Bin Set/"tools"\400%:/usr/bin`,
+    });
+
+    assert.deepEqual(
+      service.split('\n').filter((line) => line.startsWith('Environment=')),
+      [
+        String.raw`Environment="CLAUDE_ROTATOR_CONFIG=/home/alice/Config Root/\"main\"\\100%%/config.json"`,
+        String.raw`Environment="CLAUDE_CONFIG_DIR=/home/alice/Claude Data/\"primary\"\\200%%"`,
+        'Environment="NODE_OPTIONS=--dns-result-order=ipv4first"',
+        String.raw`Environment="CLAUDE_ROTATOR_CLAUDE_BIN=/home/alice/Bin Set/\"claude\"\\300%%"`,
+        String.raw`Environment="PATH=/home/alice/Bin Set/\"tools\"\\400%%:/usr/bin"`,
+      ],
+    );
   });
 
   it('renders Ubuntu recovery commands when systemd user service start fails', () => {

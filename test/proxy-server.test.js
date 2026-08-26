@@ -2,10 +2,14 @@ import { afterEach, describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 import http from 'node:http';
 import { EventEmitter } from 'node:events';
+import { mkdtemp, rm } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 
 import { AccountManager } from '../src/account-manager.js';
+import { LOCAL_GATEWAY_AUTH_TOKEN } from '../src/config.js';
 import { OAuthTokenRefreshError, parseUsageResponse } from '../src/oauth.js';
-import { MemorySecretStore } from '../src/secret-store.js';
+import { LinuxFileSecretStore, MemorySecretStore } from '../src/secret-store.js';
 import { createProxyServer, defaultTokenRefresher } from '../src/proxy-server.js';
 
 const cleanupCallbacks = [];
@@ -58,13 +62,14 @@ describe('defaultTokenRefresher', () => {
 });
 
 describe('createProxyServer', () => {
-  it('forwards requests with the selected OAuth token and records quota headers', async () => {
+  it('replaces the local gateway placeholder with the selected OAuth token', async () => {
     const upstreamSeen = [];
     const upstream = await listen(http.createServer(async (req, res) => {
       upstreamSeen.push({
         url: req.url,
         authorization: req.headers.authorization,
         apiKey: req.headers['x-api-key'],
+        beta: req.headers['anthropic-beta'],
       });
 
       res.writeHead(200, {
@@ -91,17 +96,81 @@ describe('createProxyServer', () => {
     const response = await requestJson(`${proxy.url}/v1/messages`, {
       method: 'POST',
       body: JSON.stringify({ model: 'sonnet' }),
-      headers: { 'x-api-key': 'client-key' },
+      headers: {
+        authorization: `Bearer ${LOCAL_GATEWAY_AUTH_TOKEN}`,
+        'anthropic-beta': 'example-capability',
+        'x-api-key': 'client-key',
+      },
+    });
+    const duplicateResponse = await requestJson(`${proxy.url}/v1/messages`, {
+      method: 'POST',
+      body: JSON.stringify({ model: 'sonnet' }),
+      headers: {
+        authorization: `Bearer ${LOCAL_GATEWAY_AUTH_TOKEN}`,
+        'anthropic-beta': 'oauth-2025-04-20,example-capability,oauth-2025-04-20',
+      },
     });
 
     assert.equal(response.status, 200);
+    assert.equal(duplicateResponse.status, 200);
     assert.equal(upstreamSeen[0].authorization, 'Bearer access-token-1');
     assert.equal(upstreamSeen[0].apiKey, undefined);
+    assert.deepEqual(
+      upstreamSeen[0].beta.split(','),
+      ['example-capability', 'oauth-2025-04-20'],
+    );
+    assert.deepEqual(
+      upstreamSeen[1].beta.split(','),
+      ['example-capability', 'oauth-2025-04-20'],
+    );
 
     const status = accountManager.getStatus();
     assert.equal(status.accounts[0].quota.unified5h, 0.76);
-    assert.equal(status.accounts[0].usage.totalInputTokens, 10);
-    assert.equal(status.accounts[0].usage.totalOutputTokens, 20);
+    assert.equal(status.accounts[0].usage.totalInputTokens, 20);
+    assert.equal(status.accounts[0].usage.totalOutputTokens, 40);
+
+    await close(proxy.server);
+    await close(upstream.server);
+  });
+
+  it('replaces the local gateway placeholder with a selected API key without OAuth capability', async () => {
+    const upstreamSeen = [];
+    const upstream = await listen(http.createServer(async (req, res) => {
+      upstreamSeen.push({
+        authorization: req.headers.authorization,
+        apiKey: req.headers['x-api-key'],
+        beta: req.headers['anthropic-beta'],
+      });
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ ok: true }));
+    }));
+
+    const secretStore = new MemorySecretStore();
+    await secretStore.set('api_account', { apiKey: 'selected-api-key' });
+    const accountManager = new AccountManager({
+      accounts: [{ id: 'api_account', name: 'api-account', type: 'apikey' }],
+    });
+    const proxy = await listen(createProxyServer({
+      accountManager,
+      secretStore,
+      config: { upstream: upstream.url },
+    }));
+
+    const response = await requestJson(`${proxy.url}/v1/messages`, {
+      method: 'POST',
+      body: JSON.stringify({ model: 'sonnet' }),
+      headers: {
+        authorization: `Bearer ${LOCAL_GATEWAY_AUTH_TOKEN}`,
+        'anthropic-beta': 'example-capability',
+      },
+    });
+
+    assert.equal(response.status, 200);
+    assert.deepEqual(upstreamSeen, [{
+      authorization: undefined,
+      apiKey: 'selected-api-key',
+      beta: 'example-capability',
+    }]);
 
     await close(proxy.server);
     await close(upstream.server);
@@ -681,7 +750,58 @@ describe('createProxyServer', () => {
     assert.match(logLines.join('\n'), /credential-refresh-fallback account=acct_1/);
   });
 
-  it('discards a refresh result when credential metadata changed in flight', async () => {
+  it('parks two forward attempts after one ambiguous handoff even with a usable access token', async () => {
+    let upstreamCalls = 0;
+    const upstream = await listen(http.createServer((_req, res) => {
+      upstreamCalls += 1;
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ ok: true }));
+    }));
+    const secretStore = new MemorySecretStore();
+    await secretStore.set('acct_1', {
+      accessToken: 'usable-forward-access-fixture',
+      refreshToken: 'forward-refresh-fixture',
+      expiresAt: Date.now() + 4 * 60 * 1000,
+    });
+    const accountManager = new AccountManager({
+      accounts: [{ id: 'acct_1', name: 'a@example.com', type: 'oauth', credentialRevision: 'rev-1' }],
+    });
+    let refreshCalls = 0;
+    const proxy = await listen(createProxyServer({
+      accountManager,
+      secretStore,
+      config: { upstream: upstream.url, usagePolling: { enabled: false } },
+      tokenRefresher: async (_refreshToken, context) => {
+        refreshCalls += 1;
+        await context.beforeHandoff();
+        throw Object.assign(new Error('ambiguous forward handoff'), {
+          code: 'NATIVE_REFRESH_OUTCOME_UNKNOWN',
+        });
+      },
+    }));
+    cleanupAfterTest(async () => {
+      await close(proxy.server);
+      await close(upstream.server);
+    });
+
+    const first = await requestJson(`${proxy.url}/v1/messages`, {
+      method: 'POST',
+      body: JSON.stringify({ model: 'sonnet' }),
+    });
+    const second = await requestJson(`${proxy.url}/v1/messages`, {
+      method: 'POST',
+      body: JSON.stringify({ model: 'sonnet' }),
+    });
+
+    assert.notEqual(first.status, 200);
+    assert.notEqual(second.status, 200);
+    assert.equal(refreshCalls, 1);
+    assert.equal(upstreamCalls, 0);
+    assert.equal(accountManager.getStatus().accounts[0].unavailableReason.type, 'oauth_refresh_failed');
+    assert.equal(JSON.stringify([first.body, second.body]).includes('forward-refresh-fixture'), false);
+  });
+
+  it('uses the newer credential without refreshing when it changes before the locked re-read', async () => {
     const upstreamSeen = [];
     const logLines = [];
     const upstream = await listen(http.createServer(async (req, res) => {
@@ -707,12 +827,22 @@ describe('createProxyServer', () => {
       scopes: ['user:inference', 'user:profile'],
       subscriptionType: 'max',
     };
+    const refreshIfUnchanged = secretStore.refreshIfUnchanged.bind(secretStore);
+    let replaceBeforeLockedRead = true;
+    secretStore.refreshIfUnchanged = async (...args) => {
+      if (replaceBeforeLockedRead) {
+        replaceBeforeLockedRead = false;
+        await secretStore.set('acct_1', newerSecret);
+      }
+      return refreshIfUnchanged(...args);
+    };
+    let refreshCalls = 0;
     const proxy = await listen(createProxyServer({
       accountManager,
       secretStore,
       config: { upstream: upstream.url },
       tokenRefresher: async () => {
-        await secretStore.set('acct_1', newerSecret);
+        refreshCalls += 1;
         return {
           accessToken: 'stale-refresh-result',
           refreshToken: 'refresh-token-2',
@@ -734,8 +864,91 @@ describe('createProxyServer', () => {
     assert.equal(response.status, 200);
     assert.deepEqual(upstreamSeen, ['Bearer newer-access-token']);
     assert.deepEqual(await secretStore.get('acct_1'), newerSecret);
+    assert.equal(refreshCalls, 0);
     assert.match(logLines.join('\n'), /result=discarded reason=credential-changed/);
-    assert.equal(logLines.join('\n').includes('stale-refresh-result'), false);
+  });
+
+  it('does not start a competing refresh before a failed updater releases the account lock', async () => {
+    const upstreamSeen = [];
+    const upstream = await listen(http.createServer(async (req, res) => {
+      upstreamSeen.push(req.headers.authorization);
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ ok: true }));
+    }));
+    const secretStore = new MemorySecretStore();
+    await secretStore.set('acct_1', {
+      accessToken: 'expired-token',
+      refreshToken: 'refresh-token-1',
+      expiresAt: 900,
+    });
+    const firstAccountManager = new AccountManager({
+      accounts: [{ id: 'acct_1', name: 'a@example.com', type: 'oauth' }],
+      now: () => 1000,
+    });
+    const secondAccountManager = new AccountManager({
+      accounts: [{ id: 'acct_1', name: 'a@example.com', type: 'oauth' }],
+      now: () => 1000,
+    });
+    let refreshCalls = 0;
+    let releaseFirstUpdater;
+    let firstUpdaterEntered;
+    let secondUpdaterEntered;
+    const firstUpdaterGate = new Promise(resolve => { releaseFirstUpdater = resolve; });
+    const firstUpdaterStarted = new Promise(resolve => { firstUpdaterEntered = resolve; });
+    const secondUpdaterStarted = new Promise(resolve => { secondUpdaterEntered = resolve; });
+    const tokenRefresher = async () => {
+      refreshCalls += 1;
+      if (refreshCalls === 1) {
+        firstUpdaterEntered();
+        await firstUpdaterGate;
+        throw new Error('first refresh failed');
+      }
+      secondUpdaterEntered();
+      return {
+        accessToken: 'fresh-token',
+        refreshToken: 'refresh-token-2',
+        expiresAt: 200000,
+      };
+    };
+    const firstProxy = await listen(createProxyServer({
+      accountManager: firstAccountManager,
+      secretStore,
+      config: { upstream: upstream.url },
+      tokenRefresher,
+    }));
+    const secondProxy = await listen(createProxyServer({
+      accountManager: secondAccountManager,
+      secretStore,
+      config: { upstream: upstream.url },
+      tokenRefresher,
+    }));
+    cleanupAfterTest(async () => {
+      await close(firstProxy.server);
+      await close(secondProxy.server);
+      await close(upstream.server);
+    });
+
+    const firstResponse = requestJson(`${firstProxy.url}/v1/messages`, {
+      method: 'POST',
+      body: JSON.stringify({ model: 'sonnet', request: 1 }),
+    });
+    await firstUpdaterStarted;
+    const secondResponse = requestJson(`${secondProxy.url}/v1/messages`, {
+      method: 'POST',
+      body: JSON.stringify({ model: 'sonnet', request: 2 }),
+    });
+    const secondStartedBeforeRelease = await Promise.race([
+      secondUpdaterStarted.then(() => true),
+      new Promise(resolve => setTimeout(() => resolve(false), 25)),
+    ]);
+    assert.equal(secondStartedBeforeRelease, false);
+    assert.equal(refreshCalls, 1);
+    releaseFirstUpdater();
+
+    const responses = await Promise.all([firstResponse, secondResponse]);
+    assert.deepEqual(responses.map(response => response.status), [503, 200]);
+    assert.equal(refreshCalls, 2);
+    assert.deepEqual(upstreamSeen, ['Bearer fresh-token']);
   });
 
   it('refreshes an expired OAuth token only once for concurrent requests', async () => {
@@ -946,6 +1159,117 @@ describe('createProxyServer', () => {
     });
   });
 
+  it('refreshes the stored account instead of using matching live credentials in gateway mode', async () => {
+    const upstreamSeen = [];
+    const upstream = await listen(http.createServer(async (req, res) => {
+      upstreamSeen.push(req.headers.authorization);
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ ok: true }));
+    }));
+
+    const expired = {
+      accessToken: 'expired-saved-token',
+      refreshToken: 'saved-refresh-token',
+      expiresAt: 900,
+    };
+    const freshExpiresAt = Date.now() + 60 * 60 * 1000;
+    const secretStore = new MemorySecretStore();
+    await secretStore.set('acct_1', expired);
+    const accountManager = new AccountManager({
+      accounts: [{ id: 'acct_1', name: 'a@example.com', type: 'oauth', accountUuid: 'uuid-live' }],
+      now: () => 1000,
+    });
+    let refreshCalls = 0;
+    const proxy = await listen(createProxyServer({
+      accountManager,
+      secretStore,
+      config: { upstream: upstream.url },
+      allowLiveClaudeCodeCredentials: false,
+      tokenRefresher: async refreshToken => {
+        refreshCalls += 1;
+        assert.equal(refreshToken, 'saved-refresh-token');
+        return {
+          accessToken: 'fresh-stored-token',
+          refreshToken,
+          expiresAt: freshExpiresAt,
+        };
+      },
+      currentCredentialReader: async () => {
+        throw new Error('gateway mode must not read the saved /login credential');
+      },
+      currentProfileFetcher: async () => {
+        throw new Error('gateway mode must not profile the saved /login credential');
+      },
+    }));
+    cleanupAfterTest(async () => {
+      await close(proxy.server);
+      await close(upstream.server);
+    });
+
+    const response = await requestJson(`${proxy.url}/v1/messages`, {
+      method: 'POST',
+      body: JSON.stringify({ model: 'sonnet' }),
+    });
+
+    assert.equal(response.status, 200);
+    assert.equal(refreshCalls, 1);
+    assert.deepEqual(upstreamSeen, ['Bearer fresh-stored-token']);
+    assert.deepEqual(await secretStore.get('acct_1'), {
+      accessToken: 'fresh-stored-token',
+      refreshToken: 'saved-refresh-token',
+      expiresAt: freshExpiresAt,
+    });
+  });
+
+  it('does not roll a fresh stored account back to stale live credentials in gateway mode', async () => {
+    const upstreamSeen = [];
+    const upstream = await listen(http.createServer(async (req, res) => {
+      upstreamSeen.push(req.headers.authorization);
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ ok: true }));
+    }));
+
+    const stored = {
+      accessToken: 'fresh-stored-token',
+      refreshToken: 'fresh-stored-refresh',
+      expiresAt: Date.now() + 60 * 60 * 1000,
+    };
+    const secretStore = new MemorySecretStore();
+    await secretStore.set('acct_1', stored);
+    const accountManager = new AccountManager({
+      accounts: [{ id: 'acct_1', name: 'a@example.com', type: 'oauth', accountUuid: 'uuid-live' }],
+      now: () => 1000,
+    });
+    const proxy = await listen(createProxyServer({
+      accountManager,
+      secretStore,
+      config: { upstream: upstream.url },
+      allowLiveClaudeCodeCredentials: false,
+      tokenRefresher: async () => {
+        throw new Error('fresh stored credential must not be refreshed');
+      },
+      currentCredentialReader: async () => ({
+        accessToken: 'stale-live-token',
+        refreshToken: 'stale-live-refresh',
+        expiresAt: 900,
+      }),
+      currentProfileFetcher: async () => ({ accountUuid: 'uuid-live' }),
+    }));
+    cleanupAfterTest(async () => {
+      await close(proxy.server);
+      await close(upstream.server);
+    });
+
+    const response = await requestJson(`${proxy.url}/v1/messages`, {
+      method: 'POST',
+      body: JSON.stringify({ model: 'sonnet' }),
+    });
+
+    assert.equal(response.status, 200);
+    assert.deepEqual(upstreamSeen, ['Bearer fresh-stored-token']);
+    assert.deepEqual(await secretStore.get('acct_1'), stored);
+  });
+
   it('does not let live credential mirroring overwrite an in-flight metadata update', async () => {
     const upstreamSeen = [];
     const logLines = [];
@@ -1056,6 +1380,7 @@ describe('createProxyServer', () => {
 
   it('refreshes and retries once when upstream rejects the OAuth token', async () => {
     const upstreamSeen = [];
+    const freshExpiresAt = Date.now() + 2 * 60 * 60 * 1000;
     const upstream = await listen(http.createServer(async (req, res) => {
       upstreamSeen.push(req.headers.authorization);
       if (upstreamSeen.length === 1) {
@@ -1087,7 +1412,7 @@ describe('createProxyServer', () => {
         return {
           accessToken: 'fresh-token',
           refreshToken: 'refresh-token-2',
-          expiresAt: 200000,
+          expiresAt: freshExpiresAt,
         };
       },
     }));
@@ -1106,8 +1431,58 @@ describe('createProxyServer', () => {
     assert.deepEqual(await secretStore.get('acct_1'), {
       accessToken: 'fresh-token',
       refreshToken: 'refresh-token-2',
-      expiresAt: 200000,
+      expiresAt: freshExpiresAt,
     });
+  });
+
+  it('does not repeat an ambiguous refresh entered from the upstream 401 path', async () => {
+    let upstreamCalls = 0;
+    const upstream = await listen(http.createServer((_req, res) => {
+      upstreamCalls += 1;
+      res.writeHead(401, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: { message: 'Invalid authentication credentials' } }));
+    }));
+    const secretStore = new MemorySecretStore();
+    await secretStore.set('acct_1', {
+      accessToken: 'rejected-access-fixture',
+      refreshToken: 'rejected-refresh-fixture',
+      expiresAt: Date.now() + 60 * 60 * 1000,
+    });
+    const accountManager = new AccountManager({
+      accounts: [{ id: 'acct_1', name: 'a@example.com', type: 'oauth', credentialRevision: 'rev-1' }],
+    });
+    let refreshCalls = 0;
+    const proxy = await listen(createProxyServer({
+      accountManager,
+      secretStore,
+      config: { upstream: upstream.url, usagePolling: { enabled: false } },
+      tokenRefresher: async (_refreshToken, context) => {
+        refreshCalls += 1;
+        await context.beforeHandoff();
+        throw Object.assign(new Error('ambiguous 401 refresh handoff'), {
+          code: 'NATIVE_REFRESH_OUTCOME_UNKNOWN',
+        });
+      },
+    }));
+    cleanupAfterTest(async () => {
+      await close(proxy.server);
+      await close(upstream.server);
+    });
+
+    const first = await requestJson(`${proxy.url}/v1/messages`, {
+      method: 'POST',
+      body: JSON.stringify({ model: 'sonnet' }),
+    });
+    const second = await requestJson(`${proxy.url}/v1/messages`, {
+      method: 'POST',
+      body: JSON.stringify({ model: 'sonnet' }),
+    });
+
+    assert.notEqual(first.status, 200);
+    assert.notEqual(second.status, 200);
+    assert.equal(upstreamCalls, 1);
+    assert.equal(refreshCalls, 1);
+    assert.equal(accountManager.getStatus().accounts[0].unavailableReason.type, 'oauth_refresh_failed');
   });
 
   it('reloads a live Claude Code credential after an OAuth rejection', async () => {
@@ -2356,13 +2731,15 @@ describe('createProxyServer', () => {
     await secretStore.set('acct_2', { accessToken: 'access-token-2' });
     const originalGetSecret = secretStore.get.bind(secretStore);
     let accountOneSecretReads = 0;
-    secretStore.get = async accountId => {
+    const readAccountOneSecret = async accountId => {
       if (accountId !== 'acct_1') return originalGetSecret(accountId);
       accountOneSecretReads += 1;
       return {
         accessToken: accountOneSecretReads === 1 ? 'access-token-a' : 'access-token-b',
       };
     };
+    secretStore.get = readAccountOneSecret;
+    secretStore.getOperational = readAccountOneSecret;
     const accountManager = new AccountManager({
       accounts: [
         { id: 'acct_1', type: 'oauth' },
@@ -2401,6 +2778,12 @@ describe('createProxyServer', () => {
       await close(proxy.server);
       await close(upstream.server);
     });
+    // Startup reconciliation (operationalStateCheck) reads every account's
+    // operational secret once before the server accepts requests. Settle it
+    // and reset the read counter so the assertions below only observe reads
+    // triggered by the requests this test sends.
+    await requestJson(`${proxy.url}/internal/health`, { timeoutMs: 1_000 });
+    accountOneSecretReads = 0;
 
     const requestA = requestJson(`${proxy.url}/v1/messages`, {
       method: 'POST',
@@ -2471,13 +2854,15 @@ describe('createProxyServer', () => {
     await secretStore.set('acct_2', { accessToken: 'access-token-2' });
     const originalGetSecret = secretStore.get.bind(secretStore);
     let accountOneSecretReads = 0;
-    secretStore.get = async accountId => {
+    const readAccountOneSecret = async accountId => {
       if (accountId !== 'acct_1') return originalGetSecret(accountId);
       accountOneSecretReads += 1;
       return {
         accessToken: accountOneSecretReads === 1 ? 'access-token-a' : 'access-token-b',
       };
     };
+    secretStore.get = readAccountOneSecret;
+    secretStore.getOperational = readAccountOneSecret;
     const accountManager = new AccountManager({
       accounts: [
         { id: 'acct_1', type: 'oauth' },
@@ -2516,6 +2901,12 @@ describe('createProxyServer', () => {
       await close(proxy.server);
       await close(upstream.server);
     });
+    // Startup reconciliation (operationalStateCheck) reads every account's
+    // operational secret once before the server accepts requests. Settle it
+    // and reset the read counter so the assertions below only observe reads
+    // triggered by the requests this test sends.
+    await requestJson(`${proxy.url}/internal/health`, { timeoutMs: 1_000 });
+    accountOneSecretReads = 0;
 
     const requestA = requestJson(`${proxy.url}/v1/messages`, {
       method: 'POST',
@@ -5464,7 +5855,7 @@ describe('createProxyServer', () => {
     assert.equal(accountManager.getStatus().currentAccount, 'acct_1');
   });
 
-  it('does not send an expired token upstream when refresh fails', async () => {
+  it('persists a native refresh outcome with unknown result', async () => {
     const upstreamSeen = [];
     const upstream = await listen(http.createServer(async (req, res) => {
       upstreamSeen.push(req.headers.authorization);
@@ -5495,7 +5886,9 @@ describe('createProxyServer', () => {
       secretStore,
       config: { upstream: upstream.url },
       tokenRefresher: async () => {
-        throw new Error('refresh token revoked');
+        throw Object.assign(new Error('native refresh outcome is unknown'), {
+          code: 'NATIVE_REFRESH_OUTCOME_UNKNOWN',
+        });
       },
     }));
     cleanupAfterTest(async () => {
@@ -5519,7 +5912,7 @@ describe('createProxyServer', () => {
     });
   });
 
-  it('fails closed before refresh when the secret store lacks atomic compare-and-set', async () => {
+  it('fails closed before refresh when the secret store lacks conditional update transactions', async () => {
     const upstreamSeen = [];
     let refreshCalls = 0;
     const upstream = await listen(http.createServer(async (req, res) => {
@@ -5538,7 +5931,10 @@ describe('createProxyServer', () => {
     });
     const proxy = await listen(createProxyServer({
       accountManager,
-      secretStore: { get: async () => ({ ...secret }) },
+      secretStore: {
+        get: async () => ({ ...secret }),
+        compareAndSet: async () => assert.fail('legacy compare-and-set must not be used'),
+      },
       config: { upstream: upstream.url },
       tokenRefresher: async () => {
         refreshCalls++;
@@ -5714,6 +6110,64 @@ describe('createProxyServer', () => {
     assert.deepEqual(upstreamSeen, ['Bearer access-token-2']);
     assert.equal(accountManager.getStatus().currentAccount, 'acct_2');
     assert.equal(accountManager.getStatus().accounts[0].unavailableReason.type, 'oauth_refresh_rate_limit');
+  });
+
+  it('switches to a known available account when local OAuth refresh retry is deferred', async () => {
+    const upstreamSeen = [];
+    const upstream = await listen(http.createServer(async (req, res) => {
+      upstreamSeen.push(req.headers.authorization);
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ ok: true }));
+    }));
+
+    const secretStore = new MemorySecretStore();
+    await secretStore.set('acct_1', {
+      accessToken: 'expired-token',
+      refreshToken: 'native-refresh-token',
+      expiresAt: 900,
+    });
+    await secretStore.set('acct_2', {
+      accessToken: 'access-token-2',
+      refreshToken: 'refresh-token-2',
+      expiresAt: Date.now() + 60 * 60 * 1000,
+    });
+    const accountManager = new AccountManager({
+      accounts: [
+        { id: 'acct_1', name: 'a@example.com', type: 'oauth' },
+        { id: 'acct_2', name: 'b@example.com', type: 'oauth' },
+      ],
+      now: () => 1000,
+    });
+    accountManager.updateQuota('acct_2', {
+      'anthropic-ratelimit-unified-5h-utilization': '0.1',
+      'anthropic-ratelimit-unified-7d-utilization': '0.2',
+    });
+    const proxy = await listen(createProxyServer({
+      accountManager,
+      secretStore,
+      config: { upstream: upstream.url },
+      tokenRefresher: async () => {
+        throw Object.assign(new Error('native refresh command failed'), {
+          code: 'NATIVE_REFRESH_COMMAND_FAILED',
+          retryAfterMs: 60_000,
+          retryAfterSource: 'fixed',
+        });
+      },
+    }));
+    cleanupAfterTest(async () => {
+      await close(proxy.server);
+      await close(upstream.server);
+    });
+
+    const response = await requestJson(`${proxy.url}/v1/messages`, {
+      method: 'POST',
+      body: JSON.stringify({ model: 'sonnet' }),
+    });
+
+    assert.equal(response.status, 200);
+    assert.deepEqual(upstreamSeen, ['Bearer access-token-2']);
+    assert.equal(accountManager.getStatus().currentAccount, 'acct_2');
+    assert.equal(accountManager.getStatus().accounts[0].unavailableReason.type, 'oauth_refresh_retry');
   });
 
   it('returns local quota exhaustion when the only account is exhausted', async () => {
@@ -6295,6 +6749,59 @@ describe('createProxyServer', () => {
     assert.equal(refresh.body.status.accounts[0].unavailableReason, null);
   });
 
+  it('refreshes stored OAuth usage credentials without live mirroring in gateway mode', async () => {
+    const secretStore = new MemorySecretStore();
+    await secretStore.set('acct_1', {
+      accessToken: 'expired-saved-token',
+      refreshToken: 'saved-refresh-token',
+      expiresAt: 900,
+    });
+    const accountManager = new AccountManager({
+      accounts: [{ id: 'acct_1', name: 'a@example.com', type: 'oauth', accountUuid: 'uuid-live' }],
+      now: () => 1000,
+    });
+    const seenTokens = [];
+    let refreshCalls = 0;
+    const proxy = await listen(createProxyServer({
+      accountManager,
+      secretStore,
+      config: { upstream: 'http://127.0.0.1:1', usagePolling: { enabled: false } },
+      allowLiveClaudeCodeCredentials: false,
+      tokenRefresher: async refreshToken => {
+        refreshCalls += 1;
+        return {
+          accessToken: 'fresh-stored-token',
+          refreshToken,
+          expiresAt: Date.now() + 60 * 60 * 1000,
+        };
+      },
+      currentCredentialReader: async () => {
+        throw new Error('gateway mode must not read the saved /login credential');
+      },
+      currentProfileFetcher: async () => {
+        throw new Error('gateway mode must not profile the saved /login credential');
+      },
+      usageFetcher: async token => {
+        seenTokens.push(token);
+        return {
+          five_hour: { utilization: 0.2, resets_at: null },
+          seven_day: { utilization: 0.3, resets_at: null },
+        };
+      },
+    }));
+    cleanupAfterTest(async () => {
+      await close(proxy.server);
+    });
+
+    const refresh = await requestJson(`${proxy.url}/internal/refresh-usage`, { method: 'POST' });
+
+    assert.equal(refresh.status, 200);
+    assert.equal(refresh.body.ok, true);
+    assert.equal(refreshCalls, 1);
+    assert.deepEqual(seenTokens, ['fresh-stored-token']);
+    assert.equal(refresh.body.status.accounts[0].unavailableReason, null);
+  });
+
   it('refreshes OAuth usage accounts concurrently when configured', async () => {
     const secretStore = new MemorySecretStore();
     await secretStore.set('acct_1', { accessToken: 'access-token-1' });
@@ -6416,6 +6923,146 @@ describe('createProxyServer', () => {
       ['fallback', 'fallback'],
     );
     assert.equal(JSON.stringify(refresh.body).includes('refresh-token-'), false);
+  });
+
+  it('persists an unknown native refresh outcome from usage polling', async () => {
+    const secretStore = new MemorySecretStore();
+    await secretStore.set('acct_1', {
+      accessToken: 'expired-access-token',
+      refreshToken: 'native-refresh-token',
+      expiresAt: 1,
+    });
+    const accountManager = new AccountManager({
+      accounts: [{ id: 'acct_1', name: 'a@example.com', type: 'oauth' }],
+      now: () => 1000,
+    });
+    const proxy = await listen(createProxyServer({
+      accountManager,
+      secretStore,
+      config: { upstream: 'http://127.0.0.1:1', usagePolling: { enabled: false } },
+      tokenRefresher: async () => {
+        throw Object.assign(new Error('native refresh outcome is unknown'), {
+          code: 'NATIVE_REFRESH_OUTCOME_UNKNOWN',
+        });
+      },
+      usageFetcher: async () => assert.fail('usage fetch must not run after unknown refresh outcome'),
+    }));
+    cleanupAfterTest(async () => {
+      await close(proxy.server);
+    });
+
+    const refresh = await requestJson(`${proxy.url}/internal/refresh-usage`, { method: 'POST' });
+
+    assert.equal(refresh.status, 200);
+    assert.equal(refresh.body.accounts[0].ok, false);
+    assert.deepEqual(accountManager.getStatus().accounts[0].unavailableReason, {
+      type: 'oauth_refresh_failed',
+      message: 'OAuth token refresh failed',
+    });
+  });
+
+  it('parks two consecutive usage refreshes after one ambiguous handoff', async () => {
+    const secretStore = new MemorySecretStore();
+    await secretStore.set('acct_1', {
+      accessToken: 'expired-usage-access-fixture',
+      refreshToken: 'usage-refresh-fixture',
+      expiresAt: 1,
+    });
+    const accountManager = new AccountManager({
+      accounts: [{ id: 'acct_1', name: 'a@example.com', type: 'oauth', credentialRevision: 'rev-1' }],
+      now: () => 1000,
+    });
+    let refreshCalls = 0;
+    const proxy = await listen(createProxyServer({
+      accountManager,
+      secretStore,
+      config: { upstream: 'http://127.0.0.1:1', usagePolling: { enabled: false } },
+      tokenRefresher: async (_refreshToken, context) => {
+        refreshCalls += 1;
+        await context.beforeHandoff();
+        throw Object.assign(new Error('ambiguous usage handoff'), {
+          code: 'NATIVE_REFRESH_OUTCOME_UNKNOWN',
+        });
+      },
+      usageFetcher: async () => assert.fail('parked usage credential must not be fetched'),
+    }));
+    cleanupAfterTest(async () => close(proxy.server));
+
+    const first = await requestJson(`${proxy.url}/internal/refresh-usage`, { method: 'POST' });
+    const second = await requestJson(`${proxy.url}/internal/refresh-usage`, { method: 'POST' });
+
+    assert.equal(first.body.accounts[0].ok, false);
+    assert.equal(second.body.accounts[0].ok, false);
+    assert.equal(refreshCalls, 1);
+    assert.equal(second.body.status.accounts[0].unavailableReason.type, 'oauth_refresh_failed');
+  });
+
+  it('keeps a persisted marker authoritative during startup and revision-only reload', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'claude-rotator-startup-marker-'));
+    const accountsDir = join(dir, 'accounts');
+    const originalStore = new LinuxFileSecretStore({ accountsDir });
+    const original = {
+      accessToken: 'startup-access-fixture',
+      refreshToken: 'startup-refresh-fixture',
+      expiresAt: 1,
+    };
+    await originalStore.set('acct_1', original);
+    await assert.rejects(
+      () => originalStore.refreshIfUnchanged('acct_1', original, async (_current, transaction) => {
+        await transaction.beforeHandoff();
+        throw Object.assign(new Error('startup marker fixture'), {
+          code: 'NATIVE_REFRESH_OUTCOME_UNKNOWN',
+        });
+      }),
+      error => error.code === 'NATIVE_REFRESH_OUTCOME_UNKNOWN',
+    );
+    const secretStore = new LinuxFileSecretStore({ accountsDir });
+    const getOperational = secretStore.getOperational.bind(secretStore);
+    let operationalReads = 0;
+    secretStore.getOperational = async accountId => {
+      operationalReads += 1;
+      return getOperational(accountId);
+    };
+    const accounts = [{
+      id: 'acct_1',
+      name: 'a@example.com',
+      type: 'oauth',
+      credentialRevision: 'rev-1',
+    }];
+    const accountManager = new AccountManager({ accounts, now: () => 1000 });
+    let refreshCalls = 0;
+    const proxy = await listen(createProxyServer({
+      accountManager,
+      secretStore,
+      config: {
+        upstream: 'http://127.0.0.1:1',
+        usagePolling: { enabled: true },
+      },
+      reloadAccounts: async () => accounts.map(account => ({
+        ...account,
+        credentialRevision: 'rev-2-without-credential-change',
+      })),
+      tokenRefresher: async () => {
+        refreshCalls += 1;
+        return assert.fail('startup/reload must not invoke a parked refresh token');
+      },
+      usageFetcher: async () => assert.fail('startup/reload must not fetch usage while parked'),
+    }));
+    cleanupAfterTest(async () => {
+      await close(proxy.server);
+      await rm(dir, { recursive: true, force: true });
+    });
+
+    const startup = await requestJson(`${proxy.url}/internal/status`);
+    const startupOperationalReads = operationalReads;
+    const reload = await requestJson(`${proxy.url}/internal/reload`, { method: 'POST' });
+
+    assert.equal(refreshCalls, 0);
+    assert.equal(startupOperationalReads, 2);
+    assert.equal(operationalReads, 4);
+    assert.equal(startup.body.accounts[0].unavailableReason.type, 'oauth_refresh_failed');
+    assert.equal(reload.body.accounts[0].unavailableReason.type, 'oauth_refresh_failed');
+    assert.equal(JSON.stringify([startup.body, reload.body]).includes('startup-refresh-fixture'), false);
   });
 
   it('refreshes OAuth usage accounts serially by default', async () => {

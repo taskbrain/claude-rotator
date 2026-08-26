@@ -2,7 +2,7 @@ import { createHash } from 'node:crypto';
 import http from 'node:http';
 import https from 'node:https';
 
-import { isUnifiedQuotaExhaustion } from './account-manager.js';
+import { isCredentialRefreshCooldown, isUnifiedQuotaExhaustion } from './account-manager.js';
 import { readCurrentClaudeCredentials } from './claude-credentials.js';
 import {
   DEFAULT_USAGE_POLL_INTERVAL_MS,
@@ -15,6 +15,7 @@ import {
   fetchUsage,
   isOAuthTokenRefreshRateLimit,
   isTokenExpiringSoon,
+  OAUTH_BETA_HEADER,
   refreshAccessToken,
 } from './oauth.js';
 import { createNativeClaudeRefresher } from './native-claude-refresher.js';
@@ -53,6 +54,7 @@ export function createProxyServer({
   secretStore,
   config,
   reloadAccounts = null,
+  allowLiveClaudeCodeCredentials = true,
   tokenRefresher = null,
   currentCredentialReader = readCurrentClaudeCredentials,
   currentProfileFetcher = fetchProfile,
@@ -116,6 +118,7 @@ export function createProxyServer({
     usageFetcher,
     usageRequestOptions,
     usageObservationTracker,
+    allowLiveClaudeCodeCredentials,
     usageRefreshConcurrency: usagePollingConcurrency(config, accountManager.accounts.length),
     usageRefreshRequestSpacingMs: usagePollingRequestSpacingMs(config),
     logger,
@@ -148,6 +151,12 @@ export function createProxyServer({
     });
     return persistTail;
   }
+  const checkPersistedRefreshIntents = async () => {
+    if (await reconcilePersistedRefreshIntents({ accountManager, secretStore, logger })) {
+      await persistState();
+    }
+  };
+  let operationalStateCheck = checkPersistedRefreshIntents();
 
   const server = http.createServer(async (req, res) => {
     try {
@@ -158,6 +167,7 @@ export function createProxyServer({
         });
         return;
       }
+      await operationalStateCheck;
       if (req.method === 'GET' && req.url === '/internal/health') {
         sendJson(res, 200, {
           ok: true,
@@ -189,6 +199,8 @@ export function createProxyServer({
           const accounts = await reloadAccounts();
           accountManager.replaceAccounts(accounts);
         }
+        operationalStateCheck = checkPersistedRefreshIntents();
+        await operationalStateCheck;
         if (usagePollingEnabled(config)) {
           await usageScheduler.refreshNow({ afterCurrent: true });
         }
@@ -237,6 +249,7 @@ export function createProxyServer({
         currentCredentialReader,
         currentProfileFetcher,
         reactiveQuotaConfirmer,
+        allowLiveClaudeCodeCredentials,
         logger,
         upstreamIdleTimeoutMs,
         upstreamConnectTimeoutMs,
@@ -260,6 +273,30 @@ export function createProxyServer({
 
   usageScheduler.start(server);
   return server;
+}
+
+async function reconcilePersistedRefreshIntents({ accountManager, secretStore, logger }) {
+  let changed = false;
+  for (const account of accountManager.accounts) {
+    if (
+      account.type === 'apikey'
+      || account.id === 'current'
+      || account.credentialSource === 'claude-code-current'
+    ) continue;
+    try {
+      await getOperationalSecret(secretStore, account.id);
+    } catch (error) {
+      if (error?.code !== 'NATIVE_REFRESH_OUTCOME_UNKNOWN') {
+        logger?.(`${new Date().toISOString()} credential-state-check account=${account.id} result=failed errorType=${error?.code || error?.name || 'unknown'}`);
+        continue;
+      }
+      if (account.errorReason?.type !== 'oauth_refresh_failed') {
+        accountManager.markError(account.id, 'oauth_refresh_failed', 'OAuth token refresh failed');
+        changed = true;
+      }
+    }
+  }
+  return changed;
 }
 
 export function defaultTokenRefresher({
@@ -400,6 +437,7 @@ function createUsageRefresher({
   currentCredentialReader,
   currentProfileFetcher,
   usageFetcher,
+  allowLiveClaudeCodeCredentials,
   usageRequestOptions,
   usageObservationTracker,
   usageRefreshConcurrency,
@@ -424,6 +462,7 @@ function createUsageRefresher({
       currentCredentialReader,
       currentProfileFetcher,
       usageFetcher,
+      allowLiveClaudeCodeCredentials,
       usageRequestOptions,
       usageObservationTracker,
       usageRefreshConcurrency,
@@ -1242,6 +1281,7 @@ async function refreshAllOnce({
   currentCredentialReader,
   currentProfileFetcher,
   usageFetcher,
+  allowLiveClaudeCodeCredentials,
   usageRequestOptions,
   usageObservationTracker,
   usageRefreshConcurrency,
@@ -1260,6 +1300,7 @@ async function refreshAllOnce({
       currentCredentialReader,
       currentProfileFetcher,
       usageFetcher,
+      allowLiveClaudeCodeCredentials,
       usageRequestOptions,
       usageObservationTracker,
       logger,
@@ -1309,6 +1350,7 @@ async function refreshAccountUsage({
   currentCredentialReader,
   currentProfileFetcher,
   usageFetcher,
+  allowLiveClaudeCodeCredentials,
   usageRequestOptions,
   usageObservationTracker,
   logger,
@@ -1322,6 +1364,7 @@ async function refreshAccountUsage({
       secretStore,
       currentCredentialReader,
       currentProfileFetcher,
+      allowLiveClaudeCodeCredentials,
       logger,
     });
     if (!accountManager.accounts.includes(account)) {
@@ -1329,7 +1372,7 @@ async function refreshAccountUsage({
       return { account: account.id, ok: true, stale: true };
     }
     if (!secret?.accessToken) throw new Error('OAuth access token is missing');
-    const credentialCooldown = accountManager.unavailableReason(account)?.type === 'oauth_refresh_rate_limit';
+    const credentialCooldown = isCredentialRefreshCooldown(accountManager.unavailableReason(account));
     if (credentialCooldown && !hasUsableAccessToken(secret)) {
       usageObservationTracker.fail(observation);
       return { account: account.id, ok: false, skipped: 'credential-refresh-cooldown' };
@@ -1378,8 +1421,8 @@ async function refreshAccountUsage({
     }
     const applyFailure = () => {
       if (!accountManager.accounts.includes(account)) return;
-      const refreshRateLimited = markOAuthRefreshRateLimit(accountManager, account.id, caught);
-      if (!refreshRateLimited && isOAuthCredentialError(message)) {
+      const refreshUnavailable = markOAuthRefreshUnavailable(accountManager, account.id, caught);
+      if (!refreshUnavailable && isOAuthCredentialError(message, caught)) {
         accountManager.markError(account.id, 'oauth_refresh_failed', 'OAuth token refresh failed');
       }
     };
@@ -1398,14 +1441,21 @@ function rebalanceAfterUsageRefresh(accountManager) {
   accountManager.rebalanceActiveAccount();
 }
 
-function isOAuthCredentialError(message) {
-  return /OAuth access token is missing|Token refresh failed|Usage fetch failed \(401\)/.test(String(message || ''));
+function isOAuthCredentialError(message, error = null) {
+  return error?.code === 'NATIVE_REFRESH_OUTCOME_UNKNOWN'
+    || /OAuth access token is missing|Token refresh failed|Usage fetch failed \(401\)/.test(String(message || ''));
 }
 
-function markOAuthRefreshRateLimit(accountManager, accountId, error) {
-  if (!isOAuthTokenRefreshRateLimit(error)) return false;
-  const retryAfterSeconds = Math.max(1, Math.ceil(error.retryAfterMs / 1000));
-  accountManager.markCredentialRefreshRateLimited(accountId, retryAfterSeconds, {
+function markOAuthRefreshUnavailable(accountManager, accountId, error) {
+  const retryAfterSeconds = Math.max(1, Math.ceil(Number(error?.retryAfterMs) / 1000) || 1);
+  if (isOAuthTokenRefreshRateLimit(error)) {
+    accountManager.markCredentialRefreshRateLimited(accountId, retryAfterSeconds, {
+      retryAfterSource: error.retryAfterSource,
+    });
+    return true;
+  }
+  if (!(Number.isFinite(Number(error?.retryAfterMs)) && Number(error.retryAfterMs) > 0)) return false;
+  accountManager.markCredentialRefreshDeferred(accountId, retryAfterSeconds, {
     retryAfterSource: error.retryAfterSource,
   });
   return true;
@@ -1422,6 +1472,7 @@ async function forwardWithRotation({
   currentCredentialReader,
   currentProfileFetcher,
   reactiveQuotaConfirmer,
+  allowLiveClaudeCodeCredentials,
   logger,
   upstreamIdleTimeoutMs,
   upstreamConnectTimeoutMs,
@@ -1472,6 +1523,7 @@ async function forwardWithRotation({
         tokenRefresher,
         currentCredentialReader,
         currentProfileFetcher,
+        allowLiveClaudeCodeCredentials,
         logger,
         upstreamIdleTimeoutMs,
         upstreamConnectTimeoutMs,
@@ -1511,6 +1563,7 @@ async function forwardWithRotation({
           secretStore,
           currentCredentialReader,
           currentProfileFetcher,
+          allowLiveClaudeCodeCredentials,
           logger,
         });
     } catch (error) {
@@ -1518,6 +1571,12 @@ async function forwardWithRotation({
         if (req.aborted || res.destroyed) return;
         sendBufferedResponse(res, lastRetryableResponse);
         return;
+      }
+      if (error?.code === 'NATIVE_REFRESH_OUTCOME_UNKNOWN') {
+        if (!markOAuthRefreshUnavailable(accountManager, account.id, error)) {
+          accountManager.markError(account.id, 'oauth_refresh_failed', 'OAuth token refresh failed');
+        }
+        continue;
       }
       throw error;
     }
@@ -1561,7 +1620,7 @@ async function forwardWithRotation({
         });
       } catch (caught) {
         if (!accountManager.accounts.includes(account)) continue;
-        if (!markOAuthRefreshRateLimit(accountManager, account.id, caught)) {
+        if (!markOAuthRefreshUnavailable(accountManager, account.id, caught)) {
           accountManager.markError(account.id, 'oauth_refresh_failed', 'OAuth token refresh failed');
         }
         continue;
@@ -1637,7 +1696,7 @@ async function forwardWithRotation({
         });
       } catch (caught) {
         if (!accountManager.accounts.includes(account)) continue;
-        if (!markOAuthRefreshRateLimit(accountManager, account.id, caught)) {
+        if (!markOAuthRefreshUnavailable(accountManager, account.id, caught)) {
           accountManager.markError(account.id, 'oauth_refresh_failed', 'OAuth token refresh failed');
         }
         continue;
@@ -1723,6 +1782,7 @@ async function forwardWithRotation({
       tokenRefresher,
       currentCredentialReader,
       currentProfileFetcher,
+      allowLiveClaudeCodeCredentials,
       logger,
       upstreamIdleTimeoutMs,
       upstreamConnectTimeoutMs,
@@ -1743,6 +1803,7 @@ async function forwardCurrentUnavailableAccount({
   tokenRefresher,
   currentCredentialReader,
   currentProfileFetcher,
+  allowLiveClaudeCodeCredentials,
   logger,
   upstreamIdleTimeoutMs,
   upstreamConnectTimeoutMs,
@@ -1759,13 +1820,23 @@ async function forwardCurrentUnavailableAccount({
   const account = accountManager.getFallbackAccount();
   if (!account) return false;
 
-  const secret = await resolveSecretForAccount({
-    account,
-    secretStore,
-    currentCredentialReader,
-    currentProfileFetcher,
-    logger,
-  });
+  let secret;
+  try {
+    secret = await resolveSecretForAccount({
+      account,
+      secretStore,
+      currentCredentialReader,
+      currentProfileFetcher,
+      allowLiveClaudeCodeCredentials,
+      logger,
+    });
+  } catch (caught) {
+    if (caught?.code !== 'NATIVE_REFRESH_OUTCOME_UNKNOWN') throw caught;
+    if (!markOAuthRefreshUnavailable(accountManager, account.id, caught)) {
+      accountManager.markError(account.id, 'oauth_refresh_failed', 'OAuth token refresh failed');
+    }
+    return false;
+  }
   if (req.aborted || res.destroyed || !accountManager.accounts.includes(account)) return false;
   if (!secret) return false;
 
@@ -1812,6 +1883,7 @@ async function refreshSecretIfExpiring({ account, secret, secretStore, tokenRefr
   try {
     return await refreshAndStoreSecret({ account, secret, secretStore, tokenRefresher, logger });
   } catch (error) {
+    if (error?.code === 'NATIVE_REFRESH_OUTCOME_UNKNOWN') throw error;
     if (!hasUsableAccessToken(secret)) throw error;
     const expiresAt = normalizeCredentialExpiry(secret.expiresAt);
     const remainingSec = expiresAt == null ? 'unknown' : Math.max(0, Math.floor((expiresAt - Date.now()) / 1000));
@@ -1821,24 +1893,28 @@ async function refreshSecretIfExpiring({ account, secret, secretStore, tokenRefr
 }
 
 async function refreshAndStoreSecret({ account, secret, secretStore, tokenRefresher, logger }) {
-  const compareAndSet = requireSecretStoreCompareAndSet(secretStore);
-  const refreshed = await tokenRefresher(secret.refreshToken, tokenRefreshContext(account, secret));
-  const nextSecret = { ...secret, ...refreshed };
+  const refreshIfUnchanged = requireSecretStoreRefreshIfUnchanged(secretStore);
   try {
-    if (!await compareAndSet(account.id, secret, nextSecret)) {
-      const latestSecret = await secretStore.get(account.id);
+    const result = await refreshIfUnchanged(account.id, secret, async (currentSecret, transaction) => ({
+      ...currentSecret,
+      ...(await tokenRefresher(
+        currentSecret.refreshToken,
+        tokenRefreshContext(account, currentSecret, transaction),
+      )),
+    }));
+    if (!result.updated) {
       logger?.(`${new Date().toISOString()} credential-refresh account=${account.id} result=discarded reason=credential-changed`);
-      if (latestSecret?.accessToken) return latestSecret;
+      if (result.secret?.accessToken) return result.secret;
       throw new Error('Stored OAuth credential changed while token refresh was in flight');
     }
+    return result.secret;
   } catch (error) {
     logger?.(`${new Date().toISOString()} credential-store account=${account.id} result=failed errorType=${error?.code || error?.name || 'unknown'}`);
     throw error;
   }
-  return nextSecret;
 }
 
-function tokenRefreshContext(account, secret) {
+function tokenRefreshContext(account, secret, transaction = {}) {
   return {
     accountId: account.id,
     accessToken: secret.accessToken,
@@ -1849,6 +1925,9 @@ function tokenRefreshContext(account, secret) {
     clientId: secret.clientId,
     subscriptionType: secret.subscriptionType,
     rateLimitTier: secret.rateLimitTier,
+    beforeHandoff: transaction.beforeHandoff,
+    protectChildPid: transaction.protectChildPid,
+    clearChildPid: transaction.clearChildPid,
   };
 }
 
@@ -1876,6 +1955,7 @@ async function resolveSecretForAccount({
   currentProfileFetcher,
   signal = null,
   liveCredentialLoader = null,
+  allowLiveClaudeCodeCredentials = true,
   logger,
 }) {
   throwIfOperationAborted(signal);
@@ -1885,14 +1965,17 @@ async function resolveSecretForAccount({
     return secret;
   }
   if (account.id === 'current' || account.credentialSource === 'claude-code-current') {
+    if (!allowLiveClaudeCodeCredentials) {
+      throw new Error('Live current account is unavailable while Claude login is overridden');
+    }
     const secret = await liveClaudeCodeSecret(currentCredentialReader);
     throwIfOperationAborted(signal);
     return secret;
   }
 
-  const stored = await secretStore.get(account.id);
+  const stored = await getOperationalSecret(secretStore, account.id);
   throwIfOperationAborted(signal);
-  if (!account.accountUuid) return stored;
+  if (!allowLiveClaudeCodeCredentials || !account.accountUuid) return stored;
 
   const current = await (liveCredentialLoader
     ? liveCredentialLoader()
@@ -1966,6 +2049,22 @@ function requireSecretStoreCompareAndSet(secretStore) {
   return secretStore.compareAndSet.bind(secretStore);
 }
 
+function requireSecretStoreRefreshIfUnchanged(secretStore) {
+  if (typeof secretStore?.refreshIfUnchanged !== 'function') {
+    const error = new Error('Secret store does not support conditional refresh transaction');
+    error.code = 'SECRET_STORE_TRANSACTION_UNAVAILABLE';
+    throw error;
+  }
+  return secretStore.refreshIfUnchanged.bind(secretStore);
+}
+
+function getOperationalSecret(secretStore, accountId) {
+  if (typeof secretStore?.getOperational === 'function') {
+    return secretStore.getOperational(accountId);
+  }
+  return secretStore.get(accountId);
+}
+
 function credentialsMatch(left, right) {
   return left?.accessToken === right?.accessToken
     && left?.refreshToken === right?.refreshToken
@@ -1991,7 +2090,7 @@ function hasUsableAccessToken(secret, now = Date.now()) {
 }
 
 function isCredentialUnavailable(reason) {
-  return reason?.type === 'oauth_refresh_rate_limit'
+  return isCredentialRefreshCooldown(reason)
     || reason?.type === 'oauth_refresh_failed'
     || reason?.type === 'authentication_error';
 }
@@ -2362,9 +2461,24 @@ function buildUpstreamHeaders(inputHeaders, account, secret) {
   if (account.type === 'apikey') {
     headers['x-api-key'] = secret.apiKey;
   } else {
+    appendHeaderCapability(headers, 'anthropic-beta', OAUTH_BETA_HEADER);
     headers.authorization = `Bearer ${secret.accessToken}`;
   }
   return headers;
+}
+
+function appendHeaderCapability(headers, headerName, capability) {
+  const existingKey = Object.keys(headers)
+    .find(key => key.toLowerCase() === headerName.toLowerCase());
+  const current = existingKey == null ? '' : headers[existingKey];
+  const values = (Array.isArray(current) ? current : [current])
+    .flatMap(value => String(value || '').split(','))
+    .map(value => String(value).trim())
+    .filter(Boolean);
+  const normalized = values.filter(value => value !== capability);
+  normalized.push(capability);
+  if (existingKey != null && existingKey !== headerName) delete headers[existingKey];
+  headers[headerName] = normalized.join(',');
 }
 
 async function requestUpstreamWithConnectRetries(options) {

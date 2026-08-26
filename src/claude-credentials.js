@@ -4,6 +4,9 @@ import { homedir } from 'node:os';
 import { join } from 'node:path';
 import { promisify } from 'node:util';
 
+import { claudeKeychainServiceName } from './claude-keychain.js';
+import { claudeConfigDir } from './paths.js';
+
 const execFileAsync = promisify(execFile);
 
 export function parseClaudeCredentials(raw) {
@@ -36,19 +39,23 @@ function normalizeScopes(value) {
 export async function readCurrentClaudeCredentials({
   platform = process.platform,
   home = homedir(),
+  env = process.env,
   execFileImpl = execFileAsync,
   readFileImpl = readFile,
 } = {}) {
   if (platform === 'darwin') {
+    const customConfigDir = env.CLAUDE_CONFIG_DIR
+      ? claudeConfigDir(env, home)
+      : null;
     const { stdout } = await execFileImpl('security', [
       'find-generic-password',
       '-s',
-      'Claude Code-credentials',
+      claudeKeychainServiceName(customConfigDir),
       '-w',
     ]);
     return parseClaudeCredentials(stdout.trim());
   }
 
-  const path = join(home, '.claude', '.credentials.json');
+  const path = join(claudeConfigDir(env, home), '.credentials.json');
   return parseClaudeCredentials(await readFileImpl(path, 'utf8'));
 }

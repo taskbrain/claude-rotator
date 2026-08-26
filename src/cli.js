@@ -8,7 +8,15 @@ import { dirname, isAbsolute, join, resolve } from 'node:path';
 import { isDeepStrictEqual, promisify } from 'node:util';
 
 import { AccountManager } from './account-manager.js';
-import { createDefaultConfig, getConfigPath, loadOrCreateConfig, proxyBaseUrl, saveConfig } from './config.js';
+import {
+  createDefaultConfig,
+  DEFAULT_PORT,
+  getConfigPath,
+  loadOrCreateConfig,
+  proxyBaseUrl,
+  proxyListenHost,
+  saveConfig,
+} from './config.js';
 import { createProxyServer, defaultTokenRefresher } from './proxy-server.js';
 import { createServerLogWriter } from './log-rotation.js';
 import { createSecretStore } from './secret-store.js';
@@ -63,6 +71,20 @@ const execFileAsync = promisify(execFile);
 const CURRENT_ACCOUNT_ID = 'current';
 const DEFAULT_SHUTDOWN_GRACE_MS = 5_000;
 const MACOS_HIDDEN_SERVICE_ACTION = '__macos-service-action';
+const CLAUDE_PROVIDER_OVERRIDE_ENV_VARS = Object.freeze([
+  'CLAUDE_CODE_USE_BEDROCK',
+  'CLAUDE_CODE_USE_VERTEX',
+  'CLAUDE_CODE_USE_FOUNDRY',
+  'CLAUDE_CODE_USE_ANTHROPIC_AWS',
+  'CLAUDE_CODE_USE_ANTHROPIC_GOOGLE_CLOUD',
+  'CLAUDE_CODE_USE_MANTLE',
+]);
+const CLAUDE_LOGIN_OVERRIDE_ENV_VARS = Object.freeze([
+  ...CLAUDE_PROVIDER_OVERRIDE_ENV_VARS,
+  'ANTHROPIC_AUTH_TOKEN',
+  'ANTHROPIC_API_KEY',
+  'CLAUDE_CODE_OAUTH_TOKEN',
+]);
 
 export async function runCli(argv = [], deps = {}) {
   const write = deps.write || (text => process.stdout.write(text));
@@ -307,6 +329,10 @@ function renderPrepareResume(result) {
 
 async function runServer({ write }) {
   const config = await loadOrCreateConfig();
+  const listenHost = proxyListenHost(config);
+  const loginOverride = await localClaudeLoginOverrideSource();
+  assertAnthropicGatewayProviderCompatible(loginOverride);
+  if (loginOverride) assertGatewayCompatibleAccounts(config.accounts);
   if (ensureCredentialRevisions(config)) await saveConfig(config);
   const secretStore = createSecretStore();
   const accountManager = new AccountManager({
@@ -327,7 +353,16 @@ async function runServer({ write }) {
     accountManager,
     secretStore,
     config,
-    reloadAccounts: async () => (await loadOrCreateConfig()).accounts,
+    allowLiveClaudeCodeCredentials: !loginOverride,
+    reloadAccounts: async () => {
+      const nextAccounts = (await loadOrCreateConfig()).accounts;
+      const nextLoginOverride = await localClaudeLoginOverrideSource();
+      assertAnthropicGatewayProviderCompatible(nextLoginOverride);
+      if (nextLoginOverride) {
+        assertGatewayCompatibleAccounts(nextAccounts);
+      }
+      return nextAccounts;
+    },
     logger: line => {
       if (logWriter) logWriter.write(line);
       else write(`${line}\n`);
@@ -335,13 +370,56 @@ async function runServer({ write }) {
     stateWriter: state => writeJsonFile(statePath, state),
     serviceGeneration: process.env.CLAUDE_ROTATOR_SERVICE_GENERATION || null,
   });
-  await new Promise(resolve => server.listen(config.proxy.port, config.proxy.host, resolve));
+  await new Promise(resolve => server.listen(
+    config.proxy?.port || DEFAULT_PORT,
+    listenHost,
+    resolve,
+  ));
   write(`claude-rotator listening on ${proxyBaseUrl(config)}\n`);
   try {
     await waitForShutdown(server);
   } finally {
     logWriter?.close();
   }
+}
+
+export function assertGatewayCompatibleAccounts(accounts = []) {
+  if (accounts.some(account => (
+    account.id === CURRENT_ACCOUNT_ID
+    || account.credentialSource === 'claude-code-current'
+  ))) {
+    throw new Error(
+      'Gateway authentication cannot be installed while a live current account is configured. Run claude-rotator remove current first, then claude auth login --claudeai and claude-rotator login before installing.',
+    );
+  }
+}
+
+export function assertAnthropicGatewayProviderCompatible(source) {
+  if (CLAUDE_PROVIDER_OVERRIDE_ENV_VARS.includes(source)) {
+    throw new Error(
+      `${source} selects a provider protocol that is incompatible with the Anthropic-compatible claude-rotator gateway. Remove it before installing or starting claude-rotator.`,
+    );
+  }
+}
+
+export function claudeLoginOverrideSource(settings = {}, env = {}) {
+  const settingsEnv = settings.env || {};
+  for (const name of CLAUDE_LOGIN_OVERRIDE_ENV_VARS) {
+    const value = Object.prototype.hasOwnProperty.call(settingsEnv, name)
+      ? settingsEnv[name]
+      : env[name];
+    if (value != null && String(value) !== '') return name;
+  }
+  if (settings.apiKeyHelper != null && String(settings.apiKeyHelper) !== '') {
+    return 'apiKeyHelper';
+  }
+  return null;
+}
+
+async function localClaudeLoginOverrideSource() {
+  const home = homedir();
+  const settings = await readJsonFile(claudeSettingsPath(home), {});
+  return claudeLoginOverrideSource(settings, process.env);
 }
 
 export function ensureCredentialRevisions(config, {
@@ -392,6 +470,8 @@ async function installCommand({ argv, write, deps = {} }) {
   const env = deps.env || process.env;
   const home = deps.home || homedir();
   const config = await loadOrCreateConfig();
+  assertAnthropicGatewayProviderCompatible(await localClaudeLoginOverrideSource());
+  assertGatewayCompatibleAccounts(config.accounts);
   const configPath = getConfigPath();
   const statePath = installStatePath(env, home);
   const settingsPath = claudeSettingsPath(home);
@@ -432,7 +512,13 @@ async function installCommand({ argv, write, deps = {} }) {
     proxyBaseUrl: proxyBaseUrl(config),
     force,
   });
-  await installServiceFile({ configPath, claudePath, env, home });
+  await installServiceFile({
+    configPath,
+    claudePath,
+    env,
+    home,
+    claudeConfigDir: dirname(settingsPath),
+  });
   write(`Installed claude-rotator at ${proxyBaseUrl(config)}\n`);
   if (noStart) {
     write('Service start skipped because --no-start was set.\n');
@@ -472,9 +558,9 @@ async function uninstallCommand({ argv, write, deps = {} }) {
     write('Uninstalled claude-rotator\n');
     return;
   }
-  await stopService().catch(() => {});
   const result = await uninstallSettings({ settingsPath, installStatePath: statePath, force });
   if (result.conflict) throw new Error(result.reason);
+  await stopService().catch(() => {});
   await removeServiceFile({ configPath, env, home });
   await removeInstallState(statePath);
   if (purgeSecrets) await createSecretStore().purge();
@@ -583,7 +669,7 @@ async function loginJsonCommand({ argv, write, deps }) {
   const config = await loadOrCreateConfig();
   const store = createSecretStore();
   const previousSecret = await store.get(id);
-  await store.set(id, secret);
+  await store.replaceLinkedCredential(id, secret);
 
   const existing = config.accounts.findIndex(item => item.id === id);
   const account = {
@@ -610,7 +696,7 @@ async function loginCurrentCommand({ argv, write, deps }) {
   if (!secret.refreshToken) {
     throw new Error(
       'Current Claude Code credentials do not include a refresh token. ' +
-      'Run claude auth login, then retry claude-rotator login.'
+      'Run claude auth login --claudeai, then retry claude-rotator login.'
     );
   }
   const profile = await readProfileForLogin(secret, deps);
@@ -620,7 +706,7 @@ async function loginCurrentCommand({ argv, write, deps }) {
   if (!profile && !explicitId && !explicitName) {
     throw new Error(
       'Could not verify the current Claude Code login. ' +
-      'Run claude auth login and retry, or pass both --id and --name for a known-good credential.'
+      'Run claude auth login --claudeai and retry, or pass both --id and --name for a known-good credential.'
     );
   }
   const name = argValue(argv, '--name') || profile?.email || argValue(argv, '--id') || nextAccountId(config);
@@ -656,6 +742,14 @@ async function importCurrentCommand({ argv, write, deps }) {
 }
 
 async function useCurrentCommand({ argv, write, deps }) {
+  const gatewayAuthConfigured = deps.isGatewayAuthConfigured
+    ? await deps.isGatewayAuthConfigured()
+    : Boolean(await localClaudeLoginOverrideSource());
+  if (gatewayAuthConfigured) {
+    throw new Error(
+      'use-current is incompatible with installed gateway authentication because Claude Code does not refresh its saved /login while a gateway credential is active. Use claude-rotator login to save the account instead.',
+    );
+  }
   const secret = deps.readCurrentCredentials
     ? await deps.readCurrentCredentials()
     : await readCurrentClaudeCredentials();
@@ -730,7 +824,10 @@ async function saveImportedAccount({ id, name, accountUuid = null, secret, expli
 
   const store = deps.secretStore || createSecretStore();
   const previousSecret = await store.get(targetId);
-  await store.set(targetId, secret);
+  if (typeof store.replaceLinkedCredential !== 'function') {
+    throw new Error('Secret store does not support explicit credential replacement');
+  }
+  await store.replaceLinkedCredential(targetId, secret);
   const existing = config.accounts.findIndex(item => item.id === targetId);
   const account = {
     id: targetId,
@@ -799,7 +896,7 @@ async function inspectDoctorWarnings(deps = {}) {
     try {
       const secret = account.id === CURRENT_ACCOUNT_ID
         ? await readCurrent()
-        : await store.get(account.id);
+        : await getOperationalSecret(store, account.id);
 
       if (!secret) {
         warnings.push(`${account.id}: stored credential is missing`);
@@ -838,7 +935,7 @@ async function inspectDoctorWarnings(deps = {}) {
         warnings.push(`${account.id}: config name ${account.name} differs from live login ${profile.email}`);
       }
       if (account.id === CURRENT_ACCOUNT_ID && account.accountUuid) {
-        warnings.push(`${account.id}: static accountUuid is obsolete; run claude-rotator use-current to normalize it`);
+        warnings.push(`${account.id}: static accountUuid is obsolete; run claude-rotator remove current first, then claude auth login --claudeai and claude-rotator login`);
       } else if (profile?.accountUuid && account.accountUuid && profile.accountUuid !== account.accountUuid) {
         warnings.push(`${account.id}: config accountUuid differs from live login`);
       }
@@ -861,24 +958,30 @@ async function refreshDoctorSecret({ account, secret, store, tokenRefresher }) {
   if (account.id === CURRENT_ACCOUNT_ID) {
     throw new Error('Live Claude Code credentials must be refreshed by Claude Code');
   }
-  if (typeof store?.compareAndSet !== 'function') {
-    const error = new Error('Secret store does not support atomic compare-and-set');
-    error.code = 'SECRET_STORE_CAS_UNAVAILABLE';
+  if (typeof store?.refreshIfUnchanged !== 'function') {
+    const error = new Error('Secret store does not support conditional update transaction');
+    error.code = 'SECRET_STORE_TRANSACTION_UNAVAILABLE';
     throw error;
   }
-  const refreshed = {
-    ...secret,
-    ...(await tokenRefresher(secret.refreshToken, tokenRefreshContext(account, secret))),
-  };
-  if (!await store.compareAndSet(account.id, secret, refreshed)) {
-    const latestSecret = await store.get(account.id);
-    if (latestSecret?.accessToken) return latestSecret;
+  const result = await store.refreshIfUnchanged(
+    account.id,
+    secret,
+    async (currentSecret, transaction) => ({
+      ...currentSecret,
+      ...(await tokenRefresher(
+        currentSecret.refreshToken,
+        tokenRefreshContext(account, currentSecret, transaction),
+      )),
+    }),
+  );
+  if (!result.updated) {
+    if (result.secret?.accessToken) return result.secret;
     throw new Error('Stored OAuth credential changed while token refresh was in flight');
   }
-  return refreshed;
+  return result.secret;
 }
 
-function tokenRefreshContext(account, secret) {
+function tokenRefreshContext(account, secret, transaction = {}) {
   return {
     accountId: account.id,
     accessToken: secret.accessToken,
@@ -889,7 +992,15 @@ function tokenRefreshContext(account, secret) {
     clientId: secret.clientId,
     subscriptionType: secret.subscriptionType,
     rateLimitTier: secret.rateLimitTier,
+    beforeHandoff: transaction.beforeHandoff,
+    protectChildPid: transaction.protectChildPid,
+    clearChildPid: transaction.clearChildPid,
   };
+}
+
+function getOperationalSecret(store, accountId) {
+  if (typeof store?.getOperational === 'function') return store.getOperational(accountId);
+  return store.get(accountId);
 }
 
 function duplicateAccountUuidWarnings(accounts) {
@@ -962,7 +1073,13 @@ function nextAccountId(config) {
   return `account${Date.now()}`;
 }
 
-export async function installServiceFile({ configPath, claudePath = null, env = process.env, home = homedir() }) {
+export async function installServiceFile({
+  configPath,
+  claudePath = null,
+  env = process.env,
+  home = homedir(),
+  claudeConfigDir = null,
+}) {
   const cliPath = resolve(process.argv[1]);
   const servicePath = [...new Set([
     claudePath ? dirname(claudePath) : null,
@@ -982,6 +1099,7 @@ export async function installServiceFile({ configPath, claudePath = null, env = 
       nodePath: process.execPath,
       cliPath,
       configPath,
+      claudeConfigDir,
       claudePath,
       servicePath,
       ...xdgOverrides,
@@ -993,6 +1111,7 @@ export async function installServiceFile({ configPath, claudePath = null, env = 
     nodePath,
     cliPath,
     configPath,
+    claudeConfigDir,
     claudePath,
     servicePath,
     ...xdgOverrides,
@@ -1034,7 +1153,8 @@ export async function startService({
     });
   }
   await execFileImpl('systemctl', ['--user', 'daemon-reload']);
-  await execFileImpl('systemctl', ['--user', 'enable', '--now', 'claude-rotator.service']);
+  await execFileImpl('systemctl', ['--user', 'enable', 'claude-rotator.service']);
+  await execFileImpl('systemctl', ['--user', 'restart', 'claude-rotator.service']);
 }
 
 async function stopService({
@@ -1063,34 +1183,35 @@ async function monitorLoop({ write, readStatus }) {
 
 async function readStatus() {
   const config = await loadOrCreateConfig();
-  return getJson(`http://${config.proxy.host}:${config.proxy.port}/internal/status`);
+  return getJson(internalApiUrl(config, '/internal/status'));
 }
 
 async function readHealth({ signal } = {}) {
   const config = await loadOrCreateConfig();
-  return getJson(`http://${config.proxy.host}:${config.proxy.port}/internal/health`, { signal });
+  return getJson(internalApiUrl(config, '/internal/health'), { signal });
 }
 
 async function postJson(path, body) {
   const config = await loadOrCreateConfig();
-  return requestJson(`http://${config.proxy.host}:${config.proxy.port}${path}`, {
+  return requestJson(internalApiUrl(config, path), {
     method: 'POST',
     body: JSON.stringify(body),
     headers: { 'Content-Type': 'application/json' },
   });
 }
 
+export function internalApiUrl(config, path) {
+  return `${proxyBaseUrl(config)}${path}`;
+}
+
 async function getJson(url, { signal } = {}) {
   return requestJson(url, { method: 'GET', signal });
 }
 
-async function requestJson(url, options) {
+export async function requestJson(url, options) {
   const target = new URL(url);
   const response = await new Promise((resolve, reject) => {
-    const req = http.request({
-      hostname: target.hostname,
-      port: target.port,
-      path: `${target.pathname}${target.search}`,
+    const req = http.request(target, {
       method: options.method,
       headers: options.headers || {},
       signal: options.signal,

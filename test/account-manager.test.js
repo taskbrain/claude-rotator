@@ -389,6 +389,46 @@ describe('AccountManager', () => {
     assert.equal(manager.getStatus().accounts[0].unavailableReason.type, 'oauth_refresh_rate_limit');
   });
 
+  it('treats a local OAuth refresh retry as a credential cooldown', () => {
+    const manager = new AccountManager({
+      accounts: [
+        {
+          id: 'acct_1',
+          name: 'a@example.com',
+          type: 'oauth',
+          credentialRevision: 'revision-1',
+        },
+        { id: 'acct_2', name: 'b@example.com', type: 'oauth' },
+      ],
+      now: () => 1000,
+    });
+    manager.updateQuota('acct_2', {
+      'anthropic-ratelimit-unified-5h-utilization': '0.1',
+      'anthropic-ratelimit-unified-7d-utilization': '0.2',
+    });
+
+    manager.markCredentialRefreshDeferred('acct_1', 60, { retryAfterSource: 'fixed' });
+
+    assert.equal(manager.getActiveAccount().id, 'acct_2');
+    assert.equal(manager.getStatus().accounts[0].unavailableReason.type, 'oauth_refresh_retry');
+
+    manager.markAuthenticated('acct_1');
+    assert.equal(manager.getStatus().accounts[0].unavailableReason, null);
+
+    manager.markCredentialRefreshDeferred('acct_1', 60, { retryAfterSource: 'fixed' });
+    manager.replaceAccounts([
+      {
+        id: 'acct_1',
+        name: 'a@example.com',
+        type: 'oauth',
+        credentialRevision: 'revision-2',
+      },
+      { id: 'acct_2', name: 'b@example.com', type: 'oauth' },
+    ]);
+
+    assert.equal(manager.getStatus().accounts[0].unavailableReason, null);
+  });
+
   it('falls back to the current throttled account before an exhausted alternate', () => {
     const manager = new AccountManager({
       accounts: [
@@ -1286,7 +1326,7 @@ describe('AccountManager', () => {
     assert.equal(account.unavailableReason, null);
   });
 
-  it('preserves a fixed OAuth refresh cooldown up to one hour after restart', () => {
+  it('preserves a fixed local OAuth refresh retry up to one hour after restart', () => {
     const now = Date.parse('2026-07-12T12:00:00Z');
     const manager = new AccountManager({
       accounts: [{ id: 'acct_1', name: 'a@example.com', type: 'oauth' }],
@@ -1303,7 +1343,7 @@ describe('AccountManager', () => {
         usage: {},
         rateLimitedUntil: new Date(now + 60 * 60 * 1000).toISOString(),
         temporaryUnavailableReason: {
-          type: 'oauth_refresh_rate_limit',
+          type: 'oauth_refresh_retry',
           retryAfterSource: 'fixed',
         },
         errorReason: null,
@@ -1313,10 +1353,11 @@ describe('AccountManager', () => {
     const account = manager.getStatus().accounts[0];
     assert.equal(account.status, 'throttled');
     assert.equal(account.rateLimitedUntil, '2026-07-12T13:00:00.000Z');
+    assert.equal(account.unavailableReason.type, 'oauth_refresh_retry');
     assert.equal(account.unavailableReason.retryAfterSource, 'fixed');
   });
 
-  it('clears a fixed OAuth refresh cooldown over one hour after restart', () => {
+  it('clears a fixed local OAuth refresh retry over one hour after restart', () => {
     const now = Date.parse('2026-07-12T12:00:00Z');
     const manager = new AccountManager({
       accounts: [{ id: 'acct_1', name: 'a@example.com', type: 'oauth' }],
@@ -1333,7 +1374,7 @@ describe('AccountManager', () => {
         usage: {},
         rateLimitedUntil: new Date(now + 61 * 60 * 1000).toISOString(),
         temporaryUnavailableReason: {
-          type: 'oauth_refresh_rate_limit',
+          type: 'oauth_refresh_retry',
           retryAfterSource: 'fixed',
         },
         errorReason: null,
