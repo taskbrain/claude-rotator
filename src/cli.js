@@ -5,6 +5,7 @@ import { access, mkdir, rm, stat, writeFile } from 'node:fs/promises';
 import http from 'node:http';
 import { homedir } from 'node:os';
 import { dirname, isAbsolute, join, resolve } from 'node:path';
+import { text as readStdinText } from 'node:stream/consumers';
 import { isDeepStrictEqual, promisify } from 'node:util';
 
 import { AccountManager } from './account-manager.js';
@@ -283,7 +284,8 @@ export function helpText() {
   claude-rotator prepare-resume [--json] [--refresh]
   claude-rotator accounts
   claude-rotator login [--id <id>] [--name <email>]
-  claude-rotator login --id <id> --name <email> --json <token-json>
+  claude-rotator login --id <id> --name <email> --json -             (read token JSON from stdin; keeps it out of argv)
+  claude-rotator login --id <id> --name <email> --json <token-json>  (token appears in ps output and shell history)
   claude-rotator use-current [--name <email>] [--only]
   claude-rotator remove <account> [--keep-secret]
   claude-rotator import-current --id <id> --name <email>
@@ -585,13 +587,14 @@ function serviceEnvironmentPath(claudePath) {
 async function loginJsonCommand({ argv, write, deps }) {
   const id = argValue(argv, '--id');
   const name = argValue(argv, '--name') || id;
-  const json = argValue(argv, '--json');
-  if (!id || !json) throw new Error('Usage: claude-rotator login --id <id> --name <email> --json <token-json>');
+  const jsonArg = argValue(argv, '--json');
+  if (!id || !jsonArg) throw new Error('Usage: claude-rotator login --id <id> --name <email> --json <token-json>');
   assertSnapshotAccountId(id);
 
-  const secret = JSON.parse(json);
-  const config = await loadOrCreateConfig();
-  const store = createSecretStore();
+  const json = jsonArg === '-' ? await readStdinJson(deps) : jsonArg;
+  const secret = parseTokenJson(json);
+  const config = deps.loadConfig ? await deps.loadConfig() : await loadOrCreateConfig();
+  const store = deps.secretStore || createSecretStore();
   const previousSecret = await store.get(id);
   await store.set(id, secret);
 
@@ -608,9 +611,34 @@ async function loginJsonCommand({ argv, write, deps }) {
   };
   if (existing >= 0) config.accounts[existing] = account;
   else config.accounts.push(account);
-  await saveConfig(config);
+  if (deps.saveConfig) await deps.saveConfig(config);
+  else await saveConfig(config);
   await notifyReload({ deps, write });
   write(`Added ${name}\n`);
+}
+
+async function readStdinJson(deps) {
+  const stdin = deps.stdin || process.stdin;
+  if (stdin.isTTY) {
+    throw new Error(
+      'login --json - reads the token JSON from stdin, but stdin is a terminal. Pipe the JSON instead.'
+    );
+  }
+  const input = (await readStdinText(stdin)).trim();
+  if (!input) {
+    throw new Error('login --json - received no token JSON on stdin.');
+  }
+  return input;
+}
+
+function parseTokenJson(json) {
+  try {
+    return JSON.parse(json);
+  } catch {
+    throw new Error(
+      'Could not parse the token JSON. Expected an object such as {"accessToken":"...","refreshToken":"..."}.'
+    );
+  }
 }
 
 async function loginCurrentCommand({ argv, write, deps }) {

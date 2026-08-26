@@ -4,6 +4,7 @@ import { EventEmitter } from 'node:events';
 import { mkdir, mkdtemp, readFile, rm, stat, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
+import { Readable } from 'node:stream';
 
 import {
   ensureCredentialRevisions,
@@ -392,6 +393,103 @@ describe('runCli', () => {
     assert.match(io.output(), /already registered as person-example-com/);
   });
 
+  it('reads the token JSON from stdin when --json is -, keeping it out of argv', async () => {
+    const io = createIo();
+    let savedConfig = null;
+    const stored = [];
+
+    const code = await runCli(
+      ['login', '--id', 'acct_1', '--name', 'person@example.com', '--json', '-'],
+      {
+        ...io,
+        stdin: Readable.from(['{"accessToken":"access-1","refreshToken":"refresh-1"}']),
+        loadConfig: async () => ({ accounts: [] }),
+        saveConfig: async config => { savedConfig = config; },
+        secretStore: {
+          get: async () => null,
+          set: async (id, secret) => { stored.push({ id, secret }); },
+        },
+        reloadServer: async () => {},
+      },
+    );
+
+    assert.equal(code, 0);
+    assert.deepEqual(stored, [{ id: 'acct_1', secret: { accessToken: 'access-1', refreshToken: 'refresh-1' } }]);
+    assert.equal(savedConfig.accounts[0].id, 'acct_1');
+    assert.match(io.output(), /Added person@example\.com/);
+  });
+
+  it('refuses login --json - immediately when stdin is a terminal, instead of hanging', async () => {
+    const io = createIo();
+
+    const code = await runCli(
+      ['login', '--id', 'acct_1', '--name', 'person@example.com', '--json', '-'],
+      {
+        ...io,
+        stdin: { isTTY: true },
+      },
+    );
+
+    assert.equal(code, 1);
+    assert.match(io.output(), /stdin is a terminal/);
+  });
+
+  it('refuses login --json - when stdin has no token JSON', async () => {
+    const io = createIo();
+
+    const code = await runCli(
+      ['login', '--id', 'acct_1', '--name', 'person@example.com', '--json', '-'],
+      {
+        ...io,
+        stdin: Readable.from([]),
+      },
+    );
+
+    assert.equal(code, 1);
+    assert.match(io.output(), /received no token JSON on stdin/);
+  });
+
+  it('does not leak the token JSON in the parse error message', async () => {
+    const io = createIo();
+
+    const code = await runCli(
+      ['login', '--id', 'acct_1', '--name', 'person@example.com', '--json', '-'],
+      {
+        ...io,
+        stdin: Readable.from(['sk-ant-oat01-SECRET']),
+      },
+    );
+
+    assert.equal(code, 1);
+    assert.doesNotMatch(io.output(), /sk-ant/);
+    assert.match(io.output(), /Could not parse the token JSON/);
+  });
+
+  it('still accepts a literal token JSON via --json for backward compatibility', async () => {
+    const io = createIo();
+    const secretStore = new MemorySecretStore();
+    let savedConfig = null;
+
+    const code = await runCli(
+      [
+        'login', '--id', 'acct_1', '--name', 'person@example.com',
+        '--json', '{"accessToken":"access-1","refreshToken":"refresh-1"}',
+      ],
+      {
+        ...io,
+        loadConfig: async () => ({ accounts: [] }),
+        saveConfig: async config => { savedConfig = config; },
+        secretStore,
+        reloadServer: async () => {},
+      },
+    );
+
+    assert.equal(code, 0);
+    assert.deepEqual(await secretStore.get('acct_1'), { accessToken: 'access-1', refreshToken: 'refresh-1' });
+    assert.equal(savedConfig.accounts[0].id, 'acct_1');
+    assert.match(io.output(), /Added person@example\.com/);
+  });
+
   it('removes an account and its stored secret by default', async () => {
     const io = createIo();
     let savedConfig = null;
@@ -710,7 +808,6 @@ describe('uninstall --purge-secrets account id targeting', () => {
   it('non-darwin (linux): purges the configured account ids plus the current account', async () => {
     const io = createIo();
     const sandbox = await mkdtemp(join(tmpdir(), 'claude-rotator-cli-uninstall-purge-linux-'));
-    const originalHome = process.env.HOME;
     try {
       const home = join(sandbox, 'home');
       const xdgConfig = join(sandbox, 'xdg-config');
@@ -724,12 +821,10 @@ describe('uninstall --purge-secrets account id targeting', () => {
       const { calls, secretStoreFactory } = createPurgeSpy();
 
       // removeServiceFile() (called by uninstallCommand's non-darwin branch)
-      // removes the macOS LaunchAgent plist via a path built from the real
-      // os.homedir() rather than the injected `home` (a pre-existing gap,
-      // out of scope here). Sandbox real HOME for this test only so that
-      // unrelated real files on this machine are never touched.
-      process.env.HOME = home;
-
+      // threads the `home` passed below straight into macosLaunchAgentPath()
+      // and never falls back to the real os.homedir(), so no real-HOME
+      // sandboxing is needed here (see the dedicated "removeServiceFile only
+      // deletes ... never under process.env.HOME" regression test below).
       const code = await runCli(['uninstall', '--purge-secrets'], {
         ...io,
         platform: 'linux',
@@ -742,8 +837,6 @@ describe('uninstall --purge-secrets account id targeting', () => {
       assert.equal(calls.length, 1);
       assert.deepEqual(calls[0], ['acct_1', 'acct_2', 'current']);
     } finally {
-      if (originalHome === undefined) delete process.env.HOME;
-      else process.env.HOME = originalHome;
       await rm(sandbox, { recursive: true, force: true });
     }
   });

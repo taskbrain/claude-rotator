@@ -145,7 +145,7 @@ claude-rotator status
 claude-rotator doctor
 ```
 
-`claude-rotator login --json ...` は、token JSON を直接渡す上級者向けコマンドです。通常運用では `claude-rotator login` を使ってください。
+`claude-rotator login --json ...` は、token JSON を直接渡す上級者向けコマンドです。通常運用では `claude-rotator login` を使ってください。使う場合は `claude-rotator login --id <id> --name <email> --json -` として標準入力からJSONをパイプしてください。`--json <token-json>` のように値をコマンドライン引数へ直接渡すと、Linuxでは `ps auxww` や `/proc/<pid>/cmdline` から他ユーザーに見え、シェル履歴にも残ります。
 
 重複防止:
 
@@ -425,6 +425,8 @@ You can still provide an explicit id/name:
 ```bash
 claude-rotator login --id account1 --name your-email@example.com
 ```
+
+`claude-rotator login --json ...` is an advanced command that passes the token JSON directly; use plain `claude-rotator login` for normal operation. When you do use it, pipe the JSON through stdin with `claude-rotator login --id <id> --name <email> --json -` instead of passing the value as a literal argument. Passing `--json <token-json>` directly leaves it visible to other users via `ps auxww` or `/proc/<pid>/cmdline` on Linux, and it also lands in your shell history.
 
 ### Monitor
 
