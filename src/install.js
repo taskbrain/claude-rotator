@@ -200,22 +200,14 @@ export async function installMacosLifecycle({
       return;
     }
 
-    const definitionChanged = !snapshots.mainPlistPath.exists
-      || !snapshots.mainPlistPath.bytes.equals(Buffer.from(artifacts.mainPlist));
-    await reconcileMacosMainService({
-      uid,
-      plistPath: paths.mainPlistPath,
-      definitionChanged,
-      env,
-      execFileImpl,
-    });
-    await waitForMacosHealth({
-      healthCheck,
-      expectedServiceGeneration,
-      timeoutMs: healthTimeoutMs,
-      intervalMs: healthPollIntervalMs,
-      sleep,
-    });
+    // Write the gateway settings BEFORE (re)starting the main service. Every
+    // path through reconcileMacosMainService below restarts the running
+    // process (kickstart, bootout+bootstrap, or a fresh bootstrap), and
+    // runServer() decides allowLiveClaudeCodeCredentials once at boot by
+    // reading ~/.claude/settings.json. Starting the service first would let
+    // it boot in the brief window before ANTHROPIC_AUTH_TOKEN is written,
+    // so it would allow live Claude Code credentials even though gateway
+    // auth is about to be installed.
     const installState = previousInstallState
       ? await updateMacosInstalledSettings({
         settingsPath: paths.settingsPath,
@@ -232,6 +224,23 @@ export async function installMacosLifecycle({
         force,
       });
     if (!previousInstallState) createdBackupPath = installState.backupPath;
+
+    const definitionChanged = !snapshots.mainPlistPath.exists
+      || !snapshots.mainPlistPath.bytes.equals(Buffer.from(artifacts.mainPlist));
+    await reconcileMacosMainService({
+      uid,
+      plistPath: paths.mainPlistPath,
+      definitionChanged,
+      env,
+      execFileImpl,
+    });
+    await waitForMacosHealth({
+      healthCheck,
+      expectedServiceGeneration,
+      timeoutMs: healthTimeoutMs,
+      intervalMs: healthPollIntervalMs,
+      sleep,
+    });
     await writeJsonFile(paths.markerPath, {
       version: 1,
       installStateSha256: await fileSha256(paths.installStatePath),
@@ -269,6 +278,7 @@ async function updateMacosInstalledSettings({
   installStatePath,
   previousInstallState,
   proxyBaseUrl,
+  gatewayAuthToken = LOCAL_GATEWAY_AUTH_TOKEN,
   force,
 }) {
   if (
@@ -288,12 +298,27 @@ async function updateMacosInstalledSettings({
   ) {
     throw new Error(`ANTHROPIC_BASE_URL changed after install: ${currentBaseUrl}`);
   }
-  const merged = mergeClaudeSettings(settings, proxyBaseUrl);
+  // Mirror the ANTHROPIC_BASE_URL conflict guard above for ANTHROPIC_AUTH_TOKEN:
+  // once claude-rotator manages this settings file, an unexpected token value
+  // (e.g. a real credential a user set by hand) must not be silently
+  // overwritten on reinstall the way a genuinely fresh install would reject it.
+  const previousGatewayAuthToken = previousInstallState.gatewayAuthToken ?? gatewayAuthToken;
+  const currentAuthToken = settings.env?.ANTHROPIC_AUTH_TOKEN;
+  if (
+    currentAuthToken
+    && currentAuthToken !== previousGatewayAuthToken
+    && currentAuthToken !== gatewayAuthToken
+    && !force
+  ) {
+    throw new Error(`ANTHROPIC_AUTH_TOKEN changed after install: ${currentAuthToken}`);
+  }
+  const merged = mergeClaudeSettings(settings, proxyBaseUrl, gatewayAuthToken);
   await writeJsonFile(settingsPath, merged.settings);
   const nextState = {
     ...previousInstallState,
     installedAt: new Date().toISOString(),
     proxyBaseUrl,
+    gatewayAuthToken,
   };
   await writeJsonFile(installStatePath, nextState);
   return nextState;
@@ -554,6 +579,7 @@ export function serviceGenerationForLaunchAgent({
   nodePath,
   cliPath,
   configPath,
+  claudeConfigDir = null,
   claudePath,
   servicePath,
   xdgConfigHome = null,
@@ -563,6 +589,7 @@ export function serviceGenerationForLaunchAgent({
     nodePath,
     cliPath,
     configPath,
+    claudeConfigDir,
     claudePath,
     servicePath,
     xdgConfigHome,

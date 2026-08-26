@@ -172,15 +172,12 @@ export async function refreshWithNativeClaudeCode(refreshToken, context = {}, {
     if (remainingNativeCommandTimeout(refreshDeadline, deadlineNow) == null) {
       throw nativeRefreshCommandFailedError();
     }
-    await context.beforeHandoff?.();
     const loginTimeoutMs = remainingNativeCommandTimeout(refreshDeadline, deadlineNow);
     if (loginTimeoutMs == null) {
-      // The durable handoff fence may already be armed, so fail closed even
-      // though no child can now be started safely inside the deadline.
-      throw new NativeClaudeRefreshError(
-        'Native Claude OAuth credential refresh outcome is unknown',
-        'NATIVE_REFRESH_OUTCOME_UNKNOWN',
-      );
+      // Nothing has been spawned and the durable handoff fence has not been
+      // armed yet (it only arms once a child is actually confirmed spawned,
+      // below), so this is a plain, recoverable failure to start in time.
+      throw nativeRefreshCommandFailedError();
     }
     try {
       await executeNativeRefresh({
@@ -194,7 +191,16 @@ export async function refreshWithNativeClaudeCode(refreshToken, context = {}, {
           CLAUDE_CODE_OAUTH_REFRESH_TOKEN: previous.refreshToken,
           CLAUDE_CODE_OAUTH_SCOPES: previous.scopes.join(' '),
         },
-        afterSpawn: context.protectChildPid,
+        // The durable refresh-intent fence must arm only once the child is
+        // actually confirmed spawned (a real pid exists), i.e. only once the
+        // refresh token could actually have reached a process outside ours.
+        // Arming it any earlier (e.g. before attempting to spawn) would park
+        // the account on a plain ENOENT/EACCES spawn failure even though the
+        // refresh token never left this process.
+        afterSpawn: async childPid => {
+          await context.beforeHandoff?.();
+          await context.protectChildPid?.(childPid);
+        },
         afterClose: context.clearChildPid,
       });
     } catch {}
@@ -328,6 +334,7 @@ export function createNativeClaudeCredentialStorage({
       configDir,
       account: keychainAccount,
       execImpl: keychainExecImpl,
+      openImpl,
       timeoutMs,
     });
   }
@@ -370,6 +377,7 @@ function createMacOSKeychainCredentialStorage({
   configDir,
   account,
   execImpl,
+  openImpl,
   timeoutMs,
 }) {
   const service = nativeClaudeKeychainServiceName(configDir);
@@ -385,6 +393,15 @@ function createMacOSKeychainCredentialStorage({
     maxBuffer: MAX_COMMAND_OUTPUT_BYTES,
     windowsHide: true,
   };
+  // Claude Code 2.1.246's credential store is Keychain-with-plaintext-fallback:
+  // when a Keychain WRITE fails (non-transiently, e.g. Keychain unavailable
+  // under a headless launchd session), it silently persists to a plaintext
+  // .credentials.json inside $CLAUDE_SECURESTORAGE_CONFIG_DIR instead. If this
+  // adapter only ever looked at Keychain, a refresh that actually succeeded
+  // via that fallback would look like "no credential found" and permanently
+  // park the account. So `read()` also checks the plaintext fallback file,
+  // and wipes it immediately after a successful read.
+  const plaintextFallbackPath = join(configDir, '.credentials.json');
 
   return {
     async seed(credential) {
@@ -415,7 +432,18 @@ function createMacOSKeychainCredentialStorage({
         return parseCredentialOutput(commandStdout(output), phase);
       } catch (error) {
         if (error instanceof NativeClaudeRefreshError) throw error;
-        throw invalidCredentialOutputError(phase);
+        try {
+          const fallback = await readLinuxCredentialFile(plaintextFallbackPath, {
+            openImpl,
+            errorCode: phase === 'seed'
+              ? 'NATIVE_REFRESH_SEED_INVALID'
+              : 'NATIVE_REFRESH_INVALID_OUTPUT',
+          });
+          await wipeLinuxCredentialFile(plaintextFallbackPath, openImpl).catch(() => {});
+          return fallback;
+        } catch {
+          throw invalidCredentialOutputError(phase);
+        }
       }
     },
     async cleanup() {
@@ -426,9 +454,9 @@ function createMacOSKeychainCredentialStorage({
           '-s', service,
         ], executionOptions);
       } catch (error) {
-        if (isMissingKeychainItem(error)) return;
-        throw error;
+        if (!isMissingKeychainItem(error)) throw error;
       }
+      await wipeLinuxCredentialFile(plaintextFallbackPath, openImpl).catch(() => {});
     },
   };
 }
