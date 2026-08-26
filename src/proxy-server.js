@@ -1371,7 +1371,7 @@ async function refreshAccountUsage({
     };
   } catch (caught) {
     const message = shortErrorMessage(caught);
-    logger?.(`${new Date().toISOString()} usage-refresh account=${account.id} result=failed error=${message}`);
+    logger?.(`${new Date().toISOString()} usage-refresh account=${account.id} result=failed errorType=${usageRefreshErrorType(caught)}`);
     usageObservationTracker.fail(observation);
     if (!accountManager.accounts.includes(account)) {
       return { account: account.id, ok: false, stale: true, error: message };
@@ -1857,6 +1857,11 @@ function credentialRefreshErrorType(error) {
   if (/invalid_grant/i.test(message)) return 'invalid_grant';
   const status = message.match(/Token refresh failed \((\d+)\)/)?.[1];
   return status ? `http-${status}` : (error?.code || error?.name || 'unknown');
+}
+
+function usageRefreshErrorType(error) {
+  const status = String(error?.message || '').match(/Usage fetch failed \((\d+)\)/)?.[1];
+  return status ? `http-${status}` : credentialRefreshErrorType(error);
 }
 
 function canRefreshSecret(account, secret) {

@@ -3108,7 +3108,7 @@ describe('createProxyServer', () => {
       secretStore,
       config: { upstream: 'http://127.0.0.1:1', usagePolling: { enabled: false } },
       usageFetcher: async () => {
-        throw new Error('Usage fetch failed (429): rate limited');
+        throw new Error('Usage fetch failed (429): {"detail":"SENTINEL_BODY_do_not_log"}');
       },
       logger: line => logLines.push(line),
     }));
@@ -3119,10 +3119,12 @@ describe('createProxyServer', () => {
     const response = await requestJson(`${proxy.url}/internal/refresh-usage`, { method: 'POST' });
 
     assert.equal(response.status, 200);
+    const logText = logLines.join('\n');
     assert.match(
-      logLines.join('\n'),
-      /usage-refresh account=acct_1 result=failed error=Usage fetch failed \(429\)/,
+      logText,
+      /usage-refresh account=acct_1 result=failed errorType=http-429/,
     );
+    assert.doesNotMatch(logText, /SENTINEL_BODY_do_not_log/);
   });
 
   it('does not let an older scheduled Usage 401 mark error after a newer reactive observation starts', async () => {
