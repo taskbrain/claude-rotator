@@ -18,7 +18,7 @@ import {
   refreshAccessToken,
 } from './oauth.js';
 import { createNativeClaudeRefresher } from './native-claude-refresher.js';
-import { parseRateLimitHeaders } from './quota.js';
+import { isFableScopeIdentity, parseRateLimitHeaders } from './quota.js';
 
 const HOP_HEADERS = new Set([
   'host',
@@ -910,8 +910,31 @@ function requestModelFamily(body) {
   }
 }
 
+// Exact canonical id only. Used to gate reactive Usage confirmation (a
+// second network round trip that mutates quota state), which must stay
+// conservative: see 'requires the exact canonical Fable 5 model id for
+// reactive Usage confirmation' (test/proxy-server.test.js).
 function isCanonicalFableModelId(value) {
   return value === 'claude-fable-5';
+}
+
+// Lenient prefix match for account-selection ROUTING only (never for
+// confirmation/evidence gating above). Anthropic-issued Fable ids may carry a
+// dated or numbered suffix (e.g. `claude-fable-5-20260818`, a future
+// `claude-fable-5-1`); rejecting those as non-Fable would route them straight
+// at a Fable-exhausted account and surface as a 429 to the caller.
+function isFableRoutingModelId(value) {
+  if (typeof value !== 'string') return false;
+  return /^claude-fable-\d/.test(value.trim().toLowerCase());
+}
+
+function routingModelFamily(body) {
+  try {
+    const model = JSON.parse(body.toString('utf8'))?.model;
+    return isFableRoutingModelId(model) ? 'fable' : null;
+  } catch {
+    return null;
+  }
 }
 
 function safeUsageObservation(usage, threshold, nowMs) {
@@ -1066,7 +1089,7 @@ function scopedUsageIdentity(limit) {
     .toLowerCase()
     .replace(/[^a-z0-9]+/g, '_')
     .replace(/^_+|_+$/g, '');
-  return isExactFableScopeIdentity(value) ? 'fable' : (value || 'scoped');
+  return isFableScopeIdentity(value) ? 'fable' : (value || 'scoped');
 }
 
 function usageEvidenceConfirmsRequest(fields, threshold, modelFamily, nowMs) {
@@ -1116,19 +1139,9 @@ function accountQuotaConfirmsModelFamily(account, modelFamily, threshold, nowMs)
 function scopedUsageMatchesModelFamily(limit, modelFamily) {
   if (modelFamily !== 'fable') return false;
   const key = String(limit?.key || '').trim().toLowerCase();
-  if (key) return isExactFableScopeIdentity(key);
+  if (key) return isFableScopeIdentity(key);
   const label = String(limit?.label || '').trim().toLowerCase();
-  return isExactFableScopeIdentity(label);
-}
-
-function isExactFableScopeIdentity(value) {
-  return [
-    'fable',
-    'fable 5',
-    'fable_5',
-    'claude-fable-5',
-    'claude_fable_5',
-  ].includes(String(value || '').trim().toLowerCase());
+  return isFableScopeIdentity(label);
 }
 
 function unifiedQuotaHeaderEvidence(headers, threshold, nowMs) {
@@ -1159,10 +1172,15 @@ async function snapshotKnownAvailableAlternates({
   signal = null,
 }) {
   throwIfOperationAborted(signal);
+  // This confirmer only ever runs for a Fable request (gated by
+  // `requestModelFamily(body) === 'fable'` before it is invoked), so the final
+  // gate here must judge candidates as Fable requests too — otherwise a
+  // Fable-exhausted candidate would incorrectly look available (isAvailable's
+  // default modelFamily is null / non-Fable).
   const candidates = accountManager.accounts.filter(candidate => (
     candidate !== account
-    && accountManager.isAvailable(candidate)
-    && accountManager.switchTargetScore(candidate) != null
+    && accountManager.isAvailable(candidate, 'fable')
+    && accountManager.switchTargetScore(candidate, 'fable') != null
   ));
   const snapshots = await Promise.all(candidates.map(async candidate => {
     const secret = await resolveReactiveReplaySecret({
@@ -1205,14 +1223,16 @@ function validReactiveReplayTarget({
   secret = null,
 }) {
   const snapshot = targets?.get(candidate);
+  // Same reasoning as snapshotKnownAvailableAlternates: this replay path is
+  // Fable-only, so judge the candidate as a Fable request here too.
   return Boolean(
     source
     && candidate
     && snapshot
     && accountManager.accounts.includes(source)
     && accountManager.accounts.includes(candidate)
-    && accountManager.isAvailable(candidate)
-    && accountManager.switchTargetScore(candidate) != null
+    && accountManager.isAvailable(candidate, 'fable')
+    && accountManager.switchTargetScore(candidate, 'fable') != null
     && candidate.credentialRevision === snapshot.credentialRevision
     && (!secret || (
       stableReactiveReplaySecret(candidate, secret)
@@ -1436,17 +1456,23 @@ async function forwardWithRotation({
   let reactiveReplayTargets = null;
   let reactiveReplayAuthorization = null;
 
+  // Routing uses the lenient matcher (M3): a dated/numbered Fable id
+  // suffix must still route away from a Fable-exhausted account, unlike the
+  // strict `requestModelFamily` used to gate reactive Usage confirmation.
+  const modelFamily = routingModelFamily(body);
+
   for (let attempt = 0; attempt < maxAttempts; attempt++) {
     if (req.aborted || res.destroyed) return;
     const reactiveSelection = reactiveQuotaRetryUsed
       ? accountManager.bestAvailableSwitchCandidate({
         excludeCurrent: false,
         allowedAccounts: new Set(reactiveReplayTargets?.keys() || []),
+        modelFamily,
       })
       : null;
     const account = reactiveQuotaRetryUsed
       ? reactiveSelection?.account
-      : accountManager.getActiveAccount();
+      : accountManager.getActiveAccount(modelFamily);
     if (!account) {
       if (reactiveQuotaRetryUsed && lastRetryableResponse) {
         sendBufferedResponse(res, lastRetryableResponse);
@@ -1457,6 +1483,7 @@ async function forwardWithRotation({
         res,
         accountManager,
         logger,
+        modelFamily,
       })) return;
       if (lastRetryableResponse) {
         sendBufferedResponse(res, lastRetryableResponse);
@@ -1477,6 +1504,7 @@ async function forwardWithRotation({
         upstreamConnectTimeoutMs,
         upstreamConnectRetries,
         upstreamConnectRetryDelayMs,
+        modelFamily,
       })) return;
       sendUnavailableAccounts(res, accountManager);
       return;
@@ -1708,6 +1736,7 @@ async function forwardWithRotation({
       res,
       accountManager,
       logger,
+      modelFamily,
     })) return;
     if (lastRetryableResponse) {
       sendBufferedResponse(res, lastRetryableResponse);
@@ -1728,6 +1757,7 @@ async function forwardWithRotation({
       upstreamConnectTimeoutMs,
       upstreamConnectRetries,
       upstreamConnectRetryDelayMs,
+      modelFamily,
     })) return;
     sendUnavailableAccounts(res, accountManager);
   }
@@ -1748,12 +1778,14 @@ async function forwardCurrentUnavailableAccount({
   upstreamConnectTimeoutMs,
   upstreamConnectRetries,
   upstreamConnectRetryDelayMs,
+  modelFamily = null,
 }) {
   if (sendCurrentQuotaUnavailableResponse({
     req,
     res,
     accountManager,
     logger,
+    modelFamily,
   })) return true;
 
   const account = accountManager.getFallbackAccount();
@@ -2630,15 +2662,18 @@ function syntheticUpstreamErrorResponse(error) {
   };
 }
 
-function sendCurrentQuotaUnavailableResponse({ req, res, accountManager, logger }) {
+function sendCurrentQuotaUnavailableResponse({ req, res, accountManager, logger, modelFamily = null }) {
   let account = accountManager.getCurrentAccount();
-  let reason = accountManager.unavailableReason(account);
+  // Use the modelFamily-aware reason so a non-matching-family request never
+  // gets handed a misleading scoped claim (e.g. `seven_day_fable`) when it
+  // was really blocked by an unrelated common-quota window (m2).
+  let reason = accountManager.unavailableReasonForModelFamily(account, modelFamily);
   if (!isUnifiedQuotaExhaustion(reason)) return false;
 
   const shortestResetAccount = accountManager.selectBestExhaustedFallback();
   if (shortestResetAccount) {
     account = shortestResetAccount;
-    reason = accountManager.unavailableReason(account);
+    reason = accountManager.unavailableReasonForModelFamily(account, modelFamily);
     if (!isUnifiedQuotaExhaustion(reason)) return false;
   }
 

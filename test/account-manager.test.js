@@ -1100,7 +1100,7 @@ describe('AccountManager', () => {
     assert.equal(account.unavailableReason, null);
   });
 
-  it('switches away from accounts with exhausted model-scoped weekly usage', () => {
+  function makeManagerWithFableExhaustedPrimary() {
     const manager = new AccountManager({
       accounts: [
         { id: 'acct_1', name: 'a@example.com', type: 'oauth' },
@@ -1127,7 +1127,11 @@ describe('AccountManager', () => {
       seven_day: { utilization: 0.4, resets_at: '2026-07-07T00:00:00Z' },
     });
 
-    assert.equal(manager.getActiveAccount().id, 'acct_2');
+    return manager;
+  }
+
+  it('still reports the fable sub-cap exhaustion for status/monitoring regardless of the requested model', () => {
+    const manager = makeManagerWithFableExhaustedPrimary();
     const exhausted = manager.getStatus().accounts[0];
     assert.equal(exhausted.status, 'exhausted');
     assert.deepEqual(exhausted.unavailableReason, {
@@ -1137,6 +1141,163 @@ describe('AccountManager', () => {
       utilization: 1,
       resetAt: '2026-07-07T00:00:00.000Z',
     });
+  });
+
+  it('switches away from a fable-exhausted account for FABLE requests', () => {
+    const manager = makeManagerWithFableExhaustedPrimary();
+    const picked = manager.getActiveAccount('fable');
+    assert.notEqual(picked.id, 'acct_1', 'fable request must skip the fable-exhausted account');
+    assert.equal(picked.id, 'acct_2');
+  });
+
+  it('does not permanently move currentIndex for a model-scoped-only switch (M2)', () => {
+    const manager = makeManagerWithFableExhaustedPrimary();
+
+    const fablePicked = manager.getActiveAccount('fable');
+    assert.equal(fablePicked.id, 'acct_2', 'the fable request is routed ad-hoc to acct_2');
+    assert.equal(
+      manager.getCurrentAccount().id,
+      'acct_1',
+      'a scoped-only exhaustion must not move currentIndex away from acct_1',
+    );
+
+    const sonnetPicked = manager.getActiveAccount(null);
+    assert.equal(
+      sonnetPicked.id,
+      'acct_1',
+      'a later non-fable request must still land on acct_1, not the fable ad-hoc target',
+    );
+  });
+
+  it('keeps using a fable-exhausted account for NON-fable requests (opus/sonnet/haiku)', () => {
+    const manager = makeManagerWithFableExhaustedPrimary();
+    const picked = manager.getActiveAccount(null);
+    assert.equal(picked.id, 'acct_1', 'non-fable request must still use the account');
+  });
+
+  it('treats an omitted model family the same as a non-fable request (default behavior)', () => {
+    const manager = makeManagerWithFableExhaustedPrimary();
+    // Calling with no argument at all must behave exactly like modelFamily = null,
+    // i.e. a request whose model could not be identified is routed as non-Fable.
+    const picked = manager.getActiveAccount();
+    assert.equal(picked.id, 'acct_1', 'omitting modelFamily must default to non-fable (permissive) routing');
+  });
+
+  it('rejects every model family when the common weekly/5h window is exhausted (not model-scoped)', () => {
+    const manager = new AccountManager({
+      accounts: [{ id: 'acct_1', name: 'a@example.com', type: 'oauth' }],
+      switchThreshold: 1,
+      now: () => 1000,
+    });
+    manager.applyUsage('acct_1', {
+      five_hour: { utilization: 0.2, resets_at: '2026-07-05T05:00:00Z' },
+      seven_day: { utilization: 1, resets_at: '2026-07-07T00:00:00Z' },
+    });
+
+    assert.equal(manager.isAvailable(manager.accounts[0], 'fable'), false, 'common quota exhaustion must block fable requests too');
+    assert.equal(manager.isAvailable(manager.accounts[0], null), false, 'common quota exhaustion must block non-fable requests too');
+    assert.equal(manager.getActiveAccount('fable'), null);
+    assert.equal(manager.getActiveAccount(null), null);
+  });
+
+  it('CASE B: rejects every model family when a common token-rate-limit exhaustion is hidden behind a fable-scoped exhaustion', () => {
+    const manager = new AccountManager({
+      accounts: [{ id: 'acct_1', name: 'a@example.com', type: 'oauth' }],
+      switchThreshold: 1,
+      now: () => 1000,
+    });
+    // Unified 5h/7d have headroom. The Fable weekly sub-cap is exhausted AND,
+    // independently, the common token rate limit is exhausted too.
+    // `quotaUnavailableReason` would report the Fable-scoped reason first
+    // (scoped windows are checked before tokens/requests) — a gate that only
+    // looked at that single classified reason would incorrectly let a
+    // non-fable request through even though the account has no token budget
+    // left for anyone.
+    manager.applyUsage('acct_1', {
+      five_hour: { utilization: 0.2, resets_at: '2026-07-05T05:00:00Z' },
+      seven_day: { utilization: 0.2, resets_at: '2026-07-07T00:00:00Z' },
+      scoped_weekly: [{ key: 'fable', label: 'Fable', utilization: 1, resets_at: '2026-07-07T00:00:00Z' }],
+    });
+    manager.updateQuota('acct_1', {
+      'anthropic-ratelimit-tokens-limit': '1000',
+      'anthropic-ratelimit-tokens-remaining': '0',
+    });
+
+    assert.equal(manager.isAvailable(manager.accounts[0], 'fable'), false, 'token exhaustion must block fable requests too');
+    assert.equal(manager.isAvailable(manager.accounts[0], null), false, 'token exhaustion must block non-fable requests too, even though the fable-scoped reason sorts first');
+    assert.equal(manager.getActiveAccount('fable'), null);
+    assert.equal(manager.getActiveAccount(null), null);
+  });
+
+  it('CASE C: rejects a fable request when the fable-scoped entry is not the first element of weeklyScoped', () => {
+    const manager = new AccountManager({
+      accounts: [{ id: 'acct_1', name: 'a@example.com', type: 'oauth' }],
+      switchThreshold: 1,
+      now: () => 1000,
+    });
+    // scopedWeeklyQuotaUnavailableReason only ever returns the FIRST exhausted
+    // entry it finds; if an unrelated scoped cap comes first in the array, a
+    // gate built on that single reason would never see the fable exhaustion
+    // that follows it.
+    manager.applyUsage('acct_1', {
+      five_hour: { utilization: 0.2, resets_at: '2026-07-05T05:00:00Z' },
+      seven_day: { utilization: 0.2, resets_at: '2026-07-07T00:00:00Z' },
+      scoped_weekly: [
+        { key: 'some_other_cap', label: 'Some Other Cap', utilization: 1, resets_at: '2026-07-07T00:00:00Z' },
+        { key: 'fable', label: 'Fable', utilization: 1, resets_at: '2026-07-07T00:00:00Z' },
+      ],
+    });
+
+    assert.equal(
+      manager.isAvailable(manager.accounts[0], 'fable'),
+      false,
+      'a fable-scoped exhaustion must be found even when it is not the first weeklyScoped entry',
+    );
+    assert.equal(
+      manager.isAvailable(manager.accounts[0], null),
+      true,
+      'an unrecognized scoped cap ahead of it must not gate a non-fable request',
+    );
+    assert.equal(manager.getActiveAccount('fable'), null);
+    assert.equal(manager.getActiveAccount(null)?.id, 'acct_1');
+  });
+
+  it('m2: unavailableReasonForModelFamily reports the true common-quota reason to a non-matching-family request', () => {
+    const manager = new AccountManager({
+      accounts: [{ id: 'acct_1', name: 'a@example.com', type: 'oauth' }],
+      switchThreshold: 1,
+      now: () => 1000,
+    });
+    // Same fixture as CASE B: unified 5h/7d have headroom, the Fable weekly
+    // sub-cap is exhausted, and the common token rate limit is exhausted too.
+    manager.applyUsage('acct_1', {
+      five_hour: { utilization: 0.2, resets_at: '2026-07-05T05:00:00Z' },
+      seven_day: { utilization: 0.2, resets_at: '2026-07-07T00:00:00Z' },
+      scoped_weekly: [{ key: 'fable', label: 'Fable', utilization: 1, resets_at: '2026-07-07T00:00:00Z' }],
+    });
+    manager.updateQuota('acct_1', {
+      'anthropic-ratelimit-tokens-limit': '1000',
+      'anthropic-ratelimit-tokens-remaining': '0',
+    });
+    const account = manager.accounts[0];
+
+    const fableReason = manager.unavailableReasonForModelFamily(account, 'fable');
+    assert.equal(fableReason.type, 'quota_exhausted');
+    assert.equal(fableReason.window, '7d Fable');
+    assert.equal(fableReason.claim, 'seven_day_fable');
+
+    const nonFableReason = manager.unavailableReasonForModelFamily(account, null);
+    assert.equal(
+      nonFableReason.type,
+      'token_rate_limit_exhausted',
+      'a non-fable request must be told the true (token) reason, not the fable-scoped one',
+    );
+    assert.equal(nonFableReason.claim, undefined, 'the token-exhaustion reason must not carry a fable claim');
+
+    // The unfiltered, family-agnostic reason (used for /internal/status) is
+    // unaffected: it still reports whichever reason the existing priority
+    // (5h -> 7d -> scoped -> tokens -> requests) surfaces first.
+    assert.equal(manager.unavailableReason(account).window, '7d Fable');
   });
 
   it('reports quota exhaustion ahead of retry-after throttling', () => {

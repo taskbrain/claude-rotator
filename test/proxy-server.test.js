@@ -1290,6 +1290,213 @@ describe('createProxyServer', () => {
     assert.equal(accountManager.getStatus().accounts[0].unavailableReason.window, '7d Fable');
   });
 
+  it('forwards a non-fable request to an account whose fable weekly sub-cap is already exhausted', async () => {
+    const upstreamSeen = [];
+    const upstream = await listen(http.createServer((req, res) => {
+      upstreamSeen.push(req.headers.authorization);
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ ok: true }));
+    }));
+    const secretStore = new MemorySecretStore();
+    await secretStore.set('acct_1', { accessToken: 'access-token-1' });
+    await secretStore.set('acct_2', { accessToken: 'access-token-2' });
+    const accountManager = new AccountManager({
+      accounts: [
+        { id: 'acct_1', name: 'a@example.com', type: 'oauth' },
+        { id: 'acct_2', name: 'b@example.com', type: 'oauth' },
+      ],
+      switchThreshold: 1,
+      now: () => 1000,
+    });
+    // acct_1's common windows have headroom; only the Fable weekly sub-cap is exhausted.
+    accountManager.applyUsage('acct_1', {
+      five_hour: { utilization: 0.2, resets_at: futureReset() },
+      seven_day: { utilization: 0.2, resets_at: futureReset() },
+      scoped_weekly: [{ key: 'fable', label: 'Fable', utilization: 1, resets_at: futureReset() }],
+    });
+    const proxy = await listen(createProxyServer({
+      accountManager,
+      secretStore,
+      config: { upstream: upstream.url, usagePolling: { enabled: false } },
+    }));
+    cleanupAfterTest(async () => { await close(proxy.server); await close(upstream.server); });
+
+    const response = await requestJson(`${proxy.url}/v1/messages`, {
+      method: 'POST',
+      body: JSON.stringify({ model: 'claude-sonnet-5' }),
+    });
+
+    assert.equal(response.status, 200);
+    // Must stay on acct_1 in a single attempt: a Fable-only exhaustion never
+    // excludes a non-Fable request, so no switch to acct_2 should occur.
+    assert.deepEqual(upstreamSeen, ['Bearer access-token-1']);
+    assert.equal(accountManager.getStatus().currentAccount, 'acct_1');
+  });
+
+  it('forwards a fable request away from an account whose fable weekly sub-cap is already exhausted', async () => {
+    const upstreamSeen = [];
+    const upstream = await listen(http.createServer((req, res) => {
+      upstreamSeen.push(req.headers.authorization);
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ ok: true }));
+    }));
+    const secretStore = new MemorySecretStore();
+    await secretStore.set('acct_1', { accessToken: 'access-token-1' });
+    await secretStore.set('acct_2', { accessToken: 'access-token-2' });
+    const accountManager = new AccountManager({
+      accounts: [
+        { id: 'acct_1', name: 'a@example.com', type: 'oauth' },
+        { id: 'acct_2', name: 'b@example.com', type: 'oauth' },
+      ],
+      switchThreshold: 1,
+      now: () => 1000,
+    });
+    accountManager.applyUsage('acct_1', {
+      five_hour: { utilization: 0.2, resets_at: futureReset() },
+      seven_day: { utilization: 0.2, resets_at: futureReset() },
+      scoped_weekly: [{ key: 'fable', label: 'Fable', utilization: 1, resets_at: futureReset() }],
+    });
+    // acct_2 needs known unified-quota headroom to be scored as a switch target.
+    accountManager.applyUsage('acct_2', {
+      five_hour: { utilization: 0.3, resets_at: futureReset() },
+      seven_day: { utilization: 0.3, resets_at: futureReset() },
+    });
+    const proxy = await listen(createProxyServer({
+      accountManager,
+      secretStore,
+      config: { upstream: upstream.url, usagePolling: { enabled: false } },
+    }));
+    cleanupAfterTest(async () => { await close(proxy.server); await close(upstream.server); });
+
+    const response = await requestJson(`${proxy.url}/v1/messages`, {
+      method: 'POST',
+      body: JSON.stringify({ model: 'claude-fable-5' }),
+    });
+
+    assert.equal(response.status, 200);
+    // Must skip straight to acct_2 in a single attempt: the Fable request is
+    // gated by the exhausted Fable sub-cap on acct_1.
+    assert.deepEqual(upstreamSeen, ['Bearer access-token-2']);
+    // The pick is ad-hoc, for THIS Fable request only: a model-scoped-only
+    // exhaustion must not permanently move the `currentIndex` pointer, or a
+    // later non-Fable request would be stranded on acct_2 while acct_1's
+    // common-quota headroom for non-Fable models sits idle (M2).
+    assert.equal(accountManager.getStatus().currentAccount, 'acct_1');
+
+    const sonnetResponse = await requestJson(`${proxy.url}/v1/messages`, {
+      method: 'POST',
+      body: JSON.stringify({ model: 'claude-sonnet-5' }),
+    });
+
+    assert.equal(sonnetResponse.status, 200);
+    // The non-fable follow-up must still land on acct_1 (the fable-only
+    // exhaustion never blocked it), not the ad-hoc fable target acct_2.
+    assert.deepEqual(upstreamSeen, ['Bearer access-token-2', 'Bearer access-token-1']);
+    assert.equal(accountManager.getStatus().currentAccount, 'acct_1');
+  });
+
+  it('routes a dated/suffixed Fable model id away from a fable-exhausted account (M3)', async () => {
+    const upstreamSeen = [];
+    const upstream = await listen(http.createServer((req, res) => {
+      upstreamSeen.push(req.headers.authorization);
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ ok: true }));
+    }));
+    const secretStore = new MemorySecretStore();
+    await secretStore.set('acct_1', { accessToken: 'access-token-1' });
+    await secretStore.set('acct_2', { accessToken: 'access-token-2' });
+    const accountManager = new AccountManager({
+      accounts: [
+        { id: 'acct_1', name: 'a@example.com', type: 'oauth' },
+        { id: 'acct_2', name: 'b@example.com', type: 'oauth' },
+      ],
+      switchThreshold: 1,
+      now: () => 1000,
+    });
+    accountManager.applyUsage('acct_1', {
+      five_hour: { utilization: 0.2, resets_at: futureReset() },
+      seven_day: { utilization: 0.2, resets_at: futureReset() },
+      scoped_weekly: [{ key: 'fable', label: 'Fable', utilization: 1, resets_at: futureReset() }],
+    });
+    accountManager.applyUsage('acct_2', {
+      five_hour: { utilization: 0.3, resets_at: futureReset() },
+      seven_day: { utilization: 0.3, resets_at: futureReset() },
+    });
+    const proxy = await listen(createProxyServer({
+      accountManager,
+      secretStore,
+      config: { upstream: upstream.url, usagePolling: { enabled: false } },
+    }));
+    cleanupAfterTest(async () => { await close(proxy.server); await close(upstream.server); });
+
+    // A dated/numbered Fable id must still be routed as a Fable request, even
+    // though the strict canonical check used for reactive-confirmation
+    // (`requestModelFamily`/`isCanonicalFableModelId`) intentionally rejects it.
+    for (const model of ['claude-fable-5-20260818', 'CLAUDE-FABLE-5', ' claude-fable-5 ']) {
+      upstreamSeen.length = 0;
+      const response = await requestJson(`${proxy.url}/v1/messages`, {
+        method: 'POST',
+        body: JSON.stringify({ model }),
+      });
+      assert.equal(response.status, 200, model);
+      assert.deepEqual(upstreamSeen, ['Bearer access-token-2'], `${model} must route straight to acct_2`);
+    }
+  });
+
+  it('m2: the synthesized quota-unavailable response never carries a fable claim for a non-fable request (regression via unavailableReasonForModelFamily)', async () => {
+    const upstream = await listen(http.createServer((req, res) => {
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ ok: true }));
+    }));
+    const secretStore = new MemorySecretStore();
+    await secretStore.set('acct_1', { accessToken: 'access-token-1' });
+    const accountManager = new AccountManager({
+      accounts: [{ id: 'acct_1', name: 'a@example.com', type: 'oauth' }],
+      switchThreshold: 1,
+      now: () => 1000,
+    });
+    // Single account, no fallback: the Fable weekly sub-cap is exhausted AND,
+    // independently, the common token rate limit is exhausted too.
+    // Pre-fix, `sendCurrentQuotaUnavailableResponse` used the family-agnostic
+    // `unavailableReason`, which reports the scoped Fable window first (it is
+    // checked before tokens/requests) — so a plain Sonnet request could have
+    // been handed a synthetic 429 claiming `seven_day_fable`, which is false.
+    // Note (out of scope for m2, reported as Follow-up): `isUnifiedQuotaExhaustion`
+    // does not recognize `token_rate_limit_exhausted`, so this exact fixture
+    // currently falls through to the last-resort blind-forward passthrough
+    // (200 from this fake upstream) rather than any synthetic 429 at all. That
+    // is a separate, pre-existing gap; what this test guards is narrower and
+    // still meaningful: no code path here may ever synthesize a
+    // `seven_day_fable` claim for a request whose family is not fable.
+    accountManager.applyUsage('acct_1', {
+      five_hour: { utilization: 0.2, resets_at: futureReset() },
+      seven_day: { utilization: 0.2, resets_at: futureReset() },
+      scoped_weekly: [{ key: 'fable', label: 'Fable', utilization: 1, resets_at: futureReset() }],
+    });
+    accountManager.updateQuota('acct_1', {
+      'anthropic-ratelimit-tokens-limit': '1000',
+      'anthropic-ratelimit-tokens-remaining': '0',
+    });
+    const proxy = await listen(createProxyServer({
+      accountManager,
+      secretStore,
+      config: { upstream: upstream.url, usagePolling: { enabled: false } },
+    }));
+    cleanupAfterTest(async () => { await close(proxy.server); await close(upstream.server); });
+
+    const response = await requestJson(`${proxy.url}/v1/messages`, {
+      method: 'POST',
+      body: JSON.stringify({ model: 'claude-sonnet-5' }),
+    });
+
+    assert.notEqual(
+      response.headers['anthropic-ratelimit-unified-representative-claim'],
+      'seven_day_fable',
+      'a non-fable request must never be told it was blocked by the fable sub-cap',
+    );
+    assert.notEqual(response.body?.error?.details?.window, '7d Fable');
+  });
+
   it('revalidates exact Fable exhaustion independently of scoped order and canonical id spelling', async () => {
     const scenarios = [
       {
