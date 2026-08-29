@@ -8,7 +8,7 @@ import { performance } from 'node:perf_hooks';
 import { isDeepStrictEqual, promisify } from 'node:util';
 
 import { appDataDir, linuxAccountsDir } from './paths.js';
-import { writeJsonFile } from './json-file.js';
+import { removeFileDurable, writeJsonFileDurable } from './json-file.js';
 import { executeSecurityCommand } from './native-claude-refresher.js';
 
 const execFileAsync = promisify(execFile);
@@ -649,8 +649,9 @@ function validateRefreshIntent(value) {
 }
 
 class DurableRefreshIntentStore {
-  constructor(lockDir) {
+  constructor(lockDir, { durableFileDeps } = {}) {
     this.lockDir = lockDir;
+    this.durableFileDeps = durableFileDeps;
   }
 
   async read(accountId) {
@@ -679,12 +680,20 @@ class DurableRefreshIntentStore {
     validateRefreshIntent(intent);
     await mkdir(this.lockDir, { recursive: true, mode: 0o700 });
     await chmod(this.lockDir, 0o700);
-    await writeJsonFile(refreshIntentPath(this.lockDir, accountId), intent, 0o600);
+    await writeJsonFileDurable(
+      refreshIntentPath(this.lockDir, accountId),
+      intent,
+      0o600,
+      this.durableFileDeps,
+    );
   }
 
   async remove(accountId) {
     try {
-      await rm(refreshIntentPath(this.lockDir, accountId), { force: true });
+      await removeFileDurable(
+        refreshIntentPath(this.lockDir, accountId),
+        this.durableFileDeps,
+      );
     } catch {
       throw refreshOutcomeUnknownError();
     }
@@ -1047,7 +1056,7 @@ export class LinuxFileSecretStore {
   async setUnlocked(accountId, secret) {
     await mkdir(this.accountsDir, { recursive: true, mode: 0o700 });
     await chmod(this.accountsDir, 0o700);
-    await writeJsonFile(this.secretPath(accountId), secret, 0o600);
+    await writeJsonFileDurable(this.secretPath(accountId), secret, 0o600);
   }
 
   async get(accountId) {

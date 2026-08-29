@@ -2,7 +2,7 @@ import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 import { fork } from 'node:child_process';
 import { once } from 'node:events';
-import { mkdir, mkdtemp, readFile, rm, stat, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, open, readFile, readdir, rm, stat, writeFile } from 'node:fs/promises';
 import { hostname, tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -15,6 +15,7 @@ import {
 } from '../src/secret-store.js';
 import { executeNativeClaudeCommand } from '../src/native-claude-refresher.js';
 import { refreshAccessToken } from '../src/oauth.js';
+import { removeFileDurable, writeJsonFileDurable } from '../src/json-file.js';
 import { createFileBackedFakeKeychainOptions } from '../fixtures/file-backed-fake-keychain.js';
 
 function createFakeKeychainStoreOptions(lockDir) {
@@ -56,6 +57,79 @@ const REAL_KEYCHAIN_SKIP_REASON = process.platform !== 'darwin'
   : (process.env.CLAUDE_ROTATOR_REAL_KEYCHAIN === '1'
     ? false
     : 'set CLAUDE_ROTATOR_REAL_KEYCHAIN=1 to run tests that touch the real macOS Keychain');
+
+describe('durable refresh-boundary files', () => {
+  it('does not publish a durable JSON file when file sync fails and removes its temporary file', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'claude-rotator-durable-write-'));
+    const destination = join(dir, 'credential.json');
+    try {
+      await assert.rejects(
+        () => writeJsonFileDurable(destination, { revision: 1 }, 0o600, {
+          open: async (...args) => {
+            const handle = await open(...args);
+            return {
+              writeFile: handle.writeFile.bind(handle),
+              chmod: handle.chmod.bind(handle),
+              sync: async () => { throw new Error('file sync failed'); },
+              close: handle.close.bind(handle),
+            };
+          },
+        }),
+        /file sync failed/,
+      );
+      await assert.rejects(() => readFile(destination), error => error.code === 'ENOENT');
+      assert.deepEqual(await readdir(dir), []);
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('does not report a durable JSON write as successful when parent directory sync fails', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'claude-rotator-durable-dir-'));
+    const destination = join(dir, 'credential.json');
+    try {
+      await assert.rejects(
+        () => writeJsonFileDurable(destination, { revision: 1 }, 0o600, {
+          open: async (...args) => {
+            const handle = await open(...args);
+            if (args[0] !== dir) return handle;
+            return {
+              sync: async () => { throw new Error('directory sync failed'); },
+              close: handle.close.bind(handle),
+            };
+          },
+        }),
+        /directory sync failed/,
+      );
+      assert.deepEqual(JSON.parse(await readFile(destination, 'utf8')), { revision: 1 });
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('does not report a durable removal as successful when parent directory sync fails', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'claude-rotator-durable-remove-'));
+    const destination = join(dir, 'refresh-intent.json');
+    await writeFile(destination, '{}');
+    try {
+      await assert.rejects(
+        () => removeFileDurable(destination, {
+          open: async (...args) => {
+            const handle = await open(...args);
+            return {
+              sync: async () => { throw new Error('remove directory sync failed'); },
+              close: handle.close.bind(handle),
+            };
+          },
+        }),
+        /remove directory sync failed/,
+      );
+      await assert.rejects(() => readFile(destination), error => error.code === 'ENOENT');
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+});
 
 describe('MemorySecretStore', () => {
   it('stores, lists, and removes secrets without exposing internals', async () => {
@@ -103,6 +177,45 @@ describe('LinuxFileSecretStore', () => {
     assert.deepEqual(await store.list(), ['acct_1']);
     assert.equal((await stat(join(dir, 'accounts'))).mode & 0o777, 0o700);
     assert.equal((await stat(join(dir, 'accounts', 'acct_1.json'))).mode & 0o777, 0o600);
+  });
+
+  it('converts a refresh-intent directory sync failure into an unknown native outcome', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'claude-rotator-intent-remove-sync-'));
+    const accountsDir = join(dir, 'accounts');
+    const store = new LinuxFileSecretStore({ accountsDir });
+    const original = {
+      accessToken: 'intent-access-fixture',
+      refreshToken: 'intent-refresh-fixture',
+      expiresAt: 1,
+    };
+    try {
+      await store.set('acct_1', original);
+      await assert.rejects(
+        () => store.refreshIfUnchanged('acct_1', original, async (_current, transaction) => {
+          await transaction.beforeHandoff();
+          throw Object.assign(new Error('ambiguous handoff fixture'), {
+            code: 'NATIVE_REFRESH_OUTCOME_UNKNOWN',
+          });
+        }),
+        error => error.code === 'NATIVE_REFRESH_OUTCOME_UNKNOWN',
+      );
+      store.refreshIntents.durableFileDeps = {
+        open: async (...args) => {
+          const handle = await open(...args);
+          return {
+            sync: async () => { throw new Error('intent directory sync failed'); },
+            close: handle.close.bind(handle),
+          };
+        },
+      };
+
+      await assert.rejects(
+        () => store.refreshIntents.remove('acct_1'),
+        error => error.code === 'NATIVE_REFRESH_OUTCOME_UNKNOWN',
+      );
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
   });
 
   it('rejects unsafe account ids', async () => {
