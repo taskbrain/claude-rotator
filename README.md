@@ -82,7 +82,7 @@ flowchart LR
 1. `claude-rotator install` が Claude Code の設定ファイル（`~/.claude/settings.json`）を書き換え、`ANTHROPIC_BASE_URL` をこのプロキシ（既定 `http://127.0.0.1:37891`）へ向けます。
 2. どのターミナルやサブエージェントから来たかに関係なく、各 `POST /v1/messages` の `model` をその都度判定します。`claude-fable-<数字>...` は Fable、それ以外は Other（Sonnet / Opus / Haiku / 識別不能モデル）として扱います。
 3. Fable には共通枠と Fable 固有枠、Other には共通枠を適用し、そのリクエストを処理できるアカウントを選びます。Fable 固有枠だけが枯渇していても、同じアカウントで Other のリクエストは処理できます。
-4. 共通枠の到達が確認できた場合は利用可能な別アカウントへ切り替えます。Fable の曖昧な429は Usage API で枯渇を確認できた場合だけ1回再送し、理由を確認できない429を別アカウントへ無条件に流しません。
+4. 共通枠の到達が確認できた場合は利用可能な別アカウントへ切り替えます。正確なモデル ID `claude-fable-5` の曖昧な429は、Usage API で枯渇を確認できた場合だけ1回再送します。それ以外のモデル ID や、理由を確認できない429を別アカウントへ無条件に流しません。
 5. 各アカウントの共通枠 / モデル別枠は既定で15分ごとに取得します。`claude-rotator refresh-usage` で即時取得でき、`status` / `monitor` にはモデル系列別の候補順を表示します。
 6. 保存済み OAuth access token は期限の30分前から更新対象になり、Claude Code 本体を使って隔離領域内で更新されます。詳しくは [OAuth認証情報の自動更新](#oauth認証情報の自動更新) を参照してください。
 
@@ -748,7 +748,7 @@ flowchart LR
 1. `claude-rotator install` rewrites Claude Code's config file (`~/.claude/settings.json`) so `ANTHROPIC_BASE_URL` points at this proxy (default `http://127.0.0.1:37891`).
 2. Regardless of which terminal or subagent sent it, each `POST /v1/messages` is classified from its `model`. IDs matching `claude-fable-<digit>...` are Fable; everything else is Other (Sonnet / Opus / Haiku / unidentified models).
 3. Fable requests are checked against shared and Fable-specific limits, while Other requests use shared limits. An account that has exhausted only its Fable allowance can still serve Other requests.
-4. A confirmed shared-limit exhaustion switches to another available account. An ambiguous Fable 429 is replayed once only when the Usage API confirms exhaustion; an unconfirmed 429 is not blindly sent through another account.
+4. A confirmed shared-limit exhaustion switches to another available account. An ambiguous 429 for the exact model ID `claude-fable-5` is replayed once only when the Usage API confirms exhaustion. Other model IDs and unconfirmed 429s are not blindly sent through another account.
 5. Shared and model-scoped usage is fetched every 15 minutes by default. `claude-rotator refresh-usage` fetches it immediately, and `status` / `monitor` shows the candidate order for each model family.
 6. Saved OAuth access tokens become refresh candidates 30 minutes before expiry and are refreshed by Claude Code itself in isolated storage. See [Automatic OAuth Credential Refresh](#automatic-oauth-credential-refresh).
 
