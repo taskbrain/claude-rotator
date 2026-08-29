@@ -5175,15 +5175,17 @@ describe('createProxyServer', () => {
     await secretStore.set('acct_2', { accessToken: 'access-token-2' });
     const originalGetSecret = secretStore.get.bind(secretStore);
     let targetSecretReads = 0;
-    const readAccountTwoFailingOnSecondRead = async accountId => {
+    const readAccountTwoFailingOnFinalRead = async accountId => {
       if (accountId === 'acct_2') {
         targetSecretReads += 1;
-        if (targetSecretReads === 2) throw new Error('final reactive target read failed');
+        // Duplicate-token preflight and refresh-intent reconciliation perform
+        // the first two reads; reactive snapshot/final resolution are 3/4.
+        if (targetSecretReads === 4) throw new Error('final reactive target read failed');
       }
       return originalGetSecret(accountId);
     };
-    secretStore.get = readAccountTwoFailingOnSecondRead;
-    secretStore.getOperational = readAccountTwoFailingOnSecondRead;
+    secretStore.get = readAccountTwoFailingOnFinalRead;
+    secretStore.getOperational = readAccountTwoFailingOnFinalRead;
     const accountManager = new AccountManager({
       accounts: [
         { id: 'acct_1', type: 'oauth' },
@@ -5227,7 +5229,7 @@ describe('createProxyServer', () => {
       status: 429,
       body: originalBody,
       marker: 'target-read-failed',
-      targetSecretReads: 2,
+      targetSecretReads: 4,
       usageCalls: 1,
       upstreamSeen: ['Bearer access-token-1'],
     });
@@ -7525,6 +7527,120 @@ describe('createProxyServer', () => {
     assert.equal(second.body.accounts[0].ok, false);
     assert.equal(refreshCalls, 1);
     assert.equal(second.body.status.accounts[0].unavailableReason.type, 'oauth_refresh_failed');
+  });
+
+  it('parks every account sharing a refresh token before native handoff', async () => {
+    const secretStore = new MemorySecretStore();
+    for (const [accountId, accessToken] of [
+      ['acct_1', 'duplicate-access-fixture-1'],
+      ['acct_2', 'duplicate-access-fixture-2'],
+    ]) {
+      await secretStore.set(accountId, {
+        accessToken,
+        refreshToken: 'duplicate-refresh-fixture',
+        expiresAt: 1,
+      });
+    }
+    const accountManager = new AccountManager({
+      accounts: [
+        { id: 'acct_1', name: 'a@example.com', type: 'oauth' },
+        { id: 'acct_2', name: 'b@example.com', type: 'oauth' },
+      ],
+      now: () => 1000,
+    });
+    let refreshCalls = 0;
+    const proxy = await listen(createProxyServer({
+      accountManager,
+      secretStore,
+      config: {
+        upstream: 'http://127.0.0.1:1',
+        usagePolling: { enabled: false, requestSpacingMs: 0 },
+      },
+      tokenRefresher: async () => {
+        refreshCalls += 1;
+        return assert.fail('duplicate refresh credential must not reach native handoff');
+      },
+      usageFetcher: async () => assert.fail('duplicate refresh credential must not fetch usage'),
+    }));
+    cleanupAfterTest(async () => close(proxy.server));
+
+    const refresh = await requestJson(`${proxy.url}/internal/refresh-usage`, { method: 'POST' });
+
+    assert.equal(refresh.status, 200);
+    assert.equal(refreshCalls, 0);
+    assert.deepEqual(
+      refresh.body.status.accounts.map(account => account.unavailableReason.type),
+      ['oauth_refresh_failed', 'oauth_refresh_failed'],
+    );
+    assert.equal(JSON.stringify(refresh.body).includes('duplicate-refresh-fixture'), false);
+  });
+
+  it('unparks duplicate refresh-token accounts after a credential-changing reload resolves the duplicate', async () => {
+    const secretStore = new MemorySecretStore();
+    await secretStore.set('acct_1', {
+      accessToken: 'reload-duplicate-access-1',
+      refreshToken: 'reload-duplicate-refresh',
+      expiresAt: 1,
+    });
+    await secretStore.set('acct_2', {
+      accessToken: 'reload-duplicate-access-2',
+      refreshToken: 'reload-duplicate-refresh',
+      expiresAt: 1,
+    });
+    const accounts = [
+      { id: 'acct_1', name: 'a@example.com', type: 'oauth', credentialRevision: 'rev-1' },
+      { id: 'acct_2', name: 'b@example.com', type: 'oauth', credentialRevision: 'rev-1' },
+    ];
+    let reloadedAccounts = accounts;
+    let refreshCalls = 0;
+    const accountManager = new AccountManager({ accounts, now: () => 1000 });
+    const proxy = await listen(createProxyServer({
+      accountManager,
+      secretStore,
+      config: {
+        upstream: 'http://127.0.0.1:1',
+        usagePolling: { enabled: false, requestSpacingMs: 0 },
+      },
+      reloadAccounts: async () => reloadedAccounts,
+      tokenRefresher: async refreshToken => {
+        refreshCalls += 1;
+        return {
+          accessToken: `refreshed-access-${refreshCalls}`,
+          refreshToken,
+          expiresAt: Date.now() + 60 * 60 * 1000,
+        };
+      },
+      usageFetcher: async () => ({
+        five_hour: { utilization: 0.1, resets_at: futureReset() },
+        seven_day: { utilization: 0.2, resets_at: futureReset() },
+      }),
+    }));
+    cleanupAfterTest(async () => close(proxy.server));
+
+    const parked = await requestJson(`${proxy.url}/internal/refresh-usage`, { method: 'POST' });
+    assert.equal(refreshCalls, 0);
+    assert.deepEqual(
+      parked.body.status.accounts.map(account => account.unavailableReason.type),
+      ['oauth_refresh_failed', 'oauth_refresh_failed'],
+    );
+
+    await secretStore.set('acct_2', {
+      accessToken: 'reload-distinct-access-2',
+      refreshToken: 'reload-distinct-refresh-2',
+      expiresAt: 1,
+    });
+    reloadedAccounts = accounts.map(account => ({
+      ...account,
+      credentialRevision: account.id === 'acct_2' ? 'rev-2' : account.credentialRevision,
+    }));
+    const reload = await requestJson(`${proxy.url}/internal/reload`, { method: 'POST' });
+    const refreshed = await requestJson(`${proxy.url}/internal/refresh-usage`, { method: 'POST' });
+
+    assert.equal(reload.status, 200);
+    assert.equal(refreshed.status, 200);
+    assert.equal(refreshCalls, 2);
+    assert.deepEqual(refreshed.body.status.accounts.map(account => account.unavailableReason), [null, null]);
+    assert.equal(JSON.stringify([reload.body, refreshed.body]).includes('reload-duplicate-refresh'), false);
   });
 
   it('keeps a persisted marker authoritative during startup and revision-only reload', async () => {

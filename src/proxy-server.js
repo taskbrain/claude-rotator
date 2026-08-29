@@ -102,6 +102,9 @@ export function createProxyServer({
       logger?.(`${new Date().toISOString()} credential-refresh account=${context?.accountId || 'unknown'} result=${result} errorType=${credentialRefreshErrorType(error)}${retry}${retrySource}`);
     },
   });
+  const duplicateRefreshAccountIds = new Set();
+  const duplicateRefreshAccounts = new WeakSet();
+  let operationalStateCheck = Promise.resolve();
 
   const usageObservationTracker = createUsageObservationTracker();
   const usageRequestOptions = {
@@ -121,6 +124,8 @@ export function createProxyServer({
     allowLiveClaudeCodeCredentials,
     usageRefreshConcurrency: usagePollingConcurrency(config, accountManager.accounts.length),
     usageRefreshRequestSpacingMs: usagePollingRequestSpacingMs(config),
+    beforeRefresh: () => operationalStateCheck,
+    duplicateRefreshAccountIds,
     logger,
   });
   const reactiveQuotaConfirmer = createReactiveQuotaConfirmer({
@@ -157,7 +162,22 @@ export function createProxyServer({
       await persistState();
     }
   };
-  let operationalStateCheck = checkPersistedRefreshIntents();
+  const checkInitialCredentialState = async () => {
+    replaceSet(
+      duplicateRefreshAccountIds,
+      await duplicateRefreshTokenAccountIds(accountManager.accounts, secretStore),
+    );
+    if (parkDuplicateRefreshTokenAccounts({
+      accountManager,
+      duplicateRefreshAccountIds,
+      duplicateRefreshAccounts,
+    })) {
+      await persistState();
+    }
+    await checkPersistedRefreshIntents();
+  };
+  operationalStateCheck = checkInitialCredentialState();
+  operationalStateCheck.catch(() => {});
 
   const server = http.createServer(async (req, res) => {
     try {
@@ -204,7 +224,22 @@ export function createProxyServer({
         invalidateLiveClaudeCodeCache();
         if (reloadAccounts) {
           const accounts = await reloadAccounts();
+          const nextDuplicateIds = await duplicateRefreshTokenAccountIds(accounts, secretStore);
+          const ownedDuplicateIds = duplicateRefreshErrorAccountIds(accountManager, duplicateRefreshAccounts);
+          let duplicateStateChanged = clearResolvedDuplicateRefreshErrors({
+            accountManager,
+            duplicateRefreshAccountIds: nextDuplicateIds,
+            duplicateRefreshAccounts,
+          });
           accountManager.replaceAccounts(accounts);
+          replaceSet(duplicateRefreshAccountIds, nextDuplicateIds);
+          duplicateStateChanged = parkDuplicateRefreshTokenAccounts({
+            accountManager,
+            duplicateRefreshAccountIds,
+            duplicateRefreshAccounts,
+            ownedDuplicateIds,
+          }) || duplicateStateChanged;
+          if (duplicateStateChanged) await persistState();
         }
         // Reconcile in the background instead of awaiting it (or replacing
         // the shared operationalStateCheck gate other requests await): each
@@ -309,6 +344,69 @@ async function reconcilePersistedRefreshIntents({ accountManager, secretStore, l
         changed = true;
       }
     }
+  }
+  return changed;
+}
+
+async function duplicateRefreshTokenAccountIds(accounts, secretStore) {
+  const groups = new Map();
+  for (const account of accounts) {
+    if (
+      account.type === 'apikey'
+      || account.id === 'current'
+      || account.credentialSource === 'claude-code-current'
+    ) continue;
+    const secret = await secretStore.get(account.id);
+    if (!secret?.refreshToken) continue;
+    const key = createHash('sha256').update(secret.refreshToken).digest('hex');
+    const ids = groups.get(key) || [];
+    ids.push(account.id);
+    groups.set(key, ids);
+  }
+  return new Set([...groups.values()].filter(ids => ids.length > 1).flat());
+}
+
+function replaceSet(target, values) {
+  target.clear();
+  for (const value of values) target.add(value);
+}
+
+function duplicateRefreshErrorAccountIds(accountManager, duplicateRefreshAccounts) {
+  return new Set(
+    accountManager.accounts
+      .filter(account => duplicateRefreshAccounts.has(account))
+      .map(account => account.id),
+  );
+}
+
+function parkDuplicateRefreshTokenAccounts({
+  accountManager,
+  duplicateRefreshAccountIds,
+  duplicateRefreshAccounts,
+  ownedDuplicateIds = new Set(),
+}) {
+  let changed = false;
+  for (const account of accountManager.accounts) {
+    if (!duplicateRefreshAccountIds.has(account.id)) continue;
+    if (ownedDuplicateIds.has(account.id)) duplicateRefreshAccounts.add(account);
+    if (account.errorReason?.type === 'oauth_refresh_failed') continue;
+    accountManager.markError(account.id, 'oauth_refresh_failed', 'OAuth token refresh failed');
+    duplicateRefreshAccounts.add(account);
+    changed = true;
+  }
+  return changed;
+}
+
+function clearResolvedDuplicateRefreshErrors({
+  accountManager,
+  duplicateRefreshAccountIds,
+  duplicateRefreshAccounts,
+}) {
+  let changed = false;
+  for (const account of accountManager.accounts) {
+    if (!duplicateRefreshAccounts.has(account) || duplicateRefreshAccountIds.has(account.id)) continue;
+    accountManager.markAuthenticated(account);
+    changed = true;
   }
   return changed;
 }
@@ -456,11 +554,14 @@ function createUsageRefresher({
   usageObservationTracker,
   usageRefreshConcurrency,
   usageRefreshRequestSpacingMs,
+  beforeRefresh,
+  duplicateRefreshAccountIds,
   logger,
 }) {
   let inFlight = null;
   let attempted = false;
   const refreshAll = async ({ afterCurrent = false } = {}) => {
+    await beforeRefresh?.();
     if (inFlight) {
       if (!afterCurrent) return inFlight;
       const current = inFlight;
@@ -481,6 +582,7 @@ function createUsageRefresher({
       usageObservationTracker,
       usageRefreshConcurrency,
       usageRefreshRequestSpacingMs,
+      duplicateRefreshAccountIds,
       logger,
     }).finally(() => {
       attempted = true;
@@ -1331,6 +1433,7 @@ async function refreshAllOnce({
   usageObservationTracker,
   usageRefreshConcurrency,
   usageRefreshRequestSpacingMs,
+  duplicateRefreshAccountIds,
   logger,
 }) {
   const results = await mapWithConcurrency(
@@ -1348,6 +1451,7 @@ async function refreshAllOnce({
       allowLiveClaudeCodeCredentials,
       usageRequestOptions,
       usageObservationTracker,
+      duplicateRefreshAccountIds,
       logger,
     }),
   );
@@ -1398,9 +1502,13 @@ async function refreshAccountUsage({
   allowLiveClaudeCodeCredentials,
   usageRequestOptions,
   usageObservationTracker,
+  duplicateRefreshAccountIds,
   logger,
 }) {
   if (account.type === 'apikey') return { account: account.id, ok: true, skipped: 'apikey' };
+  if (duplicateRefreshAccountIds?.has(account.id)) {
+    return { account: account.id, ok: false, skipped: 'duplicate-refresh-token' };
+  }
   const observation = usageObservationTracker.start(account);
 
   try {
