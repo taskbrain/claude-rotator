@@ -14,6 +14,7 @@ npm レジストリでは配布していません（`package.json` は `"private
 
 ## 目次
 
+- [v0.2.1 の主な更新](#v021-の主な更新)
 - [v0.2.0 の主な更新](#v020-の主な更新)
 - [なぜ作ったか](#なぜ作ったか)
 - [できること](#できること)
@@ -33,6 +34,11 @@ npm レジストリでは配布していません（`package.json` は `"private
 - [安全設計](#安全設計)
 - [開発](#開発)
 - [English](#english)
+
+## v0.2.1 の主な更新
+
+- **uninstall --purge-secrets の警告追加**（Issue #31 / PR #36）: macOS で `config.json` が破損・読み取り不能のとき、Keychain の削除対象が `current` アカウントだけに縮小されるにもかかわらず、無警告で成功表示になっていた問題を修正しました。config 読み取りが例外になった場合は stderr へ警告を1行出力します（uninstall 自体は継続し exit code は 0 のまま。ENOENT・Linux・config が正常なときは警告を出しません。元の例外内容や秘密情報は出力しません）。
+- **login --json の Usage 案内を安全な形式優先に**（Issue #32 / PR #37）: 引数不足時に表示される Usage が、ps 出力やシェル履歴に露出しうる `--json <token-json>` 形式のみを案内していたのを、安全な標準入力形式 `--json -` を第一選択として案内するよう修正しました（literal 形式にも露出リスクの注記を追加。実行ロジック自体は変更していません）。
 
 ## v0.2.0 の主な更新
 
@@ -681,6 +687,7 @@ This package is not published to the npm registry (`package.json` sets `"private
 
 ### Table of Contents
 
+- [What's New in v0.2.1](#whats-new-in-v021)
 - [What's New in v0.2.0](#whats-new-in-v020)
 - [Why](#why)
 - [What It Does](#what-it-does)
@@ -699,6 +706,11 @@ This package is not published to the npm registry (`package.json` sets `"private
 - [Troubleshooting](#troubleshooting)
 - [Security Design](#security-design)
 - [Development](#development)
+
+### What's New in v0.2.1
+
+- **`uninstall --purge-secrets` warning added** (Issue #31 / PR #36): On macOS, when `config.json` was corrupted or unreadable, the Keychain entries targeted for purge silently shrank to just the `current` account, yet the command still reported success with no warning. Fixed: a failed config read now prints a one-line warning to stderr (uninstall still continues and exits 0; ENOENT, Linux, and a healthy config produce no warning; the original exception and secret values are never printed).
+- **`login --json` usage guidance now prefers the safe form** (Issue #32 / PR #37): When required arguments were missing, the usage message only showed the unsafe `--json <token-json>` literal form. Fixed: the safe stdin form `--json -` is now shown first, and the literal form now carries a note about its exposure risk via `ps` output and shell history (the execution logic itself is unchanged).
 
 ### What's New in v0.2.0
 
