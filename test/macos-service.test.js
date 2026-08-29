@@ -51,6 +51,34 @@ describe('macOS service reconciliation', () => {
     ]);
   });
 
+  it('fails within a bounded wait when launchd never removes the main job', async () => {
+    const fake = createLaunchctl([MAIN_JOB], { delayedBootoutPrints: Infinity });
+    let guardTimer;
+    const outcome = await Promise.race([
+      reconcileMacosMainService({
+        uid: 501,
+        plistPath: '/tmp/main.plist',
+        definitionChanged: true,
+        env: LOCKED_ENV,
+        execFileImpl: fake.exec,
+        sleep: async () => {},
+      }).then(
+        () => ({ type: 'resolved' }),
+        error => ({ type: 'rejected', message: error.message }),
+      ),
+      new Promise(resolve => {
+        guardTimer = setTimeout(() => resolve({ type: 'still-pending' }), 250);
+      }),
+    ]);
+    clearTimeout(guardTimer);
+
+    assert.deepEqual(outcome, {
+      type: 'rejected',
+      message: 'main service is still registered',
+    });
+    assert.equal(fake.calls.some(args => args[0] === 'bootstrap'), false);
+  });
+
   it('kickstarts an unchanged main and reloads a changed main', async t => {
     await t.test('unchanged', async () => {
       const fake = createLaunchctl([MAIN_JOB]);
@@ -87,8 +115,30 @@ describe('macOS service reconciliation', () => {
     });
   });
 
+  it('waits for an asynchronously removed main job before bootstrapping its replacement', async () => {
+    const fake = createLaunchctl([MAIN_JOB], { delayedBootoutPrints: 1 });
+
+    await reconcileMacosMainService({
+      uid: 501,
+      plistPath: '/tmp/main.plist',
+      definitionChanged: true,
+      env: LOCKED_ENV,
+      execFileImpl: fake.exec,
+      sleep: async () => {},
+    });
+
+    assert.deepEqual(fake.calls, [
+      ['print', MAIN_JOB],
+      ['bootout', MAIN_JOB],
+      ['print', MAIN_JOB],
+      ['print', MAIN_JOB],
+      ['bootstrap', 'gui/501', '/tmp/main.plist'],
+      ['print', MAIN_JOB],
+    ]);
+  });
+
   it('starts and stops the watchdog idempotently', async () => {
-    const fake = createLaunchctl();
+    const fake = createLaunchctl([], { delayedBootoutPrints: 1 });
 
     await startMacosWatchdogService({
       uid: 501,
@@ -100,6 +150,7 @@ describe('macOS service reconciliation', () => {
       uid: 501,
       env: LOCKED_ENV,
       execFileImpl: fake.exec,
+      sleep: async () => {},
     });
 
     assert.deepEqual(fake.calls, [
@@ -109,13 +160,15 @@ describe('macOS service reconciliation', () => {
       ['print', WATCHDOG_JOB],
       ['bootout', WATCHDOG_JOB],
       ['print', WATCHDOG_JOB],
+      ['print', WATCHDOG_JOB],
     ]);
   });
 });
 
-function createLaunchctl(initialJobs = []) {
+function createLaunchctl(initialJobs = [], { delayedBootoutPrints = 0 } = {}) {
   const jobs = new Set(initialJobs);
   const calls = [];
+  const pendingRemovals = new Map();
   return {
     calls,
     async exec(command, args) {
@@ -123,6 +176,13 @@ function createLaunchctl(initialJobs = []) {
       calls.push(args);
       const [action, ...rest] = args;
       if (action === 'print') {
+        const pendingPrints = pendingRemovals.get(rest[0]);
+        if (pendingPrints === 0) {
+          pendingRemovals.delete(rest[0]);
+          jobs.delete(rest[0]);
+        } else if (pendingPrints > 0) {
+          pendingRemovals.set(rest[0], pendingPrints - 1);
+        }
         if (jobs.has(rest[0])) return;
         throw Object.assign(new Error('not found'), { code: 113 });
       }
@@ -134,7 +194,11 @@ function createLaunchctl(initialJobs = []) {
         return;
       }
       if (action === 'bootout') {
-        jobs.delete(rest[0]);
+        if (delayedBootoutPrints > 0) {
+          pendingRemovals.set(rest[0], delayedBootoutPrints);
+        } else {
+          jobs.delete(rest[0]);
+        }
         return;
       }
       if (action === 'kickstart') return;

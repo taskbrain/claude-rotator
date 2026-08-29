@@ -5,6 +5,11 @@ import { dirname } from 'node:path';
 import { promisify } from 'node:util';
 
 const execFileAsync = promisify(execFile);
+const SERVICE_REMOVAL_TIMEOUT_MS = 15_000;
+const SERVICE_REMOVAL_POLL_INTERVAL_MS = 50;
+const SERVICE_REMOVAL_MAX_WAITS = Math.ceil(
+  SERVICE_REMOVAL_TIMEOUT_MS / SERVICE_REMOVAL_POLL_INTERVAL_MS,
+);
 
 export const MACOS_SERVICE_LOCK_MARKER_ENV = 'CLAUDE_ROTATOR_MACOS_SERVICE_LOCKED';
 export const MACOS_SERVICE_LOCK_MARKER_VALUE = '1';
@@ -83,6 +88,7 @@ export async function reconcileMacosMainService({
   definitionChanged,
   env = process.env,
   execFileImpl = execFileAsync,
+  sleep = delay,
 }) {
   assertMacosServiceLockHeld(env);
   const target = serviceTarget(uid, MACOS_MAIN_SERVICE_LABEL);
@@ -95,7 +101,7 @@ export async function reconcileMacosMainService({
   }
   if (registered) {
     await runLaunchctl(execFileImpl, ['bootout', target.job]);
-    await requireNoRegistration(execFileImpl, target.job, 'main service');
+    await requireNoRegistration(execFileImpl, target.job, 'main service', sleep);
   }
   await runLaunchctl(execFileImpl, ['bootstrap', target.domain, plistPath]);
   await requireRegistration(execFileImpl, target.job, 'main service');
@@ -139,8 +145,9 @@ export async function restoreMacosServiceRegistration({
   registered,
   env = process.env,
   execFileImpl = execFileAsync,
+  sleep = delay,
 }) {
-  await stopMacosService({ uid, label, name: 'service', env, execFileImpl });
+  await stopMacosService({ uid, label, name: 'service', env, execFileImpl, sleep });
   if (!registered) return;
   const target = serviceTarget(uid, label);
   await runLaunchctl(execFileImpl, ['bootstrap', target.domain, plistPath]);
@@ -153,12 +160,13 @@ async function stopMacosService({
   name,
   env = process.env,
   execFileImpl = execFileAsync,
+  sleep = delay,
 }) {
   assertMacosServiceLockHeld(env);
   const target = serviceTarget(uid, label);
   if (!(await queryRegistration(execFileImpl, target.job))) return;
   await runLaunchctl(execFileImpl, ['bootout', target.job]);
-  await requireNoRegistration(execFileImpl, target.job, name);
+  await requireNoRegistration(execFileImpl, target.job, name, sleep);
 }
 
 function serviceTarget(uid, label) {
@@ -191,10 +199,18 @@ async function requireRegistration(execFileImpl, job, name) {
   }
 }
 
-async function requireNoRegistration(execFileImpl, job, name) {
-  if (await queryRegistration(execFileImpl, job)) {
-    throw new Error(`${name} is still registered`);
+async function requireNoRegistration(execFileImpl, job, name, sleep) {
+  for (let waits = 0; waits <= SERVICE_REMOVAL_MAX_WAITS; waits += 1) {
+    if (!(await queryRegistration(execFileImpl, job))) return;
+    if (waits === SERVICE_REMOVAL_MAX_WAITS) {
+      throw new Error(`${name} is still registered`);
+    }
+    await sleep(SERVICE_REMOVAL_POLL_INTERVAL_MS);
   }
+}
+
+function delay(ms) {
+  return new Promise(resolve => setTimeout(resolve, ms));
 }
 
 function launchctlError(action, error) {
