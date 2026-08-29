@@ -1223,6 +1223,132 @@ describe('AccountManager', () => {
     assert.equal(picked.id, 'acct_1', 'omitting modelFamily must default to non-fable (permissive) routing');
   });
 
+  it('reports model-aware availability in the order each account can actually recover', () => {
+    const now = Date.parse('2026-08-29T05:00:00.000Z');
+    const manager = new AccountManager({
+      accounts: [
+        { id: 'acct_1', name: 'a@example.com', type: 'oauth' },
+        { id: 'acct_2', name: 'b@example.com', type: 'oauth' },
+        { id: 'acct_3', name: 'c@example.com', type: 'oauth' },
+      ],
+      switchThreshold: 1,
+      now: () => now,
+    });
+
+    manager.applyUsage('acct_1', {
+      five_hour: { utilization: 0.2, resets_at: '2026-08-29T10:00:00.000Z' },
+      seven_day: { utilization: 0.2, resets_at: '2026-09-01T05:00:00.000Z' },
+      scoped_weekly: [{
+        key: 'fable',
+        label: 'Fable',
+        utilization: 1,
+        resets_at: '2026-08-29T09:00:00.000Z',
+      }],
+    });
+    manager.applyUsage('acct_2', {
+      five_hour: { utilization: 1, resets_at: '2026-08-29T06:00:00.000Z' },
+      seven_day: { utilization: 0.2, resets_at: '2026-09-01T05:00:00.000Z' },
+      scoped_weekly: [{
+        key: 'fable',
+        label: 'Fable',
+        utilization: 1,
+        resets_at: '2026-08-29T08:00:00.000Z',
+      }],
+    });
+    manager.applyUsage('acct_3', {
+      five_hour: { utilization: 0.2, resets_at: '2026-08-29T10:00:00.000Z' },
+      seven_day: { utilization: 1, resets_at: '2026-08-29T07:00:00.000Z' },
+    });
+
+    const status = manager.getStatus();
+    assert.deepEqual(status.routingAvailability.other, [
+      {
+        account: 'acct_1',
+        accountName: 'a@example.com',
+        state: 'available',
+        availableAt: null,
+      },
+      {
+        account: 'acct_2',
+        accountName: 'b@example.com',
+        state: 'waiting',
+        availableAt: '2026-08-29T06:00:00.000Z',
+      },
+      {
+        account: 'acct_3',
+        accountName: 'c@example.com',
+        state: 'waiting',
+        availableAt: '2026-08-29T07:00:00.000Z',
+      },
+    ]);
+    assert.deepEqual(status.routingAvailability.fable, [
+      {
+        account: 'acct_3',
+        accountName: 'c@example.com',
+        state: 'waiting',
+        availableAt: '2026-08-29T07:00:00.000Z',
+      },
+      {
+        account: 'acct_2',
+        accountName: 'b@example.com',
+        state: 'waiting',
+        availableAt: '2026-08-29T08:00:00.000Z',
+      },
+      {
+        account: 'acct_1',
+        accountName: 'a@example.com',
+        state: 'waiting',
+        availableAt: '2026-08-29T09:00:00.000Z',
+      },
+    ]);
+  });
+
+  it('reports unknown after timed candidates when reset evidence or credentials are unusable', () => {
+    const now = Date.parse('2026-08-29T05:00:00.000Z');
+    const manager = new AccountManager({
+      accounts: [
+        { id: 'missing_reset', name: 'missing@example.com', type: 'oauth' },
+        { id: 'credential_error', name: 'error@example.com', type: 'oauth' },
+        { id: 'cooldown', name: 'cooldown@example.com', type: 'oauth' },
+      ],
+      switchThreshold: 1,
+      now: () => now,
+    });
+    manager.applyUsage('missing_reset', {
+      five_hour: { utilization: 1 },
+      seven_day: { utilization: 0.2, resets_at: '2026-09-01T05:00:00.000Z' },
+    });
+    for (const accountId of ['credential_error', 'cooldown']) {
+      manager.applyUsage(accountId, {
+        five_hour: { utilization: 0.2, resets_at: '2026-08-29T10:00:00.000Z' },
+        seven_day: { utilization: 0.2, resets_at: '2026-09-01T05:00:00.000Z' },
+      });
+    }
+    manager.markError('credential_error', 'oauth_refresh_failed', 'refresh failed');
+    manager.markRateLimited('cooldown', 60 * 60);
+
+    assert.deepEqual(manager.getStatus().routingAvailability.other, [
+      {
+        account: 'cooldown',
+        accountName: 'cooldown@example.com',
+        state: 'waiting',
+        availableAt: '2026-08-29T06:00:00.000Z',
+      },
+      {
+        account: 'missing_reset',
+        accountName: 'missing@example.com',
+        state: 'unknown',
+        availableAt: null,
+      },
+      {
+        account: 'credential_error',
+        accountName: 'error@example.com',
+        state: 'unknown',
+        availableAt: null,
+      },
+    ]);
+  });
+
   it('rejects every model family when the common weekly/5h window is exhausted (not model-scoped)', () => {
     const manager = new AccountManager({
       accounts: [{ id: 'acct_1', name: 'a@example.com', type: 'oauth' }],

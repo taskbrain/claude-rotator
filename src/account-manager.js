@@ -282,6 +282,10 @@ export class AccountManager {
       currentAccount: active?.id || null,
       currentAccountName: active?.name || null,
       switchThreshold: this.switchThreshold,
+      routingAvailability: {
+        fable: this.getRoutingAvailability('fable'),
+        other: this.getRoutingAvailability(null),
+      },
       accounts: this.accounts.map(account => {
         this.refreshQuotaState(account);
         return {
@@ -300,6 +304,51 @@ export class AccountManager {
       }),
       events: this.events.slice(0, 50),
     };
+  }
+
+  getRoutingAvailability(modelFamily = null) {
+    const candidates = this.accounts.map((account, index) => {
+      this.refreshQuotaState(account);
+      const isCurrent = index === this.currentIndex;
+      const available = this.isAvailable(account, modelFamily);
+      const score = available ? this.switchTargetScore(account, modelFamily) : null;
+
+      if (available && (isCurrent || score)) {
+        return {
+          account,
+          index,
+          isCurrent,
+          priority: account.priority,
+          score,
+          state: 'available',
+          availableAt: null,
+        };
+      }
+
+      return {
+        account,
+        index,
+        isCurrent,
+        priority: account.priority,
+        score: null,
+        ...futureAvailabilityForModelFamily(
+          account,
+          this.switchThreshold,
+          modelFamily,
+          this.now(),
+        ),
+      };
+    });
+
+    candidates.sort(compareRoutingAvailabilityCandidates);
+    return candidates.map(candidate => ({
+      account: candidate.account.id,
+      accountName: candidate.account.name,
+      state: candidate.state,
+      availableAt: candidate.availableAt == null
+        ? null
+        : new Date(candidate.availableAt).toISOString(),
+    }));
   }
 
   exportState() {
@@ -956,6 +1005,65 @@ function commonQuotaExhausted(quota, threshold) {
     if (utilization >= threshold) return true;
   }
   return false;
+}
+
+function futureAvailabilityForModelFamily(account, threshold, modelFamily, now) {
+  if (!account || account.status === 'error') {
+    return { state: 'unknown', availableAt: null };
+  }
+
+  const blockers = [];
+  const quota = account.quota || {};
+  if (quota.unified5h != null && quota.unified5h >= threshold) {
+    blockers.push(availabilityResetTimestamp(quota.unified5hReset));
+  }
+  if (quota.unified7d != null && quota.unified7d >= threshold) {
+    blockers.push(availabilityResetTimestamp(quota.unified7dReset));
+  }
+  if (quota.tokensLimit != null && quota.tokensRemaining != null) {
+    const utilization = 1 - quota.tokensRemaining / quota.tokensLimit;
+    if (utilization >= threshold) blockers.push(availabilityResetTimestamp(quota.resetsAt));
+  }
+  if (quota.requestsLimit != null && quota.requestsRemaining != null) {
+    const utilization = 1 - quota.requestsRemaining / quota.requestsLimit;
+    if (utilization >= threshold) blockers.push(availabilityResetTimestamp(quota.resetsAt));
+  }
+  if (Array.isArray(quota.weeklyScoped)) {
+    for (const limit of quota.weeklyScoped) {
+      if (!limit || typeof limit.utilization !== 'number' || limit.utilization < threshold) continue;
+      if (!scopeMatchesModelFamily(limit, modelFamily)) continue;
+      blockers.push(availabilityResetTimestamp(limit.resetAt));
+    }
+  }
+  if (account.rateLimitedUntil && account.rateLimitedUntil > now) {
+    blockers.push(availabilityResetTimestamp(account.rateLimitedUntil));
+  }
+
+  if (blockers.length === 0 || blockers.some(resetAt => resetAt == null || resetAt <= now)) {
+    return { state: 'unknown', availableAt: null };
+  }
+  return { state: 'waiting', availableAt: Math.max(...blockers) };
+}
+
+function availabilityResetTimestamp(value) {
+  if (typeof value === 'number' && Number.isFinite(value)) return value;
+  if (typeof value !== 'string' || value.length === 0) return null;
+  const parsed = Date.parse(value);
+  return Number.isFinite(parsed) ? parsed : null;
+}
+
+function compareRoutingAvailabilityCandidates(left, right) {
+  const rank = { available: 0, waiting: 1, unknown: 2 };
+  if (rank[left.state] !== rank[right.state]) return rank[left.state] - rank[right.state];
+  if (left.state === 'available') {
+    if (left.isCurrent !== right.isCurrent) return left.isCurrent ? -1 : 1;
+    if (left.score && right.score) return compareSwitchTargetScores(left, right);
+  }
+  if (left.state === 'waiting' && left.availableAt !== right.availableAt) {
+    return left.availableAt - right.availableAt;
+  }
+  if (left.priority !== right.priority) return left.priority - right.priority;
+  return left.index - right.index;
 }
 
 function compareSwitchTargetScores(left, right) {

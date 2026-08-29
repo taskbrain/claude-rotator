@@ -1827,6 +1827,71 @@ describe('createProxyServer', () => {
     assert.equal(accountManager.getStatus().currentAccount, 'acct_1');
   });
 
+  it('routes concurrent Fable and Sonnet requests independently without moving the shared current account', async () => {
+    const upstreamSeen = [];
+    let releaseBoth;
+    const bothArrived = new Promise(resolve => { releaseBoth = resolve; });
+    const upstream = await listen(http.createServer(async (req, res) => {
+      const chunks = [];
+      for await (const chunk of req) chunks.push(chunk);
+      const model = JSON.parse(Buffer.concat(chunks).toString('utf8')).model;
+      upstreamSeen.push([model, req.headers.authorization]);
+      if (upstreamSeen.length === 2) releaseBoth();
+      await bothArrived;
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ ok: true }));
+    }));
+    const secretStore = new MemorySecretStore();
+    await secretStore.set('acct_1', { accessToken: 'access-token-1' });
+    await secretStore.set('acct_2', { accessToken: 'access-token-2' });
+    const accountManager = new AccountManager({
+      accounts: [
+        { id: 'acct_1', name: 'a@example.com', type: 'oauth' },
+        { id: 'acct_2', name: 'b@example.com', type: 'oauth' },
+      ],
+      switchThreshold: 1,
+      now: () => 1000,
+    });
+    accountManager.applyUsage('acct_1', {
+      five_hour: { utilization: 0.2, resets_at: futureReset() },
+      seven_day: { utilization: 0.2, resets_at: futureReset() },
+      scoped_weekly: [{ key: 'fable', label: 'Fable', utilization: 1, resets_at: futureReset() }],
+    });
+    accountManager.applyUsage('acct_2', {
+      five_hour: { utilization: 0.3, resets_at: futureReset() },
+      seven_day: { utilization: 0.3, resets_at: futureReset() },
+    });
+    const proxy = await listen(createProxyServer({
+      accountManager,
+      secretStore,
+      config: { upstream: upstream.url, usagePolling: { enabled: false } },
+    }));
+    cleanupAfterTest(async () => {
+      releaseBoth?.();
+      await close(proxy.server);
+      await close(upstream.server);
+    });
+
+    const [fableResponse, sonnetResponse] = await Promise.all([
+      requestJson(`${proxy.url}/v1/messages`, {
+        method: 'POST',
+        body: JSON.stringify({ model: 'claude-fable-5' }),
+      }),
+      requestJson(`${proxy.url}/v1/messages`, {
+        method: 'POST',
+        body: JSON.stringify({ model: 'claude-sonnet-5' }),
+      }),
+    ]);
+
+    assert.equal(fableResponse.status, 200);
+    assert.equal(sonnetResponse.status, 200);
+    assert.deepEqual(new Map(upstreamSeen), new Map([
+      ['claude-fable-5', 'Bearer access-token-2'],
+      ['claude-sonnet-5', 'Bearer access-token-1'],
+    ]));
+    assert.equal(accountManager.getStatus().currentAccount, 'acct_1');
+  });
+
   it('routes a dated/suffixed Fable model id away from a fable-exhausted account (M3)', async () => {
     const upstreamSeen = [];
     const upstream = await listen(http.createServer((req, res) => {
