@@ -729,7 +729,12 @@ async function loginJsonCommand({ argv, write, deps }) {
   const id = argValue(argv, '--id');
   const name = argValue(argv, '--name') || id;
   const jsonArg = argValue(argv, '--json');
-  if (!id || !jsonArg) throw new Error('Usage: claude-rotator login --id <id> --name <email> --json <token-json>');
+  if (!id || !jsonArg) {
+    throw new Error(
+      'Usage: claude-rotator login --id <id> --name <email> --json -             (read token JSON from stdin; keeps it out of argv)\n' +
+      '   or: claude-rotator login --id <id> --name <email> --json <token-json>  (token appears in ps output and shell history)'
+    );
+  }
   assertSnapshotAccountId(id);
 
   const json = jsonArg === '-' ? await readStdinJson(deps) : jsonArg;

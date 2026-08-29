@@ -683,6 +683,27 @@ describe('runCli', () => {
     assert.equal(reloadObserved, true);
   });
 
+  it('login --json shows the safe stdin form first, with literal-JSON exposure risk noted', async () => {
+    const io = createIo();
+
+    // Missing --id triggers loginJsonCommand's own argument-check Usage error
+    // (dispatcher already requires --json to have a value to reach this code path).
+    const code = await runCli(['login', '--json', '-'], { ...io });
+
+    assert.equal(code, 1);
+    const output = io.output();
+    const safeIndex = output.indexOf('--json -');
+    const literalIndex = output.indexOf('--json <token-json>');
+    assert.ok(safeIndex >= 0, 'expected the stdin form "--json -" in the Usage message');
+    assert.ok(literalIndex >= 0, 'expected the literal form "--json <token-json>" in the Usage message');
+    assert.ok(safeIndex < literalIndex, 'expected "--json -" to appear before "--json <token-json>"');
+    assert.match(
+      output,
+      /(process listing|ps output|shell history)/,
+      'expected the literal form to be annotated with a process listing / shell history exposure warning',
+    );
+  });
+
   it('refuses login --json - immediately when stdin is a terminal, instead of hanging', async () => {
     const io = createIo();
 
