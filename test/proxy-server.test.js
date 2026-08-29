@@ -7633,6 +7633,85 @@ describe('createProxyServer', () => {
     );
   });
 
+  it('includes a newly-published account in the pre-handoff duplicate scan before reload', async () => {
+    const secretStore = new MemorySecretStore();
+    await secretStore.set('acct_1', {
+      accessToken: 'publish-window-access-1',
+      refreshToken: 'publish-window-refresh',
+      expiresAt: 1,
+    });
+    let configuredAccounts = [
+      { id: 'acct_1', name: 'one@example.com', type: 'oauth' },
+    ];
+    const accountManager = new AccountManager({
+      accounts: configuredAccounts,
+      now: () => 1000,
+    });
+    let refreshCalls = 0;
+    const proxy = await listen(createProxyServer({
+      accountManager,
+      secretStore,
+      config: {
+        upstream: 'http://127.0.0.1:1',
+        usagePolling: { enabled: false, requestSpacingMs: 0 },
+      },
+      credentialAccountsReader: async () => configuredAccounts,
+      reloadAccounts: async () => configuredAccounts,
+      tokenRefresher: async (_refreshToken, context) => {
+        await context.beforeHandoff();
+        refreshCalls += 1;
+        return assert.fail('newly-published duplicate must not reach native handoff');
+      },
+      usageFetcher: async () => assert.fail('duplicate refresh credential must not fetch usage'),
+    }));
+    cleanupAfterTest(async () => close(proxy.server));
+    await requestJson(`${proxy.url}/internal/status`);
+
+    let signalPublish;
+    let releasePublish;
+    const publishStarted = new Promise(resolve => { signalPublish = resolve; });
+    const publishGate = new Promise(resolve => { releasePublish = resolve; });
+    const publish = secretStore.replaceLinkedCredentialAndRun(
+      'acct_2',
+      {
+        accessToken: 'publish-window-access-2',
+        refreshToken: 'publish-window-refresh',
+        expiresAt: 1,
+      },
+      async () => {
+        configuredAccounts = [
+          ...configuredAccounts,
+          { id: 'acct_2', name: 'two@example.com', type: 'oauth' },
+        ];
+        signalPublish();
+        await publishGate;
+      },
+    );
+    await publishStarted;
+    let refreshSettled = false;
+    const refreshPending = requestJson(`${proxy.url}/internal/refresh-usage`, {
+      method: 'POST',
+    }).then(result => {
+      refreshSettled = true;
+      return result;
+    });
+    await new Promise(resolve => setTimeout(resolve, 20));
+    assert.equal(refreshSettled, false);
+
+    releasePublish();
+    await publish;
+    const refresh = await refreshPending;
+    const reload = await requestJson(`${proxy.url}/internal/reload`, { method: 'POST' });
+
+    assert.equal(refresh.status, 200);
+    assert.equal(refreshCalls, 0);
+    assert.equal(reload.status, 200);
+    assert.deepEqual(
+      reload.body.accounts.map(account => account.unavailableReason.type),
+      ['oauth_refresh_failed', 'oauth_refresh_failed'],
+    );
+  });
+
   it('unparks duplicate refresh-token accounts after a credential-changing reload resolves the duplicate', async () => {
     const secretStore = new MemorySecretStore();
     await secretStore.set('acct_1', {

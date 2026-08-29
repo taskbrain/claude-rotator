@@ -652,6 +652,24 @@ function refreshTokenFingerprint(secret) {
     : null;
 }
 
+export async function duplicateRefreshTokenAccountIds(accounts, secretStore) {
+  const groups = new Map();
+  for (const account of accounts) {
+    if (
+      account.type === 'apikey'
+      || account.id === 'current'
+      || account.credentialSource === 'claude-code-current'
+    ) continue;
+    const secret = await secretStore.get(account.id);
+    if (!secret?.refreshToken) continue;
+    const key = digest(secret.refreshToken);
+    const ids = groups.get(key) || [];
+    ids.push(account.id);
+    groups.set(key, ids);
+  }
+  return new Set([...groups.values()].filter(ids => ids.length > 1).flat());
+}
+
 function refreshIntentPath(lockDir, accountId) {
   assertSafeAccountId(accountId);
   return join(lockDir, `${accountId}.refresh-intent.json`);
@@ -1008,17 +1026,25 @@ export class MemorySecretStore {
   }
 
   async replaceLinkedCredential(accountId, secret) {
+    return this.replaceLinkedCredentialAndRun(accountId, secret);
+  }
+
+  async replaceLinkedCredentialAndRun(accountId, secret, afterWrite = async () => {}) {
     assertSafeAccountId(accountId);
-    return this.runCredentialSetExclusive(() => this.runExclusive(
-      accountId,
-      () => replaceLinkedCredentialTransaction({
-      accountId,
-      secret,
-      readSecret: async () => this.items.has(accountId) ? this.items.get(accountId) : null,
-      writeSecret: async nextSecret => this.items.set(accountId, cloneSecret(nextSecret)),
-      intents: this.refreshIntents,
-      }),
-    ));
+    return this.runCredentialSetExclusive(async () => {
+      const result = await this.runExclusive(
+        accountId,
+        () => replaceLinkedCredentialTransaction({
+          accountId,
+          secret,
+          readSecret: async () => this.items.has(accountId) ? this.items.get(accountId) : null,
+          writeSecret: async nextSecret => this.items.set(accountId, cloneSecret(nextSecret)),
+          intents: this.refreshIntents,
+        }),
+      );
+      await afterWrite();
+      return result;
+    });
   }
 
   async runCredentialSetExclusive(operation) {
@@ -1174,16 +1200,24 @@ export class LinuxFileSecretStore {
   }
 
   async replaceLinkedCredential(accountId, secret) {
-    return this.runCredentialSetExclusive(() => this.accountLock.run(
-      accountId,
-      () => replaceLinkedCredentialTransaction({
-      accountId,
-      secret,
-      readSecret: () => this.getUnlocked(accountId),
-      writeSecret: nextSecret => this.setUnlocked(accountId, nextSecret),
-      intents: this.refreshIntents,
-      }),
-    ));
+    return this.replaceLinkedCredentialAndRun(accountId, secret);
+  }
+
+  async replaceLinkedCredentialAndRun(accountId, secret, afterWrite = async () => {}) {
+    return this.runCredentialSetExclusive(async () => {
+      const result = await this.accountLock.run(
+        accountId,
+        () => replaceLinkedCredentialTransaction({
+          accountId,
+          secret,
+          readSecret: () => this.getUnlocked(accountId),
+          writeSecret: nextSecret => this.setUnlocked(accountId, nextSecret),
+          intents: this.refreshIntents,
+        }),
+      );
+      await afterWrite();
+      return result;
+    });
   }
 
   async runCredentialSetExclusive(operation) {
@@ -1408,20 +1442,28 @@ export class MacOSKeychainSecretStore {
   }
 
   async replaceLinkedCredential(accountId, secret) {
-    return this.runCredentialSetExclusive(globalLease => this.accountLock.run(
-      accountId,
-      accountLease => replaceLinkedCredentialTransaction({
-      accountId,
-      secret,
-      readSecret: () => this.getUnlocked(accountId),
-      writeSecret: nextSecret => this.setUnlocked(
+    return this.replaceLinkedCredentialAndRun(accountId, secret);
+  }
+
+  async replaceLinkedCredentialAndRun(accountId, secret, afterWrite = async () => {}) {
+    return this.runCredentialSetExclusive(async globalLease => {
+      const result = await this.accountLock.run(
         accountId,
-        nextSecret,
-        combinedLockLease(globalLease, accountLease),
-      ),
-      intents: this.refreshIntents,
-      }),
-    ));
+        accountLease => replaceLinkedCredentialTransaction({
+          accountId,
+          secret,
+          readSecret: () => this.getUnlocked(accountId),
+          writeSecret: nextSecret => this.setUnlocked(
+            accountId,
+            nextSecret,
+            combinedLockLease(globalLease, accountLease),
+          ),
+          intents: this.refreshIntents,
+        }),
+      );
+      await afterWrite();
+      return result;
+    });
   }
 
   async runCredentialSetExclusive(operation) {

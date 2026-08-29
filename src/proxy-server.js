@@ -20,6 +20,7 @@ import {
 } from './oauth.js';
 import { createNativeClaudeRefresher } from './native-claude-refresher.js';
 import { isFableScopeIdentity, parseRateLimitHeaders } from './quota.js';
+import { duplicateRefreshTokenAccountIds } from './secret-store.js';
 
 const HOP_HEADERS = new Set([
   'host',
@@ -52,6 +53,7 @@ const guardedUpstreamSockets = new WeakSet();
 export function createProxyServer({
   accountManager,
   secretStore,
+  credentialAccountsReader = null,
   config,
   reloadAccounts = null,
   allowLiveClaudeCodeCredentials = true,
@@ -195,8 +197,14 @@ export function createProxyServer({
     return resolvedTokenRefresher(refreshToken, {
       ...context,
       beforeHandoff: async () => {
+        const credentialAccounts = credentialAccountsReader
+          ? await credentialAccountsReader()
+          : accountManager.accounts;
+        if (!Array.isArray(credentialAccounts)) {
+          throw new Error('Credential account configuration is invalid');
+        }
         const nextDuplicateIds = await duplicateRefreshTokenAccountIds(
-          accountManager.accounts,
+          credentialAccounts,
           secretStore,
         );
         replaceSet(duplicateRefreshAccountIds, nextDuplicateIds);
@@ -417,24 +425,6 @@ async function reconcilePersistedRefreshIntents({ accountManager, secretStore, l
     }
   }
   return changed;
-}
-
-async function duplicateRefreshTokenAccountIds(accounts, secretStore) {
-  const groups = new Map();
-  for (const account of accounts) {
-    if (
-      account.type === 'apikey'
-      || account.id === 'current'
-      || account.credentialSource === 'claude-code-current'
-    ) continue;
-    const secret = await secretStore.get(account.id);
-    if (!secret?.refreshToken) continue;
-    const key = createHash('sha256').update(secret.refreshToken).digest('hex');
-    const ids = groups.get(key) || [];
-    ids.push(account.id);
-    groups.set(key, ids);
-  }
-  return new Set([...groups.values()].filter(ids => ids.length > 1).flat());
 }
 
 function replaceSet(target, values) {

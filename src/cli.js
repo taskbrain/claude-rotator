@@ -21,7 +21,10 @@ import {
 } from './config.js';
 import { createProxyServer, defaultTokenRefresher } from './proxy-server.js';
 import { createServerLogWriter } from './log-rotation.js';
-import { createSecretStore } from './secret-store.js';
+import {
+  createSecretStore,
+  duplicateRefreshTokenAccountIds,
+} from './secret-store.js';
 import { renderStatus } from './monitor.js';
 import { readCurrentClaudeCredentials } from './claude-credentials.js';
 import { fetchProfile, isTokenExpiringSoon, refreshAccessToken } from './oauth.js';
@@ -355,6 +358,7 @@ async function runServer({ write }) {
     accountManager,
     secretStore,
     config,
+    credentialAccountsReader: async () => (await loadOrCreateConfig()).accounts,
     allowLiveClaudeCodeCredentials: credentialOwnership.allowLiveClaudeCodeCredentials,
     reloadAccounts: async () => {
       const nextAccounts = (await loadOrCreateConfig()).accounts;
@@ -701,8 +705,6 @@ async function loginJsonCommand({ argv, write, deps }) {
   const config = deps.loadConfig ? await deps.loadConfig() : await loadOrCreateConfig();
   const store = deps.secretStore || createSecretStore();
   const previousSecret = await store.get(id);
-  await store.replaceLinkedCredential(id, secret);
-
   const existing = config.accounts.findIndex(item => item.id === id);
   const account = {
     id,
@@ -714,10 +716,12 @@ async function loginJsonCommand({ argv, write, deps }) {
       secret,
     ),
   };
-  if (existing >= 0) config.accounts[existing] = account;
-  else config.accounts.push(account);
-  if (deps.saveConfig) await deps.saveConfig(config);
-  else await saveConfig(config);
+  await replaceLinkedCredentialAndPublish(store, id, secret, async () => {
+    if (existing >= 0) config.accounts[existing] = account;
+    else config.accounts.push(account);
+    if (deps.saveConfig) await deps.saveConfig(config);
+    else await saveConfig(config);
+  });
   await notifyReload({ deps, write });
   write(`Added ${name}\n`);
 }
@@ -884,7 +888,6 @@ async function saveImportedAccount({ id, name, accountUuid = null, secret, expli
   if (typeof store.replaceLinkedCredential !== 'function') {
     throw new Error('Secret store does not support explicit credential replacement');
   }
-  await store.replaceLinkedCredential(targetId, secret);
   const existing = config.accounts.findIndex(item => item.id === targetId);
   const account = {
     id: targetId,
@@ -897,10 +900,23 @@ async function saveImportedAccount({ id, name, accountUuid = null, secret, expli
       secret,
     ),
   };
-  if (existing >= 0) config.accounts[existing] = account;
-  else config.accounts.push(account);
-  if (deps.saveConfig) await deps.saveConfig(config);
-  else await saveConfig(config);
+  await replaceLinkedCredentialAndPublish(store, targetId, secret, async () => {
+    if (existing >= 0) config.accounts[existing] = account;
+    else config.accounts.push(account);
+    if (deps.saveConfig) await deps.saveConfig(config);
+    else await saveConfig(config);
+  });
+}
+
+async function replaceLinkedCredentialAndPublish(store, accountId, secret, publish) {
+  if (typeof store?.replaceLinkedCredentialAndRun === 'function') {
+    return store.replaceLinkedCredentialAndRun(accountId, secret, publish);
+  }
+  if (typeof store?.replaceLinkedCredential !== 'function') {
+    throw new Error('Secret store does not support explicit credential replacement');
+  }
+  await store.replaceLinkedCredential(accountId, secret);
+  return publish();
 }
 
 function credentialRevisionAfterWrite(existingAccount, previousSecret, nextSecret) {
@@ -945,10 +961,37 @@ async function inspectDoctorWarnings(deps = {}) {
     nativeRefresherFactory: options => createNativeClaudeRefresher(options),
     directRefresher: refreshAccessToken,
   });
+  const duplicateRefreshAccountIds = await withCredentialSetLock(
+    store,
+    () => duplicateRefreshTokenAccountIds(accounts, store),
+  );
+  const doctorTokenRefresher = async (refreshToken, context = {}) => {
+    const beforeHandoff = context.beforeHandoff;
+    return tokenRefresher(refreshToken, {
+      ...context,
+      beforeHandoff: async () => {
+        const currentConfig = deps.loadConfig
+          ? await deps.loadConfig()
+          : await loadOrCreateConfig();
+        const currentDuplicateIds = await duplicateRefreshTokenAccountIds(
+          currentConfig.accounts || [],
+          store,
+        );
+        if (currentDuplicateIds.has(context.accountId)) {
+          throw duplicateRefreshTokenError();
+        }
+        await beforeHandoff?.();
+      },
+    });
+  };
   const liveProfiles = [];
 
   for (const account of accounts) {
     if (account.type === 'apikey') continue;
+    if (duplicateRefreshAccountIds.has(account.id)) {
+      warnings.push(`${account.id}: ${duplicateRefreshTokenError().message}`);
+      continue;
+    }
 
     try {
       const secret = account.id === CURRENT_ACCOUNT_ID
@@ -968,7 +1011,7 @@ async function inspectDoctorWarnings(deps = {}) {
         account,
         secret,
         store,
-        tokenRefresher,
+        tokenRefresher: doctorTokenRefresher,
       });
       let profile;
       try {
@@ -983,7 +1026,7 @@ async function inspectDoctorWarnings(deps = {}) {
           account,
           secret,
           store,
-          tokenRefresher,
+          tokenRefresher: doctorTokenRefresher,
         });
         profile = await profileFetcher(refreshedSecret.accessToken);
       }
@@ -1003,6 +1046,19 @@ async function inspectDoctorWarnings(deps = {}) {
 
   warnings.push(...duplicateAccountUuidWarnings(liveProfiles).map(warning => `live ${warning}`));
   return warnings;
+}
+
+async function withCredentialSetLock(store, operation) {
+  if (typeof store?.runCredentialSetExclusive === 'function') {
+    return store.runCredentialSetExclusive(operation);
+  }
+  return operation();
+}
+
+function duplicateRefreshTokenError() {
+  const error = new Error('OAuth refresh token is linked to multiple accounts');
+  error.code = 'DUPLICATE_REFRESH_TOKEN';
+  return error;
 }
 
 async function refreshDoctorSecretIfNeeded({ account, secret, store, tokenRefresher }) {

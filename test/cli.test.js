@@ -644,6 +644,43 @@ describe('runCli', () => {
     assert.match(io.output(), /Added person@example\.com/);
   });
 
+  it('publishes a new login config while the credential-set transaction is held', async () => {
+    const io = createIo();
+    let transactionHeld = false;
+    let configSaved = false;
+    let reloadObserved = false;
+    const code = await runCli(
+      ['login', '--id', 'acct_2', '--name', 'person@example.com', '--json', '-'],
+      {
+        ...io,
+        stdin: Readable.from(['{"accessToken":"atomic-access","refreshToken":"atomic-refresh"}']),
+        loadConfig: async () => ({ accounts: [] }),
+        saveConfig: async config => {
+          assert.equal(transactionHeld, true);
+          assert.equal(config.accounts[0].id, 'acct_2');
+          configSaved = true;
+        },
+        secretStore: {
+          get: async () => null,
+          replaceLinkedCredential: async () => assert.fail('atomic publish API must be used'),
+          replaceLinkedCredentialAndRun: async (_id, _secret, afterWrite) => {
+            transactionHeld = true;
+            await afterWrite();
+            transactionHeld = false;
+          },
+        },
+        reloadServer: async () => {
+          assert.equal(transactionHeld, false);
+          assert.equal(configSaved, true);
+          reloadObserved = true;
+        },
+      },
+    );
+
+    assert.equal(code, 0);
+    assert.equal(reloadObserved, true);
+  });
+
   it('refuses login --json - immediately when stdin is a terminal, instead of hanging', async () => {
     const io = createIo();
 
@@ -822,6 +859,41 @@ describe('runCli', () => {
     assert.equal(code, 0);
     assert.match(io.output(), /accounts: ok/);
     assert.equal((await secretStore.get('acct_1')).accessToken, 'fresh-token');
+  });
+
+  it('does not hand off duplicate refresh tokens during doctor checks', async () => {
+    const io = createIo();
+    const secretStore = new MemorySecretStore();
+    for (const accountId of ['acct_1', 'acct_2']) {
+      await secretStore.set(accountId, {
+        accessToken: `doctor-duplicate-access-${accountId}`,
+        refreshToken: 'doctor-duplicate-refresh',
+        expiresAt: 1,
+      });
+    }
+    let handoffs = 0;
+    const code = await runCli(['doctor'], {
+      ...io,
+      readHealth: async () => ({ ok: true }),
+      loadConfig: async () => ({
+        accounts: [
+          { id: 'acct_1', name: 'one@example.com', type: 'oauth' },
+          { id: 'acct_2', name: 'two@example.com', type: 'oauth' },
+        ],
+      }),
+      secretStore,
+      refreshAccessToken: async (_refreshToken, context) => {
+        await context.beforeHandoff();
+        handoffs += 1;
+        return assert.fail('duplicate refresh token must not reach provider handoff');
+      },
+      fetchProfile: async () => assert.fail('duplicate credential must not fetch profile'),
+    });
+
+    assert.equal(code, 0);
+    assert.equal(handoffs, 0);
+    assert.match(io.output(), /refresh token is linked to multiple accounts/);
+    assert.doesNotMatch(io.output(), /doctor-duplicate-refresh/);
   });
 
   it('parks two consecutive doctor runs after one ambiguous handoff', async () => {
