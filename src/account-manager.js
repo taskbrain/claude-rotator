@@ -954,8 +954,9 @@ export function quotaUnavailableReasonForModelFamily(quota, threshold, modelFami
 }
 
 export function isUnifiedQuotaExhaustion(reason) {
-  return reason?.type === 'quota_exhausted'
-    && (['5h', '7d'].includes(reason.window) || String(reason.window || '').startsWith('7d '));
+  return ['token_rate_limit_exhausted', 'request_rate_limit_exhausted'].includes(reason?.type)
+    || (reason?.type === 'quota_exhausted'
+      && (['5h', '7d'].includes(reason.window) || String(reason.window || '').startsWith('7d ')));
 }
 
 export function isCredentialRefreshCooldown(reason) {

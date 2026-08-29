@@ -1940,6 +1940,57 @@ describe('createProxyServer', () => {
     }
   });
 
+  it('routes every model family away from common token and request exhaustion', async () => {
+    for (const reasonKind of ['token', 'request']) {
+      const upstreamSeen = [];
+      const upstream = await listen(http.createServer((req, res) => {
+        upstreamSeen.push(req.headers.authorization);
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ ok: true }));
+      }));
+      const secretStore = new MemorySecretStore();
+      await secretStore.set('acct_1', { accessToken: 'access-token-1' });
+      await secretStore.set('acct_2', { accessToken: 'access-token-2' });
+      const accountManager = new AccountManager({
+        accounts: [
+          { id: 'acct_1', name: 'a@example.com', type: 'oauth' },
+          { id: 'acct_2', name: 'b@example.com', type: 'oauth' },
+        ],
+        switchThreshold: 1,
+        now: () => 1000,
+      });
+      accountManager.updateQuota('acct_2', {
+        'anthropic-ratelimit-unified-5h-utilization': '0.2',
+        'anthropic-ratelimit-unified-7d-utilization': '0.3',
+      });
+      accountManager.updateQuota('acct_1', reasonKind === 'token'
+        ? {
+            'anthropic-ratelimit-tokens-limit': '1000',
+            'anthropic-ratelimit-tokens-remaining': '0',
+          }
+        : {
+            'anthropic-ratelimit-requests-limit': '100',
+            'anthropic-ratelimit-requests-remaining': '0',
+          });
+      const proxy = await listen(createProxyServer({
+        accountManager,
+        secretStore,
+        config: { upstream: upstream.url, usagePolling: { enabled: false } },
+      }));
+      cleanupAfterTest(async () => { await close(proxy.server); await close(upstream.server); });
+
+      for (const model of ['claude-fable-5', 'claude-sonnet-5']) {
+        const response = await requestJson(`${proxy.url}/v1/messages`, {
+          method: 'POST',
+          body: JSON.stringify({ model }),
+        });
+        assert.equal(response.status, 200, `${reasonKind}/${model}`);
+      }
+
+      assert.deepEqual(upstreamSeen, ['Bearer access-token-2', 'Bearer access-token-2']);
+    }
+  });
+
   it('m2: the synthesized quota-unavailable response never carries a fable claim for a non-fable request (regression via unavailableReasonForModelFamily)', async () => {
     const upstream = await listen(http.createServer((req, res) => {
       res.writeHead(200, { 'Content-Type': 'application/json' });
@@ -1958,13 +2009,8 @@ describe('createProxyServer', () => {
     // `unavailableReason`, which reports the scoped Fable window first (it is
     // checked before tokens/requests) — so a plain Sonnet request could have
     // been handed a synthetic 429 claiming `seven_day_fable`, which is false.
-    // Note (out of scope for m2, reported as Follow-up): `isUnifiedQuotaExhaustion`
-    // does not recognize `token_rate_limit_exhausted`, so this exact fixture
-    // currently falls through to the last-resort blind-forward passthrough
-    // (200 from this fake upstream) rather than any synthetic 429 at all. That
-    // is a separate, pre-existing gap; what this test guards is narrower and
-    // still meaningful: no code path here may ever synthesize a
-    // `seven_day_fable` claim for a request whose family is not fable.
+    // The common token-rate exhaustion must be reported without borrowing the
+    // unrelated Fable-scoped claim that appears first in the general status.
     accountManager.applyUsage('acct_1', {
       five_hour: { utilization: 0.2, resets_at: futureReset() },
       seven_day: { utilization: 0.2, resets_at: futureReset() },

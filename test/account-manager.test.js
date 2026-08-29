@@ -71,6 +71,36 @@ describe('AccountManager', () => {
     assert.equal(manager.getActiveAccount().id, 'acct_3');
   });
 
+  it('switches every model family away from common token and request exhaustion', () => {
+    for (const reasonKind of ['token', 'request']) {
+      for (const modelFamily of ['fable', null]) {
+        const manager = new AccountManager({
+          accounts: [
+            { id: 'acct_1', name: 'a@example.com', type: 'oauth' },
+            { id: 'acct_2', name: 'b@example.com', type: 'oauth' },
+          ],
+          switchThreshold: 1,
+          now: () => 1000,
+        });
+        manager.updateQuota('acct_2', {
+          'anthropic-ratelimit-unified-5h-utilization': '0.2',
+          'anthropic-ratelimit-unified-7d-utilization': '0.3',
+        });
+        manager.updateQuota('acct_1', reasonKind === 'token'
+          ? {
+              'anthropic-ratelimit-tokens-limit': '1000',
+              'anthropic-ratelimit-tokens-remaining': '0',
+            }
+          : {
+              'anthropic-ratelimit-requests-limit': '100',
+              'anthropic-ratelimit-requests-remaining': '0',
+            });
+
+        assert.equal(manager.getActiveAccount(modelFamily)?.id, 'acct_2', `${reasonKind}/${modelFamily || 'other'}`);
+      }
+    }
+  });
+
   it('prefers a ready account with a soon weekly reset over a lower-usage account', () => {
     const manager = new AccountManager({
       accounts: [
