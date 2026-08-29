@@ -618,6 +618,55 @@ describe('macOS watchdog lifecycle', () => {
     }
   });
 
+  it('preserves a hand-set ANTHROPIC_AUTH_TOKEN across a forced macOS upgrade from a legacy install state', async () => {
+    const fixture = await createMacosLifecycleFixture();
+    let stateAtSettingsWrite = null;
+    try {
+      await writeJsonFile(fixture.paths.settingsPath, {
+        language: 'ja',
+        env: {
+          ANTHROPIC_BASE_URL: fixture.proxyBaseUrl,
+          ANTHROPIC_AUTH_TOKEN: 'user-managed-token',
+        },
+      });
+      await writeJsonFile(fixture.paths.installStatePath, {
+        settingsPath: fixture.paths.settingsPath,
+        backupPath: join(fixture.dir, 'config', 'backups', 'legacy-backup.json'),
+        proxyBaseUrl: fixture.proxyBaseUrl,
+        previousBaseUrl: { existed: false },
+      });
+
+      await installMacosLifecycle(fixture.installOptions({
+        force: true,
+        writeJsonFileImpl: async (path, value, mode) => {
+          if (path === fixture.paths.settingsPath) {
+            stateAtSettingsWrite = await readJsonFile(fixture.paths.installStatePath);
+          }
+          await writeJsonFile(path, value, mode);
+        },
+      }));
+
+      const upgradedState = await readJsonFile(fixture.paths.installStatePath);
+      assert.notEqual(stateAtSettingsWrite, null);
+      assert.deepEqual(stateAtSettingsWrite?.previousAuthToken, {
+        existed: true,
+        value: 'user-managed-token',
+      });
+      assert.deepEqual(upgradedState.previousAuthToken, {
+        existed: true,
+        value: 'user-managed-token',
+      });
+
+      await uninstallMacosLifecycle(fixture.uninstallOptions());
+      assert.equal(
+        (await readJsonFile(fixture.paths.settingsPath)).env.ANTHROPIC_AUTH_TOKEN,
+        'user-managed-token',
+      );
+    } finally {
+      await fixture.cleanup();
+    }
+  });
+
   it('restores the fresh-install state when watchdog registration fails', async () => {
     const fixture = await createMacosLifecycleFixture({ failWatchdogBootstrap: true });
     try {
