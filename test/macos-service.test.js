@@ -53,6 +53,7 @@ describe('macOS service reconciliation', () => {
 
   it('fails within a bounded wait when launchd never removes the main job', async () => {
     const fake = createLaunchctl([MAIN_JOB], { delayedBootoutPrints: Infinity });
+    let monotonicTime = 0;
     let guardTimer;
     const outcome = await Promise.race([
       reconcileMacosMainService({
@@ -61,7 +62,9 @@ describe('macOS service reconciliation', () => {
         definitionChanged: true,
         env: LOCKED_ENV,
         execFileImpl: fake.exec,
-        sleep: async () => {},
+        serviceTimeoutMs: 100,
+        monotonicNow: () => monotonicTime,
+        sleep: async milliseconds => { monotonicTime += milliseconds; },
       }).then(
         () => ({ type: 'resolved' }),
         error => ({ type: 'rejected', message: error.message }),
@@ -76,6 +79,68 @@ describe('macOS service reconciliation', () => {
       type: 'rejected',
       message: 'main service is still registered',
     });
+    assert.equal(fake.calls.some(args => args[0] === 'bootstrap'), false);
+  });
+
+  it('times out a hung launchctl print before bootstrapping', async () => {
+    const calls = [];
+    let receivedAbortSignal = false;
+    const execFileImpl = async (_command, args, options) => {
+      calls.push(args);
+      if (args[0] === 'print') {
+        receivedAbortSignal = Boolean(options?.signal);
+        return new Promise(() => {});
+      }
+      assert.fail(`unexpected launchctl action: ${args[0]}`);
+    };
+    let guardTimer;
+    const outcome = await Promise.race([
+      reconcileMacosMainService({
+        uid: 501,
+        plistPath: '/tmp/main.plist',
+        definitionChanged: true,
+        env: LOCKED_ENV,
+        execFileImpl,
+        serviceTimeoutMs: 20,
+      }).then(
+        () => ({ type: 'resolved' }),
+        error => ({ type: 'rejected', message: error.message }),
+      ),
+      new Promise(resolve => {
+        guardTimer = setTimeout(() => resolve({ type: 'still-pending' }), 250);
+      }),
+    ]);
+    clearTimeout(guardTimer);
+
+    assert.deepEqual(outcome, {
+      type: 'rejected',
+      message: 'macOS service operation timed out',
+    });
+    assert.equal(receivedAbortSignal, true);
+    assert.deepEqual(calls, [['print', MAIN_JOB]]);
+  });
+
+  it('counts launchctl command latency against one operation deadline', async () => {
+    const fake = createLaunchctl([MAIN_JOB]);
+    let monotonicTime = 0;
+    const execFileImpl = async (...args) => {
+      monotonicTime += 6;
+      return fake.exec(...args);
+    };
+
+    await assert.rejects(
+      () => reconcileMacosMainService({
+        uid: 501,
+        plistPath: '/tmp/main.plist',
+        definitionChanged: true,
+        env: LOCKED_ENV,
+        execFileImpl,
+        serviceTimeoutMs: 10,
+        monotonicNow: () => monotonicTime,
+        sleep: async milliseconds => { monotonicTime += milliseconds; },
+      }),
+      /macOS service operation timed out/,
+    );
     assert.equal(fake.calls.some(args => args[0] === 'bootstrap'), false);
   });
 
