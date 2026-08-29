@@ -1,5 +1,6 @@
 import { afterEach, describe, it } from 'node:test';
 import assert from 'node:assert/strict';
+import { randomUUID } from 'node:crypto';
 import http from 'node:http';
 import { EventEmitter } from 'node:events';
 import { mkdtemp, rm } from 'node:fs/promises';
@@ -1706,6 +1707,62 @@ describe('createProxyServer', () => {
     // excludes a non-Fable request, so no switch to acct_2 should occur.
     assert.deepEqual(upstreamSeen, ['Bearer access-token-1']);
     assert.equal(accountManager.getStatus().currentAccount, 'acct_1');
+  });
+
+  it('routes a non-fable request away from a refresh cooldown hidden by fable quota exhaustion', async () => {
+    const upstreamSeen = [];
+    const alternateAccessToken = randomUUID();
+    const upstream = await listen(http.createServer((req, res) => {
+      upstreamSeen.push(req.headers.authorization);
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ ok: true }));
+    }));
+    const secretStore = new MemorySecretStore();
+    await secretStore.set('acct_1', {
+      accessToken: randomUUID(),
+      refreshToken: randomUUID(),
+      expiresAt: 1,
+    });
+    await secretStore.set('acct_2', { accessToken: alternateAccessToken });
+    const accountManager = new AccountManager({
+      accounts: [
+        { id: 'acct_1', name: 'a@example.com', type: 'oauth' },
+        { id: 'acct_2', name: 'b@example.com', type: 'oauth' },
+      ],
+      switchThreshold: 1,
+      now: () => 1000,
+    });
+    accountManager.applyUsage('acct_1', {
+      five_hour: { utilization: 0.2, resets_at: futureReset() },
+      seven_day: { utilization: 0.2, resets_at: futureReset() },
+      scoped_weekly: [{ key: 'fable', label: 'Fable', utilization: 1, resets_at: futureReset() }],
+    });
+    accountManager.markCredentialRefreshDeferred('acct_1', 300, { retryAfterSource: 'fixed' });
+    accountManager.applyUsage('acct_2', {
+      five_hour: { utilization: 0.2, resets_at: futureReset() },
+      seven_day: { utilization: 0.2, resets_at: futureReset() },
+    });
+    let refreshCalls = 0;
+    const proxy = await listen(createProxyServer({
+      accountManager,
+      secretStore,
+      config: { upstream: upstream.url, usagePolling: { enabled: false } },
+      tokenRefresher: async () => {
+        refreshCalls += 1;
+        throw new Error('credential refresh must remain in cooldown');
+      },
+    }));
+    cleanupAfterTest(async () => { await close(proxy.server); await close(upstream.server); });
+
+    const response = await requestJson(`${proxy.url}/v1/messages`, {
+      method: 'POST',
+      body: JSON.stringify({ model: 'claude-sonnet-5' }),
+    });
+
+    assert.equal(response.status, 200);
+    assert.equal(refreshCalls, 0);
+    assert.deepEqual(upstreamSeen, [`Bearer ${alternateAccessToken}`]);
+    assert.equal(accountManager.getStatus().currentAccount, 'acct_2');
   });
 
   it('forwards a fable request away from an account whose fable weekly sub-cap is already exhausted', async () => {
@@ -7170,6 +7227,53 @@ describe('createProxyServer', () => {
     assert.equal(refresh.status, 200);
     assert.deepEqual(calls.sort(), ['access-token-1', 'access-token-2']);
     assert.equal(refresh.body.accounts.filter(account => account.ok).length, 2);
+  });
+
+  it('does not refresh an expired credential when quota exhaustion hides its refresh cooldown', async () => {
+    const secretStore = new MemorySecretStore();
+    await secretStore.set('acct_1', {
+      accessToken: randomUUID(),
+      refreshToken: randomUUID(),
+      expiresAt: 1,
+    });
+    const accountManager = new AccountManager({
+      accounts: [{ id: 'acct_1', name: 'a@example.com', type: 'oauth' }],
+      now: () => 1000,
+    });
+    accountManager.markCredentialRefreshDeferred('acct_1', 300, {
+      retryAfterSource: 'fixed',
+    });
+    accountManager.updateQuota('acct_1', {
+      'anthropic-ratelimit-unified-5h-utilization': '1',
+      'anthropic-ratelimit-unified-5h-reset': '60',
+    });
+    assert.equal(accountManager.unavailableReason(accountManager.accounts[0]).type, 'quota_exhausted');
+
+    let refreshCalls = 0;
+    const proxy = await listen(createProxyServer({
+      accountManager,
+      secretStore,
+      config: {
+        upstream: 'http://127.0.0.1:1',
+        usagePolling: { enabled: false },
+      },
+      tokenRefresher: async () => {
+        refreshCalls += 1;
+        throw new Error('credential refresh must remain in cooldown');
+      },
+      usageFetcher: async () => {
+        throw new Error('usage fetch must not run with an expired credential');
+      },
+    }));
+    cleanupAfterTest(async () => {
+      await close(proxy.server);
+    });
+
+    const refresh = await requestJson(`${proxy.url}/internal/refresh-usage`, { method: 'POST' });
+
+    assert.equal(refresh.status, 200);
+    assert.equal(refresh.body.accounts[0].skipped, 'credential-refresh-cooldown');
+    assert.equal(refreshCalls, 0);
   });
 
   it('attempts each expired account when token refreshes are rate limited', async () => {

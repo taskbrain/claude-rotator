@@ -1,5 +1,6 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
+import { randomUUID } from 'node:crypto';
 import { EventEmitter } from 'node:events';
 import { mkdir, mkdtemp, readFile, rm, stat, writeFile } from 'node:fs/promises';
 import http from 'node:http';
@@ -830,6 +831,40 @@ describe('runCli', () => {
     assert.equal(refreshCalls, 1);
     assert.match(io.output(), /credential profile check failed/);
     assert.doesNotMatch(io.output(), /doctor-refresh-fixture/);
+  });
+
+  it('retracts a doctor refresh intent when the native child never starts', async () => {
+    const io = createIo();
+    const secretStore = new MemorySecretStore();
+    await secretStore.set('acct_1', {
+      accessToken: randomUUID(),
+      refreshToken: randomUUID(),
+      expiresAt: 1,
+    });
+    let refreshCalls = 0;
+    const deps = {
+      ...io,
+      readHealth: async () => ({ ok: true }),
+      loadConfig: async () => ({
+        accounts: [{ id: 'acct_1', name: 'person@example.com', type: 'oauth' }],
+      }),
+      secretStore,
+      refreshAccessToken: async (_refreshToken, context) => {
+        refreshCalls += 1;
+        await context.beforeHandoff();
+        await context.retractHandoff();
+        throw Object.assign(new Error('native child did not start'), {
+          code: 'NATIVE_REFRESH_COMMAND_UNAVAILABLE',
+        });
+      },
+      fetchProfile: async () => assert.fail('profile fetch must not run after refresh failure'),
+    };
+
+    assert.equal(await runCli(['doctor'], deps), 0);
+    assert.equal(await runCli(['doctor'], deps), 0);
+
+    assert.equal(refreshCalls, 2, 'a pre-spawn failure must remain retryable instead of parking the account');
+    assert.match(io.output(), /native child did not start/);
   });
 
   it('leaves current Claude Code credential refresh to Claude Code', async () => {

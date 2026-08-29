@@ -1417,7 +1417,7 @@ async function refreshAccountUsage({
       return { account: account.id, ok: true, stale: true };
     }
     if (!secret?.accessToken) throw new Error('OAuth access token is missing');
-    const credentialCooldown = isCredentialRefreshCooldown(accountManager.unavailableReason(account));
+    const credentialCooldown = accountManager.hasCredentialRefreshCooldown(account);
     if (credentialCooldown && !hasUsableAccessToken(secret)) {
       usageObservationTracker.fail(observation);
       return { account: account.id, ok: false, skipped: 'credential-refresh-cooldown' };
@@ -1901,7 +1901,10 @@ async function forwardCurrentUnavailableAccount({
   if (secret.liveClaudeCodeCredential && hasUsableAccessToken(secret)) {
     accountManager.markAuthenticated(account.id);
   }
-  if (isCredentialUnavailable(accountManager.unavailableReason(account))) return false;
+  if (
+    accountManager.hasCredentialRefreshCooldown(account)
+    || isCredentialUnavailable(accountManager.unavailableReason(account))
+  ) return false;
 
   let freshSecret;
   try {

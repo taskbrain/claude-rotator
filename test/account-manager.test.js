@@ -1359,6 +1359,40 @@ describe('AccountManager', () => {
     assert.equal(account.unavailableReason.window, '5h');
   });
 
+  it('keeps a credential refresh cooldown authoritative when a scoped quota reason hides it', () => {
+    const manager = new AccountManager({
+      accounts: [
+        { id: 'cooldown', name: 'cooldown@example.com', type: 'oauth' },
+        { id: 'quota', name: 'quota@example.com', type: 'oauth' },
+      ],
+      currentAccountId: 'cooldown',
+      switchThreshold: 1,
+      now: () => 1000,
+    });
+    manager.applyUsage('cooldown', {
+      five_hour: { utilization: 0.2, resets_at: '2026-07-05T05:00:00Z' },
+      seven_day: { utilization: 0.2, resets_at: '2026-07-07T00:00:00Z' },
+      scoped_weekly: [{ key: 'fable', label: 'Fable', utilization: 1, resets_at: '2026-07-07T00:00:00Z' }],
+    });
+    manager.markCredentialRefreshDeferred('cooldown', 300, { retryAfterSource: 'fixed' });
+    manager.updateQuota('quota', {
+      'anthropic-ratelimit-unified-5h-utilization': '1',
+      'anthropic-ratelimit-unified-5h-reset': '60',
+    });
+
+    const cooldown = manager.find('cooldown');
+    assert.equal(manager.unavailableReason(cooldown).type, 'quota_exhausted');
+    assert.equal(manager.hasCredentialRefreshCooldown(cooldown), true);
+    assert.equal(manager.isAvailable(cooldown, null), false);
+    assert.equal(manager.getActiveAccount(null), null);
+    assert.equal(manager.getCurrentAccount().id, 'cooldown');
+    assert.equal(manager.exhaustedFallbackScore(cooldown), null);
+
+    const resume = manager.prepareResumeTarget();
+    assert.equal(resume.account, 'quota');
+    assert.equal(resume.reason, 'shortest-quota-reset');
+  });
+
   it('restores persisted quota state for resume target selection after restart', () => {
     const now = Date.parse('2026-06-07T11:00:00Z');
     const accounts = [

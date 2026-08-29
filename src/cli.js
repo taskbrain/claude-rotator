@@ -1033,6 +1033,7 @@ function tokenRefreshContext(account, secret, transaction = {}) {
     subscriptionType: secret.subscriptionType,
     rateLimitTier: secret.rateLimitTier,
     beforeHandoff: transaction.beforeHandoff,
+    retractHandoff: transaction.retractHandoff,
     protectChildPid: transaction.protectChildPid,
     clearChildPid: transaction.clearChildPid,
   };

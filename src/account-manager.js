@@ -40,7 +40,7 @@ export class AccountManager {
     }
 
     const reason = this.unavailableReason(current);
-    if (current?.status === 'error' || isCredentialRefreshCooldown(reason)) {
+    if (current?.status === 'error' || this.hasCredentialRefreshCooldown(current)) {
       const next = this.selectBestAvailableSwitchTarget(modelFamily);
       if (next) {
         next.status = 'active';
@@ -590,6 +590,7 @@ export class AccountManager {
   }
 
   exhaustedFallbackScore(account) {
+    if (this.hasCredentialRefreshCooldown(account)) return null;
     const reason = this.unavailableReason(account);
     if (!isUnifiedQuotaExhaustion(reason)) return null;
     const resetAt = reason.resetAt ? Date.parse(reason.resetAt) : null;
@@ -611,6 +612,7 @@ export class AccountManager {
   isAvailable(account, modelFamily = null) {
     if (!account) return false;
     this.refreshQuotaState(account);
+    if (this.hasCredentialRefreshCooldown(account)) return false;
     if (account.status === 'throttled') return false;
     if (account.status === 'error') return false;
     if (account.status === 'exhausted') {
@@ -686,6 +688,14 @@ export class AccountManager {
     return null;
   }
 
+  hasCredentialRefreshCooldown(account) {
+    return Boolean(
+      account?.rateLimitedUntil
+      && this.now() < account.rateLimitedUntil
+      && isCredentialRefreshCooldown(account.temporaryUnavailableReason),
+    );
+  }
+
   /**
    * Same as `unavailableReason`, except a scoped weekly window (e.g. the
    * Fable sub-cap) is only trusted as THE reason when it actually matches
@@ -713,6 +723,9 @@ export class AccountManager {
   }
 
   autoSwitchReason(account) {
+    if (this.hasCredentialRefreshCooldown(account)) {
+      return account.temporaryUnavailableReason.type;
+    }
     const reason = this.unavailableReason(account);
     if (!reason) return 'account-unavailable';
     if (isUnifiedQuotaExhaustion(reason)) return 'quota-threshold';

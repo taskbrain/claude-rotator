@@ -107,7 +107,7 @@ npm install -g .
 まず Claude Code に普段どおりログインし、そのログインを `claude-rotator` へ登録します。
 
 ```bash
-claude auth login
+claude auth login --claudeai
 claude-rotator login
 ```
 
@@ -162,7 +162,7 @@ npm install -g .
 まず Claude Code に普段どおりログインし、そのログインを `claude-rotator` へ登録します。
 
 ```bash
-claude auth login
+claude auth login --claudeai
 claude-rotator login
 ```
 
@@ -266,7 +266,7 @@ claude-rotator status
 複数アカウントを固定候補として登録するのではなく、この PC で現在ログイン中の Claude Code アカウントだけを使う場合は、保存済み token snapshot ではなく Claude Code の最新認証情報を毎回読む `current` アカウントとして登録できます。Claude Code 側で token が更新されても proxy が追従するため、Ubuntu の常用 PC ではこの方法が安全です。
 
 ```bash
-claude auth login
+claude auth login --claudeai
 claude-rotator use-current --only
 ```
 
@@ -704,7 +704,7 @@ flowchart LR
 
 Claude Code usage is tracked as a "5-hour window" (a short-term limit that resets every 5 hours) and a "7-day window" (a long-term limit that resets every 7 days). See [Why](#why) for details.
 
-Credentials are stored per machine. If you use another Mac or Ubuntu machine, run `claude auth login` and `claude-rotator login` on that machine too, for each account.
+Credentials are stored per machine. If you use another Mac or Ubuntu machine, run `claude auth login --claudeai` and `claude-rotator login` on that machine too, for each account.
 
 ### Setup
 
@@ -778,7 +778,7 @@ claude-rotator install
 claude-rotator doctor
 ```
 
-`install` updates only `env.ANTHROPIC_BASE_URL` in `~/.claude/settings.json`, and records the previous value in `~/.config/claude-rotator/install-state.json`.
+`install` updates both managed gateway settings, `env.ANTHROPIC_BASE_URL` and `env.ANTHROPIC_AUTH_TOKEN`, and records their previous values in `~/.config/claude-rotator/install-state.json`.
 
 On macOS, the following LaunchAgents are created:
 
@@ -814,7 +814,7 @@ npm install -g .
 First, log in to Claude Code as usual, then register that login with `claude-rotator`.
 
 ```bash
-claude auth login
+claude auth login --claudeai
 claude-rotator login
 ```
 
@@ -859,15 +859,15 @@ The Ubuntu installer also creates a Node.js launcher for the systemd service at 
 
 `claude-rotator login` reads the current Claude Code login and registers it, fetching the email automatically when possible.
 
-Important: `claude auth login` and `claude-rotator login` change or import the Claude Code side's current login — they do not by themselves switch which account is actually used for API requests. The account used for requests is whichever one `claude-rotator status` reports as `active`. Logging in as a different account and running `claude-rotator login` does not, on its own, change `active`.
+Important: `claude auth login --claudeai` and `claude-rotator login` change or import the Claude Code side's current login — they do not by themselves switch which account is actually used for API requests. The account used for requests is whichever one `claude-rotator status` reports as `active`. Logging in as a different account and running `claude-rotator login` does not, on its own, change `active`.
 
 To save and rotate between several accounts individually, log in to Claude Code as each one and run `claude-rotator login` each time:
 
 ```bash
-claude auth login
+claude auth login --claudeai
 claude-rotator login
 
-claude auth login
+claude auth login --claudeai
 claude-rotator login
 ```
 
@@ -891,7 +891,7 @@ Duplicate prevention:
 
 - `current` is reserved for the live account and cannot be used with `login --id current` or `import-current --id current`.
 - `claude-rotator login` reads `accountUuid` from the profile, and updates the existing account if the same Claude account is already registered.
-- If the current Claude Code login has no refresh token, or cannot be verified against the profile API, `claude-rotator login` stops with an error instead of registering it under a placeholder id such as `account1`. `claude auth status` can report "logged in" even while the API-side OAuth token has expired; in that case, run `claude auth login` again and retry.
+- If the current Claude Code login has no refresh token, or cannot be verified against the profile API, `claude-rotator login` stops with an error instead of registering it under a placeholder id such as `account1`. `claude auth status` can report "logged in" even while the API-side OAuth token has expired; in that case, run `claude auth login --claudeai` again and retry.
 - If an explicit `--id` collides with an existing account's `accountUuid`, the command errors out instead of creating a duplicate. Either reuse the existing id, or run `claude-rotator remove <account>` first to clean it up.
 
 Where credentials are stored:
@@ -915,7 +915,7 @@ If the newly added account's 5-hour or 7-day window is already at 100%, it shows
 Instead of registering several accounts as fixed candidates, you can register just the Claude Code account currently logged in on this machine as a `current` account, which re-reads Claude Code's latest credentials on every request rather than a saved token snapshot. Because the proxy follows along whenever Claude Code's own token is refreshed, this approach is the safer choice on an Ubuntu machine used for day-to-day work by a single login.
 
 ```bash
-claude auth login
+claude auth login --claudeai
 claude-rotator use-current --only
 ```
 
@@ -956,8 +956,6 @@ account1@example.com       active
 7d Fable █████░░░░░  50%  reset in 1d23h -> 06/09 09:00 JST
 requests: 128
 
-OAuth access tokens become refresh candidates 30 minutes before expiry. On macOS and Ubuntu, saved accounts are refreshed by Claude Code itself inside isolated credential storage, without changing the user's normal Claude Code login. Each attempt resolves the current installer path, so newly installed Claude Code versions are used without a version allowlist, and `realpath`-pins one executable for that attempt. Immediately before token handoff it persists a durable refresh intent, then passes the official `CLAUDE_CODE_OAUTH_REFRESH_TOKEN` and `CLAUDE_CODE_OAUTH_SCOPES` variables in the child environment to exactly one `claude auth login --claudeai` command. It does not run a separate runtime capability check based on help or version output. Tokens are never command arguments, configuration, or logs, but same-user local processes can potentially inspect a short-lived child environment; run this only within that trust boundary. On macOS only the real user `HOME` is retained so `security` can resolve the login Keychain; the Claude config, dedicated Keychain service, XDG, work, and temporary directories remain isolated. Current first-party Claude Code scopes are backfilled for legacy saved credentials that omit scopes, without guessing refresh-token expiry or modifying custom OAuth clients. In installed gateway mode, every saved account remains rotator-owned even when it matches the normal `/login`; stale live credentials are not mirrored back. Claude Code OAuth metadata is preserved, refreshes are coalesced and serialized, and a rotated credential is atomically persisted before use without overwriting a concurrent relink. There is no fallback to another refresh driver after the token handoff. If Claude Code rejects an unsupported command, exits, or leaves no readable isolated credential, the outcome is unknown and the account is parked as `oauth_refresh_failed`; recover it by re-authenticating that account with `claude auth login --claudeai` and then running `claude-rotator login`. A transient native-refresh failure before token handoff uses the fixed five-minute `oauth_refresh_retry` cooldown, distinct from provider 429, which is recorded as `oauth_refresh_rate_limit`. An explicit provider `Retry-After` is honored without amplification, up to a 24-hour safety ceiling. Only the direct token-refresh fallback used on other platforms backs off missing-deadline failures through 1/2/4/8/15 minutes and then moves to a fixed hourly probe. Only a relink that actually changes an account credential clears that account's stale cooldown. Provider-side revocation and maximum token lifetime remain controlled by the OAuth provider.
-
 account2@example.com       exhausted
 reason: 5h quota exhausted; reset -> 06/07 20:00 JST
 5h ██████████ 100%  reset in 10h42m -> 06/07 20:00 JST
@@ -982,7 +980,7 @@ Reset times and event times in `status` / `monitor` are always shown in Japan St
 
 Because the OAuth Usage API tends to return 429s, usage fetches default to a 15-minute interval, one account at a time, with 1.5 seconds between the start of each request. Only change `usagePolling.intervalMs`, `usagePolling.concurrency`, and `usagePolling.requestSpacingMs` in [Configuration and Environment Variables](#configuration-and-environment-variables) if you actually need to. An interval that's too short, or concurrency that's too high, can also cause 429s on `claude-rotator refresh-usage`.
 
-OAuth access tokens become refresh candidates 30 minutes before expiry. Claude Code's OAuth scopes and the refresh token's expiry are preserved at save time. On macOS and Ubuntu, saved accounts delegate the refresh itself to Claude Code inside an isolated storage area that does not touch your normal Claude Code login, so you don't need to log in interactively again as long as the refresh token is still valid, even after the access token expires in a few hours. Concurrent refreshes of the same refresh token are coalesced into one, and refreshes for different accounts are serialized too. A new refresh token is persisted to Keychain or the Linux credential file, with an atomic compare-and-set that never overwrites a competing relogin, before it is ever used. A transient failure of the macOS/Ubuntu native refresh retries on a fixed five-minute schedule and does not grow to 15 or 60 minutes as failures repeat. An explicit `Retry-After` from the provider is honored without amplification, within a 24-hour safety ceiling that prevents a permanent stall from a bad value. Only the direct token-refresh path used where native refresh isn't available backs off a transient failure with no explicit deadline through 1/2/4/8/15 minutes per refresh token, then stops growing and settles into a fixed 60-minute health check. One account waiting does not stop other accounts from refreshing, and only a relink that actually changed the credential clears that account's stale wait state. A saved account whose Claude Code login and `accountUuid` still match mirrors the latest credential and OAuth metadata that Claude Code itself refreshed. `claude-rotator` cannot extend the lifetime of a token the provider has explicitly revoked.
+OAuth access tokens become refresh candidates 30 minutes before expiry. On macOS and Ubuntu, saved accounts are refreshed by Claude Code itself inside isolated credential storage, without changing the user's normal Claude Code login. Each attempt resolves and `realpath`-pins the current installed Claude Code executable, persists a durable refresh intent immediately before token handoff, and invokes exactly one official `claude auth login --claudeai` command. The refresh token and scopes are passed only through the child's environment, never through argv, configuration, or logs. Refreshes run inside a per-account locked transaction, persist a rotated credential atomically before use, and never fall back to another driver after handoff. If the outcome after handoff is unknown, the account is parked until it is explicitly relinked with `claude auth login --claudeai` followed by `claude-rotator login`. Local pre-handoff failures use the distinct `oauth_refresh_retry` cooldown; only provider HTTP 429 is recorded as `oauth_refresh_rate_limit`. In installed gateway mode, saved accounts remain rotator-owned and stale live `/login` credentials are not mirrored back.
 
 TTY-less environments (CI, piping through `| cat`, etc.) make `claude-rotator monitor` print once and exit automatically (the same as passing `--once` explicitly).
 
