@@ -48,6 +48,23 @@ describe('OAuth time helpers', () => {
     assert.equal(isTokenExpiringSoon(now + DEFAULT_OAUTH_REFRESH_LEAD_MS - 1, now), true);
     assert.equal(isTokenExpiringSoon(now + DEFAULT_OAUTH_REFRESH_LEAD_MS + 1, now), false);
   });
+
+  it('classifies only provider HTTP 429 responses as OAuth refresh rate limits', () => {
+    const nativeFixedError = Object.assign(new Error('native refresh failed'), {
+      code: 'NATIVE_REFRESH_COMMAND_FAILED',
+      retryAfterMs: 5 * 60 * 1000,
+      retryAfterSource: 'fixed',
+    });
+    const provider429Error = new OAuthTokenRefreshError({
+      status: 429,
+      code: 'rate_limit_error',
+      retryAfterMs: 60_000,
+      retryAfterSource: 'provider',
+    });
+
+    assert.equal(isOAuthTokenRefreshRateLimit(nativeFixedError), false);
+    assert.equal(isOAuthTokenRefreshRateLimit(provider429Error), true);
+  });
 });
 
 describe('token refresh', () => {
