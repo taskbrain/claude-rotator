@@ -155,6 +155,7 @@ export async function installMacosLifecycle({
   healthTimeoutMs = 15_000,
   healthPollIntervalMs = 100,
   sleep = delay => new Promise(resolve => setTimeout(resolve, delay)),
+  writeJsonFileImpl = writeJsonFile,
 }) {
   assertMacosServiceLockHeld(env);
   const snapshots = await snapshotMacosLifecycleFiles(paths);
@@ -220,6 +221,7 @@ export async function installMacosLifecycle({
         previousInstallState,
         proxyBaseUrl,
         force,
+        writeJsonFileImpl,
       })
       : await installSettings({
         settingsPath: paths.settingsPath,
@@ -290,6 +292,7 @@ async function updateMacosInstalledSettings({
   proxyBaseUrl,
   gatewayAuthToken = LOCAL_GATEWAY_AUTH_TOKEN,
   force,
+  writeJsonFileImpl = writeJsonFile,
 }) {
   if (
     previousInstallState.settingsPath !== settingsPath
@@ -323,14 +326,24 @@ async function updateMacosInstalledSettings({
     throw new Error('ANTHROPIC_AUTH_TOKEN changed after install');
   }
   const merged = mergeClaudeSettings(settings, proxyBaseUrl, gatewayAuthToken);
-  await writeJsonFile(settingsPath, merged.settings);
+  const previousInstallOwnsAuthToken = previousInstallState.gatewayAuthToken != null
+    && previousInstallState.gatewayAuthToken === currentAuthToken;
   const nextState = {
     ...previousInstallState,
     installedAt: new Date().toISOString(),
     proxyBaseUrl,
     gatewayAuthToken,
+    previousAuthToken: previousInstallOwnsAuthToken
+      ? previousInstallState.previousAuthToken
+      : merged.previousAuthToken,
   };
-  await writeJsonFile(installStatePath, nextState);
+  await writeJsonFileImpl(installStatePath, nextState);
+  try {
+    await writeJsonFileImpl(settingsPath, merged.settings);
+  } catch (error) {
+    await writeJsonFileImpl(installStatePath, previousInstallState).catch(() => {});
+    throw error;
+  }
   return nextState;
 }
 
