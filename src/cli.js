@@ -131,7 +131,7 @@ export async function runCli(argv = [], deps = {}) {
         await (deps.installAction || installCommand)({ argv: actionArgv, write, deps });
         return 0;
       }
-      await (deps.uninstallAction || uninstallCommand)({ argv: actionArgv, write, deps });
+      await (deps.uninstallAction || uninstallCommand)({ argv: actionArgv, write, error, deps });
       return 0;
     }
 
@@ -153,7 +153,7 @@ export async function runCli(argv = [], deps = {}) {
     }
 
     if (command === 'uninstall') {
-      await (deps.uninstallAction || uninstallCommand)({ argv, write, deps });
+      await (deps.uninstallAction || uninstallCommand)({ argv, write, error, deps });
       return 0;
     }
 
@@ -559,13 +559,24 @@ async function installCommand({ argv, write, deps = {} }) {
   }
 }
 
+// loadConfig() already treats a missing config file (ENOENT) as "no config
+// yet" and resolves to null, so any exception that reaches this function's
+// catch block is a genuine read failure (e.g. corrupt JSON, permission
+// denied) rather than the ordinary "never installed" case. Callers use
+// `configReadFailed` to warn only about that narrower, unexpected condition.
 async function purgeTargetAccountIds(configPath) {
-  const config = await loadConfig(configPath).catch(() => null);
+  let config = null;
+  let configReadFailed = false;
+  try {
+    config = await loadConfig(configPath);
+  } catch {
+    configReadFailed = true;
+  }
   const ids = (config?.accounts || []).map(account => account.id).filter(Boolean);
-  return [...new Set([...ids, CURRENT_ACCOUNT_ID])];
+  return { ids: [...new Set([...ids, CURRENT_ACCOUNT_ID])], configReadFailed };
 }
 
-async function uninstallCommand({ argv, write, deps = {} }) {
+async function uninstallCommand({ argv, write, error, deps = {} }) {
   const platform = deps.platform || process.platform;
   const env = deps.env || process.env;
   const home = deps.home || homedir();
@@ -574,7 +585,14 @@ async function uninstallCommand({ argv, write, deps = {} }) {
   const settingsPath = claudeSettingsPath(home);
   const force = argv.includes('--force');
   const purgeSecrets = argv.includes('--purge-secrets');
-  const purgeAccountIds = purgeSecrets ? await purgeTargetAccountIds(configPath) : [];
+  const warn = error || deps.error || (text => process.stderr.write(text));
+  let purgeAccountIds = [];
+  let configReadFailed = false;
+  if (purgeSecrets) {
+    const target = await purgeTargetAccountIds(configPath);
+    purgeAccountIds = target.ids;
+    configReadFailed = target.configReadFailed;
+  }
   if (platform === 'darwin') {
     await uninstallMacosLifecycle({
       uid: deps.uid ?? (typeof process.getuid === 'function' ? process.getuid() : null),
@@ -587,6 +605,20 @@ async function uninstallCommand({ argv, write, deps = {} }) {
       purgeSecretsImpl: async () => (deps.secretStoreFactory || createSecretStore)({ platform, env, home })
         .purge(purgeAccountIds),
     });
+    // The macOS Keychain store only deletes the account ids it is given, so a
+    // config read failure here means real accounts' secrets were left behind
+    // (only "current" got purged). The Linux file store instead enumerates
+    // its secrets directory directly and ignores this id list, so deletion
+    // there is unaffected and no warning applies. This warning is emitted
+    // only after uninstallMacosLifecycle() has returned successfully, so it
+    // never fires on a path (e.g. a settings conflict) that throws before
+    // any purge is attempted and rolls the uninstall back.
+    if (purgeSecrets && configReadFailed) {
+      warn(
+        'warning: claude-rotator could not read its config while purging secrets, so only '
+        + 'the "current" Keychain entry was removed; other accounts\' Keychain secrets may remain\n',
+      );
+    }
     write('Uninstalled claude-rotator\n');
     return;
   }
