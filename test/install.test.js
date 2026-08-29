@@ -671,6 +671,53 @@ describe('macOS watchdog lifecycle', () => {
     }
   });
 
+  it('reports rollback failure when the old generation is not healthy after an install rollback', async () => {
+    const fixture = await createInstalledMacosLifecycleFixture();
+    const baseOptions = fixture.installOptions();
+    let oldHealthSnapshotted = false;
+    let rollbackMainRestored = false;
+    const execFileImpl = async (command, args, options) => {
+      if (
+        args[0] === 'bootstrap'
+        && args[1] === 'gui/501'
+        && args[2] === fixture.paths.mainPlistPath
+      ) {
+        rollbackMainRestored = true;
+      }
+      return baseOptions.execFileImpl(command, args, options);
+    };
+    try {
+      const error = await installMacosLifecycle(fixture.installOptions({
+        expectedServiceGeneration: 'generation-2',
+        execFileImpl,
+        healthTimeoutMs: 20,
+        healthPollIntervalMs: 1,
+        healthCheck: async () => {
+          if (!oldHealthSnapshotted) {
+            oldHealthSnapshotted = true;
+            return { ok: true, serviceGeneration: 'generation-1' };
+          }
+          if (!rollbackMainRestored) return { ok: false };
+          return { ok: true, serviceGeneration: 'wrong-generation' };
+        },
+      })).then(
+        () => assert.fail('install must fail when the new generation never becomes healthy'),
+        caught => caught,
+      );
+
+      assert.equal(error instanceof AggregateError, true);
+      assert.match(error.message, /rollback failed/);
+      assert.equal(
+        error.errors.some(cause => /macOS service did not become healthy/.test(cause.message)),
+        true,
+      );
+      assert.equal(rollbackMainRestored, true);
+      assert.equal(fixture.jobs.has(fixture.mainJob), true);
+    } finally {
+      await fixture.cleanup();
+    }
+  });
+
   it('continues rollback after one managed-file restore fails', async () => {
     const fixture = await createMacosLifecycleFixture({ failWatchdogBootstrap: true });
     try {
@@ -751,6 +798,83 @@ describe('macOS watchdog lifecycle', () => {
         (await readJsonFile(fixture.paths.settingsPath)).env.ANTHROPIC_BASE_URL,
         fixture.proxyBaseUrl,
       );
+    } finally {
+      await fixture.cleanup();
+    }
+  });
+
+  it('keeps the original uninstall error when the old generation recovers after rollback', async () => {
+    const fixture = await createInstalledMacosLifecycleFixture();
+    const baseOptions = fixture.uninstallOptions();
+    let watchdogFailures = 0;
+    let healthCalls = 0;
+    const execFileImpl = async (command, args, options) => {
+      if (args[0] === 'bootout' && args[1] === fixture.watchdogJob && watchdogFailures === 0) {
+        watchdogFailures += 1;
+        throw Object.assign(new Error('watchdog bootout failed once'), { code: 5 });
+      }
+      return baseOptions.execFileImpl(command, args, options);
+    };
+    try {
+      const error = await uninstallMacosLifecycle(fixture.uninstallOptions({
+        execFileImpl,
+        healthTimeoutMs: 20,
+        healthPollIntervalMs: 1,
+        healthCheck: async () => {
+          healthCalls += 1;
+          return { ok: true, serviceGeneration: 'generation-1' };
+        },
+      })).then(
+        () => assert.fail('uninstall must preserve the original watchdog failure'),
+        caught => caught,
+      );
+
+      assert.equal(error instanceof AggregateError, false);
+      assert.match(error.message, /launchctl bootout failed/);
+      assert.equal(healthCalls, 2);
+      assert.equal(fixture.jobs.has(fixture.mainJob), true);
+      assert.equal(fixture.jobs.has(fixture.watchdogJob), true);
+    } finally {
+      await fixture.cleanup();
+    }
+  });
+
+  it('reports rollback failure when the old generation does not recover after uninstall rollback', async () => {
+    const fixture = await createInstalledMacosLifecycleFixture();
+    const baseOptions = fixture.uninstallOptions();
+    let watchdogFailures = 0;
+    let healthCalls = 0;
+    const execFileImpl = async (command, args, options) => {
+      if (args[0] === 'bootout' && args[1] === fixture.watchdogJob && watchdogFailures === 0) {
+        watchdogFailures += 1;
+        throw Object.assign(new Error('watchdog bootout failed once'), { code: 5 });
+      }
+      return baseOptions.execFileImpl(command, args, options);
+    };
+    try {
+      const error = await uninstallMacosLifecycle(fixture.uninstallOptions({
+        execFileImpl,
+        healthTimeoutMs: 20,
+        healthPollIntervalMs: 1,
+        healthCheck: async () => {
+          healthCalls += 1;
+          if (healthCalls === 1) {
+            return { ok: true, serviceGeneration: 'generation-1' };
+          }
+          return { ok: true, serviceGeneration: 'wrong-generation' };
+        },
+      })).then(
+        () => assert.fail('uninstall rollback must verify the old generation'),
+        caught => caught,
+      );
+
+      assert.equal(error instanceof AggregateError, true);
+      assert.match(error.message, /rollback failed/);
+      assert.equal(
+        error.errors.some(cause => /macOS service did not become healthy/.test(cause.message)),
+        true,
+      );
+      assert.equal(healthCalls > 1, true);
     } finally {
       await fixture.cleanup();
     }

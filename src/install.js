@@ -162,6 +162,11 @@ export async function installMacosLifecycle({
     ? JSON.parse(snapshots.installStatePath.bytes.toString('utf8'))
     : null;
   const registrations = await snapshotMacosRegistrations({ uid, env, execFileImpl });
+  const previousHealthyGeneration = await snapshotHealthyServiceGeneration({
+    registered: registrations.main,
+    healthCheck,
+    timeoutMs: healthTimeoutMs,
+  });
   let createdBackupPath = null;
 
   try {
@@ -259,6 +264,11 @@ export async function installMacosLifecycle({
       snapshots,
       registrations,
       execFileImpl,
+      previousHealthyGeneration,
+      healthCheck,
+      healthTimeoutMs,
+      healthPollIntervalMs,
+      sleep,
     });
     if (createdBackupPath) {
       await attemptRollback(rollbackErrors, () => rm(createdBackupPath, { force: true }));
@@ -332,6 +342,10 @@ export async function uninstallMacosLifecycle({
   purgeSecrets = false,
   execFileImpl,
   purgeSecretsImpl = async () => {},
+  healthCheck = null,
+  healthTimeoutMs = 15_000,
+  healthPollIntervalMs = 100,
+  sleep = delay => new Promise(resolve => setTimeout(resolve, delay)),
 }) {
   assertMacosServiceLockHeld(env);
   const snapshots = await snapshotMacosLifecycleFiles(paths);
@@ -345,8 +359,14 @@ export async function uninstallMacosLifecycle({
   }
 
   let registrations;
+  let previousHealthyGeneration = null;
   try {
     registrations = await snapshotMacosRegistrations({ uid, env, execFileImpl });
+    previousHealthyGeneration = await snapshotHealthyServiceGeneration({
+      registered: registrations.main,
+      healthCheck,
+      timeoutMs: healthTimeoutMs,
+    });
     await rm(paths.markerPath, { force: true });
     await stopMacosWatchdogService({ uid, env, execFileImpl });
     await stopMacosMainService({ uid, env, execFileImpl });
@@ -365,6 +385,13 @@ export async function uninstallMacosLifecycle({
         registrations,
         execFileImpl,
       }));
+      await verifyRollbackServiceHealth(rollbackErrors, {
+        previousHealthyGeneration,
+        healthCheck,
+        healthTimeoutMs,
+        healthPollIntervalMs,
+        sleep,
+      });
     }
     if (rollbackErrors.length > 0) {
       throw new AggregateError(
@@ -401,7 +428,19 @@ async function snapshotMacosRegistrations({ uid, env, execFileImpl }) {
   };
 }
 
-async function rollbackMacosLifecycle({ uid, env, paths, snapshots, registrations, execFileImpl }) {
+async function rollbackMacosLifecycle({
+  uid,
+  env,
+  paths,
+  snapshots,
+  registrations,
+  execFileImpl,
+  previousHealthyGeneration,
+  healthCheck,
+  healthTimeoutMs,
+  healthPollIntervalMs,
+  sleep,
+}) {
   const errors = [];
   await attemptRollback(errors, () => rm(paths.markerPath, { force: true }));
   await attemptRollback(errors, () => stopMacosWatchdogService({ uid, env, execFileImpl }));
@@ -413,6 +452,13 @@ async function rollbackMacosLifecycle({ uid, env, paths, snapshots, registration
     registrations,
     execFileImpl,
   }));
+  await verifyRollbackServiceHealth(errors, {
+    previousHealthyGeneration,
+    healthCheck,
+    healthTimeoutMs,
+    healthPollIntervalMs,
+    sleep,
+  });
   return errors;
 }
 
@@ -455,6 +501,43 @@ async function attemptRollback(errors, operation) {
   } catch (error) {
     errors.push(error);
   }
+}
+
+async function snapshotHealthyServiceGeneration({ registered, healthCheck, timeoutMs }) {
+  if (!registered || typeof healthCheck !== 'function') return null;
+  try {
+    const health = await runMacosHealthAttempt({
+      healthCheck,
+      deadline: Date.now() + timeoutMs,
+    });
+    if (
+      health?.ok === true
+      && typeof health.serviceGeneration === 'string'
+      && health.serviceGeneration.length > 0
+    ) {
+      return health.serviceGeneration;
+    }
+  } catch {
+    // An unavailable preflight does not prove that the old generation was healthy.
+  }
+  return null;
+}
+
+async function verifyRollbackServiceHealth(errors, {
+  previousHealthyGeneration,
+  healthCheck,
+  healthTimeoutMs,
+  healthPollIntervalMs,
+  sleep,
+}) {
+  if (!previousHealthyGeneration) return;
+  await attemptRollback(errors, () => waitForMacosHealth({
+    healthCheck,
+    expectedServiceGeneration: previousHealthyGeneration,
+    timeoutMs: healthTimeoutMs,
+    intervalMs: healthPollIntervalMs,
+    sleep,
+  }));
 }
 
 async function waitForMacosHealth({

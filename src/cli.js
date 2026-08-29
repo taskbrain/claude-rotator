@@ -567,6 +567,7 @@ async function uninstallCommand({ argv, write, deps = {} }) {
       force,
       purgeSecrets,
       execFileImpl: deps.execFileImpl || execFileAsync,
+      healthCheck: deps.healthCheck || readHealth,
       purgeSecretsImpl: async () => (deps.secretStoreFactory || createSecretStore)({ platform, env, home })
         .purge(purgeAccountIds),
     });
