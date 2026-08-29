@@ -8279,6 +8279,73 @@ describe('createProxyServer', () => {
     await close(proxy.server);
   });
 
+  for (const scenario of [
+    { name: 'manual to gateway', initialAllowLive: true, nextAllowLive: false },
+    { name: 'gateway to manual', initialAllowLive: false, nextAllowLive: true },
+  ]) {
+    it(`requires a restart when credential ownership changes from ${scenario.name}`, async () => {
+      let upstreamCalls = 0;
+      const upstream = await listen(http.createServer((_req, res) => {
+        upstreamCalls += 1;
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ ok: true }));
+      }));
+      const secretStore = new MemorySecretStore();
+      await secretStore.set('acct_1', { accessToken: 'ownership-access-fixture' });
+      const accounts = [{
+        id: 'acct_1',
+        name: 'a@example.com',
+        type: 'oauth',
+        credentialRevision: 'ownership-rev-1',
+      }];
+      const accountManager = new AccountManager({ accounts });
+      let currentCredentialReads = 0;
+      let usageCalls = 0;
+      const proxy = await listen(createProxyServer({
+        accountManager,
+        secretStore,
+        config: { upstream: upstream.url, usagePolling: { enabled: false } },
+        allowLiveClaudeCodeCredentials: scenario.initialAllowLive,
+        reloadAccounts: async () => ({
+          accounts: accounts.map(account => ({ ...account, name: 'must-not-apply@example.com' })),
+          allowLiveClaudeCodeCredentials: scenario.nextAllowLive,
+        }),
+        currentCredentialReader: async () => {
+          currentCredentialReads += 1;
+          return { accessToken: 'must-not-be-read' };
+        },
+        usageFetcher: async () => {
+          usageCalls += 1;
+          return {};
+        },
+      }));
+      cleanupAfterTest(async () => {
+        await close(proxy.server);
+        await close(upstream.server);
+      });
+
+      const reload = await requestJson(`${proxy.url}/internal/reload`, { method: 'POST' });
+      const health = await requestJson(`${proxy.url}/internal/health`);
+      const status = await requestJson(`${proxy.url}/internal/status`);
+      const refresh = await requestJson(`${proxy.url}/internal/refresh-usage`, { method: 'POST' });
+      const forwarded = await requestJson(`${proxy.url}/v1/messages`, {
+        method: 'POST',
+        body: JSON.stringify({ model: 'claude-sonnet-5' }),
+      });
+
+      assert.equal(reload.status, 409);
+      assert.equal(reload.body.error.type, 'restart_required');
+      assert.equal(health.status, 200);
+      assert.equal(status.status, 200);
+      assert.equal(status.body.accounts[0].name, 'a@example.com');
+      assert.equal(refresh.status, 503);
+      assert.equal(forwarded.status, 503);
+      assert.equal(currentCredentialReads, 0);
+      assert.equal(usageCalls, 0);
+      assert.equal(upstreamCalls, 0);
+    });
+  }
+
   it('returns a non-empty proxy error message for empty internal errors', async () => {
     const accountManager = new AccountManager({
       accounts: [{ id: 'acct_1', name: 'a@example.com', type: 'oauth' }],

@@ -12,6 +12,7 @@ import {
   assertAnthropicGatewayProviderCompatible,
   assertGatewayCompatibleAccounts,
   claudeLoginOverrideSource,
+  credentialOwnershipConfiguration,
   ensureCredentialRevisions,
   internalApiUrl,
   removeServiceFile,
@@ -110,6 +111,19 @@ describe('gateway account compatibility', () => {
       ),
       null,
     );
+  });
+
+  it('builds reload results with the same credential ownership mode used at startup', () => {
+    const accounts = [{ id: 'saved-account', type: 'oauth' }];
+
+    assert.deepEqual(credentialOwnershipConfiguration(accounts, null), {
+      accounts,
+      allowLiveClaudeCodeCredentials: true,
+    });
+    assert.deepEqual(credentialOwnershipConfiguration(accounts, 'ANTHROPIC_AUTH_TOKEN'), {
+      accounts,
+      allowLiveClaudeCodeCredentials: false,
+    });
   });
 });
 

@@ -334,8 +334,7 @@ async function runServer({ write }) {
   const config = await loadOrCreateConfig();
   const listenHost = proxyListenHost(config);
   const loginOverride = await localClaudeLoginOverrideSource();
-  assertAnthropicGatewayProviderCompatible(loginOverride);
-  if (loginOverride) assertGatewayCompatibleAccounts(config.accounts);
+  const credentialOwnership = credentialOwnershipConfiguration(config.accounts, loginOverride);
   if (ensureCredentialRevisions(config)) await saveConfig(config);
   const secretStore = createSecretStore();
   const accountManager = new AccountManager({
@@ -356,15 +355,11 @@ async function runServer({ write }) {
     accountManager,
     secretStore,
     config,
-    allowLiveClaudeCodeCredentials: !loginOverride,
+    allowLiveClaudeCodeCredentials: credentialOwnership.allowLiveClaudeCodeCredentials,
     reloadAccounts: async () => {
       const nextAccounts = (await loadOrCreateConfig()).accounts;
       const nextLoginOverride = await localClaudeLoginOverrideSource();
-      assertAnthropicGatewayProviderCompatible(nextLoginOverride);
-      if (nextLoginOverride) {
-        assertGatewayCompatibleAccounts(nextAccounts);
-      }
-      return nextAccounts;
+      return credentialOwnershipConfiguration(nextAccounts, nextLoginOverride);
     },
     logger: line => {
       if (logWriter) logWriter.write(line);
@@ -395,6 +390,15 @@ export function assertGatewayCompatibleAccounts(accounts = []) {
       'Gateway authentication cannot be installed while a live current account is configured. Run claude-rotator remove current first, then claude auth login --claudeai and claude-rotator login before installing.',
     );
   }
+}
+
+export function credentialOwnershipConfiguration(accounts, loginOverride) {
+  assertAnthropicGatewayProviderCompatible(loginOverride);
+  if (loginOverride) assertGatewayCompatibleAccounts(accounts);
+  return {
+    accounts,
+    allowLiveClaudeCodeCredentials: !loginOverride,
+  };
 }
 
 export function assertAnthropicGatewayProviderCompatible(source) {

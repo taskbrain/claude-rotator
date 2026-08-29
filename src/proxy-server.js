@@ -104,6 +104,7 @@ export function createProxyServer({
   });
   const duplicateRefreshAccountIds = new Set();
   const duplicateRefreshAccounts = new WeakSet();
+  let credentialOwnershipRestartRequired = false;
   let operationalStateCheck = Promise.resolve();
 
   const usageObservationTracker = createUsageObservationTracker();
@@ -124,7 +125,10 @@ export function createProxyServer({
     allowLiveClaudeCodeCredentials,
     usageRefreshConcurrency: usagePollingConcurrency(config, accountManager.accounts.length),
     usageRefreshRequestSpacingMs: usagePollingRequestSpacingMs(config),
-    beforeRefresh: () => operationalStateCheck,
+    beforeRefresh: async () => {
+      await operationalStateCheck;
+      if (credentialOwnershipRestartRequired) throw credentialOwnershipRestartError();
+    },
     duplicateRefreshAccountIds,
     logger,
   });
@@ -205,7 +209,11 @@ export function createProxyServer({
       await operationalStateCheck;
 
       if (req.method === 'GET' && req.url === '/internal/status') {
-        if (usagePollingEnabled(config) && !usageScheduler.hasAttempted()) {
+        if (
+          !credentialOwnershipRestartRequired
+          && usagePollingEnabled(config)
+          && !usageScheduler.hasAttempted()
+        ) {
           await usageScheduler.refreshNow();
         }
         sendJson(res, 200, accountManager.getStatus());
@@ -223,7 +231,19 @@ export function createProxyServer({
       if (req.method === 'POST' && req.url === '/internal/reload') {
         invalidateLiveClaudeCodeCache();
         if (reloadAccounts) {
-          const accounts = await reloadAccounts();
+          const reloadResult = normalizeReloadAccountsResult(
+            await reloadAccounts(),
+            allowLiveClaudeCodeCredentials,
+          );
+          if (
+            credentialOwnershipRestartRequired
+            || reloadResult.allowLiveClaudeCodeCredentials !== allowLiveClaudeCodeCredentials
+          ) {
+            credentialOwnershipRestartRequired = true;
+            sendCredentialOwnershipRestartRequired(res, 409);
+            return;
+          }
+          const { accounts } = reloadResult;
           const nextDuplicateIds = await duplicateRefreshTokenAccountIds(accounts, secretStore);
           const ownedDuplicateIds = duplicateRefreshErrorAccountIds(accountManager, duplicateRefreshAccounts);
           let duplicateStateChanged = clearResolvedDuplicateRefreshErrors({
@@ -258,12 +278,20 @@ export function createProxyServer({
       }
 
       if (req.method === 'POST' && req.url === '/internal/refresh-usage') {
+        if (credentialOwnershipRestartRequired) {
+          sendCredentialOwnershipRestartRequired(res, 503);
+          return;
+        }
         sendJson(res, 200, await usageScheduler.refreshNow());
         return;
       }
 
       if (req.method === 'POST' && req.url === '/internal/prepare-resume') {
         const body = JSON.parse((await readBody(req)).toString('utf8') || '{}');
+        if (body.refreshUsage && credentialOwnershipRestartRequired) {
+          sendCredentialOwnershipRestartRequired(res, 503);
+          return;
+        }
         if (body.refreshUsage) await usageScheduler.refreshNow();
         const result = accountManager.prepareResumeTarget();
         await persistState();
@@ -271,6 +299,11 @@ export function createProxyServer({
           ...result,
           status: accountManager.getStatus(),
         });
+        return;
+      }
+
+      if (credentialOwnershipRestartRequired) {
+        sendCredentialOwnershipRestartRequired(res, 503);
         return;
       }
 
@@ -409,6 +442,39 @@ function clearResolvedDuplicateRefreshErrors({
     changed = true;
   }
   return changed;
+}
+
+function normalizeReloadAccountsResult(result, currentAllowLiveClaudeCodeCredentials) {
+  if (Array.isArray(result)) {
+    return {
+      accounts: result,
+      allowLiveClaudeCodeCredentials: currentAllowLiveClaudeCodeCredentials,
+    };
+  }
+  if (
+    !result
+    || !Array.isArray(result.accounts)
+    || typeof result.allowLiveClaudeCodeCredentials !== 'boolean'
+  ) {
+    throw new Error('Reloaded credential configuration is invalid');
+  }
+  return result;
+}
+
+function credentialOwnershipRestartError() {
+  const error = new Error('Credential ownership changed; restart claude-rotator before continuing.');
+  error.code = 'CREDENTIAL_OWNERSHIP_RESTART_REQUIRED';
+  return error;
+}
+
+function sendCredentialOwnershipRestartRequired(res, statusCode) {
+  sendJson(res, statusCode, {
+    type: 'error',
+    error: {
+      type: 'restart_required',
+      message: 'Credential ownership changed; restart claude-rotator before continuing.',
+    },
+  });
 }
 
 export function defaultTokenRefresher({
