@@ -71,6 +71,36 @@ describe('AccountManager', () => {
     assert.equal(manager.getActiveAccount().id, 'acct_3');
   });
 
+  it('switches every model family away from common token and request exhaustion', () => {
+    for (const reasonKind of ['token', 'request']) {
+      for (const modelFamily of ['fable', null]) {
+        const manager = new AccountManager({
+          accounts: [
+            { id: 'acct_1', name: 'a@example.com', type: 'oauth' },
+            { id: 'acct_2', name: 'b@example.com', type: 'oauth' },
+          ],
+          switchThreshold: 1,
+          now: () => 1000,
+        });
+        manager.updateQuota('acct_2', {
+          'anthropic-ratelimit-unified-5h-utilization': '0.2',
+          'anthropic-ratelimit-unified-7d-utilization': '0.3',
+        });
+        manager.updateQuota('acct_1', reasonKind === 'token'
+          ? {
+              'anthropic-ratelimit-tokens-limit': '1000',
+              'anthropic-ratelimit-tokens-remaining': '0',
+            }
+          : {
+              'anthropic-ratelimit-requests-limit': '100',
+              'anthropic-ratelimit-requests-remaining': '0',
+            });
+
+        assert.equal(manager.getActiveAccount(modelFamily)?.id, 'acct_2', `${reasonKind}/${modelFamily || 'other'}`);
+      }
+    }
+  });
+
   it('prefers a ready account with a soon weekly reset over a lower-usage account', () => {
     const manager = new AccountManager({
       accounts: [
@@ -387,6 +417,46 @@ describe('AccountManager', () => {
     assert.equal(manager.getActiveAccount().id, 'acct_2');
     assert.equal(manager.getCurrentAccount().id, 'acct_2');
     assert.equal(manager.getStatus().accounts[0].unavailableReason.type, 'oauth_refresh_rate_limit');
+  });
+
+  it('treats a local OAuth refresh retry as a credential cooldown', () => {
+    const manager = new AccountManager({
+      accounts: [
+        {
+          id: 'acct_1',
+          name: 'a@example.com',
+          type: 'oauth',
+          credentialRevision: 'revision-1',
+        },
+        { id: 'acct_2', name: 'b@example.com', type: 'oauth' },
+      ],
+      now: () => 1000,
+    });
+    manager.updateQuota('acct_2', {
+      'anthropic-ratelimit-unified-5h-utilization': '0.1',
+      'anthropic-ratelimit-unified-7d-utilization': '0.2',
+    });
+
+    manager.markCredentialRefreshDeferred('acct_1', 60, { retryAfterSource: 'fixed' });
+
+    assert.equal(manager.getActiveAccount().id, 'acct_2');
+    assert.equal(manager.getStatus().accounts[0].unavailableReason.type, 'oauth_refresh_retry');
+
+    manager.markAuthenticated('acct_1');
+    assert.equal(manager.getStatus().accounts[0].unavailableReason, null);
+
+    manager.markCredentialRefreshDeferred('acct_1', 60, { retryAfterSource: 'fixed' });
+    manager.replaceAccounts([
+      {
+        id: 'acct_1',
+        name: 'a@example.com',
+        type: 'oauth',
+        credentialRevision: 'revision-2',
+      },
+      { id: 'acct_2', name: 'b@example.com', type: 'oauth' },
+    ]);
+
+    assert.equal(manager.getStatus().accounts[0].unavailableReason, null);
   });
 
   it('falls back to the current throttled account before an exhausted alternate', () => {
@@ -1100,7 +1170,7 @@ describe('AccountManager', () => {
     assert.equal(account.unavailableReason, null);
   });
 
-  it('switches away from accounts with exhausted model-scoped weekly usage', () => {
+  function makeManagerWithFableExhaustedPrimary() {
     const manager = new AccountManager({
       accounts: [
         { id: 'acct_1', name: 'a@example.com', type: 'oauth' },
@@ -1127,7 +1197,11 @@ describe('AccountManager', () => {
       seven_day: { utilization: 0.4, resets_at: '2026-07-07T00:00:00Z' },
     });
 
-    assert.equal(manager.getActiveAccount().id, 'acct_2');
+    return manager;
+  }
+
+  it('still reports the fable sub-cap exhaustion for status/monitoring regardless of the requested model', () => {
+    const manager = makeManagerWithFableExhaustedPrimary();
     const exhausted = manager.getStatus().accounts[0];
     assert.equal(exhausted.status, 'exhausted');
     assert.deepEqual(exhausted.unavailableReason, {
@@ -1137,6 +1211,289 @@ describe('AccountManager', () => {
       utilization: 1,
       resetAt: '2026-07-07T00:00:00.000Z',
     });
+  });
+
+  it('switches away from a fable-exhausted account for FABLE requests', () => {
+    const manager = makeManagerWithFableExhaustedPrimary();
+    const picked = manager.getActiveAccount('fable');
+    assert.notEqual(picked.id, 'acct_1', 'fable request must skip the fable-exhausted account');
+    assert.equal(picked.id, 'acct_2');
+  });
+
+  it('does not permanently move currentIndex for a model-scoped-only switch (M2)', () => {
+    const manager = makeManagerWithFableExhaustedPrimary();
+
+    const fablePicked = manager.getActiveAccount('fable');
+    assert.equal(fablePicked.id, 'acct_2', 'the fable request is routed ad-hoc to acct_2');
+    assert.equal(
+      manager.getCurrentAccount().id,
+      'acct_1',
+      'a scoped-only exhaustion must not move currentIndex away from acct_1',
+    );
+
+    const sonnetPicked = manager.getActiveAccount(null);
+    assert.equal(
+      sonnetPicked.id,
+      'acct_1',
+      'a later non-fable request must still land on acct_1, not the fable ad-hoc target',
+    );
+  });
+
+  it('keeps using a fable-exhausted account for NON-fable requests (opus/sonnet/haiku)', () => {
+    const manager = makeManagerWithFableExhaustedPrimary();
+    const picked = manager.getActiveAccount(null);
+    assert.equal(picked.id, 'acct_1', 'non-fable request must still use the account');
+  });
+
+  it('treats an omitted model family the same as a non-fable request (default behavior)', () => {
+    const manager = makeManagerWithFableExhaustedPrimary();
+    // Calling with no argument at all must behave exactly like modelFamily = null,
+    // i.e. a request whose model could not be identified is routed as non-Fable.
+    const picked = manager.getActiveAccount();
+    assert.equal(picked.id, 'acct_1', 'omitting modelFamily must default to non-fable (permissive) routing');
+  });
+
+  it('reports model-aware availability in the order each account can actually recover', () => {
+    const now = Date.parse('2026-08-29T05:00:00.000Z');
+    const manager = new AccountManager({
+      accounts: [
+        { id: 'acct_1', name: 'a@example.com', type: 'oauth' },
+        { id: 'acct_2', name: 'b@example.com', type: 'oauth' },
+        { id: 'acct_3', name: 'c@example.com', type: 'oauth' },
+      ],
+      switchThreshold: 1,
+      now: () => now,
+    });
+
+    manager.applyUsage('acct_1', {
+      five_hour: { utilization: 0.2, resets_at: '2026-08-29T10:00:00.000Z' },
+      seven_day: { utilization: 0.2, resets_at: '2026-09-01T05:00:00.000Z' },
+      scoped_weekly: [{
+        key: 'fable',
+        label: 'Fable',
+        utilization: 1,
+        resets_at: '2026-08-29T09:00:00.000Z',
+      }],
+    });
+    manager.applyUsage('acct_2', {
+      five_hour: { utilization: 1, resets_at: '2026-08-29T06:00:00.000Z' },
+      seven_day: { utilization: 0.2, resets_at: '2026-09-01T05:00:00.000Z' },
+      scoped_weekly: [{
+        key: 'fable',
+        label: 'Fable',
+        utilization: 1,
+        resets_at: '2026-08-29T08:00:00.000Z',
+      }],
+    });
+    manager.applyUsage('acct_3', {
+      five_hour: { utilization: 0.2, resets_at: '2026-08-29T10:00:00.000Z' },
+      seven_day: { utilization: 1, resets_at: '2026-08-29T07:00:00.000Z' },
+    });
+
+    const status = manager.getStatus();
+    assert.deepEqual(status.routingAvailability.other, [
+      {
+        account: 'acct_1',
+        accountName: 'a@example.com',
+        state: 'available',
+        availableAt: null,
+      },
+      {
+        account: 'acct_2',
+        accountName: 'b@example.com',
+        state: 'waiting',
+        availableAt: '2026-08-29T06:00:00.000Z',
+      },
+      {
+        account: 'acct_3',
+        accountName: 'c@example.com',
+        state: 'waiting',
+        availableAt: '2026-08-29T07:00:00.000Z',
+      },
+    ]);
+    assert.deepEqual(status.routingAvailability.fable, [
+      {
+        account: 'acct_3',
+        accountName: 'c@example.com',
+        state: 'waiting',
+        availableAt: '2026-08-29T07:00:00.000Z',
+      },
+      {
+        account: 'acct_2',
+        accountName: 'b@example.com',
+        state: 'waiting',
+        availableAt: '2026-08-29T08:00:00.000Z',
+      },
+      {
+        account: 'acct_1',
+        accountName: 'a@example.com',
+        state: 'waiting',
+        availableAt: '2026-08-29T09:00:00.000Z',
+      },
+    ]);
+  });
+
+  it('reports unknown after timed candidates when reset evidence or credentials are unusable', () => {
+    const now = Date.parse('2026-08-29T05:00:00.000Z');
+    const manager = new AccountManager({
+      accounts: [
+        { id: 'missing_reset', name: 'missing@example.com', type: 'oauth' },
+        { id: 'credential_error', name: 'error@example.com', type: 'oauth' },
+        { id: 'cooldown', name: 'cooldown@example.com', type: 'oauth' },
+      ],
+      switchThreshold: 1,
+      now: () => now,
+    });
+    manager.applyUsage('missing_reset', {
+      five_hour: { utilization: 1 },
+      seven_day: { utilization: 0.2, resets_at: '2026-09-01T05:00:00.000Z' },
+    });
+    for (const accountId of ['credential_error', 'cooldown']) {
+      manager.applyUsage(accountId, {
+        five_hour: { utilization: 0.2, resets_at: '2026-08-29T10:00:00.000Z' },
+        seven_day: { utilization: 0.2, resets_at: '2026-09-01T05:00:00.000Z' },
+      });
+    }
+    manager.markError('credential_error', 'oauth_refresh_failed', 'refresh failed');
+    manager.markRateLimited('cooldown', 60 * 60);
+
+    assert.deepEqual(manager.getStatus().routingAvailability.other, [
+      {
+        account: 'cooldown',
+        accountName: 'cooldown@example.com',
+        state: 'waiting',
+        availableAt: '2026-08-29T06:00:00.000Z',
+      },
+      {
+        account: 'missing_reset',
+        accountName: 'missing@example.com',
+        state: 'unknown',
+        availableAt: null,
+      },
+      {
+        account: 'credential_error',
+        accountName: 'error@example.com',
+        state: 'unknown',
+        availableAt: null,
+      },
+    ]);
+  });
+
+  it('rejects every model family when the common weekly/5h window is exhausted (not model-scoped)', () => {
+    const manager = new AccountManager({
+      accounts: [{ id: 'acct_1', name: 'a@example.com', type: 'oauth' }],
+      switchThreshold: 1,
+      now: () => 1000,
+    });
+    manager.applyUsage('acct_1', {
+      five_hour: { utilization: 0.2, resets_at: '2026-07-05T05:00:00Z' },
+      seven_day: { utilization: 1, resets_at: '2026-07-07T00:00:00Z' },
+    });
+
+    assert.equal(manager.isAvailable(manager.accounts[0], 'fable'), false, 'common quota exhaustion must block fable requests too');
+    assert.equal(manager.isAvailable(manager.accounts[0], null), false, 'common quota exhaustion must block non-fable requests too');
+    assert.equal(manager.getActiveAccount('fable'), null);
+    assert.equal(manager.getActiveAccount(null), null);
+  });
+
+  it('CASE B: rejects every model family when a common token-rate-limit exhaustion is hidden behind a fable-scoped exhaustion', () => {
+    const manager = new AccountManager({
+      accounts: [{ id: 'acct_1', name: 'a@example.com', type: 'oauth' }],
+      switchThreshold: 1,
+      now: () => 1000,
+    });
+    // Unified 5h/7d have headroom. The Fable weekly sub-cap is exhausted AND,
+    // independently, the common token rate limit is exhausted too.
+    // `quotaUnavailableReason` would report the Fable-scoped reason first
+    // (scoped windows are checked before tokens/requests) — a gate that only
+    // looked at that single classified reason would incorrectly let a
+    // non-fable request through even though the account has no token budget
+    // left for anyone.
+    manager.applyUsage('acct_1', {
+      five_hour: { utilization: 0.2, resets_at: '2026-07-05T05:00:00Z' },
+      seven_day: { utilization: 0.2, resets_at: '2026-07-07T00:00:00Z' },
+      scoped_weekly: [{ key: 'fable', label: 'Fable', utilization: 1, resets_at: '2026-07-07T00:00:00Z' }],
+    });
+    manager.updateQuota('acct_1', {
+      'anthropic-ratelimit-tokens-limit': '1000',
+      'anthropic-ratelimit-tokens-remaining': '0',
+    });
+
+    assert.equal(manager.isAvailable(manager.accounts[0], 'fable'), false, 'token exhaustion must block fable requests too');
+    assert.equal(manager.isAvailable(manager.accounts[0], null), false, 'token exhaustion must block non-fable requests too, even though the fable-scoped reason sorts first');
+    assert.equal(manager.getActiveAccount('fable'), null);
+    assert.equal(manager.getActiveAccount(null), null);
+  });
+
+  it('CASE C: rejects a fable request when the fable-scoped entry is not the first element of weeklyScoped', () => {
+    const manager = new AccountManager({
+      accounts: [{ id: 'acct_1', name: 'a@example.com', type: 'oauth' }],
+      switchThreshold: 1,
+      now: () => 1000,
+    });
+    // scopedWeeklyQuotaUnavailableReason only ever returns the FIRST exhausted
+    // entry it finds; if an unrelated scoped cap comes first in the array, a
+    // gate built on that single reason would never see the fable exhaustion
+    // that follows it.
+    manager.applyUsage('acct_1', {
+      five_hour: { utilization: 0.2, resets_at: '2026-07-05T05:00:00Z' },
+      seven_day: { utilization: 0.2, resets_at: '2026-07-07T00:00:00Z' },
+      scoped_weekly: [
+        { key: 'some_other_cap', label: 'Some Other Cap', utilization: 1, resets_at: '2026-07-07T00:00:00Z' },
+        { key: 'fable', label: 'Fable', utilization: 1, resets_at: '2026-07-07T00:00:00Z' },
+      ],
+    });
+
+    assert.equal(
+      manager.isAvailable(manager.accounts[0], 'fable'),
+      false,
+      'a fable-scoped exhaustion must be found even when it is not the first weeklyScoped entry',
+    );
+    assert.equal(
+      manager.isAvailable(manager.accounts[0], null),
+      true,
+      'an unrecognized scoped cap ahead of it must not gate a non-fable request',
+    );
+    assert.equal(manager.getActiveAccount('fable'), null);
+    assert.equal(manager.getActiveAccount(null)?.id, 'acct_1');
+  });
+
+  it('m2: unavailableReasonForModelFamily reports the true common-quota reason to a non-matching-family request', () => {
+    const manager = new AccountManager({
+      accounts: [{ id: 'acct_1', name: 'a@example.com', type: 'oauth' }],
+      switchThreshold: 1,
+      now: () => 1000,
+    });
+    // Same fixture as CASE B: unified 5h/7d have headroom, the Fable weekly
+    // sub-cap is exhausted, and the common token rate limit is exhausted too.
+    manager.applyUsage('acct_1', {
+      five_hour: { utilization: 0.2, resets_at: '2026-07-05T05:00:00Z' },
+      seven_day: { utilization: 0.2, resets_at: '2026-07-07T00:00:00Z' },
+      scoped_weekly: [{ key: 'fable', label: 'Fable', utilization: 1, resets_at: '2026-07-07T00:00:00Z' }],
+    });
+    manager.updateQuota('acct_1', {
+      'anthropic-ratelimit-tokens-limit': '1000',
+      'anthropic-ratelimit-tokens-remaining': '0',
+    });
+    const account = manager.accounts[0];
+
+    const fableReason = manager.unavailableReasonForModelFamily(account, 'fable');
+    assert.equal(fableReason.type, 'quota_exhausted');
+    assert.equal(fableReason.window, '7d Fable');
+    assert.equal(fableReason.claim, 'seven_day_fable');
+
+    const nonFableReason = manager.unavailableReasonForModelFamily(account, null);
+    assert.equal(
+      nonFableReason.type,
+      'token_rate_limit_exhausted',
+      'a non-fable request must be told the true (token) reason, not the fable-scoped one',
+    );
+    assert.equal(nonFableReason.claim, undefined, 'the token-exhaustion reason must not carry a fable claim');
+
+    // The unfiltered, family-agnostic reason (used for /internal/status) is
+    // unaffected: it still reports whichever reason the existing priority
+    // (5h -> 7d -> scoped -> tokens -> requests) surfaces first.
+    assert.equal(manager.unavailableReason(account).window, '7d Fable');
   });
 
   it('reports quota exhaustion ahead of retry-after throttling', () => {
@@ -1156,6 +1513,40 @@ describe('AccountManager', () => {
     assert.equal(account.status, 'exhausted');
     assert.equal(account.unavailableReason.type, 'quota_exhausted');
     assert.equal(account.unavailableReason.window, '5h');
+  });
+
+  it('keeps a credential refresh cooldown authoritative when a scoped quota reason hides it', () => {
+    const manager = new AccountManager({
+      accounts: [
+        { id: 'cooldown', name: 'cooldown@example.com', type: 'oauth' },
+        { id: 'quota', name: 'quota@example.com', type: 'oauth' },
+      ],
+      currentAccountId: 'cooldown',
+      switchThreshold: 1,
+      now: () => 1000,
+    });
+    manager.applyUsage('cooldown', {
+      five_hour: { utilization: 0.2, resets_at: '2026-07-05T05:00:00Z' },
+      seven_day: { utilization: 0.2, resets_at: '2026-07-07T00:00:00Z' },
+      scoped_weekly: [{ key: 'fable', label: 'Fable', utilization: 1, resets_at: '2026-07-07T00:00:00Z' }],
+    });
+    manager.markCredentialRefreshDeferred('cooldown', 300, { retryAfterSource: 'fixed' });
+    manager.updateQuota('quota', {
+      'anthropic-ratelimit-unified-5h-utilization': '1',
+      'anthropic-ratelimit-unified-5h-reset': '60',
+    });
+
+    const cooldown = manager.find('cooldown');
+    assert.equal(manager.unavailableReason(cooldown).type, 'quota_exhausted');
+    assert.equal(manager.hasCredentialRefreshCooldown(cooldown), true);
+    assert.equal(manager.isAvailable(cooldown, null), false);
+    assert.equal(manager.getActiveAccount(null), null);
+    assert.equal(manager.getCurrentAccount().id, 'cooldown');
+    assert.equal(manager.exhaustedFallbackScore(cooldown), null);
+
+    const resume = manager.prepareResumeTarget();
+    assert.equal(resume.account, 'quota');
+    assert.equal(resume.reason, 'shortest-quota-reset');
   });
 
   it('restores persisted quota state for resume target selection after restart', () => {
@@ -1286,7 +1677,7 @@ describe('AccountManager', () => {
     assert.equal(account.unavailableReason, null);
   });
 
-  it('preserves a fixed OAuth refresh cooldown up to one hour after restart', () => {
+  it('preserves a fixed local OAuth refresh retry up to one hour after restart', () => {
     const now = Date.parse('2026-07-12T12:00:00Z');
     const manager = new AccountManager({
       accounts: [{ id: 'acct_1', name: 'a@example.com', type: 'oauth' }],
@@ -1303,7 +1694,7 @@ describe('AccountManager', () => {
         usage: {},
         rateLimitedUntil: new Date(now + 60 * 60 * 1000).toISOString(),
         temporaryUnavailableReason: {
-          type: 'oauth_refresh_rate_limit',
+          type: 'oauth_refresh_retry',
           retryAfterSource: 'fixed',
         },
         errorReason: null,
@@ -1313,10 +1704,11 @@ describe('AccountManager', () => {
     const account = manager.getStatus().accounts[0];
     assert.equal(account.status, 'throttled');
     assert.equal(account.rateLimitedUntil, '2026-07-12T13:00:00.000Z');
+    assert.equal(account.unavailableReason.type, 'oauth_refresh_retry');
     assert.equal(account.unavailableReason.retryAfterSource, 'fixed');
   });
 
-  it('clears a fixed OAuth refresh cooldown over one hour after restart', () => {
+  it('clears a fixed local OAuth refresh retry over one hour after restart', () => {
     const now = Date.parse('2026-07-12T12:00:00Z');
     const manager = new AccountManager({
       accounts: [{ id: 'acct_1', name: 'a@example.com', type: 'oauth' }],
@@ -1333,7 +1725,7 @@ describe('AccountManager', () => {
         usage: {},
         rateLimitedUntil: new Date(now + 61 * 60 * 1000).toISOString(),
         temporaryUnavailableReason: {
-          type: 'oauth_refresh_rate_limit',
+          type: 'oauth_refresh_retry',
           retryAfterSource: 'fixed',
         },
         errorReason: null,

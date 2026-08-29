@@ -1,8 +1,14 @@
 import { createHash } from 'node:crypto';
 import { copyFile, mkdir, readFile, rm, symlink } from 'node:fs/promises';
 import { dirname, join } from 'node:path';
+import { isDeepStrictEqual } from 'node:util';
 
-import { mergeClaudeSettings, restoreClaudeSettings } from './config.js';
+import {
+  areClaudeGatewaySettingsRestored,
+  LOCAL_GATEWAY_AUTH_TOKEN,
+  mergeClaudeSettings,
+  restoreClaudeSettings,
+} from './config.js';
 import { fileSha256, readJsonFile, writeJsonFile } from './json-file.js';
 import {
   assertMacosServiceLockHeld,
@@ -30,23 +36,55 @@ export async function installSettings({
   installStatePath,
   backupDir,
   proxyBaseUrl,
+  gatewayAuthToken = LOCAL_GATEWAY_AUTH_TOKEN,
   now = () => new Date(),
   force = false,
 }) {
-  const settings = await readJsonFile(settingsPath, {});
+  const originalSettings = await readJsonFile(settingsPath, null);
+  const settings = originalSettings || {};
+  const previousInstallState = await readJsonFile(installStatePath, null);
+  if (
+    previousInstallState?.settingsPath
+    && previousInstallState.settingsPath !== settingsPath
+  ) {
+    throw new Error(
+      `claude-rotator already manages a different Claude settings file: ${previousInstallState.settingsPath}. Uninstall it before changing CLAUDE_CONFIG_DIR.`,
+    );
+  }
   const existingBaseUrl = settings.env?.ANTHROPIC_BASE_URL;
+  const authTokenExists = Object.prototype.hasOwnProperty.call(
+    settings.env || {},
+    'ANTHROPIC_AUTH_TOKEN',
+  );
+  const existingAuthToken = settings.env?.ANTHROPIC_AUTH_TOKEN;
   if (existingBaseUrl && existingBaseUrl !== proxyBaseUrl && !force) {
     throw new Error(`ANTHROPIC_BASE_URL already exists: ${existingBaseUrl}`);
+  }
+  if (authTokenExists && existingAuthToken !== gatewayAuthToken && !force) {
+    throw new Error('ANTHROPIC_AUTH_TOKEN already exists');
   }
 
   await mkdir(backupDir, { recursive: true });
   const backupPath = join(backupDir, `settings-${timestampForFile(now())}.json`);
-  await writeJsonFile(settingsPath, settings);
-  await copyFile(settingsPath, backupPath);
+  // Re-serialize into a private atomic file instead of copying the source mode;
+  // user settings can contain an existing gateway credential.
+  await writeJsonFile(backupPath, settings);
+
+  const latestSettings = await readJsonFile(settingsPath, null);
+  if (!isDeepStrictEqual(latestSettings, originalSettings)) {
+    throw new Error('Claude settings changed while claude-rotator was installing');
+  }
+  if (latestSettings == null) await writeJsonFile(settingsPath, settings);
 
   const settingsHashBefore = await fileSha256(settingsPath);
-  const merged = mergeClaudeSettings(settings, proxyBaseUrl);
-  await writeJsonFile(settingsPath, merged.settings);
+  const merged = mergeClaudeSettings(settings, proxyBaseUrl, gatewayAuthToken);
+
+  const sameSettingsFile = previousInstallState?.settingsPath === settingsPath;
+  const previousInstallOwnsBaseUrl = sameSettingsFile
+    && previousInstallState?.proxyBaseUrl === existingBaseUrl;
+  const previousInstallOwnsAuthToken = sameSettingsFile
+    && previousInstallState?.gatewayAuthToken != null
+    && previousInstallState.gatewayAuthToken === existingAuthToken;
 
   const installState = {
     installedAt: now().toISOString(),
@@ -54,18 +92,46 @@ export async function installSettings({
     backupPath,
     settingsHashBefore,
     proxyBaseUrl,
-    previousBaseUrl: merged.previousBaseUrl,
+    gatewayAuthToken,
+    previousBaseUrl: previousInstallOwnsBaseUrl
+      ? previousInstallState.previousBaseUrl
+      : merged.previousBaseUrl,
+    previousAuthToken: previousInstallOwnsAuthToken
+      ? previousInstallState.previousAuthToken
+      : merged.previousAuthToken,
   };
   await writeJsonFile(installStatePath, installState);
+  try {
+    await writeJsonFile(settingsPath, merged.settings);
+  } catch (error) {
+    if (previousInstallState) {
+      await writeJsonFile(installStatePath, previousInstallState).catch(() => {});
+    } else {
+      await rm(installStatePath, { force: true }).catch(() => {});
+    }
+    throw error;
+  }
   return installState;
 }
 
 export async function uninstallSettings({ settingsPath, installStatePath, force = false }) {
   const installState = await readJsonFile(installStatePath);
-  const settings = await readJsonFile(settingsPath, {});
+  const managedSettingsPath = installState.settingsPath || settingsPath;
+  const settings = await readJsonFile(managedSettingsPath, {});
   const restored = restoreClaudeSettings(settings, installState, { force });
+  if (restored.conflict && areClaudeGatewaySettingsRestored(settings, installState)) {
+    return { conflict: false, settings, alreadyRestored: true };
+  }
   if (!restored.conflict) {
-    await writeJsonFile(settingsPath, restored.settings);
+    const latestSettings = await readJsonFile(managedSettingsPath, {});
+    if (!isDeepStrictEqual(latestSettings, settings)) {
+      return {
+        conflict: true,
+        reason: 'Claude settings changed while claude-rotator was uninstalling',
+        settings: latestSettings,
+      };
+    }
+    await writeJsonFile(managedSettingsPath, restored.settings);
   }
   return restored;
 }
@@ -96,6 +162,11 @@ export async function installMacosLifecycle({
     ? JSON.parse(snapshots.installStatePath.bytes.toString('utf8'))
     : null;
   const registrations = await snapshotMacosRegistrations({ uid, env, execFileImpl });
+  const previousHealthyGeneration = await snapshotHealthyServiceGeneration({
+    registered: registrations.main,
+    healthCheck,
+    timeoutMs: healthTimeoutMs,
+  });
   let createdBackupPath = null;
 
   try {
@@ -134,22 +205,14 @@ export async function installMacosLifecycle({
       return;
     }
 
-    const definitionChanged = !snapshots.mainPlistPath.exists
-      || !snapshots.mainPlistPath.bytes.equals(Buffer.from(artifacts.mainPlist));
-    await reconcileMacosMainService({
-      uid,
-      plistPath: paths.mainPlistPath,
-      definitionChanged,
-      env,
-      execFileImpl,
-    });
-    await waitForMacosHealth({
-      healthCheck,
-      expectedServiceGeneration,
-      timeoutMs: healthTimeoutMs,
-      intervalMs: healthPollIntervalMs,
-      sleep,
-    });
+    // Write the gateway settings BEFORE (re)starting the main service. Every
+    // path through reconcileMacosMainService below restarts the running
+    // process (kickstart, bootout+bootstrap, or a fresh bootstrap), and
+    // runServer() decides allowLiveClaudeCodeCredentials once at boot by
+    // reading ~/.claude/settings.json. Starting the service first would let
+    // it boot in the brief window before ANTHROPIC_AUTH_TOKEN is written,
+    // so it would allow live Claude Code credentials even though gateway
+    // auth is about to be installed.
     const installState = previousInstallState
       ? await updateMacosInstalledSettings({
         settingsPath: paths.settingsPath,
@@ -166,6 +229,23 @@ export async function installMacosLifecycle({
         force,
       });
     if (!previousInstallState) createdBackupPath = installState.backupPath;
+
+    const definitionChanged = !snapshots.mainPlistPath.exists
+      || !snapshots.mainPlistPath.bytes.equals(Buffer.from(artifacts.mainPlist));
+    await reconcileMacosMainService({
+      uid,
+      plistPath: paths.mainPlistPath,
+      definitionChanged,
+      env,
+      execFileImpl,
+    });
+    await waitForMacosHealth({
+      healthCheck,
+      expectedServiceGeneration,
+      timeoutMs: healthTimeoutMs,
+      intervalMs: healthPollIntervalMs,
+      sleep,
+    });
     await writeJsonFile(paths.markerPath, {
       version: 1,
       installStateSha256: await fileSha256(paths.installStatePath),
@@ -184,6 +264,11 @@ export async function installMacosLifecycle({
       snapshots,
       registrations,
       execFileImpl,
+      previousHealthyGeneration,
+      healthCheck,
+      healthTimeoutMs,
+      healthPollIntervalMs,
+      sleep,
     });
     if (createdBackupPath) {
       await attemptRollback(rollbackErrors, () => rm(createdBackupPath, { force: true }));
@@ -203,6 +288,7 @@ async function updateMacosInstalledSettings({
   installStatePath,
   previousInstallState,
   proxyBaseUrl,
+  gatewayAuthToken = LOCAL_GATEWAY_AUTH_TOKEN,
   force,
 }) {
   if (
@@ -222,12 +308,27 @@ async function updateMacosInstalledSettings({
   ) {
     throw new Error(`ANTHROPIC_BASE_URL changed after install: ${currentBaseUrl}`);
   }
-  const merged = mergeClaudeSettings(settings, proxyBaseUrl);
+  // Mirror the ANTHROPIC_BASE_URL conflict guard above for ANTHROPIC_AUTH_TOKEN:
+  // once claude-rotator manages this settings file, an unexpected token value
+  // (e.g. a real credential a user set by hand) must not be silently
+  // overwritten on reinstall the way a genuinely fresh install would reject it.
+  const previousGatewayAuthToken = previousInstallState.gatewayAuthToken ?? gatewayAuthToken;
+  const currentAuthToken = settings.env?.ANTHROPIC_AUTH_TOKEN;
+  if (
+    currentAuthToken
+    && currentAuthToken !== previousGatewayAuthToken
+    && currentAuthToken !== gatewayAuthToken
+    && !force
+  ) {
+    throw new Error('ANTHROPIC_AUTH_TOKEN changed after install');
+  }
+  const merged = mergeClaudeSettings(settings, proxyBaseUrl, gatewayAuthToken);
   await writeJsonFile(settingsPath, merged.settings);
   const nextState = {
     ...previousInstallState,
     installedAt: new Date().toISOString(),
     proxyBaseUrl,
+    gatewayAuthToken,
   };
   await writeJsonFile(installStatePath, nextState);
   return nextState;
@@ -241,6 +342,10 @@ export async function uninstallMacosLifecycle({
   purgeSecrets = false,
   execFileImpl,
   purgeSecretsImpl = async () => {},
+  healthCheck = null,
+  healthTimeoutMs = 15_000,
+  healthPollIntervalMs = 100,
+  sleep = delay => new Promise(resolve => setTimeout(resolve, delay)),
 }) {
   assertMacosServiceLockHeld(env);
   const snapshots = await snapshotMacosLifecycleFiles(paths);
@@ -254,8 +359,14 @@ export async function uninstallMacosLifecycle({
   }
 
   let registrations;
+  let previousHealthyGeneration = null;
   try {
     registrations = await snapshotMacosRegistrations({ uid, env, execFileImpl });
+    previousHealthyGeneration = await snapshotHealthyServiceGeneration({
+      registered: registrations.main,
+      healthCheck,
+      timeoutMs: healthTimeoutMs,
+    });
     await rm(paths.markerPath, { force: true });
     await stopMacosWatchdogService({ uid, env, execFileImpl });
     await stopMacosMainService({ uid, env, execFileImpl });
@@ -274,6 +385,13 @@ export async function uninstallMacosLifecycle({
         registrations,
         execFileImpl,
       }));
+      await verifyRollbackServiceHealth(rollbackErrors, {
+        previousHealthyGeneration,
+        healthCheck,
+        healthTimeoutMs,
+        healthPollIntervalMs,
+        sleep,
+      });
     }
     if (rollbackErrors.length > 0) {
       throw new AggregateError(
@@ -310,7 +428,19 @@ async function snapshotMacosRegistrations({ uid, env, execFileImpl }) {
   };
 }
 
-async function rollbackMacosLifecycle({ uid, env, paths, snapshots, registrations, execFileImpl }) {
+async function rollbackMacosLifecycle({
+  uid,
+  env,
+  paths,
+  snapshots,
+  registrations,
+  execFileImpl,
+  previousHealthyGeneration,
+  healthCheck,
+  healthTimeoutMs,
+  healthPollIntervalMs,
+  sleep,
+}) {
   const errors = [];
   await attemptRollback(errors, () => rm(paths.markerPath, { force: true }));
   await attemptRollback(errors, () => stopMacosWatchdogService({ uid, env, execFileImpl }));
@@ -322,6 +452,13 @@ async function rollbackMacosLifecycle({ uid, env, paths, snapshots, registration
     registrations,
     execFileImpl,
   }));
+  await verifyRollbackServiceHealth(errors, {
+    previousHealthyGeneration,
+    healthCheck,
+    healthTimeoutMs,
+    healthPollIntervalMs,
+    sleep,
+  });
   return errors;
 }
 
@@ -364,6 +501,43 @@ async function attemptRollback(errors, operation) {
   } catch (error) {
     errors.push(error);
   }
+}
+
+async function snapshotHealthyServiceGeneration({ registered, healthCheck, timeoutMs }) {
+  if (!registered || typeof healthCheck !== 'function') return null;
+  try {
+    const health = await runMacosHealthAttempt({
+      healthCheck,
+      deadline: Date.now() + timeoutMs,
+    });
+    if (
+      health?.ok === true
+      && typeof health.serviceGeneration === 'string'
+      && health.serviceGeneration.length > 0
+    ) {
+      return health.serviceGeneration;
+    }
+  } catch {
+    // An unavailable preflight does not prove that the old generation was healthy.
+  }
+  return null;
+}
+
+async function verifyRollbackServiceHealth(errors, {
+  previousHealthyGeneration,
+  healthCheck,
+  healthTimeoutMs,
+  healthPollIntervalMs,
+  sleep,
+}) {
+  if (!previousHealthyGeneration) return;
+  await attemptRollback(errors, () => waitForMacosHealth({
+    healthCheck,
+    expectedServiceGeneration: previousHealthyGeneration,
+    timeoutMs: healthTimeoutMs,
+    intervalMs: healthPollIntervalMs,
+    sleep,
+  }));
 }
 
 async function waitForMacosHealth({
@@ -427,6 +601,7 @@ export function renderLaunchAgentPlist({
   nodePath,
   cliPath,
   configPath,
+  claudeConfigDir,
   claudePath,
   servicePath,
   serviceGeneration = null,
@@ -447,6 +622,8 @@ export function renderLaunchAgentPlist({
 <dict>
   <key>Label</key>
   <string>${MACOS_LAUNCH_AGENT_LABEL}</string>
+  <key>ProcessType</key>
+  <string>Interactive</string>
   <key>ProgramArguments</key>
   <array>
     <string>${xmlEscape(nodePath)}</string>
@@ -457,6 +634,8 @@ export function renderLaunchAgentPlist({
   <dict>
     <key>CLAUDE_ROTATOR_CONFIG</key>
     <string>${xmlEscape(configPath)}</string>
+    <key>CLAUDE_CONFIG_DIR</key>
+    <string>${xmlEscape(claudeConfigDir)}</string>
     <key>NODE_OPTIONS</key>
     <string>${xmlEscape(SERVICE_NODE_OPTIONS)}</string>
     <key>CLAUDE_ROTATOR_CLAUDE_BIN</key>
@@ -483,6 +662,7 @@ export function serviceGenerationForLaunchAgent({
   nodePath,
   cliPath,
   configPath,
+  claudeConfigDir = null,
   claudePath,
   servicePath,
   xdgConfigHome = null,
@@ -492,6 +672,7 @@ export function serviceGenerationForLaunchAgent({
     nodePath,
     cliPath,
     configPath,
+    claudeConfigDir,
     claudePath,
     servicePath,
     xdgConfigHome,
@@ -503,6 +684,7 @@ export function renderSystemdUserService({
   nodePath,
   cliPath,
   configPath,
+  claudeConfigDir,
   claudePath,
   servicePath,
   xdgConfigHome = null,
@@ -519,10 +701,11 @@ After=network-online.target
 
 [Service]
 Type=simple
-Environment=CLAUDE_ROTATOR_CONFIG=${systemdEscape(configPath)}
-Environment=NODE_OPTIONS=${systemdEscape(SERVICE_NODE_OPTIONS)}
-Environment=CLAUDE_ROTATOR_CLAUDE_BIN=${systemdEscape(claudePath)}
-Environment=PATH=${systemdEscape(servicePath)}
+${systemdEnvironmentAssignment('CLAUDE_ROTATOR_CONFIG', configPath)}
+${systemdEnvironmentAssignment('CLAUDE_CONFIG_DIR', claudeConfigDir)}
+${systemdEnvironmentAssignment('NODE_OPTIONS', SERVICE_NODE_OPTIONS)}
+${systemdEnvironmentAssignment('CLAUDE_ROTATOR_CLAUDE_BIN', claudePath)}
+${systemdEnvironmentAssignment('PATH', servicePath)}
 ${xdgEnvLines}ExecStart=${systemdEscape(nodePath)} ${systemdEscape(cliPath)} server
 Restart=always
 RestartSec=3
@@ -578,4 +761,12 @@ function xmlEscape(value) {
 
 function systemdEscape(value) {
   return String(value).replaceAll('%', '%%');
+}
+
+function systemdEnvironmentAssignment(name, value) {
+  const assignment = `${name}=${String(value)}`
+    .replaceAll('\\', '\\\\')
+    .replaceAll('"', '\\"')
+    .replaceAll('%', '%%');
+  return `Environment="${assignment}"`;
 }

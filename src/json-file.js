@@ -1,6 +1,7 @@
 import { createHash, randomBytes } from 'node:crypto';
-import { mkdir, readFile, rename, unlink, writeFile } from 'node:fs/promises';
-import { dirname } from 'node:path';
+import { constants as fsConstants } from 'node:fs';
+import { mkdir, open, readFile, rename, rm, unlink, writeFile } from 'node:fs/promises';
+import { dirname, resolve } from 'node:path';
 
 export async function readJsonFile(path, fallback = undefined) {
   try {
@@ -22,6 +23,70 @@ export async function writeJsonFile(path, value, mode = 0o600) {
   } catch (error) {
     await unlink(tmpPath).catch(() => {});
     throw error;
+  }
+}
+
+export async function writeJsonFileDurable(path, value, mode = 0o600, deps = {}) {
+  const openImpl = deps.open || open;
+  const renameImpl = deps.rename || rename;
+  const unlinkImpl = deps.unlink || unlink;
+  await ensureDirectoryDurable(dirname(path), 0o700, deps);
+  const tmpPath = `${path}.${process.pid}.${randomBytes(6).toString('hex')}.tmp`;
+  const body = `${JSON.stringify(value, null, 2)}\n`;
+  let handle;
+
+  try {
+    handle = await openImpl(tmpPath, 'wx', mode);
+    await handle.writeFile(body);
+    await handle.chmod(mode);
+    await handle.sync();
+    await handle.close();
+    handle = null;
+    await renameImpl(tmpPath, path);
+    await syncParentDirectory(path, { ...deps, open: openImpl });
+  } catch (error) {
+    await handle?.close().catch(() => {});
+    await unlinkImpl(tmpPath).catch(() => {});
+    throw error;
+  }
+}
+
+export async function ensureDirectoryDurable(path, mode = 0o700, deps = {}) {
+  const mkdirImpl = deps.mkdir || mkdir;
+  const target = resolve(path);
+  const firstCreated = await mkdirImpl(target, { recursive: true, mode });
+  if (typeof firstCreated !== 'string') return;
+
+  const first = resolve(firstCreated);
+  const createdDirectories = [];
+  let current = target;
+  while (true) {
+    createdDirectories.unshift(current);
+    if (current === first) break;
+    const parent = dirname(current);
+    if (parent === current) {
+      throw new Error('mkdir returned a directory outside the requested path');
+    }
+    current = parent;
+  }
+  for (const directory of createdDirectories) {
+    await syncParentDirectory(directory, deps);
+  }
+}
+
+export async function removeFileDurable(path, deps = {}) {
+  const rmImpl = deps.rm || rm;
+  await rmImpl(path, { force: true });
+  await syncParentDirectory(path, deps);
+}
+
+async function syncParentDirectory(path, deps = {}) {
+  const openImpl = deps.open || open;
+  const handle = await openImpl(dirname(path), fsConstants.O_RDONLY);
+  try {
+    await handle.sync();
+  } finally {
+    await handle.close();
   }
 }
 

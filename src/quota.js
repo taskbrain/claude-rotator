@@ -124,3 +124,31 @@ function normalizeScopedKey(value) {
     .replace(/^_+|_+$/g, '');
   return key || 'scoped';
 }
+
+const FABLE_SCOPE_IDENTITIES = new Set([
+  'fable',
+  'fable 5',
+  'fable5',
+  'fable_5',
+  'claude-fable-5',
+  'claude_fable_5',
+]);
+
+/** True when a weeklyScoped entry's key/label denotes the Fable sub-cap. */
+export function isFableScopeIdentity(value) {
+  if (typeof value !== 'string') return false;
+  return FABLE_SCOPE_IDENTITIES.has(value.trim().toLowerCase());
+}
+
+/**
+ * True when a weeklyScoped limit belongs to the model family of the request.
+ * `modelFamily` is null for every non-Fable request, so Fable-scoped limits
+ * never gate Opus/Sonnet/Haiku traffic. Unknown (non-Fable) scoped limits are
+ * reported but never gate any request family.
+ */
+export function scopeMatchesModelFamily(limit, modelFamily) {
+  if (!limit) return false;
+  const isFableScope = isFableScopeIdentity(limit.key) || isFableScopeIdentity(limit.label);
+  if (isFableScope) return modelFamily === 'fable';
+  return false;
+}

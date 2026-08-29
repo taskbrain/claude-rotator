@@ -1,26 +1,35 @@
 import { execFile } from 'node:child_process';
-import { randomUUID } from 'node:crypto';
-import { chmod, mkdir, readdir, readFile, rename, rm, stat, writeFile } from 'node:fs/promises';
+import { createHash, randomUUID } from 'node:crypto';
+import { constants as fsConstants } from 'node:fs';
+import { chmod, mkdir, open, readdir, readFile, rename, rm, stat, writeFile } from 'node:fs/promises';
 import { hostname } from 'node:os';
 import { join } from 'node:path';
 import { performance } from 'node:perf_hooks';
 import { isDeepStrictEqual, promisify } from 'node:util';
 
 import { appDataDir, linuxAccountsDir } from './paths.js';
-import { writeJsonFile } from './json-file.js';
+import {
+  ensureDirectoryDurable,
+  removeFileDurable,
+  writeJsonFileDurable,
+} from './json-file.js';
 import { executeSecurityCommand } from './native-claude-refresher.js';
 
 const execFileAsync = promisify(execFile);
 const ID_RE = /^[A-Za-z0-9._@-]+$/;
 const KEYCHAIN_SERVICE_PREFIX = 'claude-rotator';
-const DEFAULT_LOCK_ACQUIRE_TIMEOUT_MS = 5_000;
+const DEFAULT_LOCK_ACQUIRE_TIMEOUT_MS = 90_000;
 const DEFAULT_LOCK_RETRY_MS = 25;
 const DEFAULT_LOCK_STALE_MS = 60_000;
+const REFRESH_INTENT_VERSION = 1;
+const MAX_REFRESH_INTENT_BYTES = 4 * 1024;
+const SHA256_RE = /^sha256:[0-9a-f]{64}$/;
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 let linuxBootIdentityPromise = null;
 let darwinBootIdentityPromise = null;
 
 function assertSafeAccountId(accountId) {
-  if (!ID_RE.test(accountId)) {
+  if (!ID_RE.test(accountId) || accountId === '.' || accountId === '..') {
     throw new Error(`Invalid account id: ${accountId}`);
   }
 }
@@ -70,7 +79,7 @@ class AccountFileLock {
 
   async acquire(accountId) {
     assertSafeAccountId(accountId);
-    await mkdir(this.lockDir, { recursive: true, mode: 0o700 });
+    await ensureDirectoryDurable(this.lockDir, 0o700);
     await chmod(this.lockDir, 0o700);
     const lockPath = join(this.lockDir, `${accountId}.lock`);
     const startedAt = this.monotonicNow();
@@ -195,6 +204,33 @@ class AccountFileLock {
     }
     return identity;
   }
+}
+
+function combinedLockLease(...leases) {
+  const activeLeases = leases.filter(Boolean);
+  return {
+    async protectChildPid(childPid) {
+      const protectedLeases = [];
+      try {
+        for (const lease of activeLeases) {
+          await lease.protectChildPid(childPid);
+          protectedLeases.push(lease);
+        }
+      } catch (error) {
+        await Promise.allSettled(
+          protectedLeases.map(lease => lease.clearChildPid(childPid)),
+        );
+        throw error;
+      }
+    },
+    async clearChildPid(childPid) {
+      const results = await Promise.allSettled(
+        activeLeases.map(lease => lease.clearChildPid(childPid)),
+      );
+      const failed = results.find(result => result.status === 'rejected');
+      if (failed) throw failed.reason;
+    },
+  };
 }
 
 function isLockAlreadyHeldError(error) {
@@ -555,14 +591,385 @@ async function retireObservedLock(lockPath, observed, lockDir, accountId, suffix
   return true;
 }
 
-export class MemorySecretStore {
+function refreshOutcomeUnknownError() {
+  const error = new Error('OAuth credential refresh outcome is unknown; relink this account');
+  error.name = 'OAuthRefreshOutcomeUnknownError';
+  error.code = 'NATIVE_REFRESH_OUTCOME_UNKNOWN';
+  error.retryAfterMs = null;
+  error.retryAfterSource = null;
+  return error;
+}
+
+function digest(value) {
+  return `sha256:${createHash('sha256').update(value).digest('hex')}`;
+}
+
+function canonicalJson(value) {
+  return JSON.stringify(value, (_key, entry) => {
+    if (!entry || typeof entry !== 'object' || Array.isArray(entry)) return entry;
+    return Object.fromEntries(Object.keys(entry).sort().map(key => [key, entry[key]]));
+  });
+}
+
+function credentialFingerprint(secret) {
+  const serialized = canonicalJson(secret);
+  if (typeof serialized !== 'string') throw refreshOutcomeUnknownError();
+  return digest(serialized);
+}
+
+function validateRefreshTargetCredential(currentSecret, targetSecret) {
+  let serialized;
+  let normalized;
+  try {
+    serialized = canonicalJson(targetSecret);
+    normalized = typeof serialized === 'string' ? JSON.parse(serialized) : null;
+  } catch {
+    throw refreshOutcomeUnknownError();
+  }
+  const currentExpiresAt = Number(currentSecret?.expiresAt);
+  if (
+    !normalized
+    || typeof normalized !== 'object'
+    || Array.isArray(normalized)
+    || !isDeepStrictEqual(normalized, targetSecret)
+    || typeof normalized.accessToken !== 'string'
+    || normalized.accessToken.length === 0
+    || typeof normalized.refreshToken !== 'string'
+    || normalized.refreshToken.length === 0
+    || !Number.isFinite(normalized.expiresAt)
+    || normalized.expiresAt <= 0
+    || (Number.isFinite(currentExpiresAt) && normalized.expiresAt < currentExpiresAt)
+    || isDeepStrictEqual(normalized, currentSecret)
+  ) {
+    throw refreshOutcomeUnknownError();
+  }
+  return normalized;
+}
+
+function refreshTokenFingerprint(secret) {
+  return typeof secret?.refreshToken === 'string' && secret.refreshToken.length > 0
+    ? digest(secret.refreshToken)
+    : null;
+}
+
+export async function duplicateRefreshTokenAccountIds(accounts, secretStore) {
+  const groups = new Map();
+  for (const account of accounts) {
+    if (
+      account.type === 'apikey'
+      || account.id === 'current'
+      || account.credentialSource === 'claude-code-current'
+    ) continue;
+    const secret = await secretStore.get(account.id);
+    if (!secret?.refreshToken) continue;
+    const key = digest(secret.refreshToken);
+    const ids = groups.get(key) || [];
+    ids.push(account.id);
+    groups.set(key, ids);
+  }
+  return new Set([...groups.values()].filter(ids => ids.length > 1).flat());
+}
+
+function refreshIntentPath(lockDir, accountId) {
+  assertSafeAccountId(accountId);
+  return join(lockDir, `${accountId}.refresh-intent.json`);
+}
+
+function validateRefreshIntent(value) {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) {
+    throw refreshOutcomeUnknownError();
+  }
+  const expectedKeys = value.phase === 'handed_off'
+    ? ['attemptId', 'phase', 'sourceRefreshTokenSha256', 'version']
+    : value.phase === 'committing'
+      ? ['attemptId', 'phase', 'sourceRefreshTokenSha256', 'targetCredentialSha256', 'version']
+      : null;
+  if (
+    !expectedKeys
+    || value.version !== REFRESH_INTENT_VERSION
+    || !UUID_RE.test(value.attemptId || '')
+    || !SHA256_RE.test(value.sourceRefreshTokenSha256 || '')
+    || (value.phase === 'committing' && !SHA256_RE.test(value.targetCredentialSha256 || ''))
+    || !isDeepStrictEqual(Object.keys(value).sort(), expectedKeys)
+  ) {
+    throw refreshOutcomeUnknownError();
+  }
+  return value;
+}
+
+class DurableRefreshIntentStore {
+  constructor(lockDir, { durableFileDeps } = {}) {
+    this.lockDir = lockDir;
+    this.durableFileDeps = durableFileDeps;
+  }
+
+  async read(accountId) {
+    let handle;
+    try {
+      handle = await open(
+        refreshIntentPath(this.lockDir, accountId),
+        fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW,
+      );
+      const metadata = await handle.stat();
+      if (!metadata.isFile() || metadata.nlink !== 1 || metadata.size > MAX_REFRESH_INTENT_BYTES) {
+        throw refreshOutcomeUnknownError();
+      }
+      await handle.chmod(0o600);
+      return validateRefreshIntent(JSON.parse(await handle.readFile('utf8')));
+    } catch (error) {
+      if (error?.code === 'ENOENT') return null;
+      if (error?.code === 'NATIVE_REFRESH_OUTCOME_UNKNOWN') throw error;
+      throw refreshOutcomeUnknownError();
+    } finally {
+      await handle?.close().catch(() => {});
+    }
+  }
+
+  async write(accountId, intent) {
+    validateRefreshIntent(intent);
+    await ensureDirectoryDurable(this.lockDir, 0o700, this.durableFileDeps);
+    await chmod(this.lockDir, 0o700);
+    await writeJsonFileDurable(
+      refreshIntentPath(this.lockDir, accountId),
+      intent,
+      0o600,
+      this.durableFileDeps,
+    );
+  }
+
+  async remove(accountId) {
+    try {
+      await removeFileDurable(
+        refreshIntentPath(this.lockDir, accountId),
+        this.durableFileDeps,
+      );
+    } catch {
+      throw refreshOutcomeUnknownError();
+    }
+  }
+}
+
+class MemoryRefreshIntentStore {
   constructor() {
     this.items = new Map();
   }
 
+  async read(accountId) {
+    const value = this.items.get(accountId);
+    return value ? cloneSecret(value) : null;
+  }
+
+  async write(accountId, intent) {
+    this.items.set(accountId, cloneSecret(validateRefreshIntent(intent)));
+  }
+
+  async remove(accountId) {
+    this.items.delete(accountId);
+  }
+}
+
+async function pendingRefreshIntent(intents, accountId, currentSecret) {
+  const intent = await intents.read(accountId);
+  if (
+    intent?.phase === 'committing'
+    && credentialFingerprint(currentSecret) === intent.targetCredentialSha256
+  ) {
+    await intents.remove(accountId);
+    return null;
+  }
+  return intent;
+}
+
+async function assertOperationalCredential(intents, accountId, currentSecret) {
+  if (await pendingRefreshIntent(intents, accountId, currentSecret)) {
+    throw refreshOutcomeUnknownError();
+  }
+  return currentSecret;
+}
+
+async function assertOperationalBeforeWrite(intents, accountId, readSecret) {
+  const intent = await intents.read(accountId);
+  if (!intent) return;
+  const currentSecret = await readSecret();
+  if (
+    intent.phase === 'committing'
+    && credentialFingerprint(currentSecret) === intent.targetCredentialSha256
+  ) {
+    await intents.remove(accountId);
+    return;
+  }
+  throw refreshOutcomeUnknownError();
+}
+
+function createRefreshTransaction({ accountId, currentSecret, intents, lease }) {
+  const sourceRefreshTokenSha256 = refreshTokenFingerprint(currentSecret);
+  let intent = null;
+  let armPromise = null;
+
+  const beforeHandoff = () => {
+    armPromise ||= (async () => {
+      if (!sourceRefreshTokenSha256) throw refreshOutcomeUnknownError();
+      const nextIntent = {
+        version: REFRESH_INTENT_VERSION,
+        attemptId: randomUUID(),
+        phase: 'handed_off',
+        sourceRefreshTokenSha256,
+      };
+      await intents.write(accountId, nextIntent);
+      intent = nextIntent;
+    })();
+    return armPromise;
+  };
+
+  // Only for the case where the fence was armed (beforeHandoff wrote the
+  // durable intent) but the handoff itself never actually reached a child
+  // process (no pid was ever assigned, so the refresh token provably never
+  // left this process). Retracting here avoids permanently parking the
+  // account for a plain local spawn failure, without reopening the window
+  // beforeHandoff exists to close (an in-flight or already-spawned child
+  // must never have its intent retracted while it could still be exchanging
+  // the token).
+  const retractHandoff = async () => {
+    try {
+      await armPromise;
+    } catch {
+      return;
+    }
+    if (intent == null) return;
+    await intents.remove(accountId);
+    intent = null;
+  };
+
+  return {
+    hooks: {
+      beforeHandoff,
+      retractHandoff,
+      async protectChildPid(childPid) {
+        await beforeHandoff();
+        if (lease) await lease.protectChildPid(childPid);
+      },
+      async clearChildPid(childPid) {
+        if (lease) await lease.clearChildPid(childPid);
+      },
+    },
+    get handedOff() {
+      return intent != null;
+    },
+    async beginCommit(targetSecret) {
+      if (!intent) return;
+      intent = {
+        ...intent,
+        phase: 'committing',
+        targetCredentialSha256: credentialFingerprint(targetSecret),
+      };
+      await intents.write(accountId, intent);
+    },
+    async complete() {
+      if (intent) await intents.remove(accountId);
+    },
+  };
+}
+
+async function verifyCredentialWrite(readSecret, expectedSecret) {
+  if (!isDeepStrictEqual(await readSecret(), expectedSecret)) {
+    const error = new Error('Could not verify the credential write');
+    error.code = 'SECRET_STORE_WRITE_VERIFY_FAILED';
+    throw error;
+  }
+}
+
+async function refreshIfUnchangedTransaction({
+  accountId,
+  expectedSecret,
+  exchange,
+  readSecret,
+  writeSecret,
+  intents,
+  lease,
+}) {
+  const current = await readSecret();
+  await assertOperationalCredential(intents, accountId, current);
+  if (!isDeepStrictEqual(current, expectedSecret)) {
+    return { updated: false, secret: cloneSecret(current) };
+  }
+  const transaction = createRefreshTransaction({
+    accountId,
+    currentSecret: current,
+    intents,
+    lease,
+  });
+  let nextSecret;
+  try {
+    nextSecret = await exchange(cloneSecret(current), transaction.hooks);
+  } catch (error) {
+    if (transaction.handedOff) {
+      if (error?.name === 'OAuthTokenRefreshError' && error?.status === 429) {
+        await transaction.complete();
+        throw error;
+      }
+      throw refreshOutcomeUnknownError();
+    }
+    throw error;
+  }
+  try {
+    nextSecret = validateRefreshTargetCredential(current, nextSecret);
+    await transaction.beginCommit(nextSecret);
+    await writeSecret(nextSecret);
+    await verifyCredentialWrite(readSecret, nextSecret);
+    await transaction.complete();
+  } catch (error) {
+    if (transaction.handedOff) throw refreshOutcomeUnknownError();
+    throw error;
+  }
+  return { updated: true, secret: cloneSecret(nextSecret) };
+}
+
+async function replaceLinkedCredentialTransaction({
+  accountId,
+  secret,
+  readSecret,
+  writeSecret,
+  intents,
+}) {
+  const current = await readSecret();
+  const intent = await pendingRefreshIntent(intents, accountId, current);
+  if (intent) {
+    const replacementRefreshTokenSha256 = refreshTokenFingerprint(secret);
+    if (
+      !replacementRefreshTokenSha256
+      || replacementRefreshTokenSha256 === intent.sourceRefreshTokenSha256
+    ) {
+      throw refreshOutcomeUnknownError();
+    }
+    await intents.write(accountId, {
+      ...intent,
+      phase: 'committing',
+      targetCredentialSha256: credentialFingerprint(secret),
+    });
+  }
+  await writeSecret(secret);
+  await verifyCredentialWrite(readSecret, secret);
+  if (intent) await intents.remove(accountId);
+}
+
+export class MemorySecretStore {
+  constructor() {
+    this.items = new Map();
+    this.updateTails = new Map();
+    this.credentialSetTail = Promise.resolve();
+    this.refreshIntents = new MemoryRefreshIntentStore();
+  }
+
   async set(accountId, secret) {
     assertSafeAccountId(accountId);
-    this.items.set(accountId, cloneSecret(secret));
+    return this.runCredentialSetExclusive(() => this.runExclusive(accountId, async () => {
+      await assertOperationalBeforeWrite(
+        this.refreshIntents,
+        accountId,
+        async () => this.items.has(accountId) ? this.items.get(accountId) : null,
+      );
+      this.items.set(accountId, cloneSecret(secret));
+    }));
   }
 
   async get(accountId) {
@@ -571,17 +978,99 @@ export class MemorySecretStore {
     return value ? cloneSecret(value) : null;
   }
 
-  async compareAndSet(accountId, expectedSecret, nextSecret) {
+  async getOperational(accountId) {
     assertSafeAccountId(accountId);
-    const current = this.items.has(accountId) ? this.items.get(accountId) : null;
-    if (!isDeepStrictEqual(current, expectedSecret)) return false;
-    this.items.set(accountId, cloneSecret(nextSecret));
-    return true;
+    return this.runExclusive(accountId, async () => {
+      const current = this.items.has(accountId) ? this.items.get(accountId) : null;
+      return cloneSecret(await assertOperationalCredential(
+        this.refreshIntents,
+        accountId,
+        current,
+      ));
+    });
+  }
+
+  async compareAndSet(accountId, expectedSecret, nextSecret) {
+    const result = await this.updateIfUnchanged(accountId, expectedSecret, async () => nextSecret);
+    return result.updated;
+  }
+
+  async updateIfUnchanged(accountId, expectedSecret, updater) {
+    assertSafeAccountId(accountId);
+    return this.runCredentialSetExclusive(() => this.runExclusive(accountId, async () => {
+      const current = this.items.has(accountId) ? this.items.get(accountId) : null;
+      await assertOperationalCredential(this.refreshIntents, accountId, current);
+      if (!isDeepStrictEqual(current, expectedSecret)) {
+        return { updated: false, secret: cloneSecret(current) };
+      }
+      const nextSecret = await updater(cloneSecret(current));
+      this.items.set(accountId, cloneSecret(nextSecret));
+      return { updated: true, secret: cloneSecret(nextSecret) };
+    }));
+  }
+
+  async refreshIfUnchanged(accountId, expectedSecret, exchange) {
+    assertSafeAccountId(accountId);
+    return this.runCredentialSetExclusive(() => this.runExclusive(
+      accountId,
+      () => refreshIfUnchangedTransaction({
+      accountId,
+      expectedSecret,
+      exchange,
+      readSecret: async () => this.items.has(accountId) ? this.items.get(accountId) : null,
+      writeSecret: async secret => this.items.set(accountId, cloneSecret(secret)),
+      intents: this.refreshIntents,
+      lease: null,
+      }),
+    ));
+  }
+
+  async replaceLinkedCredential(accountId, secret) {
+    return this.replaceLinkedCredentialAndRun(accountId, secret);
+  }
+
+  async replaceLinkedCredentialAndRun(accountId, secret, afterWrite = async () => {}) {
+    assertSafeAccountId(accountId);
+    return this.runCredentialSetExclusive(async () => {
+      const result = await this.runExclusive(
+        accountId,
+        () => replaceLinkedCredentialTransaction({
+          accountId,
+          secret,
+          readSecret: async () => this.items.has(accountId) ? this.items.get(accountId) : null,
+          writeSecret: async nextSecret => this.items.set(accountId, cloneSecret(nextSecret)),
+          intents: this.refreshIntents,
+        }),
+      );
+      await afterWrite();
+      return result;
+    });
+  }
+
+  async runCredentialSetExclusive(operation) {
+    const previous = this.credentialSetTail;
+    const update = previous.then(operation);
+    this.credentialSetTail = update.catch(() => {});
+    return update;
+  }
+
+  async runExclusive(accountId, operation) {
+    const previous = this.updateTails.get(accountId) || Promise.resolve();
+    const update = previous.then(operation);
+    const tail = update.catch(() => {});
+    this.updateTails.set(accountId, tail);
+    try {
+      return await update;
+    } finally {
+      if (this.updateTails.get(accountId) === tail) this.updateTails.delete(accountId);
+    }
   }
 
   async delete(accountId) {
     assertSafeAccountId(accountId);
-    this.items.delete(accountId);
+    await this.runCredentialSetExclusive(async () => {
+      this.items.delete(accountId);
+    });
   }
 
   async list() {
@@ -589,7 +1078,9 @@ export class MemorySecretStore {
   }
 
   async purge() {
-    this.items.clear();
+    await this.runCredentialSetExclusive(async () => {
+      this.items.clear();
+    });
   }
 }
 
@@ -600,21 +1091,29 @@ export class LinuxFileSecretStore {
     lockRetryMs,
     lockStaleMs,
     now,
+    monotonicNow,
     sleepImpl,
     hostnameImpl,
     processIdentityImpl,
   } = {}) {
     this.accountsDir = accountsDir;
-    this.accountLock = new AccountFileLock({
-      lockDir: join(accountsDir, '.locks'),
+    const lockDir = join(accountsDir, '.locks');
+    const lockOptions = {
       acquireTimeoutMs: lockAcquireTimeoutMs,
       retryMs: lockRetryMs,
       staleMs: lockStaleMs,
       now,
+      monotonicNow,
       sleepImpl,
       hostnameImpl,
       processIdentityImpl,
+    };
+    this.accountLock = new AccountFileLock({ lockDir, ...lockOptions });
+    this.credentialSetLock = new AccountFileLock({
+      lockDir: join(lockDir, '.credential-set'),
+      ...lockOptions,
     });
+    this.refreshIntents = new DurableRefreshIntentStore(lockDir);
   }
 
   secretPath(accountId) {
@@ -623,17 +1122,32 @@ export class LinuxFileSecretStore {
   }
 
   async set(accountId, secret) {
-    return this.accountLock.run(accountId, () => this.setUnlocked(accountId, secret));
+    return this.runCredentialSetExclusive(() => this.accountLock.run(accountId, async () => {
+      await assertOperationalBeforeWrite(
+        this.refreshIntents,
+        accountId,
+        () => this.getUnlocked(accountId),
+      );
+      await this.setUnlocked(accountId, secret);
+    }));
   }
 
   async setUnlocked(accountId, secret) {
-    await mkdir(this.accountsDir, { recursive: true, mode: 0o700 });
+    await ensureDirectoryDurable(this.accountsDir, 0o700);
     await chmod(this.accountsDir, 0o700);
-    await writeJsonFile(this.secretPath(accountId), secret, 0o600);
+    await writeJsonFileDurable(this.secretPath(accountId), secret, 0o600);
   }
 
   async get(accountId) {
     return this.getUnlocked(accountId);
+  }
+
+  async getOperational(accountId) {
+    return this.accountLock.run(accountId, async () => cloneSecret(await assertOperationalCredential(
+      this.refreshIntents,
+      accountId,
+      await this.getUnlocked(accountId),
+    )));
   }
 
   async getUnlocked(accountId) {
@@ -646,16 +1160,68 @@ export class LinuxFileSecretStore {
   }
 
   async delete(accountId) {
-    return this.accountLock.run(accountId, () => rm(this.secretPath(accountId), { force: true }));
+    return this.runCredentialSetExclusive(() => this.accountLock.run(
+      accountId,
+      () => rm(this.secretPath(accountId), { force: true }),
+    ));
   }
 
   async compareAndSet(accountId, expectedSecret, nextSecret) {
-    return this.accountLock.run(accountId, async () => {
+    const result = await this.updateIfUnchanged(accountId, expectedSecret, async () => nextSecret);
+    return result.updated;
+  }
+
+  async updateIfUnchanged(accountId, expectedSecret, updater) {
+    return this.runCredentialSetExclusive(() => this.accountLock.run(accountId, async () => {
       const current = await this.getUnlocked(accountId);
-      if (!isDeepStrictEqual(current, expectedSecret)) return false;
+      await assertOperationalCredential(this.refreshIntents, accountId, current);
+      if (!isDeepStrictEqual(current, expectedSecret)) {
+        return { updated: false, secret: current };
+      }
+      const nextSecret = await updater(cloneSecret(current));
       await this.setUnlocked(accountId, nextSecret);
-      return true;
+      return { updated: true, secret: cloneSecret(nextSecret) };
+    }));
+  }
+
+  async refreshIfUnchanged(accountId, expectedSecret, exchange) {
+    return this.runCredentialSetExclusive(globalLease => this.accountLock.run(
+      accountId,
+      accountLease => refreshIfUnchangedTransaction({
+      accountId,
+      expectedSecret,
+      exchange,
+      readSecret: () => this.getUnlocked(accountId),
+      writeSecret: secret => this.setUnlocked(accountId, secret),
+      intents: this.refreshIntents,
+      lease: combinedLockLease(globalLease, accountLease),
+      }),
+    ));
+  }
+
+  async replaceLinkedCredential(accountId, secret) {
+    return this.replaceLinkedCredentialAndRun(accountId, secret);
+  }
+
+  async replaceLinkedCredentialAndRun(accountId, secret, afterWrite = async () => {}) {
+    return this.runCredentialSetExclusive(async () => {
+      const result = await this.accountLock.run(
+        accountId,
+        () => replaceLinkedCredentialTransaction({
+          accountId,
+          secret,
+          readSecret: () => this.getUnlocked(accountId),
+          writeSecret: nextSecret => this.setUnlocked(accountId, nextSecret),
+          intents: this.refreshIntents,
+        }),
+      );
+      await afterWrite();
+      return result;
     });
+  }
+
+  async runCredentialSetExclusive(operation) {
+    return this.credentialSetLock.run('all', operation);
   }
 
   async list() {
@@ -718,21 +1284,28 @@ export class MacOSKeychainSecretStore {
     lockRetryMs,
     lockStaleMs,
     now,
+    monotonicNow,
     sleepImpl,
     hostnameImpl,
     processIdentityImpl,
   } = {}) {
     this.execFileImpl = execFileImpl;
-    this.accountLock = new AccountFileLock({
-      lockDir,
+    const lockOptions = {
       acquireTimeoutMs: lockAcquireTimeoutMs,
       retryMs: lockRetryMs,
       staleMs: lockStaleMs,
       now,
+      monotonicNow,
       sleepImpl,
       hostnameImpl,
       processIdentityImpl,
+    };
+    this.accountLock = new AccountFileLock({ lockDir, ...lockOptions });
+    this.credentialSetLock = new AccountFileLock({
+      lockDir: join(lockDir, '.credential-set'),
+      ...lockOptions,
     });
+    this.refreshIntents = new DurableRefreshIntentStore(lockDir);
   }
 
   serviceName(accountId) {
@@ -741,10 +1314,21 @@ export class MacOSKeychainSecretStore {
   }
 
   async set(accountId, secret) {
-    return this.accountLock.run(
+    return this.runCredentialSetExclusive(globalLease => this.accountLock.run(
       accountId,
-      lease => this.setUnlocked(accountId, secret, lease),
-    );
+      async accountLease => {
+        await assertOperationalBeforeWrite(
+          this.refreshIntents,
+          accountId,
+          () => this.getUnlocked(accountId),
+        );
+        await this.setUnlocked(
+          accountId,
+          secret,
+          combinedLockLease(globalLease, accountLease),
+        );
+      },
+    ));
   }
 
   async setUnlocked(accountId, secret, lease) {
@@ -766,6 +1350,14 @@ export class MacOSKeychainSecretStore {
     return this.getUnlocked(accountId);
   }
 
+  async getOperational(accountId) {
+    return this.accountLock.run(accountId, async () => cloneSecret(await assertOperationalCredential(
+      this.refreshIntents,
+      accountId,
+      await this.getUnlocked(accountId),
+    )));
+  }
+
   async getUnlocked(accountId) {
     try {
       const { stdout } = await this.execFileImpl('security', [
@@ -782,10 +1374,13 @@ export class MacOSKeychainSecretStore {
   }
 
   async delete(accountId) {
-    return this.accountLock.run(
+    return this.runCredentialSetExclusive(globalLease => this.accountLock.run(
       accountId,
-      lease => this.deleteUnlocked(accountId, lease),
-    );
+      accountLease => this.deleteUnlocked(
+        accountId,
+        combinedLockLease(globalLease, accountLease),
+      ),
+    ));
   }
 
   async deleteUnlocked(accountId, lease) {
@@ -806,12 +1401,73 @@ export class MacOSKeychainSecretStore {
   }
 
   async compareAndSet(accountId, expectedSecret, nextSecret) {
-    return this.accountLock.run(accountId, async lease => {
+    const result = await this.updateIfUnchanged(accountId, expectedSecret, async () => nextSecret);
+    return result.updated;
+  }
+
+  async updateIfUnchanged(accountId, expectedSecret, updater) {
+    return this.runCredentialSetExclusive(globalLease => this.accountLock.run(accountId, async accountLease => {
       const current = await this.getUnlocked(accountId);
-      if (!isDeepStrictEqual(current, expectedSecret)) return false;
-      await this.setUnlocked(accountId, nextSecret, lease);
-      return true;
+      await assertOperationalCredential(this.refreshIntents, accountId, current);
+      if (!isDeepStrictEqual(current, expectedSecret)) {
+        return { updated: false, secret: current };
+      }
+      const nextSecret = await updater(cloneSecret(current));
+      await this.setUnlocked(
+        accountId,
+        nextSecret,
+        combinedLockLease(globalLease, accountLease),
+      );
+      return { updated: true, secret: cloneSecret(nextSecret) };
+    }));
+  }
+
+  async refreshIfUnchanged(accountId, expectedSecret, exchange) {
+    return this.runCredentialSetExclusive(globalLease => this.accountLock.run(
+      accountId,
+      accountLease => refreshIfUnchangedTransaction({
+      accountId,
+      expectedSecret,
+      exchange,
+      readSecret: () => this.getUnlocked(accountId),
+      writeSecret: secret => this.setUnlocked(
+        accountId,
+        secret,
+        combinedLockLease(globalLease, accountLease),
+      ),
+      intents: this.refreshIntents,
+      lease: combinedLockLease(globalLease, accountLease),
+      }),
+    ));
+  }
+
+  async replaceLinkedCredential(accountId, secret) {
+    return this.replaceLinkedCredentialAndRun(accountId, secret);
+  }
+
+  async replaceLinkedCredentialAndRun(accountId, secret, afterWrite = async () => {}) {
+    return this.runCredentialSetExclusive(async globalLease => {
+      const result = await this.accountLock.run(
+        accountId,
+        accountLease => replaceLinkedCredentialTransaction({
+          accountId,
+          secret,
+          readSecret: () => this.getUnlocked(accountId),
+          writeSecret: nextSecret => this.setUnlocked(
+            accountId,
+            nextSecret,
+            combinedLockLease(globalLease, accountLease),
+          ),
+          intents: this.refreshIntents,
+        }),
+      );
+      await afterWrite();
+      return result;
     });
+  }
+
+  async runCredentialSetExclusive(operation) {
+    return this.credentialSetLock.run('all', operation);
   }
 
   async list() {

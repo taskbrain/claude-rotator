@@ -2,7 +2,7 @@ import { createHash } from 'node:crypto';
 import http from 'node:http';
 import https from 'node:https';
 
-import { isUnifiedQuotaExhaustion } from './account-manager.js';
+import { isCredentialRefreshCooldown, isUnifiedQuotaExhaustion } from './account-manager.js';
 import { readCurrentClaudeCredentials } from './claude-credentials.js';
 import {
   DEFAULT_USAGE_POLL_INTERVAL_MS,
@@ -15,10 +15,12 @@ import {
   fetchUsage,
   isOAuthTokenRefreshRateLimit,
   isTokenExpiringSoon,
+  OAUTH_BETA_HEADER,
   refreshAccessToken,
 } from './oauth.js';
 import { createNativeClaudeRefresher } from './native-claude-refresher.js';
-import { parseRateLimitHeaders } from './quota.js';
+import { isFableScopeIdentity, parseRateLimitHeaders } from './quota.js';
+import { duplicateRefreshTokenAccountIds } from './secret-store.js';
 
 const HOP_HEADERS = new Set([
   'host',
@@ -51,8 +53,10 @@ const guardedUpstreamSockets = new WeakSet();
 export function createProxyServer({
   accountManager,
   secretStore,
+  credentialAccountsReader = null,
   config,
   reloadAccounts = null,
+  allowLiveClaudeCodeCredentials = true,
   tokenRefresher = null,
   currentCredentialReader = readCurrentClaudeCredentials,
   currentProfileFetcher = fetchProfile,
@@ -85,21 +89,32 @@ export function createProxyServer({
       },
     },
   });
-  const coordinatedTokenRefresher = createSingleFlightTokenRefresher(resolvedTokenRefresher, {
-    onSuccess({ context, refreshed, rotated }) {
-      logger?.(`${new Date().toISOString()} credential-refresh account=${context?.accountId || 'unknown'} result=success rotated=${rotated} expiresAt=${formatCredentialExpiry(refreshed.expiresAt)}`);
+  const coordinatedTokenRefresher = createSingleFlightTokenRefresher(
+    refreshTokenWithCredentialSafety,
+    {
+      // Credential writes and native handoffs are serialized by the secret
+      // store. Do not let a completed refresh result cross a later account
+      // relink that happens to present the old refresh token.
+      retentionMs: 0,
+      onSuccess({ context, refreshed, rotated }) {
+        logger?.(`${new Date().toISOString()} credential-refresh account=${context?.accountId || 'unknown'} result=success rotated=${rotated} expiresAt=${formatCredentialExpiry(refreshed.expiresAt)}`);
+      },
+      onFailure({ context, error, deferred = false }) {
+        const retry = error?.retryAfterMs
+          ? ` retryAfterSec=${Math.ceil(error.retryAfterMs / 1000)}`
+          : '';
+        const retrySource = ['provider', 'fallback', 'fixed'].includes(error?.retryAfterSource)
+          ? ` retrySource=${error.retryAfterSource}`
+          : '';
+        const result = deferred ? 'deferred' : 'failed';
+        logger?.(`${new Date().toISOString()} credential-refresh account=${context?.accountId || 'unknown'} result=${result} errorType=${credentialRefreshErrorType(error)}${retry}${retrySource}`);
+      },
     },
-    onFailure({ context, error, deferred = false }) {
-      const retry = error?.retryAfterMs
-        ? ` retryAfterSec=${Math.ceil(error.retryAfterMs / 1000)}`
-        : '';
-      const retrySource = ['provider', 'fallback', 'fixed'].includes(error?.retryAfterSource)
-        ? ` retrySource=${error.retryAfterSource}`
-        : '';
-      const result = deferred ? 'deferred' : 'failed';
-      logger?.(`${new Date().toISOString()} credential-refresh account=${context?.accountId || 'unknown'} result=${result} errorType=${credentialRefreshErrorType(error)}${retry}${retrySource}`);
-    },
-  });
+  );
+  const duplicateRefreshAccountIds = new Set();
+  const duplicateRefreshAccounts = new WeakSet();
+  let credentialOwnershipRestartRequired = false;
+  let operationalStateCheck = Promise.resolve();
 
   const usageObservationTracker = createUsageObservationTracker();
   const usageRequestOptions = {
@@ -116,8 +131,14 @@ export function createProxyServer({
     usageFetcher,
     usageRequestOptions,
     usageObservationTracker,
+    allowLiveClaudeCodeCredentials,
     usageRefreshConcurrency: usagePollingConcurrency(config, accountManager.accounts.length),
     usageRefreshRequestSpacingMs: usagePollingRequestSpacingMs(config),
+    beforeRefresh: async () => {
+      await operationalStateCheck;
+      if (credentialOwnershipRestartRequired) throw credentialOwnershipRestartError();
+    },
+    duplicateRefreshAccountIds,
     logger,
   });
   const reactiveQuotaConfirmer = createReactiveQuotaConfirmer({
@@ -127,6 +148,7 @@ export function createProxyServer({
     usageFetcher,
     usageRequestOptions,
     usageObservationTracker,
+    allowLiveClaudeCodeCredentials,
     timeoutMs: positiveTimeoutOrDefault(
       reactiveQuotaConfirmTimeoutMs,
       REACTIVE_QUOTA_CONFIRM_TIMEOUT_MS,
@@ -148,6 +170,60 @@ export function createProxyServer({
     });
     return persistTail;
   }
+  const checkPersistedRefreshIntents = async () => {
+    if (await reconcilePersistedRefreshIntents({ accountManager, secretStore, logger })) {
+      await persistState();
+    }
+  };
+  const checkInitialCredentialState = async () => {
+    replaceSet(
+      duplicateRefreshAccountIds,
+      await withCredentialSetLock(
+        secretStore,
+        () => duplicateRefreshTokenAccountIds(accountManager.accounts, secretStore),
+      ),
+    );
+    if (parkDuplicateRefreshTokenAccounts({
+      accountManager,
+      duplicateRefreshAccountIds,
+      duplicateRefreshAccounts,
+    })) {
+      await persistState();
+    }
+    await checkPersistedRefreshIntents();
+  };
+  async function refreshTokenWithCredentialSafety(refreshToken, context = {}) {
+    const beforeHandoff = context.beforeHandoff;
+    return resolvedTokenRefresher(refreshToken, {
+      ...context,
+      beforeHandoff: async () => {
+        const credentialAccounts = credentialAccountsReader
+          ? await credentialAccountsReader()
+          : accountManager.accounts;
+        if (!Array.isArray(credentialAccounts)) {
+          throw new Error('Credential account configuration is invalid');
+        }
+        const nextDuplicateIds = await duplicateRefreshTokenAccountIds(
+          credentialAccounts,
+          secretStore,
+        );
+        replaceSet(duplicateRefreshAccountIds, nextDuplicateIds);
+        if (parkDuplicateRefreshTokenAccounts({
+          accountManager,
+          duplicateRefreshAccountIds,
+          duplicateRefreshAccounts,
+        })) {
+          await persistState();
+        }
+        if (nextDuplicateIds.has(context.accountId)) {
+          throw duplicateRefreshTokenError();
+        }
+        await beforeHandoff?.();
+      },
+    });
+  }
+  operationalStateCheck = checkInitialCredentialState();
+  operationalStateCheck.catch(() => {});
 
   const server = http.createServer(async (req, res) => {
     try {
@@ -158,6 +234,12 @@ export function createProxyServer({
         });
         return;
       }
+      // /internal/health must stay a cheap liveness probe: reconciling
+      // persisted refresh intents (below) can take up to the account lock's
+      // full acquire timeout per account, which would otherwise make
+      // install/reinstall's bounded health poll (see waitForMacosHealth)
+      // time out and roll back the install whenever any account's lock is
+      // briefly held by a concurrent refresh.
       if (req.method === 'GET' && req.url === '/internal/health') {
         sendJson(res, 200, {
           ok: true,
@@ -166,9 +248,14 @@ export function createProxyServer({
         });
         return;
       }
+      await operationalStateCheck;
 
       if (req.method === 'GET' && req.url === '/internal/status') {
-        if (usagePollingEnabled(config) && !usageScheduler.hasAttempted()) {
+        if (
+          !credentialOwnershipRestartRequired
+          && usagePollingEnabled(config)
+          && !usageScheduler.hasAttempted()
+        ) {
           await usageScheduler.refreshNow();
         }
         sendJson(res, 200, accountManager.getStatus());
@@ -186,9 +273,49 @@ export function createProxyServer({
       if (req.method === 'POST' && req.url === '/internal/reload') {
         invalidateLiveClaudeCodeCache();
         if (reloadAccounts) {
-          const accounts = await reloadAccounts();
+          const reloadResult = normalizeReloadAccountsResult(
+            await reloadAccounts(),
+            allowLiveClaudeCodeCredentials,
+          );
+          if (
+            credentialOwnershipRestartRequired
+            || reloadResult.allowLiveClaudeCodeCredentials !== allowLiveClaudeCodeCredentials
+          ) {
+            credentialOwnershipRestartRequired = true;
+            sendCredentialOwnershipRestartRequired(res, 409);
+            return;
+          }
+          const { accounts } = reloadResult;
+          if (reloadResult.validationError) throw reloadResult.validationError;
+          const nextDuplicateIds = await withCredentialSetLock(
+            secretStore,
+            () => duplicateRefreshTokenAccountIds(accounts, secretStore),
+          );
+          const ownedDuplicateIds = duplicateRefreshErrorAccountIds(accountManager, duplicateRefreshAccounts);
+          let duplicateStateChanged = clearResolvedDuplicateRefreshErrors({
+            accountManager,
+            duplicateRefreshAccountIds: nextDuplicateIds,
+            duplicateRefreshAccounts,
+          });
           accountManager.replaceAccounts(accounts);
+          replaceSet(duplicateRefreshAccountIds, nextDuplicateIds);
+          duplicateStateChanged = parkDuplicateRefreshTokenAccounts({
+            accountManager,
+            duplicateRefreshAccountIds,
+            duplicateRefreshAccounts,
+            ownedDuplicateIds,
+          }) || duplicateStateChanged;
+          if (duplicateStateChanged) await persistState();
         }
+        // Reconcile in the background instead of awaiting it (or replacing
+        // the shared operationalStateCheck gate other requests await): each
+        // account's reconcile can block on that account's file lock for up
+        // to its full acquire timeout, and every other in-flight request
+        // (including /internal/status and proxied /v1/messages calls) would
+        // otherwise stall behind this single reload until it finishes.
+        checkPersistedRefreshIntents().catch(error => {
+          logger?.(`${new Date().toISOString()} reload-reconcile result=failed error=${shortErrorMessage(error)}`);
+        });
         if (usagePollingEnabled(config)) {
           await usageScheduler.refreshNow({ afterCurrent: true });
         }
@@ -197,12 +324,20 @@ export function createProxyServer({
       }
 
       if (req.method === 'POST' && req.url === '/internal/refresh-usage') {
+        if (credentialOwnershipRestartRequired) {
+          sendCredentialOwnershipRestartRequired(res, 503);
+          return;
+        }
         sendJson(res, 200, await usageScheduler.refreshNow());
         return;
       }
 
       if (req.method === 'POST' && req.url === '/internal/prepare-resume') {
         const body = JSON.parse((await readBody(req)).toString('utf8') || '{}');
+        if (body.refreshUsage && credentialOwnershipRestartRequired) {
+          sendCredentialOwnershipRestartRequired(res, 503);
+          return;
+        }
         if (body.refreshUsage) await usageScheduler.refreshNow();
         const result = accountManager.prepareResumeTarget();
         await persistState();
@@ -210,6 +345,11 @@ export function createProxyServer({
           ...result,
           status: accountManager.getStatus(),
         });
+        return;
+      }
+
+      if (credentialOwnershipRestartRequired) {
+        sendCredentialOwnershipRestartRequired(res, 503);
         return;
       }
 
@@ -237,6 +377,7 @@ export function createProxyServer({
         currentCredentialReader,
         currentProfileFetcher,
         reactiveQuotaConfirmer,
+        allowLiveClaudeCodeCredentials,
         logger,
         upstreamIdleTimeoutMs,
         upstreamConnectTimeoutMs,
@@ -260,6 +401,121 @@ export function createProxyServer({
 
   usageScheduler.start(server);
   return server;
+}
+
+async function reconcilePersistedRefreshIntents({ accountManager, secretStore, logger }) {
+  let changed = false;
+  for (const account of accountManager.accounts) {
+    if (
+      account.type === 'apikey'
+      || account.id === 'current'
+      || account.credentialSource === 'claude-code-current'
+    ) continue;
+    try {
+      await getOperationalSecret(secretStore, account.id);
+    } catch (error) {
+      if (error?.code !== 'NATIVE_REFRESH_OUTCOME_UNKNOWN') {
+        logger?.(`${new Date().toISOString()} credential-state-check account=${account.id} result=failed errorType=${error?.code || error?.name || 'unknown'}`);
+        continue;
+      }
+      if (account.errorReason?.type !== 'oauth_refresh_failed') {
+        accountManager.markError(account.id, 'oauth_refresh_failed', 'OAuth token refresh failed');
+        changed = true;
+      }
+    }
+  }
+  return changed;
+}
+
+function replaceSet(target, values) {
+  target.clear();
+  for (const value of values) target.add(value);
+}
+
+function duplicateRefreshErrorAccountIds(accountManager, duplicateRefreshAccounts) {
+  return new Set(
+    accountManager.accounts
+      .filter(account => duplicateRefreshAccounts.has(account))
+      .map(account => account.id),
+  );
+}
+
+function parkDuplicateRefreshTokenAccounts({
+  accountManager,
+  duplicateRefreshAccountIds,
+  duplicateRefreshAccounts,
+  ownedDuplicateIds = new Set(),
+}) {
+  let changed = false;
+  for (const account of accountManager.accounts) {
+    if (!duplicateRefreshAccountIds.has(account.id)) continue;
+    if (ownedDuplicateIds.has(account.id)) duplicateRefreshAccounts.add(account);
+    if (account.errorReason?.type === 'oauth_refresh_failed') continue;
+    accountManager.markError(account.id, 'oauth_refresh_failed', 'OAuth token refresh failed');
+    duplicateRefreshAccounts.add(account);
+    changed = true;
+  }
+  return changed;
+}
+
+function clearResolvedDuplicateRefreshErrors({
+  accountManager,
+  duplicateRefreshAccountIds,
+  duplicateRefreshAccounts,
+}) {
+  let changed = false;
+  for (const account of accountManager.accounts) {
+    if (!duplicateRefreshAccounts.has(account) || duplicateRefreshAccountIds.has(account.id)) continue;
+    accountManager.markAuthenticated(account);
+    changed = true;
+  }
+  return changed;
+}
+
+function normalizeReloadAccountsResult(result, currentAllowLiveClaudeCodeCredentials) {
+  if (Array.isArray(result)) {
+    return {
+      accounts: result,
+      allowLiveClaudeCodeCredentials: currentAllowLiveClaudeCodeCredentials,
+    };
+  }
+  if (
+    !result
+    || !Array.isArray(result.accounts)
+    || typeof result.allowLiveClaudeCodeCredentials !== 'boolean'
+  ) {
+    throw new Error('Reloaded credential configuration is invalid');
+  }
+  return result;
+}
+
+async function withCredentialSetLock(secretStore, operation) {
+  if (typeof secretStore?.runCredentialSetExclusive === 'function') {
+    return secretStore.runCredentialSetExclusive(operation);
+  }
+  return operation();
+}
+
+function duplicateRefreshTokenError() {
+  const error = new Error('OAuth refresh token is linked to multiple accounts');
+  error.code = 'DUPLICATE_REFRESH_TOKEN';
+  return error;
+}
+
+function credentialOwnershipRestartError() {
+  const error = new Error('Credential ownership changed; restart claude-rotator before continuing.');
+  error.code = 'CREDENTIAL_OWNERSHIP_RESTART_REQUIRED';
+  return error;
+}
+
+function sendCredentialOwnershipRestartRequired(res, statusCode) {
+  sendJson(res, statusCode, {
+    type: 'error',
+    error: {
+      type: 'restart_required',
+      message: 'Credential ownership changed; restart claude-rotator before continuing.',
+    },
+  });
 }
 
 export function defaultTokenRefresher({
@@ -400,15 +656,19 @@ function createUsageRefresher({
   currentCredentialReader,
   currentProfileFetcher,
   usageFetcher,
+  allowLiveClaudeCodeCredentials,
   usageRequestOptions,
   usageObservationTracker,
   usageRefreshConcurrency,
   usageRefreshRequestSpacingMs,
+  beforeRefresh,
+  duplicateRefreshAccountIds,
   logger,
 }) {
   let inFlight = null;
   let attempted = false;
   const refreshAll = async ({ afterCurrent = false } = {}) => {
+    await beforeRefresh?.();
     if (inFlight) {
       if (!afterCurrent) return inFlight;
       const current = inFlight;
@@ -424,10 +684,12 @@ function createUsageRefresher({
       currentCredentialReader,
       currentProfileFetcher,
       usageFetcher,
+      allowLiveClaudeCodeCredentials,
       usageRequestOptions,
       usageObservationTracker,
       usageRefreshConcurrency,
       usageRefreshRequestSpacingMs,
+      duplicateRefreshAccountIds,
       logger,
     }).finally(() => {
       attempted = true;
@@ -622,6 +884,7 @@ function createReactiveQuotaConfirmer({
   usageFetcher,
   usageRequestOptions,
   usageObservationTracker,
+  allowLiveClaudeCodeCredentials = true,
   timeoutMs,
   logger,
 }) {
@@ -669,6 +932,7 @@ function createReactiveQuotaConfirmer({
             account,
             secretStore,
             currentCredentialReader,
+            allowLiveClaudeCodeCredentials,
             signal: entry.abortController.signal,
           }),
         ]);
@@ -910,8 +1174,31 @@ function requestModelFamily(body) {
   }
 }
 
+// Exact canonical id only. Used to gate reactive Usage confirmation (a
+// second network round trip that mutates quota state), which must stay
+// conservative: see 'requires the exact canonical Fable 5 model id for
+// reactive Usage confirmation' (test/proxy-server.test.js).
 function isCanonicalFableModelId(value) {
   return value === 'claude-fable-5';
+}
+
+// Lenient prefix match for account-selection ROUTING only (never for
+// confirmation/evidence gating above). Anthropic-issued Fable ids may carry a
+// dated or numbered suffix (e.g. `claude-fable-5-20260818`, a future
+// `claude-fable-5-1`); rejecting those as non-Fable would route them straight
+// at a Fable-exhausted account and surface as a 429 to the caller.
+function isFableRoutingModelId(value) {
+  if (typeof value !== 'string') return false;
+  return /^claude-fable-\d/.test(value.trim().toLowerCase());
+}
+
+function routingModelFamily(body) {
+  try {
+    const model = JSON.parse(body.toString('utf8'))?.model;
+    return isFableRoutingModelId(model) ? 'fable' : null;
+  } catch {
+    return null;
+  }
 }
 
 function safeUsageObservation(usage, threshold, nowMs) {
@@ -1066,7 +1353,7 @@ function scopedUsageIdentity(limit) {
     .toLowerCase()
     .replace(/[^a-z0-9]+/g, '_')
     .replace(/^_+|_+$/g, '');
-  return isExactFableScopeIdentity(value) ? 'fable' : (value || 'scoped');
+  return isFableScopeIdentity(value) ? 'fable' : (value || 'scoped');
 }
 
 function usageEvidenceConfirmsRequest(fields, threshold, modelFamily, nowMs) {
@@ -1116,19 +1403,9 @@ function accountQuotaConfirmsModelFamily(account, modelFamily, threshold, nowMs)
 function scopedUsageMatchesModelFamily(limit, modelFamily) {
   if (modelFamily !== 'fable') return false;
   const key = String(limit?.key || '').trim().toLowerCase();
-  if (key) return isExactFableScopeIdentity(key);
+  if (key) return isFableScopeIdentity(key);
   const label = String(limit?.label || '').trim().toLowerCase();
-  return isExactFableScopeIdentity(label);
-}
-
-function isExactFableScopeIdentity(value) {
-  return [
-    'fable',
-    'fable 5',
-    'fable_5',
-    'claude-fable-5',
-    'claude_fable_5',
-  ].includes(String(value || '').trim().toLowerCase());
+  return isFableScopeIdentity(label);
 }
 
 function unifiedQuotaHeaderEvidence(headers, threshold, nowMs) {
@@ -1156,19 +1433,26 @@ async function snapshotKnownAvailableAlternates({
   account,
   secretStore,
   currentCredentialReader,
+  allowLiveClaudeCodeCredentials = true,
   signal = null,
 }) {
   throwIfOperationAborted(signal);
+  // This confirmer only ever runs for a Fable request (gated by
+  // `requestModelFamily(body) === 'fable'` before it is invoked), so the final
+  // gate here must judge candidates as Fable requests too — otherwise a
+  // Fable-exhausted candidate would incorrectly look available (isAvailable's
+  // default modelFamily is null / non-Fable).
   const candidates = accountManager.accounts.filter(candidate => (
     candidate !== account
-    && accountManager.isAvailable(candidate)
-    && accountManager.switchTargetScore(candidate) != null
+    && accountManager.isAvailable(candidate, 'fable')
+    && accountManager.switchTargetScore(candidate, 'fable') != null
   ));
   const snapshots = await Promise.all(candidates.map(async candidate => {
     const secret = await resolveReactiveReplaySecret({
       account: candidate,
       secretStore,
       currentCredentialReader,
+      allowLiveClaudeCodeCredentials,
       signal,
     });
     throwIfOperationAborted(signal);
@@ -1185,12 +1469,19 @@ async function resolveReactiveReplaySecret({
   account,
   secretStore,
   currentCredentialReader,
+  allowLiveClaudeCodeCredentials = true,
   signal = null,
 }) {
   throwIfOperationAborted(signal);
-  const secret = account.id === 'current' || account.credentialSource === 'claude-code-current'
-    ? await liveClaudeCodeSecret(currentCredentialReader)
-    : await secretStore.get(account.id);
+  if (account.id === 'current' || account.credentialSource === 'claude-code-current') {
+    if (!allowLiveClaudeCodeCredentials) {
+      throw new Error('Live current account is unavailable while Claude login is overridden');
+    }
+    const secret = await liveClaudeCodeSecret(currentCredentialReader);
+    throwIfOperationAborted(signal);
+    return secret;
+  }
+  const secret = await getOperationalSecret(secretStore, account.id);
   throwIfOperationAborted(signal);
   return secret;
 }
@@ -1205,14 +1496,16 @@ function validReactiveReplayTarget({
   secret = null,
 }) {
   const snapshot = targets?.get(candidate);
+  // Same reasoning as snapshotKnownAvailableAlternates: this replay path is
+  // Fable-only, so judge the candidate as a Fable request here too.
   return Boolean(
     source
     && candidate
     && snapshot
     && accountManager.accounts.includes(source)
     && accountManager.accounts.includes(candidate)
-    && accountManager.isAvailable(candidate)
-    && accountManager.switchTargetScore(candidate) != null
+    && accountManager.isAvailable(candidate, 'fable')
+    && accountManager.switchTargetScore(candidate, 'fable') != null
     && candidate.credentialRevision === snapshot.credentialRevision
     && (!secret || (
       stableReactiveReplaySecret(candidate, secret)
@@ -1242,10 +1535,12 @@ async function refreshAllOnce({
   currentCredentialReader,
   currentProfileFetcher,
   usageFetcher,
+  allowLiveClaudeCodeCredentials,
   usageRequestOptions,
   usageObservationTracker,
   usageRefreshConcurrency,
   usageRefreshRequestSpacingMs,
+  duplicateRefreshAccountIds,
   logger,
 }) {
   const results = await mapWithConcurrency(
@@ -1260,8 +1555,10 @@ async function refreshAllOnce({
       currentCredentialReader,
       currentProfileFetcher,
       usageFetcher,
+      allowLiveClaudeCodeCredentials,
       usageRequestOptions,
       usageObservationTracker,
+      duplicateRefreshAccountIds,
       logger,
     }),
   );
@@ -1309,11 +1606,16 @@ async function refreshAccountUsage({
   currentCredentialReader,
   currentProfileFetcher,
   usageFetcher,
+  allowLiveClaudeCodeCredentials,
   usageRequestOptions,
   usageObservationTracker,
+  duplicateRefreshAccountIds,
   logger,
 }) {
   if (account.type === 'apikey') return { account: account.id, ok: true, skipped: 'apikey' };
+  if (duplicateRefreshAccountIds?.has(account.id)) {
+    return { account: account.id, ok: false, skipped: 'duplicate-refresh-token' };
+  }
   const observation = usageObservationTracker.start(account);
 
   try {
@@ -1322,6 +1624,7 @@ async function refreshAccountUsage({
       secretStore,
       currentCredentialReader,
       currentProfileFetcher,
+      allowLiveClaudeCodeCredentials,
       logger,
     });
     if (!accountManager.accounts.includes(account)) {
@@ -1329,7 +1632,7 @@ async function refreshAccountUsage({
       return { account: account.id, ok: true, stale: true };
     }
     if (!secret?.accessToken) throw new Error('OAuth access token is missing');
-    const credentialCooldown = accountManager.unavailableReason(account)?.type === 'oauth_refresh_rate_limit';
+    const credentialCooldown = accountManager.hasCredentialRefreshCooldown(account);
     if (credentialCooldown && !hasUsableAccessToken(secret)) {
       usageObservationTracker.fail(observation);
       return { account: account.id, ok: false, skipped: 'credential-refresh-cooldown' };
@@ -1378,8 +1681,8 @@ async function refreshAccountUsage({
     }
     const applyFailure = () => {
       if (!accountManager.accounts.includes(account)) return;
-      const refreshRateLimited = markOAuthRefreshRateLimit(accountManager, account.id, caught);
-      if (!refreshRateLimited && isOAuthCredentialError(message)) {
+      const refreshUnavailable = markOAuthRefreshUnavailable(accountManager, account.id, caught);
+      if (!refreshUnavailable && isOAuthCredentialError(message, caught)) {
         accountManager.markError(account.id, 'oauth_refresh_failed', 'OAuth token refresh failed');
       }
     };
@@ -1398,14 +1701,21 @@ function rebalanceAfterUsageRefresh(accountManager) {
   accountManager.rebalanceActiveAccount();
 }
 
-function isOAuthCredentialError(message) {
-  return /OAuth access token is missing|Token refresh failed|Usage fetch failed \(401\)/.test(String(message || ''));
+function isOAuthCredentialError(message, error = null) {
+  return error?.code === 'NATIVE_REFRESH_OUTCOME_UNKNOWN'
+    || /OAuth access token is missing|Token refresh failed|Usage fetch failed \(401\)/.test(String(message || ''));
 }
 
-function markOAuthRefreshRateLimit(accountManager, accountId, error) {
-  if (!isOAuthTokenRefreshRateLimit(error)) return false;
-  const retryAfterSeconds = Math.max(1, Math.ceil(error.retryAfterMs / 1000));
-  accountManager.markCredentialRefreshRateLimited(accountId, retryAfterSeconds, {
+function markOAuthRefreshUnavailable(accountManager, accountId, error) {
+  const retryAfterSeconds = Math.max(1, Math.ceil(Number(error?.retryAfterMs) / 1000) || 1);
+  if (isOAuthTokenRefreshRateLimit(error)) {
+    accountManager.markCredentialRefreshRateLimited(accountId, retryAfterSeconds, {
+      retryAfterSource: error.retryAfterSource,
+    });
+    return true;
+  }
+  if (!(Number.isFinite(Number(error?.retryAfterMs)) && Number(error.retryAfterMs) > 0)) return false;
+  accountManager.markCredentialRefreshDeferred(accountId, retryAfterSeconds, {
     retryAfterSource: error.retryAfterSource,
   });
   return true;
@@ -1422,6 +1732,7 @@ async function forwardWithRotation({
   currentCredentialReader,
   currentProfileFetcher,
   reactiveQuotaConfirmer,
+  allowLiveClaudeCodeCredentials,
   logger,
   upstreamIdleTimeoutMs,
   upstreamConnectTimeoutMs,
@@ -1436,17 +1747,23 @@ async function forwardWithRotation({
   let reactiveReplayTargets = null;
   let reactiveReplayAuthorization = null;
 
+  // Routing uses the lenient matcher (M3): a dated/numbered Fable id
+  // suffix must still route away from a Fable-exhausted account, unlike the
+  // strict `requestModelFamily` used to gate reactive Usage confirmation.
+  const modelFamily = routingModelFamily(body);
+
   for (let attempt = 0; attempt < maxAttempts; attempt++) {
     if (req.aborted || res.destroyed) return;
     const reactiveSelection = reactiveQuotaRetryUsed
       ? accountManager.bestAvailableSwitchCandidate({
         excludeCurrent: false,
         allowedAccounts: new Set(reactiveReplayTargets?.keys() || []),
+        modelFamily,
       })
       : null;
     const account = reactiveQuotaRetryUsed
       ? reactiveSelection?.account
-      : accountManager.getActiveAccount();
+      : accountManager.getActiveAccount(modelFamily);
     if (!account) {
       if (reactiveQuotaRetryUsed && lastRetryableResponse) {
         sendBufferedResponse(res, lastRetryableResponse);
@@ -1457,6 +1774,7 @@ async function forwardWithRotation({
         res,
         accountManager,
         logger,
+        modelFamily,
       })) return;
       if (lastRetryableResponse) {
         sendBufferedResponse(res, lastRetryableResponse);
@@ -1472,11 +1790,13 @@ async function forwardWithRotation({
         tokenRefresher,
         currentCredentialReader,
         currentProfileFetcher,
+        allowLiveClaudeCodeCredentials,
         logger,
         upstreamIdleTimeoutMs,
         upstreamConnectTimeoutMs,
         upstreamConnectRetries,
         upstreamConnectRetryDelayMs,
+        modelFamily,
       })) return;
       sendUnavailableAccounts(res, accountManager);
       return;
@@ -1505,12 +1825,14 @@ async function forwardWithRotation({
           account,
           secretStore,
           currentCredentialReader,
+          allowLiveClaudeCodeCredentials,
         })
         : await resolveSecretForAccount({
           account,
           secretStore,
           currentCredentialReader,
           currentProfileFetcher,
+          allowLiveClaudeCodeCredentials,
           logger,
         });
     } catch (error) {
@@ -1518,6 +1840,12 @@ async function forwardWithRotation({
         if (req.aborted || res.destroyed) return;
         sendBufferedResponse(res, lastRetryableResponse);
         return;
+      }
+      if (error?.code === 'NATIVE_REFRESH_OUTCOME_UNKNOWN') {
+        if (!markOAuthRefreshUnavailable(accountManager, account.id, error)) {
+          accountManager.markError(account.id, 'oauth_refresh_failed', 'OAuth token refresh failed');
+        }
+        continue;
       }
       throw error;
     }
@@ -1561,7 +1889,7 @@ async function forwardWithRotation({
         });
       } catch (caught) {
         if (!accountManager.accounts.includes(account)) continue;
-        if (!markOAuthRefreshRateLimit(accountManager, account.id, caught)) {
+        if (!markOAuthRefreshUnavailable(accountManager, account.id, caught)) {
           accountManager.markError(account.id, 'oauth_refresh_failed', 'OAuth token refresh failed');
         }
         continue;
@@ -1637,7 +1965,7 @@ async function forwardWithRotation({
         });
       } catch (caught) {
         if (!accountManager.accounts.includes(account)) continue;
-        if (!markOAuthRefreshRateLimit(accountManager, account.id, caught)) {
+        if (!markOAuthRefreshUnavailable(accountManager, account.id, caught)) {
           accountManager.markError(account.id, 'oauth_refresh_failed', 'OAuth token refresh failed');
         }
         continue;
@@ -1708,6 +2036,7 @@ async function forwardWithRotation({
       res,
       accountManager,
       logger,
+      modelFamily,
     })) return;
     if (lastRetryableResponse) {
       sendBufferedResponse(res, lastRetryableResponse);
@@ -1723,11 +2052,13 @@ async function forwardWithRotation({
       tokenRefresher,
       currentCredentialReader,
       currentProfileFetcher,
+      allowLiveClaudeCodeCredentials,
       logger,
       upstreamIdleTimeoutMs,
       upstreamConnectTimeoutMs,
       upstreamConnectRetries,
       upstreamConnectRetryDelayMs,
+      modelFamily,
     })) return;
     sendUnavailableAccounts(res, accountManager);
   }
@@ -1743,36 +2074,52 @@ async function forwardCurrentUnavailableAccount({
   tokenRefresher,
   currentCredentialReader,
   currentProfileFetcher,
+  allowLiveClaudeCodeCredentials,
   logger,
   upstreamIdleTimeoutMs,
   upstreamConnectTimeoutMs,
   upstreamConnectRetries,
   upstreamConnectRetryDelayMs,
+  modelFamily = null,
 }) {
   if (sendCurrentQuotaUnavailableResponse({
     req,
     res,
     accountManager,
     logger,
+    modelFamily,
   })) return true;
 
   const account = accountManager.getFallbackAccount();
   if (!account) return false;
 
-  const secret = await resolveSecretForAccount({
-    account,
-    secretStore,
-    currentCredentialReader,
-    currentProfileFetcher,
-    logger,
-  });
+  let secret;
+  try {
+    secret = await resolveSecretForAccount({
+      account,
+      secretStore,
+      currentCredentialReader,
+      currentProfileFetcher,
+      allowLiveClaudeCodeCredentials,
+      logger,
+    });
+  } catch (caught) {
+    if (caught?.code !== 'NATIVE_REFRESH_OUTCOME_UNKNOWN') throw caught;
+    if (!markOAuthRefreshUnavailable(accountManager, account.id, caught)) {
+      accountManager.markError(account.id, 'oauth_refresh_failed', 'OAuth token refresh failed');
+    }
+    return false;
+  }
   if (req.aborted || res.destroyed || !accountManager.accounts.includes(account)) return false;
   if (!secret) return false;
 
   if (secret.liveClaudeCodeCredential && hasUsableAccessToken(secret)) {
     accountManager.markAuthenticated(account.id);
   }
-  if (isCredentialUnavailable(accountManager.unavailableReason(account))) return false;
+  if (
+    accountManager.hasCredentialRefreshCooldown(account)
+    || isCredentialUnavailable(accountManager.unavailableReason(account))
+  ) return false;
 
   let freshSecret;
   try {
@@ -1812,6 +2159,7 @@ async function refreshSecretIfExpiring({ account, secret, secretStore, tokenRefr
   try {
     return await refreshAndStoreSecret({ account, secret, secretStore, tokenRefresher, logger });
   } catch (error) {
+    if (error?.code === 'NATIVE_REFRESH_OUTCOME_UNKNOWN') throw error;
     if (!hasUsableAccessToken(secret)) throw error;
     const expiresAt = normalizeCredentialExpiry(secret.expiresAt);
     const remainingSec = expiresAt == null ? 'unknown' : Math.max(0, Math.floor((expiresAt - Date.now()) / 1000));
@@ -1821,24 +2169,28 @@ async function refreshSecretIfExpiring({ account, secret, secretStore, tokenRefr
 }
 
 async function refreshAndStoreSecret({ account, secret, secretStore, tokenRefresher, logger }) {
-  const compareAndSet = requireSecretStoreCompareAndSet(secretStore);
-  const refreshed = await tokenRefresher(secret.refreshToken, tokenRefreshContext(account, secret));
-  const nextSecret = { ...secret, ...refreshed };
+  const refreshIfUnchanged = requireSecretStoreRefreshIfUnchanged(secretStore);
   try {
-    if (!await compareAndSet(account.id, secret, nextSecret)) {
-      const latestSecret = await secretStore.get(account.id);
+    const result = await refreshIfUnchanged(account.id, secret, async (currentSecret, transaction) => ({
+      ...currentSecret,
+      ...(await tokenRefresher(
+        currentSecret.refreshToken,
+        tokenRefreshContext(account, currentSecret, transaction),
+      )),
+    }));
+    if (!result.updated) {
       logger?.(`${new Date().toISOString()} credential-refresh account=${account.id} result=discarded reason=credential-changed`);
-      if (latestSecret?.accessToken) return latestSecret;
+      if (result.secret?.accessToken) return result.secret;
       throw new Error('Stored OAuth credential changed while token refresh was in flight');
     }
+    return result.secret;
   } catch (error) {
     logger?.(`${new Date().toISOString()} credential-store account=${account.id} result=failed errorType=${error?.code || error?.name || 'unknown'}`);
     throw error;
   }
-  return nextSecret;
 }
 
-function tokenRefreshContext(account, secret) {
+function tokenRefreshContext(account, secret, transaction = {}) {
   return {
     accountId: account.id,
     accessToken: secret.accessToken,
@@ -1849,6 +2201,10 @@ function tokenRefreshContext(account, secret) {
     clientId: secret.clientId,
     subscriptionType: secret.subscriptionType,
     rateLimitTier: secret.rateLimitTier,
+    beforeHandoff: transaction.beforeHandoff,
+    retractHandoff: transaction.retractHandoff,
+    protectChildPid: transaction.protectChildPid,
+    clearChildPid: transaction.clearChildPid,
   };
 }
 
@@ -1876,6 +2232,7 @@ async function resolveSecretForAccount({
   currentProfileFetcher,
   signal = null,
   liveCredentialLoader = null,
+  allowLiveClaudeCodeCredentials = true,
   logger,
 }) {
   throwIfOperationAborted(signal);
@@ -1885,14 +2242,17 @@ async function resolveSecretForAccount({
     return secret;
   }
   if (account.id === 'current' || account.credentialSource === 'claude-code-current') {
+    if (!allowLiveClaudeCodeCredentials) {
+      throw new Error('Live current account is unavailable while Claude login is overridden');
+    }
     const secret = await liveClaudeCodeSecret(currentCredentialReader);
     throwIfOperationAborted(signal);
     return secret;
   }
 
-  const stored = await secretStore.get(account.id);
+  const stored = await getOperationalSecret(secretStore, account.id);
   throwIfOperationAborted(signal);
-  if (!account.accountUuid) return stored;
+  if (!allowLiveClaudeCodeCredentials || !account.accountUuid) return stored;
 
   const current = await (liveCredentialLoader
     ? liveCredentialLoader()
@@ -1966,6 +2326,22 @@ function requireSecretStoreCompareAndSet(secretStore) {
   return secretStore.compareAndSet.bind(secretStore);
 }
 
+function requireSecretStoreRefreshIfUnchanged(secretStore) {
+  if (typeof secretStore?.refreshIfUnchanged !== 'function') {
+    const error = new Error('Secret store does not support conditional refresh transaction');
+    error.code = 'SECRET_STORE_TRANSACTION_UNAVAILABLE';
+    throw error;
+  }
+  return secretStore.refreshIfUnchanged.bind(secretStore);
+}
+
+function getOperationalSecret(secretStore, accountId) {
+  if (typeof secretStore?.getOperational === 'function') {
+    return secretStore.getOperational(accountId);
+  }
+  return secretStore.get(accountId);
+}
+
 function credentialsMatch(left, right) {
   return left?.accessToken === right?.accessToken
     && left?.refreshToken === right?.refreshToken
@@ -1991,7 +2367,7 @@ function hasUsableAccessToken(secret, now = Date.now()) {
 }
 
 function isCredentialUnavailable(reason) {
-  return reason?.type === 'oauth_refresh_rate_limit'
+  return isCredentialRefreshCooldown(reason)
     || reason?.type === 'oauth_refresh_failed'
     || reason?.type === 'authentication_error';
 }
@@ -2362,9 +2738,24 @@ function buildUpstreamHeaders(inputHeaders, account, secret) {
   if (account.type === 'apikey') {
     headers['x-api-key'] = secret.apiKey;
   } else {
+    appendHeaderCapability(headers, 'anthropic-beta', OAUTH_BETA_HEADER);
     headers.authorization = `Bearer ${secret.accessToken}`;
   }
   return headers;
+}
+
+function appendHeaderCapability(headers, headerName, capability) {
+  const existingKey = Object.keys(headers)
+    .find(key => key.toLowerCase() === headerName.toLowerCase());
+  const current = existingKey == null ? '' : headers[existingKey];
+  const values = (Array.isArray(current) ? current : [current])
+    .flatMap(value => String(value || '').split(','))
+    .map(value => String(value).trim())
+    .filter(Boolean);
+  const normalized = values.filter(value => value !== capability);
+  normalized.push(capability);
+  if (existingKey != null && existingKey !== headerName) delete headers[existingKey];
+  headers[headerName] = normalized.join(',');
 }
 
 async function requestUpstreamWithConnectRetries(options) {
@@ -2630,15 +3021,18 @@ function syntheticUpstreamErrorResponse(error) {
   };
 }
 
-function sendCurrentQuotaUnavailableResponse({ req, res, accountManager, logger }) {
+function sendCurrentQuotaUnavailableResponse({ req, res, accountManager, logger, modelFamily = null }) {
   let account = accountManager.getCurrentAccount();
-  let reason = accountManager.unavailableReason(account);
+  // Use the modelFamily-aware reason so a non-matching-family request never
+  // gets handed a misleading scoped claim (e.g. `seven_day_fable`) when it
+  // was really blocked by an unrelated common-quota window (m2).
+  let reason = accountManager.unavailableReasonForModelFamily(account, modelFamily);
   if (!isUnifiedQuotaExhaustion(reason)) return false;
 
   const shortestResetAccount = accountManager.selectBestExhaustedFallback();
   if (shortestResetAccount) {
     account = shortestResetAccount;
-    reason = accountManager.unavailableReason(account);
+    reason = accountManager.unavailableReasonForModelFamily(account, modelFamily);
     if (!isUnifiedQuotaExhaustion(reason)) return false;
   }
 

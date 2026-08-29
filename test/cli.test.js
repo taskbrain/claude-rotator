@@ -1,14 +1,22 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
+import { randomUUID } from 'node:crypto';
 import { EventEmitter } from 'node:events';
 import { mkdir, mkdtemp, readFile, rm, stat, writeFile } from 'node:fs/promises';
+import http from 'node:http';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { Readable } from 'node:stream';
 
 import {
+  assertAnthropicGatewayProviderCompatible,
+  assertGatewayCompatibleAccounts,
+  claudeLoginOverrideSource,
+  credentialOwnershipConfiguration,
   ensureCredentialRevisions,
+  internalApiUrl,
   removeServiceFile,
+  requestJson,
   runCli,
   runMacosCliActionWithLock,
   startService,
@@ -33,6 +41,138 @@ describe('ensureCredentialRevisions', () => {
     assert.equal(ensureCredentialRevisions(config, {
       createRevision: () => assert.fail('no new revision expected'),
     }), false);
+  });
+});
+
+describe('gateway account compatibility', () => {
+  it('rejects provider protocols that are incompatible with an Anthropic gateway', () => {
+    for (const source of [
+      'CLAUDE_CODE_USE_BEDROCK',
+      'CLAUDE_CODE_USE_VERTEX',
+      'CLAUDE_CODE_USE_FOUNDRY',
+      'CLAUDE_CODE_USE_ANTHROPIC_AWS',
+      'CLAUDE_CODE_USE_ANTHROPIC_GOOGLE_CLOUD',
+      'CLAUDE_CODE_USE_MANTLE',
+    ]) {
+      assert.throws(
+        () => assertAnthropicGatewayProviderCompatible(source),
+        /provider protocol that is incompatible/,
+      );
+    }
+    assert.doesNotThrow(() => assertAnthropicGatewayProviderCompatible('ANTHROPIC_AUTH_TOKEN'));
+    assert.doesNotThrow(() => assertAnthropicGatewayProviderCompatible(null));
+  });
+
+  it('rejects live current accounts and accepts stored snapshots', () => {
+    assert.throws(
+      () => assertGatewayCompatibleAccounts([{
+        id: 'current',
+        credentialSource: 'claude-code-current',
+      }]),
+      /Run claude-rotator remove current first, then claude auth login --claudeai and claude-rotator login before installing\./,
+    );
+    assert.doesNotThrow(() => assertGatewayCompatibleAccounts([{
+      id: 'saved-account',
+      type: 'oauth',
+    }]));
+  });
+
+  it('detects every configured credential that takes precedence over saved login', () => {
+    for (const name of [
+      'CLAUDE_CODE_USE_BEDROCK',
+      'CLAUDE_CODE_USE_VERTEX',
+      'CLAUDE_CODE_USE_FOUNDRY',
+      'CLAUDE_CODE_USE_ANTHROPIC_AWS',
+      'CLAUDE_CODE_USE_ANTHROPIC_GOOGLE_CLOUD',
+      'CLAUDE_CODE_USE_MANTLE',
+      'ANTHROPIC_AUTH_TOKEN',
+      'ANTHROPIC_API_KEY',
+      'CLAUDE_CODE_OAUTH_TOKEN',
+    ]) {
+      assert.equal(claudeLoginOverrideSource({}, { [name]: 'configured' }), name);
+      assert.equal(claudeLoginOverrideSource({ env: { [name]: 'configured' } }), name);
+    }
+    assert.equal(
+      claudeLoginOverrideSource({ apiKeyHelper: '/usr/local/bin/read-key' }),
+      'apiKeyHelper',
+    );
+    assert.equal(
+      claudeLoginOverrideSource({ env: { ANTHROPIC_AUTH_TOKEN: ' ' } }),
+      'ANTHROPIC_AUTH_TOKEN',
+    );
+    assert.equal(claudeLoginOverrideSource({}, {}), null);
+  });
+
+  it('uses settings env values ahead of inherited shell values', () => {
+    assert.equal(
+      claudeLoginOverrideSource(
+        { env: { ANTHROPIC_AUTH_TOKEN: '' } },
+        { ANTHROPIC_AUTH_TOKEN: 'inherited' },
+      ),
+      null,
+    );
+  });
+
+  it('builds reload results with the same credential ownership mode used at startup', () => {
+    const accounts = [{ id: 'saved-account', type: 'oauth' }];
+
+    assert.deepEqual(credentialOwnershipConfiguration(accounts, null), {
+      accounts,
+      allowLiveClaudeCodeCredentials: true,
+    });
+    assert.deepEqual(credentialOwnershipConfiguration(accounts, 'ANTHROPIC_AUTH_TOKEN'), {
+      accounts,
+      allowLiveClaudeCodeCredentials: false,
+    });
+  });
+
+  it('returns a changed ownership mode before surfacing gateway account validation', () => {
+    const accounts = [{
+      id: 'current',
+      type: 'oauth',
+      credentialSource: 'claude-code-current',
+    }];
+
+    const result = credentialOwnershipConfiguration(accounts, 'ANTHROPIC_AUTH_TOKEN', {
+      deferValidationError: true,
+    });
+
+    assert.equal(result.allowLiveClaudeCodeCredentials, false);
+    assert.equal(result.accounts, accounts);
+    assert.match(result.validationError.message, /Gateway authentication cannot be installed/);
+  });
+});
+
+describe('internal API transport', () => {
+  it('uses a valid IPv6 loopback URL for local CLI requests', async t => {
+    const server = http.createServer((request, response) => {
+      response.writeHead(200, { 'Content-Type': 'application/json' });
+      response.end(JSON.stringify({ ok: true, path: request.url }));
+    });
+    try {
+      await new Promise((resolve, reject) => {
+        server.once('error', reject);
+        server.listen(0, '::1', resolve);
+      });
+    } catch (error) {
+      if (['EADDRNOTAVAIL', 'EAFNOSUPPORT'].includes(error?.code)) {
+        t.skip('IPv6 loopback is unavailable on this host');
+        return;
+      }
+      throw error;
+    }
+
+    try {
+      const port = server.address().port;
+      const url = internalApiUrl({ proxy: { host: '::1', port } }, '/internal/health');
+      assert.equal(url, `http://[::1]:${port}/internal/health`);
+      assert.deepEqual(await requestJson(url, { method: 'GET' }), {
+        ok: true,
+        path: '/internal/health',
+      });
+    } finally {
+      await new Promise(resolve => server.close(resolve));
+    }
   });
 });
 import { MemorySecretStore } from '../src/secret-store.js';
@@ -266,7 +406,10 @@ describe('runCli', () => {
 
     assert.equal(code, 1);
     assert.deepEqual(imported, []);
-    assert.match(io.output(), /include a refresh token/);
+    assert.match(
+      io.output(),
+      /Run claude auth login --claudeai, then retry claude-rotator login\./,
+    );
   });
 
   it('refuses to create a fallback account when current login cannot be verified', async () => {
@@ -287,7 +430,10 @@ describe('runCli', () => {
     assert.equal(code, 1);
     assert.deepEqual(imported, []);
     assert.doesNotMatch(io.output(), /Imported account1/);
-    assert.match(io.output(), /Could not verify the current Claude Code login/);
+    assert.match(
+      io.output(),
+      /Could not verify the current Claude Code login\. Run claude auth login --claudeai and retry,/,
+    );
   });
 
   it('configures live current Claude Code login without storing a token snapshot', async () => {
@@ -297,6 +443,7 @@ describe('runCli', () => {
 
     const code = await runCli(['use-current', '--only'], {
       ...io,
+      isGatewayAuthConfigured: async () => false,
       readCurrentCredentials: async () => ({ accessToken: 'access', refreshToken: 'refresh' }),
       fetchProfile: async () => ({ email: 'person@example.com', accountUuid: 'uuid-1' }),
       loadConfig: async () => ({
@@ -323,6 +470,7 @@ describe('runCli', () => {
 
     const code = await runCli(['use-current'], {
       ...io,
+      isGatewayAuthConfigured: async () => false,
       readCurrentCredentials: async () => ({ accessToken: 'access', refreshToken: 'refresh' }),
       fetchProfile: async () => ({ email: 'person@example.com', accountUuid: 'uuid-1' }),
       loadConfig: async () => ({
@@ -336,6 +484,25 @@ describe('runCli', () => {
     assert.equal(savedConfig, null);
     assert.match(io.output(), /already registered as person-example-com/);
     assert.match(io.output(), /use-current --only/);
+  });
+
+  it('rejects use-current while local gateway authentication is configured', async () => {
+    const io = createIo();
+    let credentialsRead = false;
+
+    const code = await runCli(['use-current', '--only'], {
+      ...io,
+      isGatewayAuthConfigured: async () => true,
+      readCurrentCredentials: async () => {
+        credentialsRead = true;
+        return { accessToken: 'access', refreshToken: 'refresh' };
+      },
+    });
+
+    assert.equal(code, 1);
+    assert.equal(credentialsRead, false);
+    assert.match(io.output(), /incompatible with installed gateway authentication/);
+    assert.match(io.output(), /claude-rotator login/);
   });
 
   it('updates an existing account when login sees the same accountUuid without an explicit id', async () => {
@@ -353,7 +520,7 @@ describe('runCli', () => {
       saveConfig: async config => { savedConfig = config; },
       secretStore: {
         get: async () => null,
-        set: async (id, secret) => { stored.push({ id, secret }); },
+        replaceLinkedCredential: async (id, secret) => { stored.push({ id, secret }); },
       },
       reloadServer: async () => {},
     });
@@ -368,6 +535,64 @@ describe('runCli', () => {
     }]);
     assert.match(savedConfig.accounts[0].credentialRevision, /^[0-9a-f-]{36}$/);
     assert.match(io.output(), /Imported person@example\.com/);
+  });
+
+  it('relinks a parked account only with a new refresh token and changes its revision', async () => {
+    const original = {
+      accessToken: 'relink-old-access-fixture',
+      refreshToken: 'relink-old-refresh-fixture',
+      expiresAt: 1,
+    };
+    const store = new MemorySecretStore();
+    await store.set('acct_1', original);
+    await assert.rejects(
+      () => store.refreshIfUnchanged('acct_1', original, async (_current, transaction) => {
+        await transaction.beforeHandoff();
+        throw Object.assign(new Error('ambiguous relink fixture'), {
+          code: 'NATIVE_REFRESH_OUTCOME_UNKNOWN',
+        });
+      }),
+      error => error.code === 'NATIVE_REFRESH_OUTCOME_UNKNOWN',
+    );
+    const originalConfig = {
+      accounts: [{
+        id: 'acct_1',
+        name: 'person@example.com',
+        type: 'oauth',
+        accountUuid: 'uuid-1',
+        credentialRevision: 'revision-before-relink',
+      }],
+    };
+    let credential = { ...original, accessToken: 'same-token-rewrite-fixture' };
+    let savedConfig = null;
+    const dependencies = () => ({
+      readCurrentCredentials: async () => credential,
+      fetchProfile: async () => ({ email: 'person@example.com', accountUuid: 'uuid-1' }),
+      loadConfig: async () => structuredClone(originalConfig),
+      saveConfig: async config => { savedConfig = config; },
+      secretStore: store,
+      reloadServer: async () => {},
+    });
+
+    const rejectedIo = createIo();
+    assert.equal(await runCli(['login'], { ...rejectedIo, ...dependencies() }), 1);
+    assert.equal(savedConfig, null);
+    await assert.rejects(
+      () => store.getOperational('acct_1'),
+      error => error.code === 'NATIVE_REFRESH_OUTCOME_UNKNOWN',
+    );
+
+    credential = {
+      accessToken: 'relink-new-access-fixture',
+      refreshToken: 'relink-new-refresh-fixture',
+      expiresAt: Date.now() + 60 * 60 * 1000,
+    };
+    const acceptedIo = createIo();
+    assert.equal(await runCli(['login'], { ...acceptedIo, ...dependencies() }), 0);
+
+    assert.deepEqual(await store.getOperational('acct_1'), credential);
+    assert.notEqual(savedConfig.accounts[0].credentialRevision, 'revision-before-relink');
+    assert.match(savedConfig.accounts[0].credentialRevision, /^[0-9a-f-]{36}$/);
   });
 
   it('refuses an explicit account id when the accountUuid already exists', async () => {
@@ -407,7 +632,7 @@ describe('runCli', () => {
         saveConfig: async config => { savedConfig = config; },
         secretStore: {
           get: async () => null,
-          set: async (id, secret) => { stored.push({ id, secret }); },
+          replaceLinkedCredential: async (id, secret) => { stored.push({ id, secret }); },
         },
         reloadServer: async () => {},
       },
@@ -417,6 +642,43 @@ describe('runCli', () => {
     assert.deepEqual(stored, [{ id: 'acct_1', secret: { accessToken: 'access-1', refreshToken: 'refresh-1' } }]);
     assert.equal(savedConfig.accounts[0].id, 'acct_1');
     assert.match(io.output(), /Added person@example\.com/);
+  });
+
+  it('publishes a new login config while the credential-set transaction is held', async () => {
+    const io = createIo();
+    let transactionHeld = false;
+    let configSaved = false;
+    let reloadObserved = false;
+    const code = await runCli(
+      ['login', '--id', 'acct_2', '--name', 'person@example.com', '--json', '-'],
+      {
+        ...io,
+        stdin: Readable.from(['{"accessToken":"atomic-access","refreshToken":"atomic-refresh"}']),
+        loadConfig: async () => ({ accounts: [] }),
+        saveConfig: async config => {
+          assert.equal(transactionHeld, true);
+          assert.equal(config.accounts[0].id, 'acct_2');
+          configSaved = true;
+        },
+        secretStore: {
+          get: async () => null,
+          replaceLinkedCredential: async () => assert.fail('atomic publish API must be used'),
+          replaceLinkedCredentialAndRun: async (_id, _secret, afterWrite) => {
+            transactionHeld = true;
+            await afterWrite();
+            transactionHeld = false;
+          },
+        },
+        reloadServer: async () => {
+          assert.equal(transactionHeld, false);
+          assert.equal(configSaved, true);
+          reloadObserved = true;
+        },
+      },
+    );
+
+    assert.equal(code, 0);
+    assert.equal(reloadObserved, true);
   });
 
   it('refuses login --json - immediately when stdin is a terminal, instead of hanging', async () => {
@@ -549,7 +811,7 @@ describe('runCli', () => {
     assert.match(io.output(), /server: ok/);
     assert.match(io.output(), /warning: duplicate accountUuid for current, duplicate/);
     assert.match(io.output(), /warning: current: config name old@example\.com differs from live login live@example\.com/);
-    assert.match(io.output(), /warning: current: static accountUuid is obsolete; run claude-rotator use-current to normalize it/);
+    assert.match(io.output(), /warning: current: static accountUuid is obsolete; run claude-rotator remove current first, then claude auth login --claudeai and claude-rotator login/);
     assert.match(io.output(), /warning: bad: credential profile check failed: Profile fetch failed \(401\)/);
     assert.match(io.output(), /warning: live duplicate accountUuid for current, duplicate/);
   });
@@ -599,6 +861,114 @@ describe('runCli', () => {
     assert.equal((await secretStore.get('acct_1')).accessToken, 'fresh-token');
   });
 
+  it('does not hand off duplicate refresh tokens during doctor checks', async () => {
+    const io = createIo();
+    const secretStore = new MemorySecretStore();
+    for (const accountId of ['acct_1', 'acct_2']) {
+      await secretStore.set(accountId, {
+        accessToken: `doctor-duplicate-access-${accountId}`,
+        refreshToken: 'doctor-duplicate-refresh',
+        expiresAt: 1,
+      });
+    }
+    let handoffs = 0;
+    const code = await runCli(['doctor'], {
+      ...io,
+      readHealth: async () => ({ ok: true }),
+      loadConfig: async () => ({
+        accounts: [
+          { id: 'acct_1', name: 'one@example.com', type: 'oauth' },
+          { id: 'acct_2', name: 'two@example.com', type: 'oauth' },
+        ],
+      }),
+      secretStore,
+      refreshAccessToken: async (_refreshToken, context) => {
+        await context.beforeHandoff();
+        handoffs += 1;
+        return assert.fail('duplicate refresh token must not reach provider handoff');
+      },
+      fetchProfile: async () => assert.fail('duplicate credential must not fetch profile'),
+    });
+
+    assert.equal(code, 0);
+    assert.equal(handoffs, 0);
+    assert.match(io.output(), /refresh token is linked to multiple accounts/);
+    assert.doesNotMatch(io.output(), /doctor-duplicate-refresh/);
+  });
+
+  it('parks two consecutive doctor runs after one ambiguous handoff', async () => {
+    const io = createIo();
+    const secretStore = new MemorySecretStore();
+    await secretStore.set('acct_1', {
+      accessToken: 'expired-doctor-access-fixture',
+      refreshToken: 'doctor-refresh-fixture',
+      expiresAt: 1,
+    });
+    let refreshCalls = 0;
+    const deps = {
+      ...io,
+      readHealth: async () => ({ ok: true }),
+      loadConfig: async () => ({
+        accounts: [{
+          id: 'acct_1',
+          name: 'person@example.com',
+          type: 'oauth',
+          credentialRevision: 'rev-1',
+        }],
+      }),
+      secretStore,
+      refreshAccessToken: async (_refreshToken, context) => {
+        refreshCalls += 1;
+        await context.beforeHandoff();
+        throw Object.assign(new Error('ambiguous doctor handoff'), {
+          code: 'NATIVE_REFRESH_OUTCOME_UNKNOWN',
+        });
+      },
+      fetchProfile: async () => assert.fail('doctor profile fetch must not run while parked'),
+    };
+
+    assert.equal(await runCli(['doctor'], deps), 0);
+    assert.equal(await runCli(['doctor'], deps), 0);
+
+    assert.equal(refreshCalls, 1);
+    assert.match(io.output(), /credential profile check failed/);
+    assert.doesNotMatch(io.output(), /doctor-refresh-fixture/);
+  });
+
+  it('retracts a doctor refresh intent when the native child never starts', async () => {
+    const io = createIo();
+    const secretStore = new MemorySecretStore();
+    await secretStore.set('acct_1', {
+      accessToken: randomUUID(),
+      refreshToken: randomUUID(),
+      expiresAt: 1,
+    });
+    let refreshCalls = 0;
+    const deps = {
+      ...io,
+      readHealth: async () => ({ ok: true }),
+      loadConfig: async () => ({
+        accounts: [{ id: 'acct_1', name: 'person@example.com', type: 'oauth' }],
+      }),
+      secretStore,
+      refreshAccessToken: async (_refreshToken, context) => {
+        refreshCalls += 1;
+        await context.beforeHandoff();
+        await context.retractHandoff();
+        throw Object.assign(new Error('native child did not start'), {
+          code: 'NATIVE_REFRESH_COMMAND_UNAVAILABLE',
+        });
+      },
+      fetchProfile: async () => assert.fail('profile fetch must not run after refresh failure'),
+    };
+
+    assert.equal(await runCli(['doctor'], deps), 0);
+    assert.equal(await runCli(['doctor'], deps), 0);
+
+    assert.equal(refreshCalls, 2, 'a pre-spawn failure must remain retryable instead of parking the account');
+    assert.match(io.output(), /native child did not start/);
+  });
+
   it('leaves current Claude Code credential refresh to Claude Code', async () => {
     const io = createIo();
     let refreshCalls = 0;
@@ -628,7 +998,7 @@ describe('runCli', () => {
     assert.match(io.output(), /current: credential profile check failed: Profile fetch failed \(401\)/);
   });
 
-  it('discards a doctor refresh result when credential metadata changed in flight', async () => {
+  it('uses the newer doctor credential without refreshing when it changes before the locked re-read', async () => {
     const io = createIo();
     const secretStore = new MemorySecretStore();
     await secretStore.set('acct_1', {
@@ -644,6 +1014,16 @@ describe('runCli', () => {
       subscriptionType: 'max',
       rateLimitTier: 'tier-2',
     };
+    const refreshIfUnchanged = secretStore.refreshIfUnchanged.bind(secretStore);
+    let replaceBeforeLockedRead = true;
+    secretStore.refreshIfUnchanged = async (...args) => {
+      if (replaceBeforeLockedRead) {
+        replaceBeforeLockedRead = false;
+        await secretStore.set('acct_1', newerSecret);
+      }
+      return refreshIfUnchanged(...args);
+    };
+    let refreshCalls = 0;
 
     const code = await runCli(['doctor'], {
       ...io,
@@ -655,7 +1035,7 @@ describe('runCli', () => {
       }),
       secretStore,
       refreshAccessToken: async () => {
-        await secretStore.set('acct_1', newerSecret);
+        refreshCalls += 1;
         return {
           accessToken: 'stale-refresh-result',
           refreshToken: 'refresh-token-2',
@@ -670,9 +1050,10 @@ describe('runCli', () => {
 
     assert.equal(code, 0);
     assert.deepEqual(await secretStore.get('acct_1'), newerSecret);
+    assert.equal(refreshCalls, 0);
   });
 
-  it('fails doctor refresh closed when atomic compare-and-set is unavailable', async () => {
+  it('fails doctor refresh closed when conditional update transactions are unavailable', async () => {
     const io = createIo();
     let refreshCalls = 0;
     const secret = {
@@ -687,7 +1068,10 @@ describe('runCli', () => {
       loadConfig: async () => ({
         accounts: [{ id: 'acct_1', name: 'person@example.com', type: 'oauth' }],
       }),
-      secretStore: { get: async () => ({ ...secret }) },
+      secretStore: {
+        get: async () => ({ ...secret }),
+        compareAndSet: async () => assert.fail('legacy compare-and-set must not be used'),
+      },
       refreshAccessToken: async () => {
         refreshCalls++;
         return { accessToken: 'must-not-be-used' };
@@ -697,7 +1081,7 @@ describe('runCli', () => {
 
     assert.equal(code, 0);
     assert.equal(refreshCalls, 0);
-    assert.match(io.output(), /Secret store does not support atomic compare-and-set/);
+    assert.match(io.output(), /Secret store does not support conditional update transaction/);
   });
 
   it('reports a doctor health-check failure as a normal CLI failure', async () => {
@@ -881,6 +1265,23 @@ describe('runMacosCliActionWithLock', () => {
 });
 
 describe('startService', () => {
+  it('enables and restarts an existing Linux service after daemon reload', async () => {
+    const calls = [];
+
+    await startService({
+      platform: 'linux',
+      execFileImpl: async (cmd, args) => {
+        calls.push([cmd, args]);
+      },
+    });
+
+    assert.deepEqual(calls, [
+      ['systemctl', ['--user', 'daemon-reload']],
+      ['systemctl', ['--user', 'enable', 'claude-rotator.service']],
+      ['systemctl', ['--user', 'restart', 'claude-rotator.service']],
+    ]);
+  });
+
   it('requires the shared lock for macOS service changes', async () => {
     const calls = [];
 

@@ -1,4 +1,4 @@
-import { emptyQuota, normalizeWeeklyScopedUsage, parseRateLimitHeaders } from './quota.js';
+import { emptyQuota, normalizeWeeklyScopedUsage, parseRateLimitHeaders, scopeMatchesModelFamily } from './quota.js';
 import {
   DEFAULT_MAX_PROVIDER_RETRY_AFTER_MS,
   DEFAULT_MAX_TOKEN_REFRESH_BACKOFF_MS,
@@ -27,16 +27,21 @@ export class AccountManager {
     this.currentIndex = configuredIndex >= 0 ? configuredIndex : 0;
   }
 
-  getActiveAccount() {
+  /**
+   * @param {string|null} modelFamily 'fable' for a Fable request, null for every
+   *   other (or unidentified) request. A Fable-only sub-cap exhaustion never
+   *   blocks a non-Fable request; a common 5h/7d exhaustion blocks every family.
+   */
+  getActiveAccount(modelFamily = null) {
     const current = this.accounts[this.currentIndex];
-    if (this.isAvailable(current)) {
+    if (this.isAvailable(current, modelFamily)) {
       current.status = 'active';
       return current;
     }
 
     const reason = this.unavailableReason(current);
-    if (current?.status === 'error' || reason?.type === 'oauth_refresh_rate_limit') {
-      const next = this.selectBestAvailableSwitchTarget();
+    if (current?.status === 'error' || this.hasCredentialRefreshCooldown(current)) {
+      const next = this.selectBestAvailableSwitchTarget(modelFamily);
       if (next) {
         next.status = 'active';
         return next;
@@ -45,7 +50,15 @@ export class AccountManager {
     }
     if (!isUnifiedQuotaExhaustion(reason)) return null;
 
-    const next = this.selectBestAvailableSwitchTarget();
+    if (!commonQuotaExhausted(current.quota, this.switchThreshold)) {
+      // Only a model-scoped window (e.g. Fable) is exhausted: `current` is
+      // still perfectly usable for every other family, so pick an alternate
+      // for THIS request only and leave `currentIndex` untouched.
+      const adHoc = this.bestAvailableSwitchCandidate({ excludeCurrent: true, modelFamily });
+      return adHoc ? adHoc.account : null;
+    }
+
+    const next = this.selectBestAvailableSwitchTarget(modelFamily);
     if (next) {
       next.status = 'active';
       return next;
@@ -156,6 +169,16 @@ export class AccountManager {
     });
   }
 
+  markCredentialRefreshDeferred(accountId, retryAfterSeconds, { retryAfterSource = null } = {}) {
+    this.markTemporaryUnavailable(accountId, retryAfterSeconds, {
+      type: 'oauth_refresh_retry',
+      ...(retryAfterSource ? { retryAfterSource } : {}),
+    }, {
+      eventType: 'credential-refresh-deferred',
+      retryAfterSeconds,
+    });
+  }
+
   markTemporaryUnavailable(accountId, retryAfterSeconds, reason, event = {}) {
     const account = this.find(accountId);
     const retryAfterMs = Math.max(0, Number(retryAfterSeconds) || 0) * 1000;
@@ -186,7 +209,7 @@ export class AccountManager {
 
   markAuthenticated(accountOrId) {
     const account = typeof accountOrId === 'string' ? this.find(accountOrId) : accountOrId;
-    const credentialThrottled = account.temporaryUnavailableReason?.type === 'oauth_refresh_rate_limit';
+    const credentialThrottled = isCredentialRefreshCooldown(account.temporaryUnavailableReason);
     account.errorReason = null;
     if (credentialThrottled) {
       account.rateLimitedUntil = null;
@@ -259,6 +282,10 @@ export class AccountManager {
       currentAccount: active?.id || null,
       currentAccountName: active?.name || null,
       switchThreshold: this.switchThreshold,
+      routingAvailability: {
+        fable: this.getRoutingAvailability('fable'),
+        other: this.getRoutingAvailability(null),
+      },
       accounts: this.accounts.map(account => {
         this.refreshQuotaState(account);
         return {
@@ -277,6 +304,51 @@ export class AccountManager {
       }),
       events: this.events.slice(0, 50),
     };
+  }
+
+  getRoutingAvailability(modelFamily = null) {
+    const candidates = this.accounts.map((account, index) => {
+      this.refreshQuotaState(account);
+      const isCurrent = index === this.currentIndex;
+      const available = this.isAvailable(account, modelFamily);
+      const score = available ? this.switchTargetScore(account, modelFamily) : null;
+
+      if (available && (isCurrent || score)) {
+        return {
+          account,
+          index,
+          isCurrent,
+          priority: account.priority,
+          score,
+          state: 'available',
+          availableAt: null,
+        };
+      }
+
+      return {
+        account,
+        index,
+        isCurrent,
+        priority: account.priority,
+        score: null,
+        ...futureAvailabilityForModelFamily(
+          account,
+          this.switchThreshold,
+          modelFamily,
+          this.now(),
+        ),
+      };
+    });
+
+    candidates.sort(compareRoutingAvailabilityCandidates);
+    return candidates.map(candidate => ({
+      account: candidate.account.id,
+      accountName: candidate.account.name,
+      state: candidate.state,
+      availableAt: candidate.availableAt == null
+        ? null
+        : new Date(candidate.availableAt).toISOString(),
+    }));
   }
 
   exportState() {
@@ -342,7 +414,7 @@ export class AccountManager {
 
   normalizeRestoredCredentialCooldown(account) {
     const reason = account.temporaryUnavailableReason;
-    if (reason?.type !== 'oauth_refresh_rate_limit') return;
+    if (!isCredentialRefreshCooldown(reason)) return;
     if (!account.rateLimitedUntil) return;
     const remainingMs = account.rateLimitedUntil - this.now();
     const maximumRestoredCooldownMs = restoredCredentialCooldownLimitMs(
@@ -354,8 +426,8 @@ export class AccountManager {
     if (account.status === 'throttled') account.status = 'ready';
   }
 
-  selectBestAvailableSwitchTarget() {
-    const selected = this.bestAvailableSwitchCandidate({ excludeCurrent: true });
+  selectBestAvailableSwitchTarget(modelFamily = null) {
+    const selected = this.bestAvailableSwitchCandidate({ excludeCurrent: true, modelFamily });
     if (!selected) return null;
 
     const previous = this.accounts[this.currentIndex];
@@ -432,9 +504,9 @@ export class AccountManager {
     return this.switchToCandidate(selected, 'weekly-reset-priority');
   }
 
-  bestAvailableSwitchCandidate({ excludeCurrent, allowedAccounts = null } = {}) {
+  bestAvailableSwitchCandidate({ excludeCurrent, allowedAccounts = null, modelFamily = null } = {}) {
     const candidates = this.accounts
-      .map((account, index) => ({ account, index, score: this.switchTargetScore(account) }))
+      .map((account, index) => ({ account, index, score: this.switchTargetScore(account, modelFamily) }))
       .filter(candidate => (
         (!excludeCurrent || candidate.index !== this.currentIndex)
         && (!allowedAccounts || allowedAccounts.has(candidate.account))
@@ -538,8 +610,8 @@ export class AccountManager {
     };
   }
 
-  switchTargetScore(account) {
-    if (!this.isAvailable(account)) return null;
+  switchTargetScore(account, modelFamily = null) {
+    if (!this.isAvailable(account, modelFamily)) return null;
     const quota = account.quota || {};
     const utilizations = [quota.unified5h, quota.unified7d]
       .filter(value => typeof value === 'number' && Number.isFinite(value));
@@ -567,6 +639,7 @@ export class AccountManager {
   }
 
   exhaustedFallbackScore(account) {
+    if (this.hasCredentialRefreshCooldown(account)) return null;
     const reason = this.unavailableReason(account);
     if (!isUnifiedQuotaExhaustion(reason)) return null;
     const resetAt = reason.resetAt ? Date.parse(reason.resetAt) : null;
@@ -578,12 +651,22 @@ export class AccountManager {
     };
   }
 
-  isAvailable(account) {
+  /**
+   * @param {string|null} modelFamily 'fable' for a Fable request, null otherwise
+   *   (including when the request's model could not be identified). A model-scoped
+   *   exhaustion (e.g. the Fable weekly sub-cap) only makes the account unavailable
+   *   for requests of that same family; a common 5h/7d/token/request exhaustion
+   *   makes it unavailable for every family.
+   */
+  isAvailable(account, modelFamily = null) {
     if (!account) return false;
     this.refreshQuotaState(account);
+    if (this.hasCredentialRefreshCooldown(account)) return false;
     if (account.status === 'throttled') return false;
-    if (account.status === 'exhausted') return false;
     if (account.status === 'error') return false;
+    if (account.status === 'exhausted') {
+      return !quotaBlocksModelFamily(account.quota, this.switchThreshold, modelFamily);
+    }
     return true;
   }
 
@@ -654,7 +737,44 @@ export class AccountManager {
     return null;
   }
 
+  hasCredentialRefreshCooldown(account) {
+    return Boolean(
+      account?.rateLimitedUntil
+      && this.now() < account.rateLimitedUntil
+      && isCredentialRefreshCooldown(account.temporaryUnavailableReason),
+    );
+  }
+
+  /**
+   * Same as `unavailableReason`, except a scoped weekly window (e.g. the
+   * Fable sub-cap) is only trusted as THE reason when it actually matches
+   * `modelFamily`. This keeps `unavailableReason` itself family-agnostic
+   * (informational, used for /internal/status) while giving the proxy layer a
+   * way to avoid handing a non-matching-family request a misleading claim
+   * such as `seven_day_fable` when it was really blocked by a common window
+   * (token/request rate limit) that happened to be checked after the scoped
+   * one (m2).
+   */
+  unavailableReasonForModelFamily(account, modelFamily = null) {
+    if (!account) return null;
+    if (account.status === 'error') {
+      return account.errorReason || { type: 'account_error' };
+    }
+    const quotaReason = quotaUnavailableReasonForModelFamily(account.quota, this.switchThreshold, modelFamily);
+    if (quotaReason) return quotaReason;
+    if (account.rateLimitedUntil && this.now() < account.rateLimitedUntil) {
+      return {
+        ...(account.temporaryUnavailableReason || { type: 'temporary_throttle' }),
+        retryAt: new Date(account.rateLimitedUntil).toISOString(),
+      };
+    }
+    return null;
+  }
+
   autoSwitchReason(account) {
+    if (this.hasCredentialRefreshCooldown(account)) {
+      return account.temporaryUnavailableReason.type;
+    }
     const reason = this.unavailableReason(account);
     if (!reason) return 'account-unavailable';
     if (isUnifiedQuotaExhaustion(reason)) return 'quota-threshold';
@@ -773,9 +893,178 @@ export function quotaUnavailableReason(quota, threshold) {
   return null;
 }
 
+/**
+ * Same idea as `quotaUnavailableReason`, but a `weeklyScoped` window is only
+ * eligible to be returned when it matches `modelFamily` (via
+ * `scopeMatchesModelFamily`). This lets the proxy layer report the true
+ * common-quota reason (token/request rate limit) to a non-matching-family
+ * request instead of a scoped claim that does not apply to it (m2).
+ */
+export function quotaUnavailableReasonForModelFamily(quota, threshold, modelFamily) {
+  if (quota.unified5h != null && quota.unified5h >= threshold) {
+    return {
+      type: 'quota_exhausted',
+      window: '5h',
+      utilization: quota.unified5h,
+      resetAt: quota.unified5hReset ? new Date(quota.unified5hReset).toISOString() : null,
+    };
+  }
+  if (quota.unified7d != null && quota.unified7d >= threshold) {
+    return {
+      type: 'quota_exhausted',
+      window: '7d',
+      utilization: quota.unified7d,
+      resetAt: quota.unified7dReset ? new Date(quota.unified7dReset).toISOString() : null,
+    };
+  }
+  if (Array.isArray(quota.weeklyScoped)) {
+    for (const limit of quota.weeklyScoped) {
+      if (!limit || typeof limit.utilization !== 'number' || limit.utilization < threshold) continue;
+      if (!scopeMatchesModelFamily(limit, modelFamily)) continue;
+      return {
+        type: 'quota_exhausted',
+        window: `7d ${limit.label || limit.key || 'scoped'}`,
+        claim: `seven_day_${limit.key || 'scoped'}`,
+        utilization: limit.utilization,
+        resetAt: limit.resetAt ? new Date(limit.resetAt).toISOString() : null,
+      };
+    }
+  }
+  if (quota.tokensLimit != null && quota.tokensRemaining != null) {
+    const utilization = 1 - quota.tokensRemaining / quota.tokensLimit;
+    if (utilization >= threshold) {
+      return {
+        type: 'token_rate_limit_exhausted',
+        utilization,
+        resetAt: quota.resetsAt || null,
+      };
+    }
+  }
+  if (quota.requestsLimit != null && quota.requestsRemaining != null) {
+    const utilization = 1 - quota.requestsRemaining / quota.requestsLimit;
+    if (utilization >= threshold) {
+      return {
+        type: 'request_rate_limit_exhausted',
+        utilization,
+        resetAt: quota.resetsAt || null,
+      };
+    }
+  }
+  return null;
+}
+
 export function isUnifiedQuotaExhaustion(reason) {
-  return reason?.type === 'quota_exhausted'
-    && (['5h', '7d'].includes(reason.window) || String(reason.window || '').startsWith('7d '));
+  return ['token_rate_limit_exhausted', 'request_rate_limit_exhausted'].includes(reason?.type)
+    || (reason?.type === 'quota_exhausted'
+      && (['5h', '7d'].includes(reason.window) || String(reason.window || '').startsWith('7d ')));
+}
+
+export function isCredentialRefreshCooldown(reason) {
+  return reason?.type === 'oauth_refresh_rate_limit'
+    || reason?.type === 'oauth_refresh_retry';
+}
+
+/**
+ * Decides whether an account's quota gates a request of the given model family.
+ * This evaluates every window directly (never a single classified "the" reason)
+ * so a model-scoped exhaustion can never mask a concurrent common-quota
+ * exhaustion, and so a scoped exhaustion buried behind an earlier non-matching
+ * scoped entry is never missed (Blockers B1/B2).
+ *
+ * Common windows (5h / 7d / token / request rate limits) gate every family.
+ * Every entry in `weeklyScoped` is scanned independently via
+ * `scopeMatchesModelFamily`: a Fable-scoped entry at/over threshold gates only
+ * Fable requests; an unrecognized scope is reported but never gates any request.
+ */
+function quotaBlocksModelFamily(quota, threshold, modelFamily) {
+  if (!quota) return true;
+  if (commonQuotaExhausted(quota, threshold)) return true;
+  if (Array.isArray(quota.weeklyScoped)) {
+    for (const limit of quota.weeklyScoped) {
+      if (!limit || typeof limit.utilization !== 'number' || limit.utilization < threshold) continue;
+      if (scopeMatchesModelFamily(limit, modelFamily)) return true;
+    }
+  }
+  return false;
+}
+
+/**
+ * True when a common (family-independent) window is exhausted: unified 5h/7d,
+ * or the token/request rate limit. These block every model family. Does NOT
+ * consider `weeklyScoped` — a model-scoped exhaustion is never "common".
+ */
+function commonQuotaExhausted(quota, threshold) {
+  if (!quota) return true;
+  if (quota.unified5h != null && quota.unified5h >= threshold) return true;
+  if (quota.unified7d != null && quota.unified7d >= threshold) return true;
+  if (quota.tokensLimit != null && quota.tokensRemaining != null) {
+    const utilization = 1 - quota.tokensRemaining / quota.tokensLimit;
+    if (utilization >= threshold) return true;
+  }
+  if (quota.requestsLimit != null && quota.requestsRemaining != null) {
+    const utilization = 1 - quota.requestsRemaining / quota.requestsLimit;
+    if (utilization >= threshold) return true;
+  }
+  return false;
+}
+
+function futureAvailabilityForModelFamily(account, threshold, modelFamily, now) {
+  if (!account || account.status === 'error') {
+    return { state: 'unknown', availableAt: null };
+  }
+
+  const blockers = [];
+  const quota = account.quota || {};
+  if (quota.unified5h != null && quota.unified5h >= threshold) {
+    blockers.push(availabilityResetTimestamp(quota.unified5hReset));
+  }
+  if (quota.unified7d != null && quota.unified7d >= threshold) {
+    blockers.push(availabilityResetTimestamp(quota.unified7dReset));
+  }
+  if (quota.tokensLimit != null && quota.tokensRemaining != null) {
+    const utilization = 1 - quota.tokensRemaining / quota.tokensLimit;
+    if (utilization >= threshold) blockers.push(availabilityResetTimestamp(quota.resetsAt));
+  }
+  if (quota.requestsLimit != null && quota.requestsRemaining != null) {
+    const utilization = 1 - quota.requestsRemaining / quota.requestsLimit;
+    if (utilization >= threshold) blockers.push(availabilityResetTimestamp(quota.resetsAt));
+  }
+  if (Array.isArray(quota.weeklyScoped)) {
+    for (const limit of quota.weeklyScoped) {
+      if (!limit || typeof limit.utilization !== 'number' || limit.utilization < threshold) continue;
+      if (!scopeMatchesModelFamily(limit, modelFamily)) continue;
+      blockers.push(availabilityResetTimestamp(limit.resetAt));
+    }
+  }
+  if (account.rateLimitedUntil && account.rateLimitedUntil > now) {
+    blockers.push(availabilityResetTimestamp(account.rateLimitedUntil));
+  }
+
+  if (blockers.length === 0 || blockers.some(resetAt => resetAt == null || resetAt <= now)) {
+    return { state: 'unknown', availableAt: null };
+  }
+  return { state: 'waiting', availableAt: Math.max(...blockers) };
+}
+
+function availabilityResetTimestamp(value) {
+  if (typeof value === 'number' && Number.isFinite(value)) return value;
+  if (typeof value !== 'string' || value.length === 0) return null;
+  const parsed = Date.parse(value);
+  return Number.isFinite(parsed) ? parsed : null;
+}
+
+function compareRoutingAvailabilityCandidates(left, right) {
+  const rank = { available: 0, waiting: 1, unknown: 2 };
+  if (rank[left.state] !== rank[right.state]) return rank[left.state] - rank[right.state];
+  if (left.state === 'available') {
+    if (left.isCurrent !== right.isCurrent) return left.isCurrent ? -1 : 1;
+    if (left.score && right.score) return compareSwitchTargetScores(left, right);
+  }
+  if (left.state === 'waiting' && left.availableAt !== right.availableAt) {
+    return left.availableAt - right.availableAt;
+  }
+  if (left.priority !== right.priority) return left.priority - right.priority;
+  return left.index - right.index;
 }
 
 function compareSwitchTargetScores(left, right) {
