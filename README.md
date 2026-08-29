@@ -4,7 +4,7 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](./LICENSE)
 ![Node.js >=18.10.0](https://img.shields.io/badge/node-%3E%3D18.10.0-brightgreen)
 
-Claude Code の複数アカウントをローカルで自動的に切り替える、ローカル動作専用の非公式プロキシツールです。macOS と Linux で動作します。
+Claude Code の複数アカウントを、リクエストのモデルと利用枠に応じてローカルで自動的に使い分ける非公式プロキシツールです。macOS と Linux で動作します。
 
 `claude-rotator` は `127.0.0.1` だけで待ち受ける Anthropic 互換の HTTP プロキシを起動し、Claude Code の `~/.claude/settings.json` の `ANTHROPIC_BASE_URL` をこのプロキシへ向けます。インストール後も、Claude Code は通常どおり `claude` コマンドで起動できます。
 
@@ -14,6 +14,7 @@ npm レジストリでは配布していません（`package.json` は `"private
 
 ## 目次
 
+- [v0.2.0 の主な更新](#v020-の主な更新)
 - [なぜ作ったか](#なぜ作ったか)
 - [できること](#できること)
 - [しくみ](#しくみ)
@@ -22,6 +23,7 @@ npm レジストリでは配布していません（`package.json` は `"private
 - [セットアップ](#セットアップ)
 - [アカウント登録](#アカウント登録)
 - [モニター](#モニター)
+- [OAuth認証情報の自動更新](#oauth認証情報の自動更新)
 - [設定ファイルと環境変数](#設定ファイルと環境変数)
 - [ログと切り替え診断](#ログと切り替え診断)
 - [主なコマンド](#主なコマンド)
@@ -31,6 +33,15 @@ npm レジストリでは配布していません（`package.json` は `"private
 - [安全設計](#安全設計)
 - [開発](#開発)
 - [English](#english)
+
+## v0.2.0 の主な更新
+
+- **モデル別ルーティング**: Fable リクエストは Fable 枠が利用可能なアカウントへ、Sonnet / Opus / Haiku は共通枠が利用可能なアカウントへ、HTTP リクエストごとに振り分けます。
+- **並列利用に対応**: 複数ターミナルやサブエージェントが異なるモデルを同時に使っても、それぞれのリクエストを独立して判定します。
+- **復帰順が見える status / monitor**: モデル系列ごとに、今使えるアカウントと、次に復帰するアカウント・時刻・その後の順番を表示します。十分に広い端末ではアカウント詳細を2列にします。
+- **OAuth更新の安定化**: 保存済みの Keychain / credential file を使い、通常の Claude Code ログインを切り替えずに OAuth token を更新します。競合や結果不明時は誤った認証情報を使わず停止します。
+
+既存環境から更新する場合は [アップデート](#アップデート) を参照してください。
 
 ## なぜ作ったか
 
@@ -42,14 +53,16 @@ Claude Code は、5時間ごとにリセットされる短期の利用枠（以�
 - 気づいた後も、別アカウントで `claude auth login` をやり直す手間がかかる
 - どのアカウントがいつリセットされるか、都度 Anthropic 側の情報を確認する必要がある
 
-`claude-rotator` は、Claude Code と Anthropic API の間にローカルプロキシを挟むことでこれを解決します。プロキシは各アカウントの使用率を定期的に取得し、現在のアカウントが枠に達すると、別の空いているアカウントへ自動的に切り替えて同じリクエストを再送します。Claude Code 側の操作や設定は変わりません。
+`claude-rotator` は、Claude Code と Anthropic API の間にローカルプロキシを挟むことでこれを解決します。各アカウントの共通枠とモデル別枠を定期的に取得し、リクエストのモデルに合う空きアカウントを選びます。Claude Code 側の起動方法は変わりません。
 
 ## できること
 
 - 通常の `claude` コマンドを変えずに、裏側で `claude-rotator` proxy を使う
-- 5時間枠 / 7日枠の使用率を見て、100% 到達時に最も空いている既知のアカウントへ切り替える
-- 全アカウントが利用上限に達した場合、最短 reset のアカウントを再開候補として選び直す
-- `claude-rotator monitor` で各アカウントの使用率を一覧表示する
+- 共通の5時間枠 / 7日枠とモデル別週次枠を見て、リクエストごとに利用可能なアカウントへ振り分ける
+- Fable 固有枠だけが枯渇したアカウントを、Sonnet / Opus / Haiku では引き続き利用する
+- 全アカウントが利用上限に達した場合、モデル系列別の復帰候補・復帰時刻・順番を表示する
+- `claude-rotator status` / `monitor` で各アカウントの使用率とルーティング可否を確認する
+- 保存済み OAuth 認証情報を、通常の Claude Code ログインを切り替えずに自動更新する
 - macOS では Keychain、Linux では private permission のファイルに認証情報を保存する
 - `claude-rotator uninstall` で `~/.claude/settings.json` を元に戻す
 
@@ -57,19 +70,21 @@ Claude Code は、5時間ごとにリセットされる短期の利用枠（以�
 
 ```mermaid
 flowchart LR
-    CC["Claude Code<br/>(claude コマンド)"] -->|"ANTHROPIC_BASE_URL"| P(("claude-rotator<br/>127.0.0.1:37891"))
-    P -->|"現在アクティブな<br/>アカウントのトークンで転送"| API["api.anthropic.com"]
-    API -->|"200 OK"| CC
-    API -->|"429 (利用枠到達)"| P
-    P -->|"空いている次のアカウントへ<br/>切り替えて再送"| API
-    U["OAuth Usage API"] -.->|"5h/7d 使用率を定期取得<br/>(既定15分間隔)"| P
+    CC["複数の Claude Code<br/>ターミナル / サブエージェント"] -->|"ANTHROPIC_BASE_URL"| P(("claude-rotator<br/>127.0.0.1:37891"))
+    P -->|"Fable request"| F["Fable枠が<br/>利用可能なアカウント"]
+    P -->|"Sonnet / Opus / Haiku"| O["共通枠が<br/>利用可能なアカウント"]
+    F --> API["api.anthropic.com"]
+    O --> API
+    U["OAuth Usage API"] -.->|"共通枠 / モデル別枠を取得<br/>(既定15分間隔)"| P
+    C["Keychain / credential file"] -.->|"OAuth自動更新"| P
 ```
 
 1. `claude-rotator install` が Claude Code の設定ファイル（`~/.claude/settings.json`）を書き換え、`ANTHROPIC_BASE_URL` をこのプロキシ（既定 `http://127.0.0.1:37891`）へ向けます。
-2. `claude` コマンドを実行すると、リクエストはまず自分の PC 内で待ち受けている `claude-rotator` プロキシへ届きます。プロキシは `127.0.0.1` 以外の `Host` ヘッダーやブラウザからの cross-site リクエストを拒否します。
-3. プロキシは現在アクティブなアカウントの OAuth トークンを付けて `https://api.anthropic.com` へリクエストを転送します。
-4. Anthropic 側が 429（利用枠到達）を返した場合、または定期的な Usage API 取得で現在のアカウントが100%に達したと分かった場合、プロキシは既知のアカウントの中から最も空いているものへ自動的に切り替え、同じリクエストを再送します。
-5. 各アカウントの 5時間枠 / 7日枠の使用率は、既定で15分ごとにバックグラウンドで取得します（`claude-rotator refresh-usage` で即時取得も可能です）。
+2. どのターミナルやサブエージェントから来たかに関係なく、各 `POST /v1/messages` の `model` をその都度判定します。`claude-fable-<数字>...` は Fable、それ以外は Other（Sonnet / Opus / Haiku / 識別不能モデル）として扱います。
+3. Fable には共通枠と Fable 固有枠、Other には共通枠を適用し、そのリクエストを処理できるアカウントを選びます。Fable 固有枠だけが枯渇していても、同じアカウントで Other のリクエストは処理できます。
+4. 共通枠の到達が確認できた場合は利用可能な別アカウントへ切り替えます。Fable の曖昧な429は Usage API で枯渇を確認できた場合だけ1回再送し、理由を確認できない429を別アカウントへ無条件に流しません。
+5. 各アカウントの共通枠 / モデル別枠は既定で15分ごとに取得します。`claude-rotator refresh-usage` で即時取得でき、`status` / `monitor` にはモデル系列別の候補順を表示します。
+6. 保存済み OAuth access token は期限の30分前から更新対象になり、Claude Code 本体を使って隔離領域内で更新されます。詳しくは [OAuth認証情報の自動更新](#oauth認証情報の自動更新) を参照してください。
 
 ## 利用上の注意
 
@@ -207,9 +222,9 @@ Ubuntu の installer は systemd サービス用に `~/.config/claude-rotator/ru
 
 `claude-rotator login` は現在の Claude Code ログインを読み取り、可能であれば email を自動取得して登録します。
 
-重要: `claude auth login --claudeai` や `claude-rotator login` は、Claude Code 側の現在ログインを変更したり、そのログインを rotator の候補一覧へ取り込んだりする操作です。実際に API リクエストで使われるアカウントは `claude-rotator status` の `active` で決まります。別アカウントでログインして `claude-rotator login` しても、それだけでは active は切り替わりません。
+重要: `claude auth login --claudeai` や `claude-rotator login` は、Claude Code 側の現在ログインを変更したり、そのログインを rotator の候補一覧へ取り込んだりする操作です。実際に API リクエストで使われるアカウントは、リクエストのモデルと `claude-rotator status` の `Routing availability` からその都度決まります。ヘッダーの `current` は基本となる現在位置ですが、Fable 固有枠だけが枯渇した場合などは、`current` を変えずに Fable リクエストだけを別アカウントへ送ります。別アカウントでログインして `claude-rotator login` しても、それだけでは `current` は切り替わりません。
 
-インストール中の通常セッションは gateway auth が `/login` より優先されるため、`claude auth status` は rotator 内の active account を示しません。gateway の base URL と認証元変数は対話セッションの `/status` で確認できます。アカウントを再取り込みするときは、明示的に `claude auth login --claudeai` を完了してから `claude-rotator login` を実行し、取り込み結果は `claude-rotator accounts` または `claude-rotator status` で確認してください。
+インストール中の通常セッションは gateway auth が `/login` より優先されるため、`claude auth status` は rotator 内の `current` やモデル別ルーティング先を示しません。gateway の base URL と認証元変数は対話セッションの `/status` で確認できます。アカウントを再取り込みするときは、明示的に `claude auth login --claudeai` を完了してから `claude-rotator login` を実行し、取り込み結果は `claude-rotator accounts` または `claude-rotator status` で確認してください。
 
 `use-current` は、gateway credential や API key など `/login` より優先される認証を一切設定せず、proxy を手動運用する場合だけの互換モードです。通常の `install` では gateway auth が `/login` より優先され、Claude Code 自身が保存済み `/login` を更新しなくなるため使用できません。通常運用では `claude-rotator login` で各アカウントを保存してください。旧 `current` を移行する場合は、先に `claude-rotator remove current` を実行してから `claude auth login --claudeai` と `claude-rotator login` を順に実行します。互換モードの自動検査対象は shell 環境と user settings です。project / local / managed settings の実効認証は Claude Code の `/status` でも確認し、override があれば使用しないでください。
 複数アカウントを個別に保存して切り替える場合は、各アカウントで Claude Code にログインしてから `claude-rotator login` を実行します。
@@ -299,41 +314,76 @@ claude-rotator monitor
 表示例（`claude-rotator monitor` / `claude-rotator status` 共通のレイアウトです。実際のアカウント名・数値・時刻は環境によって変わります）:
 
 ```text
-Claude Rotator                         active: account1@example.com
+Claude Rotator                         current: account1@example.com
 
-account1@example.com       active
-5h ███████░░░  76%  reset in 8h42m -> 06/07 18:00 JST
-7d ███████░░░  76%  reset in 2d9h -> 06/09 19:00 JST
-7d Fable █████░░░░░  50%  reset in 1d23h -> 06/09 09:00 JST
-requests: 128
+Routing availability
+Fable (none now)                                      Other (Sonnet / Opus / Haiku) (1 now)
+  1. account2@example.com  in 1h -> 06/04 19:00 JST     1. account1@example.com  now
+  2. account1@example.com  in 2d -> 06/06 18:00 JST     2. account2@example.com  in 1h -> 06/04 19:00 JST
 
-account2@example.com       exhausted
-reason: 5h quota exhausted; reset -> 06/07 20:00 JST
-5h ██████████ 100%  reset in 10h42m -> 06/07 20:00 JST
-7d ████░░░░░░  40%  reset in 2d23h -> 06/10 09:00 JST
-requests: 54
+account1@example.com       exhausted                         account2@example.com       exhausted
+routes Fable: 2d | Other: now                                routes Fable: 1h | Other: 1h
+reason: 7d Fable quota exhausted; reset -> 06/06 18:00 JST   reason: 5h quota exhausted; reset -> 06/04 19:00 JST
+5h ███████░░░  76%  reset in 8h42m -> 06/05 02:42 JST        5h ██████████ 100%  reset in 1h -> 06/04 19:00 JST
+7d ███████░░░  76%  reset in 2d9h -> 06/07 03:00 JST         7d ████░░░░░░  40%  reset in 2d23h -> 06/07 17:00 JST
+7d Fable ██████████ 100%  reset in 2d -> 06/06 18:00 JST     7d Fable █████░░░░░  50%  reset in 2d -> 06/06 18:00 JST
+requests: 128                                                requests: 54
 
 Events
-06/07 12:43 JST request account1 POST /v1/messages -> 429 1203ms outcome=quota-retry req=req_xxx
-06/07 12:43 JST switched account1 -> account2 reason=quota-threshold
+06/04 18:02 JST request account2 POST /v1/messages -> 200 3538ms outcome=ok req=req_xxx
+06/04 18:01 JST switched account2 -> account1 reason=quota-threshold
 ```
 
 各行の意味:
 
-- 先頭行の `active:` は、現在 API リクエストに使われているアカウントです。
-- アカウントごとに1ブロック表示され、`ready` / `active` / `exhausted` / `throttled` / `error` のいずれかの状態が付きます。利用不可の場合は `reason:` 行で理由を表示します。
+- 先頭行の `current:` は基本となる現在位置です。Fable 固有枠だけが枯渇している場合、Fable リクエストは別アカウントへ送られても `current` は変わりません。
+- `Routing availability` は Fable と Other（Sonnet / Opus / Haiku）の候補を別々に表示します。`now` は現在利用可能、`in ... -> ... JST` は復帰までの時間と時刻、`unknown` は安全に時刻を計算できない状態です。
+- 候補は「現在利用可能」「復帰時刻が早い」「復帰時刻不明」の順です。この一覧は表示時点の共有ルーターの候補順であり、特定のターミナルや会話へアカウントを予約するものではありません。
+- アカウントごとに1カード表示され、`routes Fable: ... | Other: ...` でモデル系列別の利用可否を確認できます。カードの `active` / `ready` / `exhausted` / `throttled` / `error` と `reason:` はアカウント全体の代表状態です。
 - `5h` / `7d` 行は進捗バー（`█` / `░` を10文字）、使用率、reset までの残り時間と reset 時刻を表示します。使用率のデータが無い場合は ` --%`、reset 情報が無い場合は `no data yet` になります。
 - Usage API がモデル別週次枠（`limits[]`）を返す場合は、`7d Fable` のような追加行がさらに表示されます。
 - `requests:` はそのアカウントで proxy が転送した累計リクエスト数です。
 - `Events` には直近の切り替え・リクエスト・エラーが最大8件表示されます。
 
-`status` / `monitor` の reset 時刻と Events 時刻は、日本時間（JST）で表示します。未使用のアカウントでも、server 起動時・アカウント reload 時・初回 status 表示時・定期 polling で OAuth Usage API から 5時間枠 / 7日枠の状態を取得します。Usage API が取得できない場合だけ `unknown` と表示されます。`unknown` のアカウントは空いている確認が取れていないため、自動切り替え先には使いません。
+十分に広い端末では `Routing availability` とアカウントカードを横2列にし、全行が収まらない場合は情報を切り捨てず縦1列へ戻します。`monitor` は端末のリサイズにも追従します。
+
+`status` / `monitor` の reset 時刻と Events 時刻は、日本時間（JST）で表示します。未使用のアカウントでも、server 起動時・アカウント reload 時・初回 status 表示時・定期 polling で OAuth Usage API から共通枠 / モデル別枠を取得します。Usage API が取得できない場合は `unknown` と表示され、そのアカウントを自動切り替え先には使いません。
 
 TTY が無い環境（CI、`| cat` 経由など）で `claude-rotator monitor` を実行すると、自動的に1回だけ表示して終了します（`--once` を明示しても同じ挙動です）。
 
 OAuth Usage API は 429 を返しやすいため、usage 取得はデフォルトで 15 分間隔、1アカウントずつ、各リクエストの開始間隔 1.5 秒で実行します。必要な場合だけ [設定ファイルと環境変数](#設定ファイルと環境変数) の `usagePolling.intervalMs`、`usagePolling.concurrency`、`usagePolling.requestSpacingMs` を変更してください。短すぎる間隔や高い concurrency は `claude-rotator refresh-usage` でも 429 の原因になります。
 
-OAuth access token は期限の30分前から自動更新対象になります。保存時に Claude Code の OAuth scope と refresh token の期限を保持します。macOS / Ubuntu の保存アカウントは、通常のClaude Codeログインを変更しない隔離領域で Claude Code 本体へ更新を委譲します。各試行は現在の installer path を解決するため、バージョン許可リストなしに新しくインストールされた Claude Code を使用します。解決した実行ファイルは `realpath` でその試行中だけ固定します。token handoff直前にdurable refresh intentを永続化し、公式の `CLAUDE_CODE_OAUTH_REFRESH_TOKEN` と `CLAUDE_CODE_OAUTH_SCOPES` を子プロセス環境に設定して `claude auth login --claudeai` を正確に1回だけ実行します。helpやversionによる別のruntime capability checkは行いません。token は引数、設定、ログには書きませんが、同一ユーザーで動くローカルプロセスは短命な子プロセスの環境を観測できる場合があるため、その信頼境界内でのみ実行してください。macOSでは login Keychain を正しく解決するため実ユーザーの `HOME` だけを維持し、Claude設定、専用Keychain service、XDG、作業・一時ディレクトリは隔離します。旧版から取り込んだ first-party credential に scope が無い場合は現在の Claude Code 公式5 scopeを補完しますが、refresh token期限を推測したりcustom OAuth clientへ適用したりはしません。同じ refresh token に対する同時更新は1回へ集約し、異なるアカウントの更新も直列化します。新しい refresh token は、競合する再ログインを上書きしない原子的比較更新で、使用前に Keychain またはLinuxのcredential fileへ保存します。token handoff後は他のrefresh driverへfallbackしません。Claude Code が未対応のcommandとして拒否した場合を含め、Claude Code の終了後に隔離credentialを読み取れず結果が不明な場合は、アカウントを `oauth_refresh_failed` としてparkし、`claude auth login --claudeai` でそのアカウントを再認証してから `claude-rotator login` を実行して復旧してください。native更新のtoken handoff前のローカル一時失敗は固定5分の `oauth_refresh_retry` cooldownで、providerが返した429は `oauth_refresh_rate_limit` として別に扱います。providerが明示した `Retry-After` は増幅せず、異常値による永久停止を避ける24時間の安全上限内で尊重します。native更新を使わない環境のdirect token更新だけは、明示値が無い一時失敗をrefresh token単位で1/2/4/8/15分までbackoffし、その後は指数を増やさず固定60分の疎通確認へ移ります。1アカウントの待機は他アカウントの更新を停止せず、実際にcredentialが変わった再リンクだけがそのアカウントの古い待機状態を解除します。installしたgatewayモードでは、通常の `/login` と一致する保存アカウントもRotatorが所有して更新し、未更新の `/login` から古いcredentialをミラーしません。live credentialのミラーはgateway credentialを使わない手動互換モードだけです。provider側で明示的にrevocationされたtokenの期限自体をrotatorから延長することはできません。
+## OAuth認証情報の自動更新
+
+保存済み OAuth access token は期限の30分前から自動更新対象になります。macOS / Ubuntu とも、通常の Claude Code ログインを変更せず、Claude Code 本体へ隔離領域内で更新を委譲します。更新された認証情報は、実際の API リクエストで使う前に Keychain または Linux の credential file へ保存します。
+
+通常はログインし直す必要はありません。`status` の理由に応じて次のように動作します。
+
+- `oauth_refresh_retry`: token を渡す前の一時的なローカル失敗です。5分後に再試行し、他アカウントの処理は続けます。
+- `oauth_refresh_rate_limit`: provider が更新をレート制限しています。`Retry-After` の範囲で再試行します。
+- `oauth_refresh_failed`: token を渡した後の結果を安全に確定できなかったため、そのアカウントを停止しています。次を実行して再登録してください。
+
+```bash
+claude auth login --claudeai
+claude-rotator login
+claude-rotator refresh-usage
+claude-rotator status
+```
+
+明示的に revoke された refresh token を Rotator 側で復活させることはできないため、その場合も再ログインが必要です。
+
+<details>
+<summary>更新処理の保証と信頼境界</summary>
+
+- 実行時点でインストールされている Claude Code を解決し、試行中は同じ実体へ固定して `claude auth login --claudeai` を1回だけ呼びます。
+- refresh token と scope は短命な子プロセスの環境だけで引き渡し、argv、設定、ログには書きません。同じOSユーザーの別プロセスは子プロセス環境を観測できる場合があるため、単一ユーザーまたは信頼できるローカル環境で使ってください。
+- 同じ refresh token の同時更新は1回に集約し、異なるアカウントの credential 更新も直列化します。重複 token、競合する再ログイン、結果不明の handoff は fail-closed で停止します。
+- 新しい credential は比較更新で保存し、同時に行われた再ログインを上書きしません。handoff 後に別方式へ fallback して、どの token が有効か分からない状態にすることもありません。
+- installed gateway mode では保存アカウントを Rotator が更新し、古い通常ログインの credential を保存アカウントへ再コピーしません。live credential の追従は、gateway credential を使わない手動互換モードだけです。
+
+詳細設計は [OAuth credential lifecycle design](./docs/specs/2026-07-10-oauth-credential-lifecycle-design.md) を参照してください。
+
+</details>
 
 ## 設定ファイルと環境変数
 
@@ -405,7 +455,7 @@ OAuth access token は期限の30分前から自動更新対象になります�
 
 proxy request ログに出るのは `account`、`method`、`path`、`status`、`durationMs`、`outcome`、`requestId`、timeout/network error 時の `errorType` だけです。内部 proxy error は `proxy-error method=... path=... error=...` として短い原因を出します。token / Authorization header / API key / request body / response body は出しません。
 
-自動切り替えは、現在のアカウントの 5時間枠、7日枠、または Fable などのモデル別週次枠が 100% に達した場合に行います。利用可能な候補がある場合は、通常は 5時間枠 / 7日枠の既知使用率から `max(5h, 7d)` が最も低いアカウントを選びます。ただし、7日枠の reset が近いアカウントがある場合は、reset 前に週次枠を使い切れるように、そのアカウントを優先します。この週次 reset 優先は、現在の active がまだ 100% ではない場合でも、Usage API の再取得後に proactive に active を更新できます。現在のアカウント自身が quota exhausted で、すべての候補も 100% の場合は、reset 時刻が最も近い exhausted アカウントを選び、Claude Code に最短で再開できる limit message を返します。OAuth refresh failure、authentication error、一時的な throttle では exhausted アカウントへ切り替えません。
+共通の5時間枠 / 7日枠 / token枠 / request枠が100%に達すると、そのアカウントは全モデルで利用不可になり、利用可能な別アカウントへ `current` を切り替えます。Fable 固有枠だけが100%の場合は、Fable リクエストだけを別候補へ送り、Other で使える `current` は維持します。候補は通常、既知の `max(5h, 7d)` が最も低いアカウントです。ただし、7日枠の reset が近いアカウントは、reset 前に週次枠を使い切れるよう優先されます。この週次 reset 優先により、共通枠に余裕がある段階でも Usage API の再取得後に `current` が変わる場合があります。すべての候補が共通枠で exhausted の場合は、reset が最も近いアカウントを選び、Claude Code に最短再開時刻を含む limit message を返します。OAuth refresh failure、authentication error、一時的な throttle を理由に exhausted アカウントへ切り替えることはありません。
 
 Claude Code からの正確なモデル ID `claude-fable-5` の `POST /v1/messages` が、上限到達を確定できる quota ヘッダーを伴わない 429 を返した場合、OAuth アカウントでは同じ access token の Usage API を最大5秒だけ再確認します。5時間枠 / 7日枠、または要求した Fable の週次枠が100%で、将来の reset 時刻と既知の利用可能な切り替え先を確認できた場合に限り、その同じクライアント要求を次のアカウントへ再送します。この確認を根拠にした再送は1要求につき最大1回です。確認できない場合、別モデルの枠だけが exhausted の場合、Usage API が失敗・timeout した場合は、上流の元の429をそのまま返します。他モデルの曖昧な429では、この追加確認を行いません。
 
@@ -422,13 +472,13 @@ claude-rotator refresh-usage
 claude-rotator status
 ```
 
-`refresh-usage` 後は `claude-rotator status` で active を確認してください。Usage API の再取得で現在の active が 100% と判明した場合、または 7日枠の reset が近く週次枠を優先消化したい利用可能アカウントがある場合は、active が更新されることがあります。意図的に active を変更する場合は `claude-rotator switch <account>` を使います。
+`refresh-usage` 後は `claude-rotator status` の `current` と `Routing availability` を確認してください。Usage API の再取得で `current` の共通枠が100%と判明した場合、または7日枠の reset が近い候補を優先する場合は、`current` が更新されることがあります。基本位置を意図的に変更する場合は `claude-rotator switch <account>` を使います。
 
 OAuth usage refresh は Node.js fetch の 10 秒 connect timeout に依存しないよう native HTTP client を使い、デフォルトでは登録アカウントを1件ずつ直列に取得します。各リクエストの idle timeout は 60 秒です。HTTPS 接続が確立する前の timeout / unreachable は、proxy と同じ `proxy.upstreamConnectTimeoutMs`、`proxy.upstreamConnectRetries`、`proxy.upstreamConnectRetryDelayMs` で短く retry します。
 
 `usagePolling.concurrency` のデフォルトは `1` です。同一ネットワークから Anthropic 宛ての TCP 接続が安定しており、意図的に複数アカウントを同時取得したい場合だけ、この値を増やしてください。
 
-直近の quota / usage / active account は `~/.config/claude-rotator/runtime-state.json` に保存されます。これにより、service 再起動直後に Usage API へ到達できない場合でも、最後に取得できた status を復元して切り替え判断に使えます。reset 時刻を過ぎた quota は、復元後の status 計算時に stale として消去されます。
+直近の quota / usage / `current` account は `~/.config/claude-rotator/runtime-state.json` に保存されます。これにより、service 再起動直後に Usage API へ到達できない場合でも、最後に取得できた status を復元して切り替え判断に使えます。reset 時刻を過ぎた quota は、復元後の status 計算時に stale として消去されます。
 
 `cc-auto-resume` などの外部再注入ツールからは、再注入前に次のコマンドを呼ぶと、rotator が最短で再開できるアカウントへ切り替え、再注入すべき時刻を返します。利用可能なアカウントがあれば `action=ready`、全候補が枯渇していれば最短 reset の `action=wait` になります。
 
@@ -472,9 +522,9 @@ claude-rotator doctor
 | `install [--no-start] [--force]` | proxy サービスを登録し、`~/.claude/settings.json` を書き換える。`--no-start` はサービスを起動せず資産だけを配置する（macOS では設定変更も省略、Linux では設定変更のみ実行される）。`--force` は `ANTHROPIC_BASE_URL` の不一致チェックを無視して上書きする |
 | `uninstall [--purge-secrets] [--force]` | proxy サービスを止め、`~/.claude/settings.json` をインストール前の値に戻す。`--purge-secrets` は登録済みアカウントの保存済み認証情報も削除する |
 | `server` | プロキシサーバー本体を起動する。LaunchAgent / systemd サービスもこのコマンドを実行しており、通常は `install` 経由で自動起動されるため、直接使うのはデバッグ用途 |
-| `status` | 現在の active アカウントと各アカウントの使用率を1回表示する |
+| `status` | `current`、モデル系列別の候補順、各アカウントの使用率を1回表示する |
 | `monitor [--once]` | `status` と同じ内容を1秒ごとに更新表示する。TTY が無い場合や `--once` 指定時は1回だけ表示して終了する |
-| `switch <account>` | active アカウントを手動で切り替える |
+| `switch <account>` | 基本となる `current` アカウントを手動で切り替える。モデル別枠に応じたリクエスト単位の振り分けは引き続き有効 |
 | `refresh-usage` | 全登録アカウントの Usage API を即時に再取得する |
 | `prepare-resume [--json] [--refresh]` | 外部の再注入ツール向けに、最短で再開できるアカウントへ切り替えて再開時刻を返す |
 | `accounts` | 登録済みアカウントの id・名前・種別を一覧表示する |
@@ -621,7 +671,7 @@ docker run --rm --network=none -v "$PWD":/app:ro -w /app node:22-alpine npm run 
 
 ## English
 
-An unofficial, local-only proxy tool that automatically rotates multiple Claude Code accounts. Runs on macOS and Linux.
+An unofficial, local-only proxy that routes Claude Code requests across multiple accounts according to the requested model and available quota. Runs on macOS and Linux.
 
 `claude-rotator` runs an Anthropic-compatible HTTP proxy that listens only on `127.0.0.1`, and points Claude Code's `~/.claude/settings.json` `ANTHROPIC_BASE_URL` at it. After installation you keep launching Claude Code with the ordinary `claude` command.
 
@@ -631,6 +681,7 @@ This package is not published to the npm registry (`package.json` sets `"private
 
 ### Table of Contents
 
+- [What's New in v0.2.0](#whats-new-in-v020)
 - [Why](#why)
 - [What It Does](#what-it-does)
 - [How It Works](#how-it-works)
@@ -639,6 +690,7 @@ This package is not published to the npm registry (`package.json` sets `"private
 - [Setup](#setup)
 - [Account Registration](#account-registration)
 - [Monitor](#monitor)
+- [Automatic OAuth Credential Refresh](#automatic-oauth-credential-refresh)
 - [Configuration and Environment Variables](#configuration-and-environment-variables)
 - [Logs and Rotation Diagnostics](#logs-and-rotation-diagnostics)
 - [Commands](#commands)
@@ -647,6 +699,15 @@ This package is not published to the npm registry (`package.json` sets `"private
 - [Troubleshooting](#troubleshooting)
 - [Security Design](#security-design)
 - [Development](#development)
+
+### What's New in v0.2.0
+
+- **Model-aware routing**: Fable requests go to an account with Fable quota, while Sonnet / Opus / Haiku use an account with shared quota, selected independently for each HTTP request.
+- **Parallel use**: Different models can run at the same time across multiple terminals and subagents; every request gets its own routing decision.
+- **Actionable status / monitor output**: For each model family, see which accounts work now, which account recovers next, at what time, and the order after that. Account cards use two columns when the terminal is wide enough.
+- **Reliable OAuth refresh**: Saved Keychain / credential-file entries are refreshed without changing the user's normal Claude Code login. Conflicts and uncertain outcomes stop safely instead of using ambiguous credentials.
+
+Existing installations should follow [Update](#update).
 
 ### Why
 
@@ -658,14 +719,16 @@ If you have more than one Claude account, you can keep working by switching from
 - Even after noticing, switching means running `claude auth login` again for a different account.
 - You have to keep checking Anthropic's own status information to know when each account resets.
 
-`claude-rotator` solves this by putting a local proxy between Claude Code and the Anthropic API. The proxy periodically fetches each account's usage, and once the current account hits its limit, it automatically switches to another available account and resends the same request. Nothing about how you use or configure Claude Code itself changes.
+`claude-rotator` solves this by putting a local proxy between Claude Code and the Anthropic API. It periodically fetches shared and model-scoped usage for each account, then picks an available account that matches each request's model. You keep launching Claude Code in the same way.
 
 ### What It Does
 
 - Keeps the normal `claude` command as-is, backed by the `claude-rotator` proxy behind the scenes
-- Watches 5h/7d usage and switches to the least-used known account once the current one reaches 100%
-- If every account is exhausted, re-picks the one with the soonest reset as the resume candidate
-- `claude-rotator monitor` lists every account's usage
+- Uses shared 5h/7d and model-scoped weekly limits to route every request to an available account
+- Keeps using a Fable-exhausted account for Sonnet / Opus / Haiku when only its Fable-specific allowance is exhausted
+- Shows model-family-specific recovery candidates, reset times, and ordering when every account is exhausted
+- `claude-rotator status` / `monitor` shows usage and routing availability for every account
+- Automatically refreshes saved OAuth credentials without changing the normal Claude Code login
 - Stores credentials in Keychain on macOS, and in a private-permission file on Linux
 - `claude-rotator uninstall` restores `~/.claude/settings.json`
 
@@ -673,19 +736,21 @@ If you have more than one Claude account, you can keep working by switching from
 
 ```mermaid
 flowchart LR
-    CC["Claude Code<br/>(claude command)"] -->|"ANTHROPIC_BASE_URL"| P(("claude-rotator<br/>127.0.0.1:37891"))
-    P -->|"forwards with the<br/>active account's token"| API["api.anthropic.com"]
-    API -->|"200 OK"| CC
-    API -->|"429 (quota reached)"| P
-    P -->|"switches to the next<br/>available account, then retries"| API
-    U["OAuth Usage API"] -.->|"polls 5h/7d usage<br/>(default: every 15 min)"| P
+    CC["Multiple Claude Code<br/>terminals / subagents"] -->|"ANTHROPIC_BASE_URL"| P(("claude-rotator<br/>127.0.0.1:37891"))
+    P -->|"Fable request"| F["Account with<br/>available Fable quota"]
+    P -->|"Sonnet / Opus / Haiku"| O["Account with<br/>available shared quota"]
+    F --> API["api.anthropic.com"]
+    O --> API
+    U["OAuth Usage API"] -.->|"shared / model-scoped quota<br/>(default: every 15 min)"| P
+    C["Keychain / credential file"] -.->|"automatic OAuth refresh"| P
 ```
 
 1. `claude-rotator install` rewrites Claude Code's config file (`~/.claude/settings.json`) so `ANTHROPIC_BASE_URL` points at this proxy (default `http://127.0.0.1:37891`).
-2. When you run `claude`, the request first reaches the `claude-rotator` proxy listening on your own machine. The proxy rejects any `Host` header other than `127.0.0.1` and any cross-site request from a browser.
-3. The proxy attaches the OAuth token of the currently active account and forwards the request to `https://api.anthropic.com`.
-4. If Anthropic returns 429 (quota reached), or a periodic Usage API fetch shows the current account has reached 100%, the proxy automatically switches to whichever known account is most available and resends the same request.
-5. Each account's 5h/7d usage is fetched in the background every 15 minutes by default (`claude-rotator refresh-usage` fetches it immediately on demand).
+2. Regardless of which terminal or subagent sent it, each `POST /v1/messages` is classified from its `model`. IDs matching `claude-fable-<digit>...` are Fable; everything else is Other (Sonnet / Opus / Haiku / unidentified models).
+3. Fable requests are checked against shared and Fable-specific limits, while Other requests use shared limits. An account that has exhausted only its Fable allowance can still serve Other requests.
+4. A confirmed shared-limit exhaustion switches to another available account. An ambiguous Fable 429 is replayed once only when the Usage API confirms exhaustion; an unconfirmed 429 is not blindly sent through another account.
+5. Shared and model-scoped usage is fetched every 15 minutes by default. `claude-rotator refresh-usage` fetches it immediately, and `status` / `monitor` shows the candidate order for each model family.
+6. Saved OAuth access tokens become refresh candidates 30 minutes before expiry and are refreshed by Claude Code itself in isolated storage. See [Automatic OAuth Credential Refresh](#automatic-oauth-credential-refresh).
 
 ### Important Notes
 
@@ -763,9 +828,9 @@ claude-rotator login
 
 Once an account is registered, install the proxy.
 
-`claude auth login --claudeai` and `claude-rotator login` do not automatically switch the rotator's active account. They only change or import the Claude Code login. The account actually used for API requests is the `active` account shown by `claude-rotator status`.
+`claude auth login --claudeai` and `claude-rotator login` do not automatically change the rotator's routing position. They only change or import the Claude Code login. Each API request is routed from its model and `Routing availability`; the `current` account is only the normal starting point.
 
-While installed, gateway authentication takes precedence over `/login`, so `claude auth status` does not identify the rotator's active account. Use `/status` in an interactive session to confirm the gateway base URL and credential source. To relink an account, explicitly complete `claude auth login --claudeai`, run `claude-rotator login`, and verify the result with `claude-rotator accounts` or `claude-rotator status`.
+While installed, gateway authentication takes precedence over `/login`, so `claude auth status` does not identify the rotator's `current` account or model-specific route. Use `/status` in an interactive session to confirm the gateway base URL and credential source. To relink an account, explicitly complete `claude auth login --claudeai`, run `claude-rotator login`, and verify the result with `claude-rotator accounts` or `claude-rotator status`.
 
 `use-current` is only compatible with a manually operated proxy that has no credential source taking precedence over `/login`. A normal installation rejects it because gateway authentication leaves the saved `/login` unused and therefore not refreshed. Use stored accounts imported with `claude-rotator login` for installed operation. To migrate a legacy `current` entry, run `claude-rotator remove current` first, then `claude auth login --claudeai` and `claude-rotator login`. Its automatic check covers the shell environment and user settings; also inspect Claude Code `/status` and do not use this mode when project, local, or managed settings provide an override.
 
@@ -859,7 +924,7 @@ The Ubuntu installer also creates a Node.js launcher for the systemd service at 
 
 `claude-rotator login` reads the current Claude Code login and registers it, fetching the email automatically when possible.
 
-Important: `claude auth login --claudeai` and `claude-rotator login` change or import the Claude Code side's current login — they do not by themselves switch which account is actually used for API requests. The account used for requests is whichever one `claude-rotator status` reports as `active`. Logging in as a different account and running `claude-rotator login` does not, on its own, change `active`.
+Important: `claude auth login --claudeai` and `claude-rotator login` change or import the Claude Code side's current login — they do not by themselves select the account used for API requests. Each request is routed from its model and the `Routing availability` shown by `claude-rotator status`. The header's `current` account is the normal starting point, but when only its Fable-specific quota is exhausted, Fable requests can use another account without changing `current`. Logging in as a different account and running `claude-rotator login` does not, on its own, change `current`.
 
 To save and rotate between several accounts individually, log in to Claude Code as each one and run `claude-rotator login` each time:
 
@@ -948,41 +1013,76 @@ claude-rotator monitor
 Example output (the same layout is shared by `claude-rotator monitor` and `claude-rotator status`; the actual account names, numbers, and times vary by environment):
 
 ```text
-Claude Rotator                         active: account1@example.com
+Claude Rotator                         current: account1@example.com
 
-account1@example.com       active
-5h ███████░░░  76%  reset in 8h42m -> 06/07 18:00 JST
-7d ███████░░░  76%  reset in 2d9h -> 06/09 19:00 JST
-7d Fable █████░░░░░  50%  reset in 1d23h -> 06/09 09:00 JST
-requests: 128
+Routing availability
+Fable (none now)                                      Other (Sonnet / Opus / Haiku) (1 now)
+  1. account2@example.com  in 1h -> 06/04 19:00 JST     1. account1@example.com  now
+  2. account1@example.com  in 2d -> 06/06 18:00 JST     2. account2@example.com  in 1h -> 06/04 19:00 JST
 
-account2@example.com       exhausted
-reason: 5h quota exhausted; reset -> 06/07 20:00 JST
-5h ██████████ 100%  reset in 10h42m -> 06/07 20:00 JST
-7d ████░░░░░░  40%  reset in 2d23h -> 06/10 09:00 JST
-requests: 54
+account1@example.com       exhausted                         account2@example.com       exhausted
+routes Fable: 2d | Other: now                                routes Fable: 1h | Other: 1h
+reason: 7d Fable quota exhausted; reset -> 06/06 18:00 JST   reason: 5h quota exhausted; reset -> 06/04 19:00 JST
+5h ███████░░░  76%  reset in 8h42m -> 06/05 02:42 JST        5h ██████████ 100%  reset in 1h -> 06/04 19:00 JST
+7d ███████░░░  76%  reset in 2d9h -> 06/07 03:00 JST         7d ████░░░░░░  40%  reset in 2d23h -> 06/07 17:00 JST
+7d Fable ██████████ 100%  reset in 2d -> 06/06 18:00 JST     7d Fable █████░░░░░  50%  reset in 2d -> 06/06 18:00 JST
+requests: 128                                                requests: 54
 
 Events
-06/07 12:43 JST request account1 POST /v1/messages -> 429 1203ms outcome=quota-retry req=req_xxx
-06/07 12:43 JST switched account1 -> account2 reason=quota-threshold
+06/04 18:02 JST request account2 POST /v1/messages -> 200 3538ms outcome=ok req=req_xxx
+06/04 18:01 JST switched account2 -> account1 reason=quota-threshold
 ```
 
 What each line means:
 
-- The `active:` field on the header line is the account currently used for API requests.
-- Each account gets one block, tagged `ready` / `active` / `exhausted` / `throttled`, or `error`. A `reason:` line explains why an account is unavailable.
+- The header's `current:` account is the normal starting point. If only its Fable-specific quota is exhausted, a Fable request can use another account without changing `current`.
+- `Routing availability` has separate candidate lists for Fable and Other (Sonnet / Opus / Haiku). `now` means available immediately, `in ... -> ... JST` gives the recovery delay and time, and `unknown` means a safe recovery time cannot be calculated.
+- Candidates are ordered by currently available, earliest known recovery, then unknown recovery. This is a snapshot of the shared router's candidate order; it does not reserve an account for a terminal or conversation.
+- Each account gets a card. `routes Fable: ... | Other: ...` is the model-family-specific availability. The card's `active` / `ready` / `exhausted` / `throttled` / `error` and `reason:` remain its overall representative state.
 - The `5h` / `7d` rows show a progress bar (`█` / `░`, 10 characters), the usage ratio, and time remaining to reset plus the reset time itself. Usage shows as ` --%` when no data is available yet, and the reset field shows `no data yet` when there's no reset information.
 - If the Usage API returns model-scoped weekly limits (`limits[]`), an extra row appears, such as `7d Fable`.
 - `requests:` is the cumulative number of requests the proxy has forwarded for that account.
 - `Events` shows up to the 8 most recent switches, requests, and errors.
 
-Reset times and event times in `status` / `monitor` are always shown in Japan Standard Time (JST). Even for an account you haven't used yet, 5h/7d state is fetched from the OAuth Usage API at server startup, on account reload, on the first `status` read, and on every periodic poll. An account shows as `unknown` only when the Usage API could not be fetched; `unknown` accounts are never chosen as an automatic switch target, since it isn't confirmed that they're actually available.
+On a wide terminal, `Routing availability` and account cards use two columns. If every line does not fit, the renderer falls back to one vertical column without truncating information. `monitor` also responds to terminal resizing.
+
+Reset times and event times in `status` / `monitor` are always shown in Japan Standard Time (JST). Even for an account you haven't used yet, shared and model-scoped usage is fetched from the OAuth Usage API at server startup, on account reload, on the first `status` read, and on every periodic poll. An account shows as `unknown` when safe availability cannot be confirmed; `unknown` accounts are never chosen as automatic switch targets.
 
 Because the OAuth Usage API tends to return 429s, usage fetches default to a 15-minute interval, one account at a time, with 1.5 seconds between the start of each request. Only change `usagePolling.intervalMs`, `usagePolling.concurrency`, and `usagePolling.requestSpacingMs` in [Configuration and Environment Variables](#configuration-and-environment-variables) if you actually need to. An interval that's too short, or concurrency that's too high, can also cause 429s on `claude-rotator refresh-usage`.
 
-OAuth access tokens become refresh candidates 30 minutes before expiry. On macOS and Ubuntu, saved accounts are refreshed by Claude Code itself inside isolated credential storage, without changing the user's normal Claude Code login. Each attempt resolves and `realpath`-pins the current installed Claude Code executable, persists a durable refresh intent immediately before token handoff, and invokes exactly one official `claude auth login --claudeai` command. The refresh token and scopes are passed only through the child's environment, never through argv, configuration, or logs. Refreshes run inside a per-account locked transaction, persist a rotated credential atomically before use, and never fall back to another driver after handoff. If the outcome after handoff is unknown, the account is parked until it is explicitly relinked with `claude auth login --claudeai` followed by `claude-rotator login`. Local pre-handoff failures use the distinct `oauth_refresh_retry` cooldown; only provider HTTP 429 is recorded as `oauth_refresh_rate_limit`. In installed gateway mode, saved accounts remain rotator-owned and stale live `/login` credentials are not mirrored back.
-
 TTY-less environments (CI, piping through `| cat`, etc.) make `claude-rotator monitor` print once and exit automatically (the same as passing `--once` explicitly).
+
+### Automatic OAuth Credential Refresh
+
+Saved OAuth access tokens become refresh candidates 30 minutes before expiry. On macOS and Ubuntu, Claude Code itself refreshes them inside isolated storage without changing the user's normal Claude Code login. A refreshed credential is saved to Keychain or the Linux credential file before it can serve an API request.
+
+Normally, no new login is required. Use the reason shown by `status` to distinguish recovery paths:
+
+- `oauth_refresh_retry`: a temporary local failure before token handoff. It retries after five minutes while other accounts keep working.
+- `oauth_refresh_rate_limit`: the provider rate-limited the refresh. It retries according to `Retry-After`.
+- `oauth_refresh_failed`: the post-handoff result could not be established safely, so that account is parked. Re-register it with:
+
+```bash
+claude auth login --claudeai
+claude-rotator login
+claude-rotator refresh-usage
+claude-rotator status
+```
+
+Rotator cannot revive an explicitly revoked refresh token, so revocation also requires a new login.
+
+<details>
+<summary>Refresh guarantees and trust boundary</summary>
+
+- Each attempt resolves the currently installed Claude Code executable, pins that exact file for the attempt, and invokes `claude auth login --claudeai` exactly once.
+- The refresh token and scopes are handed over only through a short-lived child-process environment, never through argv, configuration, or logs. Another process running as the same OS user may be able to inspect that environment, so use this only on a single-user or otherwise trusted local machine.
+- Concurrent refreshes of the same refresh token are coalesced, and credential mutations across accounts are serialized. Duplicate tokens, competing logins, and uncertain handoffs stop fail-closed.
+- New credentials use compare-and-update persistence, so a concurrent re-login is not overwritten. After handoff, Rotator does not fall back to another refresh driver and create ambiguity about which token won.
+- In installed gateway mode, saved accounts remain Rotator-owned and stale normal-login credentials are not copied back into them. Live-credential following is limited to the manual compatibility mode without gateway credentials.
+
+See [OAuth credential lifecycle design](./docs/specs/2026-07-10-oauth-credential-lifecycle-design.md) for the detailed design.
+
+</details>
 
 ### Configuration and Environment Variables
 
@@ -1054,7 +1154,7 @@ See [Troubleshooting](#troubleshooting) for how to check the resident server's f
 
 The only fields written to the proxy request log are `account`, `method`, `path`, `status`, `durationMs`, `outcome`, `requestId`, and, on a timeout/network error, `errorType`. Internal proxy errors are logged as a short `proxy-error method=... path=... error=...` line. Tokens, the `Authorization` header, API keys, request bodies, and response bodies are never logged.
 
-Automatic switching happens when the current account's 5-hour window, 7-day window, or a model-scoped weekly window (such as Fable's) reaches 100%. When an available candidate exists, the proxy normally picks whichever account has the lowest known `max(5h, 7d)` usage. However, if a candidate's 7-day window is about to reset soon, that account is prioritized instead, so its weekly allowance can be used up before it resets. This weekly-reset priority can proactively move `active` right after a fresh Usage API fetch, even while the current account hasn't hit 100% yet. If the current account itself is quota-exhausted and every candidate is also at 100%, the proxy picks whichever exhausted account has the soonest reset time, and returns a limit message to Claude Code that lets it resume as soon as possible. The proxy never switches to an exhausted account because of an OAuth refresh failure, an authentication error, or a temporary throttle.
+A shared 5-hour, 7-day, token, or request limit at 100% makes an account unavailable to every model, so `current` moves to another available account. If only the Fable-specific allowance is at 100%, just the Fable request uses another candidate and the `current` account remains available to Other models. The normal candidate is the account with the lowest known `max(5h, 7d)` usage. An account whose 7-day window will reset soon is prioritized so its weekly allowance can be used before reset; this can proactively change `current` after a Usage API refresh even before shared quota reaches 100%. If every candidate is exhausted on a shared limit, the proxy chooses the account with the soonest reset and returns a limit message with the earliest resume time. OAuth refresh failures, authentication errors, and temporary throttles never cause a switch to an exhausted account.
 
 When Claude Code sends `POST /v1/messages` for the exact model ID `claude-fable-5` and gets back a 429 without quota headers that confirm the reason, the proxy rechecks the Usage API with that same access token, for at most five seconds, for OAuth accounts. It only replays that same client request to the next account when the 5h/7d window, or the requested Fable weekly window, is actually at 100% and a future reset time plus a known available switch target were confirmed. This confirmation-based replay happens at most once per client request. If it cannot be confirmed, if only a different model's window is exhausted, or if the Usage API call itself fails or times out, the proxy passes the original upstream 429 straight through. This extra check never runs for an ambiguous 429 on any other model ID.
 
@@ -1071,13 +1171,13 @@ claude-rotator refresh-usage
 claude-rotator status
 ```
 
-After `refresh-usage`, check `active` with `claude-rotator status`. The active account can change automatically if the fresh usage shows it's now at 100%, or if another available account's 7-day window is close to reset and should be prioritized. To change `active` deliberately, use `claude-rotator switch <account>`.
+After `refresh-usage`, inspect both `current` and `Routing availability` with `claude-rotator status`. `current` can change if the refreshed shared quota reaches 100%, or if another available account's 7-day window is close enough to reset to receive priority. To deliberately change the base position, use `claude-rotator switch <account>`.
 
 OAuth usage refreshes use a native HTTP client rather than Node's `fetch`, so they aren't bound by fetch's 10-second connect timeout, and by default registered accounts are fetched one at a time. Each request has a 60-second idle timeout. A timeout or unreachable error before the HTTPS connection is established retries quickly, using the same `proxy.upstreamConnectTimeoutMs`, `proxy.upstreamConnectRetries`, and `proxy.upstreamConnectRetryDelayMs` the proxy itself uses.
 
 `usagePolling.concurrency` defaults to `1`. Only raise it if TCP connections from your network to Anthropic are reliably stable and you deliberately want to fetch several accounts at once.
 
-The most recent quota/usage state and the active account are persisted to `~/.config/claude-rotator/runtime-state.json`. This lets the service restore the last known status for switching decisions right after a restart, even if the Usage API isn't reachable yet. A quota whose reset time has already passed is discarded as stale when status is recomputed after restore.
+The most recent quota/usage state and `current` account are persisted to `~/.config/claude-rotator/runtime-state.json`. This lets the service restore the last known status for switching decisions right after a restart, even if the Usage API isn't reachable yet. A quota whose reset time has already passed is discarded as stale when status is recomputed after restore.
 
 External reinjection tools such as `cc-auto-resume` can call the following before reinjecting, to have the rotator switch to whichever account can resume soonest and report when to reinject. It returns `action=ready` if an account is available, or `action=wait` with the soonest reset if every candidate is exhausted.
 
@@ -1121,9 +1221,9 @@ What each command does:
 | `install [--no-start] [--force]` | Registers the proxy service and rewrites `~/.claude/settings.json`. `--no-start` deploys the assets without starting the service (on macOS this also skips the settings change; on Linux the settings change still happens). `--force` ignores the `ANTHROPIC_BASE_URL` mismatch check and overwrites anyway |
 | `uninstall [--purge-secrets] [--force]` | Stops the proxy service and restores `~/.claude/settings.json` to its pre-install value. `--purge-secrets` also deletes the saved credentials of every registered account |
 | `server` | Runs the proxy server itself. The LaunchAgent / systemd service both run this command; running it directly is normally only useful for debugging, since `install` starts it automatically |
-| `status` | Prints the current active account and every account's usage once |
+| `status` | Prints `current`, model-family candidate order, and every account's usage once |
 | `monitor [--once]` | Re-renders the same content as `status` once per second. Without a TTY, or with `--once`, it prints once and exits |
-| `switch <account>` | Manually switches the active account |
+| `switch <account>` | Manually changes the base `current` account; per-request model-aware routing remains active |
 | `refresh-usage` | Immediately re-fetches the Usage API for every registered account |
 | `prepare-resume [--json] [--refresh]` | For external resume tooling: switches to whichever account can resume soonest and reports the resume time |
 | `accounts` | Lists every registered account's id, name, and type |
