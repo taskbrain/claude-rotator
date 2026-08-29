@@ -359,7 +359,9 @@ async function runServer({ write }) {
     reloadAccounts: async () => {
       const nextAccounts = (await loadOrCreateConfig()).accounts;
       const nextLoginOverride = await localClaudeLoginOverrideSource();
-      return credentialOwnershipConfiguration(nextAccounts, nextLoginOverride);
+      return credentialOwnershipConfiguration(nextAccounts, nextLoginOverride, {
+        deferValidationError: true,
+      });
     },
     logger: line => {
       if (logWriter) logWriter.write(line);
@@ -392,13 +394,23 @@ export function assertGatewayCompatibleAccounts(accounts = []) {
   }
 }
 
-export function credentialOwnershipConfiguration(accounts, loginOverride) {
-  assertAnthropicGatewayProviderCompatible(loginOverride);
-  if (loginOverride) assertGatewayCompatibleAccounts(accounts);
-  return {
+export function credentialOwnershipConfiguration(
+  accounts,
+  loginOverride,
+  { deferValidationError = false } = {},
+) {
+  const result = {
     accounts,
     allowLiveClaudeCodeCredentials: !loginOverride,
   };
+  try {
+    assertAnthropicGatewayProviderCompatible(loginOverride);
+    if (loginOverride) assertGatewayCompatibleAccounts(accounts);
+    return result;
+  } catch (validationError) {
+    if (!deferValidationError) throw validationError;
+    return { ...result, validationError };
+  }
 }
 
 export function assertAnthropicGatewayProviderCompatible(source) {

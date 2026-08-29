@@ -107,6 +107,33 @@ describe('durable refresh-boundary files', () => {
     }
   });
 
+  it('syncs every newly-created directory entry before reporting a durable JSON write', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'claude-rotator-durable-tree-'));
+    const firstDirectory = join(dir, 'accounts');
+    const secondDirectory = join(firstDirectory, '.locks');
+    const destination = join(secondDirectory, 'refresh-intent.json');
+    const syncedDirectories = [];
+    try {
+      await writeJsonFileDurable(destination, { revision: 1 }, 0o600, {
+        open: async (...args) => {
+          const handle = await open(...args);
+          if (![dir, firstDirectory, secondDirectory].includes(args[0])) return handle;
+          return {
+            sync: async () => {
+              syncedDirectories.push(args[0]);
+              await handle.sync();
+            },
+            close: handle.close.bind(handle),
+          };
+        },
+      });
+
+      assert.deepEqual(syncedDirectories, [dir, firstDirectory, secondDirectory]);
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
   it('does not report a durable removal as successful when parent directory sync fails', async () => {
     const dir = await mkdtemp(join(tmpdir(), 'claude-rotator-durable-remove-'));
     const destination = join(dir, 'refresh-intent.json');
@@ -256,6 +283,59 @@ describe('LinuxFileSecretStore', () => {
       JSON.stringify(nextA),
       JSON.stringify(nextB),
     ].includes(JSON.stringify(await first.get('acct_1'))));
+  });
+
+  it('serializes a credential replacement in one account with another account native handoff', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'claude-rotator-cross-account-lock-'));
+    const accountsDir = join(dir, 'accounts');
+    const server = new LinuxFileSecretStore({ accountsDir });
+    const login = new LinuxFileSecretStore({ accountsDir });
+    const original = {
+      accessToken: 'cross-account-access-1',
+      refreshToken: 'cross-account-refresh-1',
+      expiresAt: 1,
+    };
+    await server.set('acct_1', original);
+    await server.set('acct_2', {
+      accessToken: 'cross-account-access-2',
+      refreshToken: 'cross-account-refresh-2',
+      expiresAt: 1,
+    });
+
+    let releaseHandoff;
+    let signalHandoff;
+    const handoffGate = new Promise(resolve => { releaseHandoff = resolve; });
+    const handoffStarted = new Promise(resolve => { signalHandoff = resolve; });
+    const refresh = server.refreshIfUnchanged('acct_1', original, async (current, transaction) => {
+      await transaction.beforeHandoff();
+      signalHandoff();
+      await handoffGate;
+      return {
+        ...current,
+        accessToken: 'cross-account-rotated-access',
+        refreshToken: 'cross-account-rotated-refresh',
+        expiresAt: Date.now() + 60_000,
+      };
+    });
+    await handoffStarted;
+
+    const replacement = login.replaceLinkedCredential('acct_2', {
+      accessToken: 'cross-account-linked-access',
+      refreshToken: original.refreshToken,
+      expiresAt: Date.now() + 60_000,
+    });
+    const replacementWonRace = await Promise.race([
+      replacement.then(() => true),
+      new Promise(resolve => setTimeout(() => resolve(false), 100)),
+    ]);
+
+    try {
+      assert.equal(replacementWonRace, false);
+    } finally {
+      releaseHandoff();
+      await Promise.allSettled([refresh, replacement]);
+      await rm(dir, { recursive: true, force: true });
+    }
   });
 
   it('serializes refresh updates across store instances and returns the rotated credential', async () => {

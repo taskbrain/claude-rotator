@@ -5872,7 +5872,8 @@ describe('createProxyServer', () => {
       usageFetcher: async () => ({
         five_hour: { utilization: 1, resets_at: futureReset() },
       }),
-      tokenRefresher: async refreshToken => {
+      tokenRefresher: async (refreshToken, context) => {
+        await context.beforeHandoff();
         refreshCalls += 1;
         assert.equal(refreshToken, 'refresh-token-2');
         return {
@@ -7575,6 +7576,63 @@ describe('createProxyServer', () => {
     assert.equal(JSON.stringify(refresh.body).includes('duplicate-refresh-fixture'), false);
   });
 
+  it('rescans for refresh-token duplicates immediately before native handoff', async () => {
+    const secretStore = new MemorySecretStore();
+    await secretStore.set('acct_1', {
+      accessToken: 'late-duplicate-access-1',
+      refreshToken: 'late-duplicate-refresh-1',
+      expiresAt: 1,
+    });
+    await secretStore.set('acct_2', {
+      accessToken: 'late-duplicate-access-2',
+      refreshToken: 'late-duplicate-refresh-2',
+      expiresAt: 1,
+    });
+    const accountManager = new AccountManager({
+      accounts: [
+        { id: 'acct_1', name: 'a@example.com', type: 'oauth' },
+        { id: 'acct_2', name: 'b@example.com', type: 'oauth' },
+      ],
+      now: () => 1000,
+    });
+    let refreshCalls = 0;
+    const proxy = await listen(createProxyServer({
+      accountManager,
+      secretStore,
+      config: {
+        upstream: 'http://127.0.0.1:1',
+        usagePolling: { enabled: false, requestSpacingMs: 0 },
+      },
+      tokenRefresher: async (refreshToken, context) => {
+        await context.beforeHandoff();
+        refreshCalls += 1;
+        return {
+          accessToken: 'must-not-be-committed',
+          refreshToken,
+          expiresAt: Date.now() + 60 * 60 * 1000,
+        };
+      },
+      usageFetcher: async () => assert.fail('duplicate refresh credential must not fetch usage'),
+    }));
+    cleanupAfterTest(async () => close(proxy.server));
+
+    await requestJson(`${proxy.url}/internal/status`);
+    await secretStore.replaceLinkedCredential('acct_2', {
+      accessToken: 'late-duplicate-access-2-updated',
+      refreshToken: 'late-duplicate-refresh-1',
+      expiresAt: 1,
+    });
+
+    const refresh = await requestJson(`${proxy.url}/internal/refresh-usage`, { method: 'POST' });
+
+    assert.equal(refresh.status, 200);
+    assert.equal(refreshCalls, 0);
+    assert.deepEqual(
+      refresh.body.status.accounts.map(account => account.unavailableReason.type),
+      ['oauth_refresh_failed', 'oauth_refresh_failed'],
+    );
+  });
+
   it('unparks duplicate refresh-token accounts after a credential-changing reload resolves the duplicate', async () => {
     const secretStore = new MemorySecretStore();
     await secretStore.set('acct_1', {
@@ -8345,6 +8403,33 @@ describe('createProxyServer', () => {
       assert.equal(upstreamCalls, 0);
     });
   }
+
+  it('keeps the previous accounts when same-mode reload validation fails', async () => {
+    const secretStore = new MemorySecretStore();
+    await secretStore.set('acct_1', { accessToken: 'reload-validation-access' });
+    const accountManager = new AccountManager({
+      accounts: [{ id: 'acct_1', name: 'before@example.com', type: 'oauth' }],
+    });
+    const proxy = await listen(createProxyServer({
+      accountManager,
+      secretStore,
+      config: { upstream: 'http://127.0.0.1:1', usagePolling: { enabled: false } },
+      allowLiveClaudeCodeCredentials: false,
+      reloadAccounts: async () => ({
+        accounts: [{ id: 'acct_1', name: 'must-not-apply@example.com', type: 'oauth' }],
+        allowLiveClaudeCodeCredentials: false,
+        validationError: new Error('candidate gateway configuration is invalid'),
+      }),
+    }));
+    cleanupAfterTest(async () => close(proxy.server));
+
+    const reload = await requestJson(`${proxy.url}/internal/reload`, { method: 'POST' });
+    const status = await requestJson(`${proxy.url}/internal/status`);
+
+    assert.equal(reload.status, 502);
+    assert.equal(status.status, 200);
+    assert.equal(status.body.accounts[0].name, 'before@example.com');
+  });
 
   it('returns a non-empty proxy error message for empty internal errors', async () => {
     const accountManager = new AccountManager({

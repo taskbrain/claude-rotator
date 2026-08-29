@@ -8,7 +8,11 @@ import { performance } from 'node:perf_hooks';
 import { isDeepStrictEqual, promisify } from 'node:util';
 
 import { appDataDir, linuxAccountsDir } from './paths.js';
-import { removeFileDurable, writeJsonFileDurable } from './json-file.js';
+import {
+  ensureDirectoryDurable,
+  removeFileDurable,
+  writeJsonFileDurable,
+} from './json-file.js';
 import { executeSecurityCommand } from './native-claude-refresher.js';
 
 const execFileAsync = promisify(execFile);
@@ -75,7 +79,7 @@ class AccountFileLock {
 
   async acquire(accountId) {
     assertSafeAccountId(accountId);
-    await mkdir(this.lockDir, { recursive: true, mode: 0o700 });
+    await ensureDirectoryDurable(this.lockDir, 0o700);
     await chmod(this.lockDir, 0o700);
     const lockPath = join(this.lockDir, `${accountId}.lock`);
     const startedAt = this.monotonicNow();
@@ -200,6 +204,33 @@ class AccountFileLock {
     }
     return identity;
   }
+}
+
+function combinedLockLease(...leases) {
+  const activeLeases = leases.filter(Boolean);
+  return {
+    async protectChildPid(childPid) {
+      const protectedLeases = [];
+      try {
+        for (const lease of activeLeases) {
+          await lease.protectChildPid(childPid);
+          protectedLeases.push(lease);
+        }
+      } catch (error) {
+        await Promise.allSettled(
+          protectedLeases.map(lease => lease.clearChildPid(childPid)),
+        );
+        throw error;
+      }
+    },
+    async clearChildPid(childPid) {
+      const results = await Promise.allSettled(
+        activeLeases.map(lease => lease.clearChildPid(childPid)),
+      );
+      const failed = results.find(result => result.status === 'rejected');
+      if (failed) throw failed.reason;
+    },
+  };
 }
 
 function isLockAlreadyHeldError(error) {
@@ -678,7 +709,7 @@ class DurableRefreshIntentStore {
 
   async write(accountId, intent) {
     validateRefreshIntent(intent);
-    await mkdir(this.lockDir, { recursive: true, mode: 0o700 });
+    await ensureDirectoryDurable(this.lockDir, 0o700, this.durableFileDeps);
     await chmod(this.lockDir, 0o700);
     await writeJsonFileDurable(
       refreshIntentPath(this.lockDir, accountId),
@@ -907,19 +938,20 @@ export class MemorySecretStore {
   constructor() {
     this.items = new Map();
     this.updateTails = new Map();
+    this.credentialSetTail = Promise.resolve();
     this.refreshIntents = new MemoryRefreshIntentStore();
   }
 
   async set(accountId, secret) {
     assertSafeAccountId(accountId);
-    return this.runExclusive(accountId, async () => {
+    return this.runCredentialSetExclusive(() => this.runExclusive(accountId, async () => {
       await assertOperationalBeforeWrite(
         this.refreshIntents,
         accountId,
         async () => this.items.has(accountId) ? this.items.get(accountId) : null,
       );
       this.items.set(accountId, cloneSecret(secret));
-    });
+    }));
   }
 
   async get(accountId) {
@@ -947,7 +979,7 @@ export class MemorySecretStore {
 
   async updateIfUnchanged(accountId, expectedSecret, updater) {
     assertSafeAccountId(accountId);
-    return this.runExclusive(accountId, async () => {
+    return this.runCredentialSetExclusive(() => this.runExclusive(accountId, async () => {
       const current = this.items.has(accountId) ? this.items.get(accountId) : null;
       await assertOperationalCredential(this.refreshIntents, accountId, current);
       if (!isDeepStrictEqual(current, expectedSecret)) {
@@ -956,12 +988,14 @@ export class MemorySecretStore {
       const nextSecret = await updater(cloneSecret(current));
       this.items.set(accountId, cloneSecret(nextSecret));
       return { updated: true, secret: cloneSecret(nextSecret) };
-    });
+    }));
   }
 
   async refreshIfUnchanged(accountId, expectedSecret, exchange) {
     assertSafeAccountId(accountId);
-    return this.runExclusive(accountId, () => refreshIfUnchangedTransaction({
+    return this.runCredentialSetExclusive(() => this.runExclusive(
+      accountId,
+      () => refreshIfUnchangedTransaction({
       accountId,
       expectedSecret,
       exchange,
@@ -969,18 +1003,29 @@ export class MemorySecretStore {
       writeSecret: async secret => this.items.set(accountId, cloneSecret(secret)),
       intents: this.refreshIntents,
       lease: null,
-    }));
+      }),
+    ));
   }
 
   async replaceLinkedCredential(accountId, secret) {
     assertSafeAccountId(accountId);
-    return this.runExclusive(accountId, () => replaceLinkedCredentialTransaction({
+    return this.runCredentialSetExclusive(() => this.runExclusive(
+      accountId,
+      () => replaceLinkedCredentialTransaction({
       accountId,
       secret,
       readSecret: async () => this.items.has(accountId) ? this.items.get(accountId) : null,
       writeSecret: async nextSecret => this.items.set(accountId, cloneSecret(nextSecret)),
       intents: this.refreshIntents,
-    }));
+      }),
+    ));
+  }
+
+  async runCredentialSetExclusive(operation) {
+    const previous = this.credentialSetTail;
+    const update = previous.then(operation);
+    this.credentialSetTail = update.catch(() => {});
+    return update;
   }
 
   async runExclusive(accountId, operation) {
@@ -997,7 +1042,9 @@ export class MemorySecretStore {
 
   async delete(accountId) {
     assertSafeAccountId(accountId);
-    this.items.delete(accountId);
+    await this.runCredentialSetExclusive(async () => {
+      this.items.delete(accountId);
+    });
   }
 
   async list() {
@@ -1005,7 +1052,9 @@ export class MemorySecretStore {
   }
 
   async purge() {
-    this.items.clear();
+    await this.runCredentialSetExclusive(async () => {
+      this.items.clear();
+    });
   }
 }
 
@@ -1023,8 +1072,7 @@ export class LinuxFileSecretStore {
   } = {}) {
     this.accountsDir = accountsDir;
     const lockDir = join(accountsDir, '.locks');
-    this.accountLock = new AccountFileLock({
-      lockDir,
+    const lockOptions = {
       acquireTimeoutMs: lockAcquireTimeoutMs,
       retryMs: lockRetryMs,
       staleMs: lockStaleMs,
@@ -1033,6 +1081,11 @@ export class LinuxFileSecretStore {
       sleepImpl,
       hostnameImpl,
       processIdentityImpl,
+    };
+    this.accountLock = new AccountFileLock({ lockDir, ...lockOptions });
+    this.credentialSetLock = new AccountFileLock({
+      lockDir: join(lockDir, '.credential-set'),
+      ...lockOptions,
     });
     this.refreshIntents = new DurableRefreshIntentStore(lockDir);
   }
@@ -1043,18 +1096,18 @@ export class LinuxFileSecretStore {
   }
 
   async set(accountId, secret) {
-    return this.accountLock.run(accountId, async () => {
+    return this.runCredentialSetExclusive(() => this.accountLock.run(accountId, async () => {
       await assertOperationalBeforeWrite(
         this.refreshIntents,
         accountId,
         () => this.getUnlocked(accountId),
       );
       await this.setUnlocked(accountId, secret);
-    });
+    }));
   }
 
   async setUnlocked(accountId, secret) {
-    await mkdir(this.accountsDir, { recursive: true, mode: 0o700 });
+    await ensureDirectoryDurable(this.accountsDir, 0o700);
     await chmod(this.accountsDir, 0o700);
     await writeJsonFileDurable(this.secretPath(accountId), secret, 0o600);
   }
@@ -1081,7 +1134,10 @@ export class LinuxFileSecretStore {
   }
 
   async delete(accountId) {
-    return this.accountLock.run(accountId, () => rm(this.secretPath(accountId), { force: true }));
+    return this.runCredentialSetExclusive(() => this.accountLock.run(
+      accountId,
+      () => rm(this.secretPath(accountId), { force: true }),
+    ));
   }
 
   async compareAndSet(accountId, expectedSecret, nextSecret) {
@@ -1090,7 +1146,7 @@ export class LinuxFileSecretStore {
   }
 
   async updateIfUnchanged(accountId, expectedSecret, updater) {
-    return this.accountLock.run(accountId, async () => {
+    return this.runCredentialSetExclusive(() => this.accountLock.run(accountId, async () => {
       const current = await this.getUnlocked(accountId);
       await assertOperationalCredential(this.refreshIntents, accountId, current);
       if (!isDeepStrictEqual(current, expectedSecret)) {
@@ -1099,29 +1155,39 @@ export class LinuxFileSecretStore {
       const nextSecret = await updater(cloneSecret(current));
       await this.setUnlocked(accountId, nextSecret);
       return { updated: true, secret: cloneSecret(nextSecret) };
-    });
+    }));
   }
 
   async refreshIfUnchanged(accountId, expectedSecret, exchange) {
-    return this.accountLock.run(accountId, lease => refreshIfUnchangedTransaction({
+    return this.runCredentialSetExclusive(globalLease => this.accountLock.run(
+      accountId,
+      accountLease => refreshIfUnchangedTransaction({
       accountId,
       expectedSecret,
       exchange,
       readSecret: () => this.getUnlocked(accountId),
       writeSecret: secret => this.setUnlocked(accountId, secret),
       intents: this.refreshIntents,
-      lease,
-    }));
+      lease: combinedLockLease(globalLease, accountLease),
+      }),
+    ));
   }
 
   async replaceLinkedCredential(accountId, secret) {
-    return this.accountLock.run(accountId, () => replaceLinkedCredentialTransaction({
+    return this.runCredentialSetExclusive(() => this.accountLock.run(
+      accountId,
+      () => replaceLinkedCredentialTransaction({
       accountId,
       secret,
       readSecret: () => this.getUnlocked(accountId),
       writeSecret: nextSecret => this.setUnlocked(accountId, nextSecret),
       intents: this.refreshIntents,
-    }));
+      }),
+    ));
+  }
+
+  async runCredentialSetExclusive(operation) {
+    return this.credentialSetLock.run('all', operation);
   }
 
   async list() {
@@ -1190,8 +1256,7 @@ export class MacOSKeychainSecretStore {
     processIdentityImpl,
   } = {}) {
     this.execFileImpl = execFileImpl;
-    this.accountLock = new AccountFileLock({
-      lockDir,
+    const lockOptions = {
       acquireTimeoutMs: lockAcquireTimeoutMs,
       retryMs: lockRetryMs,
       staleMs: lockStaleMs,
@@ -1200,6 +1265,11 @@ export class MacOSKeychainSecretStore {
       sleepImpl,
       hostnameImpl,
       processIdentityImpl,
+    };
+    this.accountLock = new AccountFileLock({ lockDir, ...lockOptions });
+    this.credentialSetLock = new AccountFileLock({
+      lockDir: join(lockDir, '.credential-set'),
+      ...lockOptions,
     });
     this.refreshIntents = new DurableRefreshIntentStore(lockDir);
   }
@@ -1210,17 +1280,21 @@ export class MacOSKeychainSecretStore {
   }
 
   async set(accountId, secret) {
-    return this.accountLock.run(
+    return this.runCredentialSetExclusive(globalLease => this.accountLock.run(
       accountId,
-      async lease => {
+      async accountLease => {
         await assertOperationalBeforeWrite(
           this.refreshIntents,
           accountId,
           () => this.getUnlocked(accountId),
         );
-        await this.setUnlocked(accountId, secret, lease);
+        await this.setUnlocked(
+          accountId,
+          secret,
+          combinedLockLease(globalLease, accountLease),
+        );
       },
-    );
+    ));
   }
 
   async setUnlocked(accountId, secret, lease) {
@@ -1266,10 +1340,13 @@ export class MacOSKeychainSecretStore {
   }
 
   async delete(accountId) {
-    return this.accountLock.run(
+    return this.runCredentialSetExclusive(globalLease => this.accountLock.run(
       accountId,
-      lease => this.deleteUnlocked(accountId, lease),
-    );
+      accountLease => this.deleteUnlocked(
+        accountId,
+        combinedLockLease(globalLease, accountLease),
+      ),
+    ));
   }
 
   async deleteUnlocked(accountId, lease) {
@@ -1295,38 +1372,60 @@ export class MacOSKeychainSecretStore {
   }
 
   async updateIfUnchanged(accountId, expectedSecret, updater) {
-    return this.accountLock.run(accountId, async lease => {
+    return this.runCredentialSetExclusive(globalLease => this.accountLock.run(accountId, async accountLease => {
       const current = await this.getUnlocked(accountId);
       await assertOperationalCredential(this.refreshIntents, accountId, current);
       if (!isDeepStrictEqual(current, expectedSecret)) {
         return { updated: false, secret: current };
       }
       const nextSecret = await updater(cloneSecret(current));
-      await this.setUnlocked(accountId, nextSecret, lease);
+      await this.setUnlocked(
+        accountId,
+        nextSecret,
+        combinedLockLease(globalLease, accountLease),
+      );
       return { updated: true, secret: cloneSecret(nextSecret) };
-    });
+    }));
   }
 
   async refreshIfUnchanged(accountId, expectedSecret, exchange) {
-    return this.accountLock.run(accountId, lease => refreshIfUnchangedTransaction({
+    return this.runCredentialSetExclusive(globalLease => this.accountLock.run(
+      accountId,
+      accountLease => refreshIfUnchangedTransaction({
       accountId,
       expectedSecret,
       exchange,
       readSecret: () => this.getUnlocked(accountId),
-      writeSecret: secret => this.setUnlocked(accountId, secret, lease),
+      writeSecret: secret => this.setUnlocked(
+        accountId,
+        secret,
+        combinedLockLease(globalLease, accountLease),
+      ),
       intents: this.refreshIntents,
-      lease,
-    }));
+      lease: combinedLockLease(globalLease, accountLease),
+      }),
+    ));
   }
 
   async replaceLinkedCredential(accountId, secret) {
-    return this.accountLock.run(accountId, lease => replaceLinkedCredentialTransaction({
+    return this.runCredentialSetExclusive(globalLease => this.accountLock.run(
+      accountId,
+      accountLease => replaceLinkedCredentialTransaction({
       accountId,
       secret,
       readSecret: () => this.getUnlocked(accountId),
-      writeSecret: nextSecret => this.setUnlocked(accountId, nextSecret, lease),
+      writeSecret: nextSecret => this.setUnlocked(
+        accountId,
+        nextSecret,
+        combinedLockLease(globalLease, accountLease),
+      ),
       intents: this.refreshIntents,
-    }));
+      }),
+    ));
+  }
+
+  async runCredentialSetExclusive(operation) {
+    return this.credentialSetLock.run('all', operation);
   }
 
   async list() {

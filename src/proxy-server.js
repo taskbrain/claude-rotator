@@ -87,21 +87,28 @@ export function createProxyServer({
       },
     },
   });
-  const coordinatedTokenRefresher = createSingleFlightTokenRefresher(resolvedTokenRefresher, {
-    onSuccess({ context, refreshed, rotated }) {
-      logger?.(`${new Date().toISOString()} credential-refresh account=${context?.accountId || 'unknown'} result=success rotated=${rotated} expiresAt=${formatCredentialExpiry(refreshed.expiresAt)}`);
+  const coordinatedTokenRefresher = createSingleFlightTokenRefresher(
+    refreshTokenWithCredentialSafety,
+    {
+      // Credential writes and native handoffs are serialized by the secret
+      // store. Do not let a completed refresh result cross a later account
+      // relink that happens to present the old refresh token.
+      retentionMs: 0,
+      onSuccess({ context, refreshed, rotated }) {
+        logger?.(`${new Date().toISOString()} credential-refresh account=${context?.accountId || 'unknown'} result=success rotated=${rotated} expiresAt=${formatCredentialExpiry(refreshed.expiresAt)}`);
+      },
+      onFailure({ context, error, deferred = false }) {
+        const retry = error?.retryAfterMs
+          ? ` retryAfterSec=${Math.ceil(error.retryAfterMs / 1000)}`
+          : '';
+        const retrySource = ['provider', 'fallback', 'fixed'].includes(error?.retryAfterSource)
+          ? ` retrySource=${error.retryAfterSource}`
+          : '';
+        const result = deferred ? 'deferred' : 'failed';
+        logger?.(`${new Date().toISOString()} credential-refresh account=${context?.accountId || 'unknown'} result=${result} errorType=${credentialRefreshErrorType(error)}${retry}${retrySource}`);
+      },
     },
-    onFailure({ context, error, deferred = false }) {
-      const retry = error?.retryAfterMs
-        ? ` retryAfterSec=${Math.ceil(error.retryAfterMs / 1000)}`
-        : '';
-      const retrySource = ['provider', 'fallback', 'fixed'].includes(error?.retryAfterSource)
-        ? ` retrySource=${error.retryAfterSource}`
-        : '';
-      const result = deferred ? 'deferred' : 'failed';
-      logger?.(`${new Date().toISOString()} credential-refresh account=${context?.accountId || 'unknown'} result=${result} errorType=${credentialRefreshErrorType(error)}${retry}${retrySource}`);
-    },
-  });
+  );
   const duplicateRefreshAccountIds = new Set();
   const duplicateRefreshAccounts = new WeakSet();
   let credentialOwnershipRestartRequired = false;
@@ -169,7 +176,10 @@ export function createProxyServer({
   const checkInitialCredentialState = async () => {
     replaceSet(
       duplicateRefreshAccountIds,
-      await duplicateRefreshTokenAccountIds(accountManager.accounts, secretStore),
+      await withCredentialSetLock(
+        secretStore,
+        () => duplicateRefreshTokenAccountIds(accountManager.accounts, secretStore),
+      ),
     );
     if (parkDuplicateRefreshTokenAccounts({
       accountManager,
@@ -180,6 +190,30 @@ export function createProxyServer({
     }
     await checkPersistedRefreshIntents();
   };
+  async function refreshTokenWithCredentialSafety(refreshToken, context = {}) {
+    const beforeHandoff = context.beforeHandoff;
+    return resolvedTokenRefresher(refreshToken, {
+      ...context,
+      beforeHandoff: async () => {
+        const nextDuplicateIds = await duplicateRefreshTokenAccountIds(
+          accountManager.accounts,
+          secretStore,
+        );
+        replaceSet(duplicateRefreshAccountIds, nextDuplicateIds);
+        if (parkDuplicateRefreshTokenAccounts({
+          accountManager,
+          duplicateRefreshAccountIds,
+          duplicateRefreshAccounts,
+        })) {
+          await persistState();
+        }
+        if (nextDuplicateIds.has(context.accountId)) {
+          throw duplicateRefreshTokenError();
+        }
+        await beforeHandoff?.();
+      },
+    });
+  }
   operationalStateCheck = checkInitialCredentialState();
   operationalStateCheck.catch(() => {});
 
@@ -244,7 +278,11 @@ export function createProxyServer({
             return;
           }
           const { accounts } = reloadResult;
-          const nextDuplicateIds = await duplicateRefreshTokenAccountIds(accounts, secretStore);
+          if (reloadResult.validationError) throw reloadResult.validationError;
+          const nextDuplicateIds = await withCredentialSetLock(
+            secretStore,
+            () => duplicateRefreshTokenAccountIds(accounts, secretStore),
+          );
           const ownedDuplicateIds = duplicateRefreshErrorAccountIds(accountManager, duplicateRefreshAccounts);
           let duplicateStateChanged = clearResolvedDuplicateRefreshErrors({
             accountManager,
@@ -459,6 +497,19 @@ function normalizeReloadAccountsResult(result, currentAllowLiveClaudeCodeCredent
     throw new Error('Reloaded credential configuration is invalid');
   }
   return result;
+}
+
+async function withCredentialSetLock(secretStore, operation) {
+  if (typeof secretStore?.runCredentialSetExclusive === 'function') {
+    return secretStore.runCredentialSetExclusive(operation);
+  }
+  return operation();
+}
+
+function duplicateRefreshTokenError() {
+  const error = new Error('OAuth refresh token is linked to multiple accounts');
+  error.code = 'DUPLICATE_REFRESH_TOKEN';
+  return error;
 }
 
 function credentialOwnershipRestartError() {

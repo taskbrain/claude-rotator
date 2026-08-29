@@ -125,6 +125,22 @@ describe('gateway account compatibility', () => {
       allowLiveClaudeCodeCredentials: false,
     });
   });
+
+  it('returns a changed ownership mode before surfacing gateway account validation', () => {
+    const accounts = [{
+      id: 'current',
+      type: 'oauth',
+      credentialSource: 'claude-code-current',
+    }];
+
+    const result = credentialOwnershipConfiguration(accounts, 'ANTHROPIC_AUTH_TOKEN', {
+      deferValidationError: true,
+    });
+
+    assert.equal(result.allowLiveClaudeCodeCredentials, false);
+    assert.equal(result.accounts, accounts);
+    assert.match(result.validationError.message, /Gateway authentication cannot be installed/);
+  });
 });
 
 describe('internal API transport', () => {
