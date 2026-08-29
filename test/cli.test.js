@@ -1,11 +1,12 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
+import { spawn } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
 import { EventEmitter } from 'node:events';
 import { mkdir, mkdtemp, readFile, rm, stat, writeFile } from 'node:fs/promises';
 import http from 'node:http';
 import { tmpdir } from 'node:os';
-import { dirname, join } from 'node:path';
+import { dirname, join, resolve } from 'node:path';
 import { Readable } from 'node:stream';
 
 import {
@@ -21,7 +22,8 @@ import {
   runMacosCliActionWithLock,
   startService,
 } from '../src/cli.js';
-import { MACOS_LAUNCH_AGENT_LABEL } from '../src/install.js';
+import { MACOS_LAUNCH_AGENT_LABEL, installSettings } from '../src/install.js';
+import { writeJsonFile } from '../src/json-file.js';
 
 describe('ensureCredentialRevisions', () => {
   it('assigns a non-secret baseline only to accounts missing a revision', () => {
@@ -1225,6 +1227,283 @@ describe('uninstall --purge-secrets account id targeting', () => {
     }
   });
 });
+
+describe('uninstall --purge-secrets config read failure warning', () => {
+  // Regression coverage for #31: purgeTargetAccountIds() used to swallow every
+  // loadConfig() error via `.catch(() => null)`, so a corrupt config.json
+  // silently narrowed the macOS Keychain purge down to only the "current"
+  // account while `uninstall` still reported plain success. On macOS,
+  // MacOSKeychainSecretStore.purge(ids) only deletes the given ids, so other
+  // accounts' Keychain secrets were left behind with no warning at all.
+  const noopExecFileImpl = async (command, args) => {
+    if (args[0] === 'print') throw Object.assign(new Error('not found'), { code: 113 });
+    return { stdout: '', stderr: '' };
+  };
+
+  function createSplitIo() {
+    let stdout = '';
+    let stderr = '';
+    return {
+      write: chunk => { stdout += chunk; },
+      error: chunk => { stderr += chunk; },
+      stdout: () => stdout,
+      stderr: () => stderr,
+    };
+  }
+
+  function createPurgeSpy() {
+    const calls = [];
+    const secretStoreFactory = () => ({
+      purge: async ids => { calls.push(ids); },
+    });
+    return { calls, secretStoreFactory };
+  }
+
+  async function writeBrokenConfig(configPath) {
+    await mkdir(dirname(configPath), { recursive: true });
+    // Deliberately invalid JSON (not a secret) so loadConfig() throws a
+    // SyntaxError instead of returning null the way a merely-missing file
+    // (ENOENT) does.
+    await writeFile(configPath, '{ this is not valid json', 'utf8');
+  }
+
+  it('darwin: uninstall --purge-secrets warns on stderr and still purges "current" when config read fails', async () => {
+    const io = createSplitIo();
+    const sandbox = await mkdtemp(join(tmpdir(), 'claude-rotator-cli-uninstall-purge-warn-darwin-'));
+    try {
+      const home = join(sandbox, 'home');
+      const xdgConfig = join(sandbox, 'xdg-config');
+      const xdgData = join(sandbox, 'xdg-data');
+      const configPath = join(xdgConfig, 'claude-rotator', 'config.json');
+      await writeBrokenConfig(configPath);
+      const { calls, secretStoreFactory } = createPurgeSpy();
+
+      const code = await runCli(['__macos-service-action', 'uninstall', '--purge-secrets'], {
+        write: io.write,
+        error: io.error,
+        platform: 'darwin',
+        home,
+        env: {
+          CLAUDE_ROTATOR_MACOS_SERVICE_LOCKED: '1',
+          XDG_CONFIG_HOME: xdgConfig,
+          XDG_DATA_HOME: xdgData,
+        },
+        execFileImpl: noopExecFileImpl,
+        secretStoreFactory,
+      });
+
+      assert.equal(code, 0);
+      assert.match(io.stdout(), /Uninstalled claude-rotator/);
+      const stderrLines = io.stderr().split('\n').filter(Boolean);
+      assert.equal(stderrLines.length, 1, `expected exactly one stderr warning line, got: ${io.stderr()}`);
+      assert.match(io.stderr(), /warning:.*purg/i);
+      assert.equal(calls.length, 1);
+      assert.deepEqual(calls[0], ['current']);
+    } finally {
+      await rm(sandbox, { recursive: true, force: true });
+    }
+  });
+
+  it('darwin: uninstall --purge-secrets does not warn when config is simply absent (ENOENT)', async () => {
+    const io = createSplitIo();
+    const sandbox = await mkdtemp(join(tmpdir(), 'claude-rotator-cli-uninstall-purge-enoent-darwin-'));
+    try {
+      const home = join(sandbox, 'home');
+      const xdgConfig = join(sandbox, 'xdg-config');
+      const xdgData = join(sandbox, 'xdg-data');
+      // No config.json is written at all: loadConfig() must treat this as
+      // "never installed" (existing behaviour) and stay silent.
+      const { calls, secretStoreFactory } = createPurgeSpy();
+
+      const code = await runCli(['__macos-service-action', 'uninstall', '--purge-secrets'], {
+        write: io.write,
+        error: io.error,
+        platform: 'darwin',
+        home,
+        env: {
+          CLAUDE_ROTATOR_MACOS_SERVICE_LOCKED: '1',
+          XDG_CONFIG_HOME: xdgConfig,
+          XDG_DATA_HOME: xdgData,
+        },
+        execFileImpl: noopExecFileImpl,
+        secretStoreFactory,
+      });
+
+      assert.equal(code, 0);
+      assert.match(io.stdout(), /Uninstalled claude-rotator/);
+      assert.equal(io.stderr(), '');
+      assert.equal(calls.length, 1);
+      assert.deepEqual(calls[0], ['current']);
+    } finally {
+      await rm(sandbox, { recursive: true, force: true });
+    }
+  });
+
+  it('linux: uninstall --purge-secrets never warns about "current"-only deletion, even when config read fails', async () => {
+    const io = createSplitIo();
+    const sandbox = await mkdtemp(join(tmpdir(), 'claude-rotator-cli-uninstall-purge-warn-linux-'));
+    try {
+      const home = join(sandbox, 'home');
+      const xdgConfig = join(sandbox, 'xdg-config');
+      const xdgData = join(sandbox, 'xdg-data');
+      const configPath = join(xdgConfig, 'claude-rotator', 'config.json');
+      await writeBrokenConfig(configPath);
+      // uninstallSettings() reads installStatePath eagerly with no ENOENT
+      // fallback, so a prior "install" state must exist for the restore step
+      // to no-op cleanly instead of throwing (see the darwin/linux purge
+      // tests above for the same setup).
+      await writeFile(join(xdgConfig, 'claude-rotator', 'install-state.json'), '{}', 'utf8');
+      const { calls, secretStoreFactory } = createPurgeSpy();
+
+      const code = await runCli(['uninstall', '--purge-secrets'], {
+        write: io.write,
+        error: io.error,
+        platform: 'linux',
+        home,
+        env: { XDG_CONFIG_HOME: xdgConfig, XDG_DATA_HOME: xdgData },
+        secretStoreFactory,
+      });
+
+      assert.equal(code, 0);
+      assert.match(io.stdout(), /Uninstalled claude-rotator/);
+      // LinuxFileSecretStore.purge() enumerates its own secrets directory and
+      // ignores the id list entirely, so a config read failure never shrinks
+      // what actually gets deleted on Linux; warning here would misinform
+      // the user that only "current" was removed.
+      assert.equal(io.stderr(), '');
+      assert.equal(calls.length, 1);
+      assert.deepEqual(calls[0], ['current']);
+    } finally {
+      await rm(sandbox, { recursive: true, force: true });
+    }
+  });
+
+  it('darwin: uninstall --purge-secrets does not claim a Keychain purge when uninstall fails before any purge runs', async () => {
+    // Regression coverage for the false-completeness report: if
+    // uninstallMacosLifecycle() throws before purgeSecretsImpl() ever runs
+    // (e.g. Claude settings were edited after install, so uninstallSettings()
+    // detects a conflict and refuses to proceed without --force), the whole
+    // uninstall rolls back and the command exits 1. The config-read-failure
+    // warning must not appear in that case: nothing was purged at all, so
+    // "the 'current' Keychain entry was removed" would be a false claim.
+    const io = createSplitIo();
+    const sandbox = await mkdtemp(join(tmpdir(), 'claude-rotator-cli-uninstall-purge-warn-conflict-'));
+    try {
+      const home = join(sandbox, 'home');
+      const xdgConfig = join(sandbox, 'xdg-config');
+      const xdgData = join(sandbox, 'xdg-data');
+      const configPath = join(xdgConfig, 'claude-rotator', 'config.json');
+      const settingsPath = join(home, '.claude', 'settings.json');
+      const installStatePath = join(xdgConfig, 'claude-rotator', 'install-state.json');
+
+      // A corrupt config.json is what would otherwise trigger the "config
+      // read failed" warning path.
+      await writeBrokenConfig(configPath);
+      // Install for real, then edit the managed settings file afterwards so
+      // uninstallSettings() detects the conflict and throws without --force.
+      await installSettings({
+        settingsPath,
+        installStatePath,
+        backupDir: join(xdgConfig, 'claude-rotator', 'backups'),
+        proxyBaseUrl: 'http://127.0.0.1:37891',
+      });
+      await writeJsonFile(settingsPath, { env: { ANTHROPIC_BASE_URL: 'http://127.0.0.1:9999' } });
+      const { calls, secretStoreFactory } = createPurgeSpy();
+
+      const code = await runCli(['__macos-service-action', 'uninstall', '--purge-secrets'], {
+        write: io.write,
+        error: io.error,
+        platform: 'darwin',
+        home,
+        env: {
+          CLAUDE_ROTATOR_MACOS_SERVICE_LOCKED: '1',
+          XDG_CONFIG_HOME: xdgConfig,
+          XDG_DATA_HOME: xdgData,
+        },
+        execFileImpl: noopExecFileImpl,
+        secretStoreFactory,
+      });
+
+      assert.equal(code, 1);
+      assert.match(io.stdout(), /^$/);
+      assert.match(io.stderr(), /ANTHROPIC_BASE_URL is/);
+      assert.doesNotMatch(io.stderr(), /warning:.*purg/i);
+      assert.equal(calls.length, 0);
+    } finally {
+      await rm(sandbox, { recursive: true, force: true });
+    }
+  });
+
+  it('darwin: uninstall --purge-secrets warning reaches the real OS-level stderr of the re-executed process (stdio inheritance)', async () => {
+    // The public `uninstall --purge-secrets` command on macOS re-execs itself
+    // as a locked child process via runMacosCliActionWithLock(), which spawns
+    // with `stdio: 'inherit'` so the child's real stderr fd is shared
+    // directly with the parent's terminal (no Node-level piping in between).
+    // This test exercises that same re-executed-process code path as a real,
+    // separate OS process (not a mocked `error` callback) and captures its
+    // genuine stdout/stderr file descriptors independently, to confirm the
+    // warning is actually written to real process.stderr rather than only to
+    // a test double.
+    const sandbox = await mkdtemp(join(tmpdir(), 'claude-rotator-cli-uninstall-purge-warn-realproc-'));
+    try {
+      const home = join(sandbox, 'home');
+      const xdgConfig = join(sandbox, 'xdg-config');
+      const xdgData = join(sandbox, 'xdg-data');
+      const configPath = join(xdgConfig, 'claude-rotator', 'config.json');
+      await writeBrokenConfig(configPath);
+
+      const cliPath = resolve('src/cli.js');
+      const scriptPath = join(sandbox, 'run-hidden-uninstall.mjs');
+      await writeFile(scriptPath, `
+        import { runCli } from ${JSON.stringify(cliPath)};
+
+        const noopExecFileImpl = async (command, args) => {
+          if (args[0] === 'print') throw Object.assign(new Error('not found'), { code: 113 });
+          return { stdout: '', stderr: '' };
+        };
+
+        const code = await runCli(['__macos-service-action', 'uninstall', '--purge-secrets'], {
+          platform: 'darwin',
+          home: ${JSON.stringify(home)},
+          env: {
+            CLAUDE_ROTATOR_MACOS_SERVICE_LOCKED: '1',
+            XDG_CONFIG_HOME: ${JSON.stringify(xdgConfig)},
+            XDG_DATA_HOME: ${JSON.stringify(xdgData)},
+          },
+          execFileImpl: noopExecFileImpl,
+          secretStoreFactory: () => ({ purge: async () => {} }),
+        });
+        process.exitCode = code;
+      `, 'utf8');
+
+      const result = await runNodeScript(scriptPath);
+
+      assert.equal(result.code, 0, `stderr: ${result.stderr}`);
+      assert.match(result.stdout, /Uninstalled claude-rotator/);
+      assert.match(result.stderr, /warning:.*purg/i);
+    } finally {
+      await rm(sandbox, { recursive: true, force: true });
+    }
+  });
+});
+
+function runNodeScript(scriptPath) {
+  return new Promise((resolveDone, reject) => {
+    const child = spawn(process.execPath, [scriptPath], { stdio: ['ignore', 'pipe', 'pipe'] });
+    const stdout = [];
+    const stderr = [];
+    child.stdout.on('data', chunk => stdout.push(chunk));
+    child.stderr.on('data', chunk => stderr.push(chunk));
+    child.on('error', reject);
+    child.on('exit', code => {
+      resolveDone({
+        code,
+        stdout: Buffer.concat(stdout).toString('utf8'),
+        stderr: Buffer.concat(stderr).toString('utf8'),
+      });
+    });
+  });
+}
 
 describe('runMacosCliActionWithLock', () => {
   it('prepares the lock and re-execs the CLI through absolute lockf', async () => {
