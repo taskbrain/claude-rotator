@@ -1174,19 +1174,25 @@ function requestModelFamily(body) {
   }
 }
 
-// Exact canonical id only. Used to gate reactive Usage confirmation (a
-// second network round trip that mutates quota state), which must stay
-// conservative: see 'requires the exact canonical Fable 5 model id for
-// reactive Usage confirmation' (test/proxy-server.test.js).
+// Exact canonical id match only (no trim/lowercase/regex). Used to gate
+// reactive Usage confirmation (a second network round trip that mutates
+// quota state), which must stay conservative: see 'requires the exact
+// canonical Fable model id for reactive Usage confirmation'
+// (test/proxy-server.test.js). Fable 5 and Fable 5.1 share the same weekly
+// sub-cap, so both canonical ids are listed; a date- or build-suffixed id
+// (e.g. `claude-fable-5-20260818`, `claude-fable-5-1-20260901`) is
+// deliberately excluded.
+const CANONICAL_FABLE_MODEL_IDS = new Set(['claude-fable-5', 'claude-fable-5-1']);
 function isCanonicalFableModelId(value) {
-  return value === 'claude-fable-5';
+  return CANONICAL_FABLE_MODEL_IDS.has(value);
 }
 
 // Lenient prefix match for account-selection ROUTING only (never for
 // confirmation/evidence gating above). Anthropic-issued Fable ids may carry a
-// dated or numbered suffix (e.g. `claude-fable-5-20260818`, a future
-// `claude-fable-5-1`); rejecting those as non-Fable would route them straight
-// at a Fable-exhausted account and surface as a 429 to the caller.
+// dated or numbered suffix (e.g. `claude-fable-5-20260818`,
+// `claude-fable-5-1-20260901`); rejecting those as non-Fable would route
+// them straight at a Fable-exhausted account and surface as a 429 to the
+// caller.
 function isFableRoutingModelId(value) {
   if (typeof value !== 'string') return false;
   return /^claude-fable-\d/.test(value.trim().toLowerCase());

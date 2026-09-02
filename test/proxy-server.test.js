@@ -1666,6 +1666,57 @@ describe('createProxyServer', () => {
     assert.equal(accountManager.getStatus().accounts[0].unavailableReason.window, '7d Fable');
   });
 
+  it('confirms an ambiguous Fable 5.1 429 from same-account usage and retries exactly once', async () => {
+    const upstreamSeen = [];
+    const upstream = await listen(http.createServer((req, res) => {
+      upstreamSeen.push(req.headers.authorization);
+      if (req.headers.authorization === 'Bearer access-token-1') {
+        res.writeHead(429, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ type: 'error', error: { type: 'rate_limit_error', message: 'limit' } }));
+        return;
+      }
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ ok: true }));
+    }));
+    const secretStore = new MemorySecretStore();
+    await secretStore.set('acct_1', { accessToken: 'access-token-1' });
+    await secretStore.set('acct_2', { accessToken: 'access-token-2' });
+    const accountManager = new AccountManager({
+      accounts: [
+        { id: 'acct_1', name: 'a@example.com', type: 'oauth' },
+        { id: 'acct_2', name: 'b@example.com', type: 'oauth' },
+      ],
+      switchThreshold: 1,
+    });
+    accountManager.updateQuota('acct_2', { 'anthropic-ratelimit-unified-5h-utilization': '0.1' });
+    let usageCalls = 0;
+    const proxy = await listen(createProxyServer({
+      accountManager,
+      secretStore,
+      config: { upstream: upstream.url, usagePolling: { enabled: false } },
+      usageFetcher: async token => {
+        usageCalls += 1;
+        assert.equal(token, 'access-token-1');
+        return {
+          scoped_weekly: [{
+            key: 'fable', label: 'Fable', utilization: 1, resets_at: futureReset(),
+          }],
+        };
+      },
+    }));
+    cleanupAfterTest(async () => { await close(proxy.server); await close(upstream.server); });
+
+    const response = await requestJson(`${proxy.url}/v1/messages`, {
+      method: 'POST', body: JSON.stringify({ model: 'claude-fable-5-1' }),
+    });
+
+    assert.equal(response.status, 200);
+    assert.equal(usageCalls, 1);
+    assert.deepEqual(upstreamSeen, ['Bearer access-token-1', 'Bearer access-token-2']);
+    assert.equal(accountManager.find('acct_1').quota.weeklyScoped[0].utilization, 1);
+    assert.equal(accountManager.getStatus().accounts[0].unavailableReason.window, '7d Fable');
+  });
+
   it('forwards a non-fable request to an account whose fable weekly sub-cap is already exhausted', async () => {
     const upstreamSeen = [];
     const upstream = await listen(http.createServer((req, res) => {
@@ -1929,7 +1980,7 @@ describe('createProxyServer', () => {
     // A dated/numbered Fable id must still be routed as a Fable request, even
     // though the strict canonical check used for reactive-confirmation
     // (`requestModelFamily`/`isCanonicalFableModelId`) intentionally rejects it.
-    for (const model of ['claude-fable-5-20260818', 'CLAUDE-FABLE-5', ' claude-fable-5 ']) {
+    for (const model of ['claude-fable-5-20260818', 'CLAUDE-FABLE-5', ' claude-fable-5 ', 'claude-fable-5-1', 'claude-fable-5-1-20260901']) {
       upstreamSeen.length = 0;
       const response = await requestJson(`${proxy.url}/v1/messages`, {
         method: 'POST',
@@ -1937,6 +1988,60 @@ describe('createProxyServer', () => {
       });
       assert.equal(response.status, 200, model);
       assert.deepEqual(upstreamSeen, ['Bearer access-token-2'], `${model} must route straight to acct_2`);
+    }
+  });
+
+  it('keeps the canonical Fable id set a subset of the Fable routing set (canonical subset of routing invariant)', async () => {
+    // isCanonicalFableModelId() and isFableRoutingModelId() are internal
+    // (unexported) helpers in src/proxy-server.js, so this invariant is
+    // pinned behaviorally through the proxy, the same way the M3 test above
+    // pins isFableRoutingModelId(): if an id is canonical (drives reactive
+    // Usage confirmation; see 'confirms an ambiguous Fable ... 429 ...'
+    // tests), it must also be treated as Fable for account-selection
+    // ROUTING, i.e. it must be routed away from an account whose Fable
+    // weekly sub-cap alone is exhausted. The two ids below are exactly the
+    // canonical set (CANONICAL_FABLE_MODEL_IDS in src/proxy-server.js).
+    const canonicalFableModelIds = ['claude-fable-5', 'claude-fable-5-1'];
+    for (const model of canonicalFableModelIds) {
+      const upstreamSeen = [];
+      const upstream = await listen(http.createServer((req, res) => {
+        upstreamSeen.push(req.headers.authorization);
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ ok: true }));
+      }));
+      const secretStore = new MemorySecretStore();
+      await secretStore.set('acct_1', { accessToken: 'access-token-1' });
+      await secretStore.set('acct_2', { accessToken: 'access-token-2' });
+      const accountManager = new AccountManager({
+        accounts: [
+          { id: 'acct_1', name: 'a@example.com', type: 'oauth' },
+          { id: 'acct_2', name: 'b@example.com', type: 'oauth' },
+        ],
+        switchThreshold: 1,
+        now: () => 1000,
+      });
+      accountManager.applyUsage('acct_1', {
+        five_hour: { utilization: 0.2, resets_at: futureReset() },
+        seven_day: { utilization: 0.2, resets_at: futureReset() },
+        scoped_weekly: [{ key: 'fable', label: 'Fable', utilization: 1, resets_at: futureReset() }],
+      });
+      accountManager.applyUsage('acct_2', {
+        five_hour: { utilization: 0.3, resets_at: futureReset() },
+        seven_day: { utilization: 0.3, resets_at: futureReset() },
+      });
+      const proxy = await listen(createProxyServer({
+        accountManager,
+        secretStore,
+        config: { upstream: upstream.url, usagePolling: { enabled: false } },
+      }));
+      cleanupAfterTest(async () => { await close(proxy.server); await close(upstream.server); });
+
+      const response = await requestJson(`${proxy.url}/v1/messages`, {
+        method: 'POST',
+        body: JSON.stringify({ model }),
+      });
+      assert.equal(response.status, 200, model);
+      assert.deepEqual(upstreamSeen, ['Bearer access-token-2'], `${model} (canonical) must also route as Fable, straight to acct_2`);
     }
   });
 
@@ -4222,7 +4327,7 @@ describe('createProxyServer', () => {
     assert.deepEqual(upstreamSeen, ['Bearer access-token-1']);
   });
 
-  it('requires the exact canonical Fable 5 model id for reactive Usage confirmation', async () => {
+  it('requires an exact canonical Fable model id set match for reactive Usage confirmation', async () => {
     const upstreamSeen = [];
     const originalBody = {
       type: 'error', error: { type: 'rate_limit_error', message: 'negated model throttle' },
@@ -4271,12 +4376,15 @@ describe('createProxyServer', () => {
       await close(upstream.server);
     });
 
-    for (const model of [
+    const models = [
       'claude-not-fable-5',
       'CLAUDE-FABLE-5',
       ' claude-fable-5 ',
       'claude-fable-5-20260818',
-    ]) {
+      'claude-fable-5-1-20260901',
+      'claude-mythos-5-1',
+    ];
+    for (const model of models) {
       const response = await requestJson(`${proxy.url}/v1/messages`, {
         method: 'POST', body: JSON.stringify({ model }),
       });
@@ -4285,7 +4393,7 @@ describe('createProxyServer', () => {
       assert.equal(response.headers['x-reactive-test'], 'negated-fable-token', model);
     }
     assert.equal(usageCalls, 0);
-    assert.deepEqual(upstreamSeen, Array(4).fill('Bearer access-token-1'));
+    assert.deepEqual(upstreamSeen, Array(models.length).fill('Bearer access-token-1'));
   });
 
   it('expires a 20ms reactive confirmation so late Usage success cannot mutate quota', async () => {
