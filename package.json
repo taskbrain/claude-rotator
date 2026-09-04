@@ -1,6 +1,6 @@
 {
   "name": "claude-rotator",
-  "version": "0.2.1",
+  "version": "0.2.2",
   "description": "Local model-aware Claude Code account rotator proxy for macOS and Linux.",
   "keywords": [
     "claude",
