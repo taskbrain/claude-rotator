@@ -14,6 +14,7 @@ npm レジストリでは配布していません（`package.json` は `"private
 
 ## 目次
 
+- [v0.2.2 の主な更新](#v022-の主な更新)
 - [v0.2.1 の主な更新](#v021-の主な更新)
 - [v0.2.0 の主な更新](#v020-の主な更新)
 - [なぜ作ったか](#なぜ作ったか)
@@ -34,6 +35,10 @@ npm レジストリでは配布していません（`package.json` は `"private
 - [安全設計](#安全設計)
 - [開発](#開発)
 - [English](#english)
+
+## v0.2.2 の主な更新
+
+- **Fable 5.1 (`claude-fable-5-1`) を正規Fableモデルとして認識**（#40）: 曖昧な429に対する「Usage API再確認→別口座への再送」という回復経路のゲートが、正確なモデルID `claude-fable-5` の完全一致だけを見ており、`claude-fable-5-1` のリクエストはこの回復経路を丸ごと通れず、上流の429がそのまま返っていました。Fable 5 と 5.1 は同一の週次サブキャップを共有するため、正規IDを `{claude-fable-5, claude-fable-5-1}` の完全一致集合に拡張しました（日付付きID・trim違い・小文字化違いは引き続き非該当）。
 
 ## v0.2.1 の主な更新
 
@@ -687,6 +692,7 @@ This package is not published to the npm registry (`package.json` sets `"private
 
 ### Table of Contents
 
+- [What's New in v0.2.2](#whats-new-in-v022)
 - [What's New in v0.2.1](#whats-new-in-v021)
 - [What's New in v0.2.0](#whats-new-in-v020)
 - [Why](#why)
@@ -706,6 +712,10 @@ This package is not published to the npm registry (`package.json` sets `"private
 - [Troubleshooting](#troubleshooting)
 - [Security Design](#security-design)
 - [Development](#development)
+
+### What's New in v0.2.2
+
+- **Recognize Fable 5.1 (`claude-fable-5-1`) as a canonical Fable model** (#40): The gate for the recovery path that rechecks the Usage API and replays an ambiguous 429 to another account only matched the exact model ID `claude-fable-5`, so `claude-fable-5-1` requests never got this recovery and the original upstream 429 was returned as-is. Since Fable 5 and 5.1 share the same weekly sub-cap, the canonical ID set was extended to the exact-match set `{claude-fable-5, claude-fable-5-1}` (dated IDs, trimming, and case differences remain excluded).
 
 ### What's New in v0.2.1
 
