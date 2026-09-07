@@ -1,6 +1,7 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 import http from 'node:http';
+import { EventEmitter } from 'node:events';
 
 import { AccountManager } from '../src/account-manager.js';
 import { LOCAL_GATEWAY_AUTH_TOKEN, createDefaultConfig } from '../src/config.js';
@@ -58,17 +59,6 @@ describe('shouldRouteToOpenAiBridge', () => {
     }
   });
 
-  it('returns the parsed body so callers never re-parse it (仕様書 4.2.2 節 a)', () => {
-    const body = Buffer.from(JSON.stringify({ model: 'gpt-6-astra', max_tokens: 7 }));
-    const result = shouldRouteToOpenAiBridge(body, settings);
-    assert.equal(typeof result.parsed, 'object');
-    assert.equal(result.parsed.max_tokens, 7);
-    // Claude 宛（no-match）でも parsed を返す。forwardWithRotation 側へ渡して再パースを避けるため。
-    const claude = shouldRouteToOpenAiBridge(Buffer.from(JSON.stringify({ model: 'claude-opus-5' })), settings);
-    assert.equal(claude.route, false);
-    assert.equal(claude.parsed.model, 'claude-opus-5');
-  });
-
   it('never routes Claude models', () => {
     for (const model of ['claude-opus-5', 'claude-haiku-4-5-20251001', 'claude-fable-5-1', 'claude-sonnet-5']) {
       const result = shouldRouteToOpenAiBridge(Buffer.from(JSON.stringify({ model })), settings);
@@ -114,6 +104,31 @@ describe('shouldRouteToOpenAiBridge', () => {
     assert.equal(settingsRemote.enabled, false);
     assert.match(settingsRemote.warning, /loopback/);
   });
+
+  it('never parses the body when the bridge is disabled (レビュー指摘8)', () => {
+    // safeParseBody() は内部で JSON.parse() を呼ぶ。無効時に早期 return していれば、
+    // JSON.parse は一度も呼ばれない。呼び出し回数を直接計測して確認する
+    // （戻り値だけでは disabled 時に parsed が返らないことしか確認できず、
+    //  内部で実際にパースを試みたかどうかは判定できないため）。
+    const originalParse = JSON.parse;
+    let parseCalls = 0;
+    JSON.parse = (...args) => { parseCalls += 1; return originalParse(...args); };
+    try {
+      const body = Buffer.from('{"model":"gpt-6-astra"}');
+      const disabledSettings = resolveOpenAiBridgeSettings(createDefaultConfig());
+      const disabledResult = shouldRouteToOpenAiBridge(body, disabledSettings);
+      assert.equal(disabledResult.reason, 'disabled');
+      assert.equal(disabledResult.route, false);
+      assert.equal(parseCalls, 0, 'JSON.parse must not run at all when the bridge is disabled');
+
+      const enabledSettings = resolveOpenAiBridgeSettings({ openaiBridge: { ...createDefaultConfig().openaiBridge, enabled: true } });
+      const enabledResult = shouldRouteToOpenAiBridge(body, enabledSettings);
+      assert.equal(enabledResult.route, true);
+      assert.equal(parseCalls, 1, 'JSON.parse must run once the bridge is enabled');
+    } finally {
+      JSON.parse = originalParse;
+    }
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -147,6 +162,86 @@ async function callThroughRotator({ bridgeHandler, requestBody, settingsOverride
   front.close();
   bridge.close();
   return { response, text, lines, bridgePort: port };
+}
+
+// ---------------------------------------------------------------------------
+// httpRequestImpl を差し替えるための最小フェイク（Task 26 追試: レビュー指摘6・7）
+// 実ネットワークに頼らず、接続確立・応答・データイベントを手動で駆動する。
+// ---------------------------------------------------------------------------
+
+function fakeIncomingRequest({ url = '/v1/messages', method = 'POST', headers = {} } = {}) {
+  const req = new EventEmitter();
+  req.url = url;
+  req.method = method;
+  req.headers = headers;
+  return req;
+}
+
+function fakeServerResponse() {
+  const res = new EventEmitter();
+  res.headersSent = false;
+  res.writableEnded = false;
+  res.destroyed = false;
+  res.writes = [];
+  let forceNextWriteFalse = false;
+  res.writeHead = (statusCode, headers) => {
+    res.headersSent = true;
+    res.statusCode = statusCode;
+    res.headers = headers;
+  };
+  res.write = chunk => {
+    res.writes.push(chunk);
+    if (forceNextWriteFalse) {
+      forceNextWriteFalse = false;
+      return false;
+    }
+    return true;
+  };
+  res.forceNextWriteToReportBackpressure = () => { forceNextWriteFalse = true; };
+  res.end = () => { res.writableEnded = true; };
+  res.destroy = () => {
+    // 実際の http.ServerResponse#destroy() は 'close' を非同期に発火する
+    // （基底ソケットのクローズ経由）。同期発火にすると、この destroy() 自体を
+    // 呼び出したコード（例: upstream の 'error' ハンドラ）が続けて finish() を
+    // 呼ぶより先に res.on('close') 経由の finish('client-abort') が先着してしまい、
+    // 本来の outcome を上書きしてしまう。process.nextTick で実機の順序を再現する。
+    if (res.destroyed) return;
+    res.destroyed = true;
+    process.nextTick(() => res.emit('close'));
+  };
+  return res;
+}
+
+// 接続は常に即座に（次tickで）成功したことにする最小の httpRequestImpl。
+// テスト側は返り値の getCallback()/getUpstream() で upstream 応答を手動駆動する。
+function createManualUpstream() {
+  let callback = null;
+  let upstream = null;
+  const requestImpl = (options, cb) => {
+    callback = cb;
+    upstream = new EventEmitter();
+    upstream.destroyed = false;
+    upstream.destroy = () => { upstream.destroyed = true; };
+    upstream.end = () => {
+      process.nextTick(() => upstream.emit('socket', { connecting: false }));
+    };
+    return upstream;
+  };
+  return {
+    requestImpl,
+    getCallback: () => callback,
+    getUpstream: () => upstream,
+  };
+}
+
+function fakeUpstreamResponse(statusCode = 200, headers = {}) {
+  const upstreamRes = new EventEmitter();
+  upstreamRes.statusCode = statusCode;
+  upstreamRes.headers = headers;
+  upstreamRes.paused = false;
+  upstreamRes.pause = () => { upstreamRes.paused = true; };
+  upstreamRes.resume = () => { upstreamRes.paused = false; };
+  return upstreamRes;
 }
 
 describe('forwardToOpenAiBridge', () => {
@@ -276,7 +371,7 @@ describe('forwardToOpenAiBridge', () => {
     assert.ok(lines.every(l => !/secret text/.test(l)));
   });
 
-  it('propagates a client abort to the upstream bridge connection', async () => {
+  it('propagates a client abort to the upstream bridge connection (production shape: req fully drained before forward, レビュー指摘1)', async () => {
     let bridgeReqAborted = false;
     const { server: bridge, port } = await startFakeBridge((req, res) => {
       req.on('aborted', () => { bridgeReqAborted = true; });
@@ -288,8 +383,17 @@ describe('forwardToOpenAiBridge', () => {
     const lines = [];
     let finished;
     const finishedPromise = new Promise(resolve => { finished = resolve; });
-    const front = http.createServer((req, res) => {
-      forwardToOpenAiBridge({ req, res, body: Buffer.from('{"model":"gpt-6-astra"}'), settings, logger: l => { lines.push(l); finished(); } });
+    const front = http.createServer(async (req, res) => {
+      // src/proxy-server.js の readBody(req) と同じく、for-await で本文を読み切って
+      // から forward する。これで req.complete===true になり、この時点以降
+      // 'aborted' はもう発火しない。client-abort の検出は res.on('close') 経由で
+      // なければならない（旧テストは body を読み切らずに forward していたため、
+      // 本番では起きない 'aborted' 発火に依存する空振りテストになっていた）。
+      const chunks = [];
+      for await (const chunk of req) chunks.push(chunk);
+      assert.equal(req.complete, true, 'the request body must be fully drained before forwarding, matching production readBody()');
+      const body = Buffer.concat(chunks);
+      await forwardToOpenAiBridge({ req, res, body, model: safeParseModel(body), settings, logger: l => { lines.push(l); finished(); } });
     });
     await new Promise(resolve => front.listen(0, '127.0.0.1', resolve));
     const controller = new AbortController();
@@ -307,8 +411,201 @@ describe('forwardToOpenAiBridge', () => {
     await new Promise(resolve => setTimeout(resolve, 50));
     front.close();
     bridge.close();
-    assert.ok(bridgeReqAborted, 'the upstream bridge request must be destroyed when the client aborts');
+    assert.ok(bridgeReqAborted, 'the upstream bridge request must be destroyed when the client aborts (detected via res.on("close"), not req.on("aborted"))');
     assert.ok(lines.some(l => /outcome=client-abort/.test(l)), lines.join('\n'));
+  });
+
+  it('pins the upstream host/port to settings.url even for an absolute-form req.url (レビュー指摘3)', async () => {
+    // HTTP のリクエストラインは絶対形式（proxy形式）を取り得る。req.url をそのまま
+    // `new URL(req.url, settings.url)` に渡すと、絶対URLが base を無視して接続先
+    // ホストを乗っ取ってしまう。hostname/port は必ず settings.url 由来であることを固定する。
+    let seenPath = null;
+    const { server: bridge, port } = await startFakeBridge((req, res) => {
+      seenPath = req.url;
+      res.writeHead(200, { 'Content-Type': 'application/json' }).end('{"ok":true}');
+    });
+    const settings = resolveOpenAiBridgeSettings({
+      openaiBridge: { enabled: true, url: `http://127.0.0.1:${port}`, modelPattern: '^gpt-', connectTimeoutMs: 2000, idleTimeoutMs: 2000, connectRetries: 0 },
+    });
+    const front = http.createServer(async (req, res) => {
+      const chunks = [];
+      for await (const c of req) chunks.push(c);
+      const body = Buffer.concat(chunks);
+      await forwardToOpenAiBridge({ req, res, body, model: safeParseModel(body), settings, logger: () => {} });
+    });
+    await new Promise(resolve => front.listen(0, '127.0.0.1', resolve));
+    const response = await new Promise((resolve, reject) => {
+      const request = http.request({
+        hostname: '127.0.0.1',
+        port: front.address().port,
+        // 絶対形式のリクエストライン。攻撃者が req.url でホストを制御しようとする状況を再現する。
+        path: 'http://evil.example.com:1/v1/messages?beta=true',
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+      }, res => {
+        const chunks = [];
+        res.on('data', chunk => chunks.push(chunk));
+        res.on('end', () => resolve({ status: res.statusCode, text: Buffer.concat(chunks).toString() }));
+      });
+      request.on('error', reject);
+      request.end('{"model":"gpt-6-astra"}');
+    });
+    front.close();
+    bridge.close();
+    assert.equal(response.status, 200, response.text);
+    assert.equal(seenPath, '/v1/messages?beta=true', 'the bridge must only see the path/query; the evil.example.com host from the absolute-form request line must never reach it');
+  });
+
+  it('retries a connection reset before any bridge response arrives, up to connectRetries (レビュー指摘2)', async () => {
+    let connectionCount = 0;
+    const bridge = http.createServer((req, res) => {
+      res.writeHead(200, { 'Content-Type': 'application/json' }).end('{"ok":true}');
+    });
+    bridge.on('connection', socket => {
+      connectionCount += 1;
+      if (connectionCount === 1) socket.destroy(); // 最初の接続だけ即座にリセットする
+    });
+    await new Promise(resolve => bridge.listen(0, '127.0.0.1', resolve));
+    const port = bridge.address().port;
+    const settings = resolveOpenAiBridgeSettings({
+      openaiBridge: { enabled: true, url: `http://127.0.0.1:${port}`, modelPattern: '^gpt-', connectTimeoutMs: 2000, idleTimeoutMs: 2000, connectRetries: 1 },
+    });
+    const lines = [];
+    const front = http.createServer(async (req, res) => {
+      const chunks = [];
+      for await (const c of req) chunks.push(c);
+      const body = Buffer.concat(chunks);
+      await forwardToOpenAiBridge({ req, res, body, model: safeParseModel(body), settings, logger: l => lines.push(l) });
+    });
+    await new Promise(resolve => front.listen(0, '127.0.0.1', resolve));
+    const response = await fetch(`http://127.0.0.1:${front.address().port}/v1/messages`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{"model":"gpt-6-astra"}',
+    });
+    const text = await response.text();
+    front.close();
+    bridge.close();
+    assert.equal(response.status, 200, text);
+    assert.ok(connectionCount >= 2, `expected at least 2 connection attempts (initial + retry), saw ${connectionCount}`);
+    assert.ok(lines.some(l => /outcome=forwarded/.test(l)), lines.join('\n'));
+  });
+
+  it('does not retry once a response has already been forwarded to the client (no double-processing after res.headersSent)', async () => {
+    // ヘッダ送出後（res.headersSent===true）に低レベルの接続エラーが起きても、
+    // bridge は既にリクエストを処理し始めているため再試行してはいけない
+    // （二重処理のリスク）。fake httpRequestImpl で決定的に再現する
+    // （実ソケットで headers 送出直後に destroy() すると、Node の http クライアントが
+    //  ヘッダ受信自体を完了できず response イベントより先に ECONNRESET を req 側で
+    //  検出することがあり、実ネットワークでは再現が不安定なため）。
+    let requestImplCalls = 0;
+    const manual = createManualUpstream();
+    const countingRequestImpl = (options, callback) => {
+      requestImplCalls += 1;
+      return manual.requestImpl(options, callback);
+    };
+    const req = fakeIncomingRequest();
+    const res = fakeServerResponse();
+    const settings = resolveOpenAiBridgeSettings({
+      openaiBridge: { enabled: true, url: 'http://127.0.0.1:1', modelPattern: '^gpt-', connectTimeoutMs: 2000, idleTimeoutMs: 2000, connectRetries: 2 },
+    });
+    const donePromise = forwardToOpenAiBridge({
+      req, res, body: Buffer.from('{"model":"gpt-6-astra"}'), model: 'gpt-6-astra', settings,
+      logger: () => {}, httpRequestImpl: countingRequestImpl,
+    });
+    await new Promise(resolve => setImmediate(resolve));
+
+    const upstreamRes = fakeUpstreamResponse(200, {});
+    manual.getCallback()(upstreamRes); // ヘッダ受信 → res.writeHead() が走り res.headersSent=true になる
+    assert.equal(res.headersSent, true, 'precondition: the response head must already be forwarded to the client');
+
+    // ヘッダ送出後に bridge 側の接続が切れた状況を模す。
+    manual.getUpstream().emit('error', Object.assign(new Error('read ECONNRESET'), { code: 'ECONNRESET' }));
+
+    assert.equal(requestImplCalls, 1, 'a failure after the response head was already forwarded must never open a retry connection');
+    const result = await donePromise;
+    assert.equal(result.outcome, 'bridge-unreachable');
+  });
+
+  it('logs the synthesized 403 status for an idle-timeout, not the placeholder "-" (レビュー指摘6)', async () => {
+    // 旧実装は sendSynthetic() を呼んだ後に res.headersSent を再評価していたため、
+    // sendSynthetic 自身が headersSent を true にしてしまい、実際には403を送っている
+    // のにログの status が null（"-"）になるバグがあった。sendSynthetic 前に
+    // willSend を確定してから使う。
+    const manual = createManualUpstream();
+    const req = fakeIncomingRequest();
+    const res = fakeServerResponse();
+    const lines = [];
+    const settings = resolveOpenAiBridgeSettings({
+      openaiBridge: { enabled: true, url: 'http://127.0.0.1:1', modelPattern: '^gpt-', connectTimeoutMs: 2000, idleTimeoutMs: 20, connectRetries: 0 },
+    });
+    const result = await forwardToOpenAiBridge({
+      req, res, body: Buffer.from('{"model":"gpt-6-astra"}'), model: 'gpt-6-astra', settings,
+      logger: l => lines.push(l), httpRequestImpl: manual.requestImpl,
+    });
+    assert.equal(result.outcome, 'bridge-timeout');
+    assert.equal(result.status, 403, 'a synthesized 403 must be reported as the log status, not null');
+    const logLine = lines.find(l => /outcome=bridge-timeout/.test(l));
+    assert.ok(logLine, lines.join('\n'));
+    assert.match(logLine, /status=403/);
+  });
+
+  it('pauses the upstream response and resumes on drain when the client write buffer is full (レビュー指摘7)', async () => {
+    const manual = createManualUpstream();
+    const req = fakeIncomingRequest();
+    const res = fakeServerResponse();
+    const settings = resolveOpenAiBridgeSettings({
+      openaiBridge: { enabled: true, url: 'http://127.0.0.1:1', modelPattern: '^gpt-', connectTimeoutMs: 2000, idleTimeoutMs: 2000, connectRetries: 0 },
+    });
+    const donePromise = forwardToOpenAiBridge({
+      req, res, body: Buffer.from('{"model":"gpt-6-astra"}'), model: 'gpt-6-astra', settings,
+      logger: () => {}, httpRequestImpl: manual.requestImpl,
+    });
+
+    // フェイクの接続確立（process.nextTick で 'socket' イベントが発火する）を待つ。
+    await new Promise(resolve => setImmediate(resolve));
+
+    const upstreamRes = fakeUpstreamResponse(200, { 'content-type': 'text/event-stream' });
+    manual.getCallback()(upstreamRes);
+
+    res.forceNextWriteToReportBackpressure();
+    upstreamRes.emit('data', Buffer.from('chunk-1'));
+    assert.equal(upstreamRes.paused, true, 'the upstream response must be paused when res.write() reports backpressure');
+
+    res.emit('drain');
+    assert.equal(upstreamRes.paused, false, 'the upstream response must resume once the client drains');
+
+    upstreamRes.emit('data', Buffer.from('chunk-2'));
+    assert.deepEqual(res.writes.map(chunk => chunk.toString()), ['chunk-1', 'chunk-2']);
+
+    upstreamRes.emit('end');
+    const result = await donePromise;
+    assert.equal(result.outcome, 'forwarded');
+  });
+
+  it('drops incoming chunks and destroys the upstream once the client response is already destroyed (data ハンドラ先頭のガード)', async () => {
+    const manual = createManualUpstream();
+    const req = fakeIncomingRequest();
+    const res = fakeServerResponse();
+    const settings = resolveOpenAiBridgeSettings({
+      openaiBridge: { enabled: true, url: 'http://127.0.0.1:1', modelPattern: '^gpt-', connectTimeoutMs: 2000, idleTimeoutMs: 2000, connectRetries: 0 },
+    });
+    const donePromise = forwardToOpenAiBridge({
+      req, res, body: Buffer.from('{"model":"gpt-6-astra"}'), model: 'gpt-6-astra', settings,
+      logger: () => {}, httpRequestImpl: manual.requestImpl,
+    });
+    await new Promise(resolve => setImmediate(resolve));
+    const upstreamRes = fakeUpstreamResponse(200, {});
+    manual.getCallback()(upstreamRes);
+
+    res.destroyed = true;
+    let upstreamDestroyed = false;
+    manual.getUpstream().destroy = () => { upstreamDestroyed = true; };
+    upstreamRes.emit('data', Buffer.from('too-late'));
+    assert.equal(upstreamDestroyed, true, 'the upstream request must be destroyed once the client response is already gone');
+    assert.deepEqual(res.writes, [], 'no data may be written to an already-destroyed client response');
+
+    // 後始末: end を発火させて Promise を解決させる（未解決の Promise を残さない）。
+    upstreamRes.emit('end');
+    await donePromise;
   });
 });
 
@@ -317,15 +614,225 @@ describe('forwardToOpenAiBridge', () => {
 // ---------------------------------------------------------------------------
 
 describe('POST /internal/reload with openaiBridge', () => {
-  it('applies an openaiBridge change without a process restart', async () => {
-    // config オブジェクトを差し替えるリロード関数を模し、reload 後に enabled が効くことを確認する
-    const config = { openaiBridge: { enabled: false, url: 'http://127.0.0.1:18765', modelPattern: '^gpt-', connectTimeoutMs: 1000, idleTimeoutMs: 1000, connectRetries: 0 } };
-    const before = resolveOpenAiBridgeSettings(config);
-    assert.equal(before.enabled, false);
-    // reload 相当: 設定ファイルの内容で config を更新する
-    Object.assign(config, { openaiBridge: { ...config.openaiBridge, enabled: true } });
-    const after = resolveOpenAiBridgeSettings(config);
-    assert.equal(after.enabled, true, 'the branch must pick up the reloaded config object');
+  it('reverts to the default (disabled) bridge config once the section/config.json disappears on reload (レビュー指摘4)', async () => {
+    // reloadOpenAiBridge が undefined を返す状況（openaiBridge セクションが config.json
+    // から削除された、または config.json 自体が無い）を模す。旧実装は falsy を
+    // 「変更なし」と誤認し、削除後も古い（有効な）設定を保持し続けるバグがあった。
+    const anthropicSeen = [];
+    const anthropic = await listen(http.createServer(async (req, res) => {
+      const chunks = [];
+      for await (const c of req) chunks.push(c);
+      anthropicSeen.push({ body: Buffer.concat(chunks).toString() });
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ ok: true, usage: { input_tokens: 1, output_tokens: 1 } }));
+    }));
+
+    const bridgeSeen = [];
+    const bridge = await listen(http.createServer(async (req, res) => {
+      const chunks = [];
+      for await (const c of req) chunks.push(c);
+      bridgeSeen.push({ body: Buffer.concat(chunks).toString() });
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ ok: true }));
+    }));
+
+    const secretStore = new MemorySecretStore();
+    await secretStore.set('acct_1', { accessToken: 'access-token-1' });
+    const accountManager = new AccountManager({
+      accounts: [{ id: 'acct_1', name: 'a@example.com', type: 'oauth' }],
+      now: () => 1000,
+    });
+
+    // 起動時は明示的に enabled:true
+    const config = {
+      upstream: anthropic.url,
+      usagePolling: { enabled: false },
+      openaiBridge: {
+        enabled: true,
+        url: bridge.url,
+        modelPattern: '^gpt-',
+        connectTimeoutMs: 1000,
+        idleTimeoutMs: 1000,
+        connectRetries: 0,
+      },
+    };
+    const proxy = await listen(createProxyServer({
+      accountManager,
+      secretStore,
+      config,
+      // undefined を返す = openaiBridge セクション・config.json が消えた状態
+      reloadOpenAiBridge: async () => undefined,
+    }));
+
+    try {
+      const before = await requestJson(`${proxy.url}/v1/messages`, {
+        method: 'POST',
+        body: JSON.stringify({ model: 'gpt-6-astra' }),
+        headers: {
+          authorization: `Bearer ${LOCAL_GATEWAY_AUTH_TOKEN}`,
+          'content-type': 'application/json',
+        },
+      });
+      assert.equal(before.status, 200);
+      assert.equal(bridgeSeen.length, 1, 'starts enabled, so the request must reach the bridge stub');
+
+      const reloadResponse = await requestJson(`${proxy.url}/internal/reload`, { method: 'POST' });
+      assert.equal(reloadResponse.status, 200);
+
+      const after = await requestJson(`${proxy.url}/v1/messages`, {
+        method: 'POST',
+        body: JSON.stringify({ model: 'gpt-6-astra' }),
+        headers: {
+          authorization: `Bearer ${LOCAL_GATEWAY_AUTH_TOKEN}`,
+          'content-type': 'application/json',
+        },
+      });
+      assert.equal(after.status, 200);
+      assert.equal(bridgeSeen.length, 1, 'the bridge stub must not see a second request once the section disappears');
+      assert.equal(anthropicSeen.length, 1, 'the request must fall back to the Anthropic stub once the branch reverts to the default (disabled)');
+    } finally {
+      await close(proxy.server);
+      await close(anthropic.server);
+      await close(bridge.server);
+    }
+  });
+
+  it('logs the openaiBridge config-warning only once at startup, not per request (レビュー指摘5)', async () => {
+    const anthropicSeen = [];
+    const anthropic = await listen(http.createServer(async (req, res) => {
+      const chunks = [];
+      for await (const c of req) chunks.push(c);
+      anthropicSeen.push({ body: Buffer.concat(chunks).toString() });
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ ok: true, usage: { input_tokens: 1, output_tokens: 1 } }));
+    }));
+
+    const secretStore = new MemorySecretStore();
+    await secretStore.set('acct_1', { accessToken: 'access-token-1' });
+    const accountManager = new AccountManager({
+      accounts: [{ id: 'acct_1', name: 'a@example.com', type: 'oauth' }],
+      now: () => 1000,
+    });
+
+    const lines = [];
+    // modelPattern が不正 → resolveOpenAiBridgeSettings のフェイルセーフで無効化され、
+    // warning が立つ（仕様書 4.2.2 節 b）。
+    const badOpenaiBridgeConfig = {
+      enabled: true,
+      url: 'http://127.0.0.1:18765',
+      modelPattern: '([unclosed',
+      connectTimeoutMs: 1000,
+      idleTimeoutMs: 1000,
+      connectRetries: 0,
+    };
+    const config = {
+      upstream: anthropic.url,
+      usagePolling: { enabled: false },
+      openaiBridge: { ...badOpenaiBridgeConfig },
+    };
+    const proxy = await listen(createProxyServer({
+      accountManager,
+      secretStore,
+      config,
+      reloadOpenAiBridge: async () => badOpenaiBridgeConfig,
+      logger: line => lines.push(line),
+    }));
+    const countConfigWarnings = () => lines.filter(l => /openai-bridge config-warning/.test(l)).length;
+
+    try {
+      assert.equal(countConfigWarnings(), 1, 'exactly one config-warning line must be logged at startup');
+
+      for (let i = 0; i < 3; i += 1) {
+        // eslint-disable-next-line no-await-in-loop
+        const response = await requestJson(`${proxy.url}/v1/messages`, {
+          method: 'POST',
+          body: JSON.stringify({ model: 'gpt-6-astra' }),
+          headers: {
+            authorization: `Bearer ${LOCAL_GATEWAY_AUTH_TOKEN}`,
+            'content-type': 'application/json',
+          },
+        });
+        assert.equal(response.status, 200);
+      }
+      assert.equal(anthropicSeen.length, 3, 'the fail-safe branch must still fall back to the Anthropic stub for every request');
+      assert.equal(countConfigWarnings(), 1, 'sending more requests must not repeat the per-request config-warning log line (旧実装は毎リクエスト再ログしていた)');
+
+      const reloadResponse = await requestJson(`${proxy.url}/internal/reload`, { method: 'POST' });
+      assert.equal(reloadResponse.status, 200);
+      assert.equal(countConfigWarnings(), 1, 'reload must not add a second separate config-warning line; the warning is folded into the reload log line instead');
+      assert.ok(lines.some(l => /openai-bridge reload/.test(l) && /warning=/.test(l)), lines.join('\n'));
+    } finally {
+      await close(proxy.server);
+      await close(anthropic.server);
+    }
+  });
+
+  it('does not log parse-error-fallback for a bodyless request, but does for a malformed non-empty body (レビュー指摘5)', async () => {
+    const anthropicSeen = [];
+    const anthropic = await listen(http.createServer(async (req, res) => {
+      const chunks = [];
+      for await (const c of req) chunks.push(c);
+      anthropicSeen.push({ method: req.method, url: req.url });
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ ok: true, usage: { input_tokens: 1, output_tokens: 1 } }));
+    }));
+    const bridge = await listen(http.createServer((req, res) => {
+      res.writeHead(200, { 'Content-Type': 'application/json' }).end('{"ok":true}');
+    }));
+
+    const secretStore = new MemorySecretStore();
+    await secretStore.set('acct_1', { accessToken: 'access-token-1' });
+    const accountManager = new AccountManager({
+      accounts: [{ id: 'acct_1', name: 'a@example.com', type: 'oauth' }],
+      now: () => 1000,
+    });
+
+    const lines = [];
+    const config = {
+      upstream: anthropic.url,
+      usagePolling: { enabled: false },
+      openaiBridge: {
+        enabled: true,
+        url: bridge.url,
+        modelPattern: '^gpt-',
+        connectTimeoutMs: 1000,
+        idleTimeoutMs: 1000,
+        connectRetries: 0,
+      },
+    };
+    const proxy = await listen(createProxyServer({
+      accountManager,
+      secretStore,
+      config,
+      logger: line => lines.push(line),
+    }));
+
+    try {
+      // 本文なしの GET は無ログ（HEAD/GET相当。仕様書のテスト対象そのもの）。
+      const getResponse = await requestJson(`${proxy.url}/v1/models`, {
+        method: 'GET',
+        headers: { authorization: `Bearer ${LOCAL_GATEWAY_AUTH_TOKEN}` },
+      });
+      assert.equal(getResponse.status, 200);
+      assert.equal(anthropicSeen.length, 1, 'a GET with no matching model must still reach the Anthropic stub');
+      assert.ok(lines.every(l => !/parse-error-fallback/.test(l)), `a bodyless GET must not log parse-error-fallback: ${lines.join('\n')}`);
+
+      // 本文はあるが JSON として壊れているリクエストは記録する。
+      const badResponse = await requestJson(`${proxy.url}/v1/messages`, {
+        method: 'POST',
+        body: '<<not json>>',
+        headers: {
+          authorization: `Bearer ${LOCAL_GATEWAY_AUTH_TOKEN}`,
+          'content-type': 'application/json',
+        },
+      });
+      assert.equal(badResponse.status, 200);
+      assert.ok(lines.some(l => /parse-error-fallback/.test(l)), `a malformed non-empty body must still be logged: ${lines.join('\n')}`);
+    } finally {
+      await close(proxy.server);
+      await close(anthropic.server);
+      await close(bridge.server);
+    }
   });
 
   it('serves a reloaded openaiBridge setting on the next request', async () => {

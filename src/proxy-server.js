@@ -22,6 +22,7 @@ import { createNativeClaudeRefresher } from './native-claude-refresher.js';
 import { isFableScopeIdentity, parseRateLimitHeaders } from './quota.js';
 import { duplicateRefreshTokenAccountIds } from './secret-store.js';
 import {
+  DEFAULT_OPENAI_BRIDGE,
   forwardToOpenAiBridge,
   resolveOpenAiBridgeSettings,
   shouldRouteToOpenAiBridge,
@@ -231,6 +232,14 @@ export function createProxyServer({
   operationalStateCheck = checkInitialCredentialState();
   operationalStateCheck.catch(() => {});
 
+  // openaiBridge の設定解決結果はここでキャッシュする（起動時に1回、以後は
+  // POST /internal/reload のときだけ再計算する）。毎リクエスト resolveOpenAiBridgeSettings()
+  // を呼び直すと正規表現の再コンパイルとログの洪水（レビュー指摘5）を招く。
+  let openaiBridgeSettings = resolveOpenAiBridgeSettings(config);
+  if (openaiBridgeSettings.warning) {
+    logger?.(`${new Date().toISOString()} openai-bridge config-warning ${openaiBridgeSettings.warning}`);
+  }
+
   const server = http.createServer(async (req, res) => {
     try {
       if (!isTrustedLocalHttpRequest(req)) {
@@ -317,14 +326,18 @@ export function createProxyServer({
         // 口座再読込のロジックには一切触れない。
         if (reloadOpenAiBridge) {
           const nextOpenaiBridge = await reloadOpenAiBridge();
-          if (nextOpenaiBridge) {
-            config.openaiBridge = nextOpenaiBridge;
-            const resolved = resolveOpenAiBridgeSettings(config);
-            logger?.(
-              `${new Date().toISOString()} openai-bridge reload enabled=${resolved.enabled} `
-              + `url=${resolved.url}${resolved.warning ? ` warning="${resolved.warning}"` : ''}`,
-            );
-          }
+          // openaiBridge セクションが無い、または config.json 自体が無い場合
+          // （reloadOpenAiBridge が undefined を返す）は既定（オフ）へ戻す。
+          // 旧実装は falsy を「変更なし」と誤認し、削除後も古い（有効な）
+          // 設定を保持し続けるバグがあった（レビュー指摘4）。
+          config.openaiBridge = nextOpenaiBridge !== undefined
+            ? nextOpenaiBridge
+            : { ...DEFAULT_OPENAI_BRIDGE };
+          openaiBridgeSettings = resolveOpenAiBridgeSettings(config);
+          logger?.(
+            `${new Date().toISOString()} openai-bridge reload enabled=${openaiBridgeSettings.enabled} `
+            + `url=${openaiBridgeSettings.url}${openaiBridgeSettings.warning ? ` warning="${openaiBridgeSettings.warning}"` : ''}`,
+          );
         }
         // Reconcile in the background instead of awaiting it (or replacing
         // the shared operationalStateCheck gate other requests await): each
@@ -382,12 +395,8 @@ export function createProxyServer({
         return;
       }
       const body = await readBody(req);
-      const openaiBridgeSettings = resolveOpenAiBridgeSettings(config);
-      if (openaiBridgeSettings.warning) {
-        // fail-safe（仕様書 4.2.2 節 b・v3 で拡張）: modelPattern のコンパイル失敗でも例外にせず、
-        // 分岐を無効化して既存経路を壊さない。警告はここで1行残す。
-        logger?.(`${new Date().toISOString()} openai-bridge config-warning ${openaiBridgeSettings.warning}`);
-      }
+      // openaiBridgeSettings はキャッシュ済み（起動時・reload 時にのみ再計算。レビュー指摘5）。
+      // config-warning のログもここでは出さず、起動時・reload 時に1回だけ出す。
       const openaiBridgeRouting = shouldRouteToOpenAiBridge(body, openaiBridgeSettings);
       if (openaiBridgeRouting.route) {
         // 経路はここで OpenAI 宛に固定される。以後どのような失敗でも
@@ -402,8 +411,14 @@ export function createProxyServer({
         });
         return;
       }
-      if (openaiBridgeRouting.reason === 'parse-error' && (openaiBridgeSettings.enabled || openaiBridgeSettings.warning)) {
-        // JSON パース失敗、または modelPattern コンパイル失敗で分岐が無効化された場合の両方を記録する
+      // 本文が空（HEAD/GET 等）の要求は JSON パース失敗と区別できないため無ログにする
+      // （レビュー指摘5）。実際に本文があってパースに失敗した場合、または
+      // modelPattern コンパイル失敗で分岐が無効化された場合だけを記録する。
+      if (
+        openaiBridgeRouting.reason === 'parse-error'
+        && body.length > 0
+        && (openaiBridgeSettings.enabled || openaiBridgeSettings.warning)
+      ) {
         logger?.(
           `${new Date().toISOString()} openai-bridge model=- method=${req.method} `
           + `path=${safeRequestPath(req.url)} status=- durationMs=0 outcome=parse-error-fallback`,
