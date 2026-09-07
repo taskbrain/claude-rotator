@@ -456,7 +456,15 @@ describe('forwardToOpenAiBridge', () => {
     assert.equal(seenPath, '/v1/messages?beta=true', 'the bridge must only see the path/query; the evil.example.com host from the absolute-form request line must never reach it');
   });
 
-  it('retries a connection reset before any bridge response arrives, up to connectRetries (レビュー指摘2)', async () => {
+  it('does not retry a connection reset that arrives after the request was accepted, even immediately (double-send risk, レビュー再検証指摘1で挙動修正)', async () => {
+    // 旧テスト（レビュー指摘2時点）は「接続直後の即時リセットなら安全に再試行できる」
+    // という前提で connectionCount>=2・200 を期待していたが、実測（/tmp/dbg.js 相当の
+    // 検証）で、小さな本文はローカルループバック上では socket の 'connect' →
+    // ClientRequest の 'finish'（全データをOSへ渡し終えた合図）が、RST由来の
+    // 'error' より必ず先に発火することを確認した。つまり「応答がまだ何も届いて
+    // いない」ことは「本文がまだ bridge に渡っていない」ことを一切保証しない。
+    // このため再検証指摘1でこの再試行経路自体を閉じており、本テストは
+    // 「即時リセットでも再試行しない・403で統一される」ことを固定する内容へ更新した。
     let connectionCount = 0;
     const bridge = http.createServer((req, res) => {
       res.writeHead(200, { 'Content-Type': 'application/json' }).end('{"ok":true}');
@@ -484,9 +492,9 @@ describe('forwardToOpenAiBridge', () => {
     const text = await response.text();
     front.close();
     bridge.close();
-    assert.equal(response.status, 200, text);
-    assert.ok(connectionCount >= 2, `expected at least 2 connection attempts (initial + retry), saw ${connectionCount}`);
-    assert.ok(lines.some(l => /outcome=forwarded/.test(l)), lines.join('\n'));
+    assert.equal(response.status, 403, text);
+    assert.equal(connectionCount, 1, `expected exactly 1 connection attempt (no retry after the request body may already have been sent), saw ${connectionCount}`);
+    assert.ok(lines.some(l => /outcome=bridge-unreachable/.test(l)), lines.join('\n'));
   });
 
   it('does not retry once a response has already been forwarded to the client (no double-processing after res.headersSent)', async () => {
@@ -523,6 +531,100 @@ describe('forwardToOpenAiBridge', () => {
     assert.equal(requestImplCalls, 1, 'a failure after the response head was already forwarded must never open a retry connection');
     const result = await donePromise;
     assert.equal(result.outcome, 'bridge-unreachable');
+  });
+
+  it('does not retry once the request body has been fully flushed to the bridge, even before any response arrives (no double-send, レビュー再検証指摘1)', async () => {
+    // upstream.end(body) は接続直後に本文を送り切るため、リクエスト全体（ヘッダ＋
+    // 本文）の送信完了（'finish'）後の ECONNRESET は「bridge が本文を全受信した後に
+    // 落ちた」可能性があり、再試行すると二重送信（Pro 枠の二重消費）になる。
+    // res.headersSent だけを見る旧実装はこのケースを再試行してしまっていた。
+    let requestImplCalls = 0;
+    const manual = createManualUpstream();
+    const countingRequestImpl = (options, callback) => {
+      requestImplCalls += 1;
+      return manual.requestImpl(options, callback);
+    };
+    const req = fakeIncomingRequest();
+    const res = fakeServerResponse();
+    const settings = resolveOpenAiBridgeSettings({
+      openaiBridge: { enabled: true, url: 'http://127.0.0.1:1', modelPattern: '^gpt-', connectTimeoutMs: 2000, idleTimeoutMs: 2000, connectRetries: 1 },
+    });
+    const donePromise = forwardToOpenAiBridge({
+      req, res, body: Buffer.from('{"model":"gpt-6-astra"}'), model: 'gpt-6-astra', settings,
+      logger: () => {}, httpRequestImpl: countingRequestImpl,
+    });
+    // manual upstream の end() が次tickで 'socket' を発火するまで待つ（bridge からの
+    // 応答はまだ何も届いていない）。
+    await new Promise(resolve => setImmediate(resolve));
+    assert.equal(res.headersSent, false, 'precondition: no bridge response has been forwarded yet');
+
+    // bridge が本文を全受信した（＝クライアント側の書き込みが完了した）状況を
+    // 'finish' で模してから、直後に接続がリセットされた状況を再現する。
+    manual.getUpstream().emit('finish');
+    manual.getUpstream().emit('error', Object.assign(new Error('read ECONNRESET'), { code: 'ECONNRESET' }));
+
+    assert.equal(requestImplCalls, 1, 'a reset after the request body was fully sent must never open a retry connection (double-send risk)');
+    const result = await donePromise;
+    assert.equal(result.outcome, 'bridge-unreachable');
+    assert.equal(res.headersSent, true, 'a synthetic error response must still be sent to the client');
+    assert.equal(res.statusCode, 403);
+  });
+
+  it('ignores an upstream error that fires after finish() has already settled a client abort (レビュー再検証指摘2)', async () => {
+    // onClientGone() は currentUpstream.destroy() を呼ぶ。実機（Node 22）では
+    // ClientRequest の destroy() 由来の 'error'（ECONNRESET/socket hang up）が
+    // 遅れて発火することがあり、settled ガードが無いと res.headersSent===false の
+    // まま再試行条件を通過して、クライアント不在のまま2回目のリクエストが飛ぶ。
+    let requestImplCalls = 0;
+    const manual = createManualUpstream();
+    const countingRequestImpl = (options, callback) => {
+      requestImplCalls += 1;
+      return manual.requestImpl(options, callback);
+    };
+    const req = fakeIncomingRequest();
+    const res = fakeServerResponse();
+    const settings = resolveOpenAiBridgeSettings({
+      openaiBridge: { enabled: true, url: 'http://127.0.0.1:1', modelPattern: '^gpt-', connectTimeoutMs: 2000, idleTimeoutMs: 2000, connectRetries: 1 },
+    });
+    const donePromise = forwardToOpenAiBridge({
+      req, res, body: Buffer.from('{"model":"gpt-6-astra"}'), model: 'gpt-6-astra', settings,
+      logger: () => {}, httpRequestImpl: countingRequestImpl,
+    });
+    await new Promise(resolve => setImmediate(resolve));
+
+    // クライアントが切断し、res.on('close') 経由で finish('client-abort') が
+    // 既に確定した状況を模す（production の onClientGone と同じ経路）。
+    res.destroy();
+    await new Promise(resolve => setImmediate(resolve));
+    const result = await donePromise;
+    assert.equal(result.outcome, 'client-abort');
+    assert.equal(requestImplCalls, 1, 'precondition: only the initial connection was opened so far');
+
+    // finish() 確定後に、destroy() されたソケット由来の 'error' が遅れて発火した
+    // 状況を再現する。settled ガードが無いとここで再試行接続が開いてしまう。
+    manual.getUpstream().emit('error', Object.assign(new Error('socket hang up'), { code: 'ECONNRESET' }));
+    assert.equal(requestImplCalls, 1, 'an error firing after finish() has already settled must never open a retry connection');
+  });
+
+  it('logs a connect-retry line before re-attempting a refused connection (レビュー指摘5)', async () => {
+    const settings = resolveOpenAiBridgeSettings({
+      openaiBridge: { enabled: true, url: 'http://127.0.0.1:1', modelPattern: '^gpt-', connectTimeoutMs: 3000, idleTimeoutMs: 3000, connectRetries: 1 },
+    });
+    const lines = [];
+    const front = http.createServer(async (req, res) => {
+      const chunks = [];
+      for await (const c of req) chunks.push(c);
+      await forwardToOpenAiBridge({ req, res, body: Buffer.concat(chunks), settings, logger: l => lines.push(l) });
+    });
+    await new Promise(resolve => front.listen(0, '127.0.0.1', resolve));
+    const response = await fetch(`http://127.0.0.1:${front.address().port}/v1/messages`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{"model":"gpt-6-astra"}',
+    });
+    await response.text();
+    front.close();
+    assert.equal(response.status, 403);
+    assert.ok(lines.some(l => /outcome=connect-retry attempt=2 code=ECONNREFUSED/.test(l)), lines.join('\n'));
+    assert.ok(lines.some(l => /outcome=bridge-unreachable/.test(l)), lines.join('\n'));
   });
 
   it('logs the synthesized 403 status for an idle-timeout, not the placeholder "-" (レビュー指摘6)', async () => {

@@ -140,14 +140,20 @@ export function forwardToOpenAiBridge({ req, res, body, model, settings, logger,
   headers['content-length'] = String(Buffer.byteLength(body || Buffer.alloc(0)));
 
   const maxConnectAttempts = 1 + Math.max(0, Number(settings.connectRetries) || 0);
-  // プール再利用（keep-alive）による ECONNRESET を避ける（レビュー指摘2）。
-  const agent = new http.Agent({ keepAlive: false });
 
   return new Promise(resolve => {
     let settled = false;
     let connectTimer = null;
     let idleTimer = null;
     let currentUpstream = null;
+    // upstream（ClientRequest）の 'finish' が一度でも発火したら true。'finish' は
+    // リクエスト全体（ヘッダ＋本文）がOSへ渡され切った時点で発火するため、これが
+    // 立った後の接続エラーは「bridge が本文を受信済みの可能性がある」ことを意味し、
+    // 再試行すると二重送信（Pro枠の二重消費）になり得るため再試行しない
+    // （レビュー再検証指摘1）。接続確立直後（'connect'）に即座に切断された場合は
+    // 通常 'finish' が間に合わず立たないため、既存の「接続直後リセット」再試行
+    // （レビュー指摘2）は引き続き機能する。
+    let requestFullySent = false;
 
     const clearTimers = () => {
       clearTimeout(connectTimer);
@@ -202,15 +208,21 @@ export function forwardToOpenAiBridge({ req, res, body, model, settings, logger,
           path: `${target.pathname}${target.search}`,
           method: req.method,
           headers,
-          agent,
+          // リクエストごとに使い捨てる（プールしない）。keep-alive の使い回しによる
+          // ECONNRESET を避ける（レビュー指摘2）。new http.Agent() を毎回生成すると
+          // ソケットプールが個別に残り続けるため、Node 標準の「プールしない」指定
+          // である agent:false を使う（レビュー再検証指摘4）。
+          agent: false,
         },
         upstreamRes => {
-          // ヘッダを受け取った時点で「アイドル」の窓を仕切り直す。
-          armIdleTimer();
           if (res.destroyed) {
             upstream.destroy();
             return;
           }
+          // ヘッダを受け取った時点で「アイドル」の窓を仕切り直す
+          // （res.destroyed ガードの後ろに置き、切断済みクライアント宛にタイマーを
+          // 張ったまま宙に浮かせない。レビュー再検証指摘3）。
+          armIdleTimer();
           const responseHeaders = {};
           for (const [key, value] of Object.entries(upstreamRes.headers)) {
             if (!HOP_BY_HOP.has(key.toLowerCase())) responseHeaders[key] = value;
@@ -244,6 +256,7 @@ export function forwardToOpenAiBridge({ req, res, body, model, settings, logger,
         },
       );
       currentUpstream = upstream;
+      upstream.once('finish', () => { requestFullySent = true; });
 
       // 接続確立前のタイムアウト（403 permission_error・outcome=bridge-unreachable 側）。
       // TCP の接続確立（socket の 'connect'）が起きるまでだけを計測する。確立後は
@@ -266,17 +279,28 @@ export function forwardToOpenAiBridge({ req, res, body, model, settings, logger,
       });
 
       upstream.on('error', error => {
+        // finish() 確定後（クライアント切断・タイムアウト等で既に処理済み）に
+        // 発火した 'error'（例: destroy() 由来の ECONNRESET/socket hang up）は
+        // 無視する。res 相手が既にいない状態で再試行・応答書込みを行わない
+        // （レビュー再検証指摘2）。
+        if (settled) return;
         // ヘッダ送出後は新しいステータスを返せない（仕様書 4.2.3 節）
         if (res.headersSent) {
           res.destroy();
           finish('bridge-unreachable', null);
           return;
         }
-        // まだ bridge からの応答を何も受け取っていない（本文送信前）接続確立失敗
-        // （ECONNREFUSED／ECONNRESET／ENOTFOUND）に限り settings.connectRetries まで再試行する
-        // （レビュー指摘2）。既定は0回のため再試行しない。
-        if (attempt < maxConnectAttempts && RETRYABLE_CONNECT_ERROR_CODES.has(error?.code)) {
+        // まだ bridge からの応答を何も受け取っておらず、かつリクエスト全体（本文含む）
+        // の送信が完了していない場合に限り settings.connectRetries まで再試行する
+        // （レビュー指摘2・再検証指摘1）。requestFullySent===true の場合、本文は
+        // 既に bridge へ渡り切っている（受信済みの可能性がある）ため、再試行すると
+        // 二重送信（Pro 枠の二重消費）になり得るため再試行しない。
+        if (!requestFullySent && attempt < maxConnectAttempts && RETRYABLE_CONNECT_ERROR_CODES.has(error?.code)) {
           clearTimers();
+          logger?.(
+            `${new Date().toISOString()} openai-bridge model=${model || '-'} method=${req.method} `
+            + `path=${target.pathname} outcome=connect-retry attempt=${attempt + 1} code=${error?.code || '-'}`,
+          );
           attemptConnect(attempt + 1);
           return;
         }
