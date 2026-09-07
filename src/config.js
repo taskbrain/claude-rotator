@@ -1,5 +1,6 @@
 import { defaultConfigPath } from './paths.js';
 import { readJsonFile, writeJsonFile } from './json-file.js';
+import { DEFAULT_OPENAI_BRIDGE } from './openai-bridge.js';
 
 export const DEFAULT_PORT = 37891;
 export const DEFAULT_THRESHOLD = 1;
@@ -39,6 +40,7 @@ export function createDefaultConfig() {
       concurrency: DEFAULT_USAGE_REFRESH_CONCURRENCY,
       requestSpacingMs: DEFAULT_USAGE_REFRESH_REQUEST_SPACING_MS,
     },
+    openaiBridge: { ...DEFAULT_OPENAI_BRIDGE },
     accounts: [],
   };
 }

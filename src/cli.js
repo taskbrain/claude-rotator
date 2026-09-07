@@ -367,6 +367,7 @@ async function runServer({ write }) {
         deferValidationError: true,
       });
     },
+    reloadOpenAiBridge: () => loadConfig().then(nextConfig => nextConfig?.openaiBridge),
     logger: line => {
       if (logWriter) logWriter.write(line);
       else write(`${line}\n`);
