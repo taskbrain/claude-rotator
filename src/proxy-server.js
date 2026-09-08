@@ -24,6 +24,7 @@ import { duplicateRefreshTokenAccountIds } from './secret-store.js';
 import {
   DEFAULT_OPENAI_BRIDGE,
   forwardToOpenAiBridge,
+  logDegradeMappingConfigNotice,
   resolveOpenAiBridgeSettings,
   shouldRouteToOpenAiBridge,
 } from './openai-bridge.js';
@@ -239,6 +240,9 @@ export function createProxyServer({
   if (openaiBridgeSettings.warning) {
     logger?.(`${new Date().toISOString()} openai-bridge config-warning ${openaiBridgeSettings.warning}`);
   }
+  // degradeMapping の設定通知（設計書 §7.2・§7.3-4）。reload 時も同じ関数を呼ぶ。
+  // degradeMapping を書いていない構成では1行も出ない。
+  logDegradeMappingConfigNotice(openaiBridgeSettings, logger);
 
   const server = http.createServer(async (req, res) => {
     try {
@@ -338,6 +342,7 @@ export function createProxyServer({
             `${new Date().toISOString()} openai-bridge reload enabled=${openaiBridgeSettings.enabled} `
             + `url=${openaiBridgeSettings.url}${openaiBridgeSettings.warning ? ` warning="${openaiBridgeSettings.warning}"` : ''}`,
           );
+          logDegradeMappingConfigNotice(openaiBridgeSettings, logger);
         }
         // Reconcile in the background instead of awaiting it (or replacing
         // the shared operationalStateCheck gate other requests await): each

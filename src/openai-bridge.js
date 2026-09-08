@@ -24,7 +24,130 @@ export const DEFAULT_OPENAI_BRIDGE = {
   connectRetries: 0,
 };
 
-function disabled(raw, warning) {
+// 設計書 §7.3-1（R3-2）: degradeMapping の既定は DEFAULT_OPENAI_BRIDGE にも
+// createDefaultConfig() にも足さず、内部定数として持つ。理由は2つある。
+// 理由A（浅いマージの罠）: resolveOpenAiBridgeSettings() の
+//   raw = { ...DEFAULT_OPENAI_BRIDGE, ...config.openaiBridge } は浅いマージなので、
+//   既定側にセクションを置くと、利用者が {"degradeMapping":{"enabled":true}} とだけ
+//   書いた瞬間に残りの既定値（gptPoolUnusableTtlMs 等）がすべて undefined になる。
+// 理由B（OSS 生成物の不変）: createDefaultConfig() は新規インストール時の config.json を
+//   そのまま書き出す。キーを足さなければ、この機能を使わない利用者の生成ファイルは
+//   1バイトも変わらない（src/config.js は本タスクで1行も変えない）。
+export const DISABLED_DEGRADE_MAPPING = Object.freeze({
+  enabled: false,
+  bothUnusableStatus: 403,
+  gptPoolUnusableTtlMs: 60000,
+  codexStatusUrl: null,
+  codexStatusTimeoutMs: 1500,
+  // 正規化の過程で捨てた設定の理由。値そのものは載せない（設定由来の文字列を
+  // ログへ流さない）。起動時と reload 時に logDegradeMappingConfigNotice() が
+  // 1件1行で出す（設計書 §7.2「非ループバックは警告つきで null と同じ扱い」）。
+  notices: Object.freeze([]),
+});
+
+// bothUnusableStatus は「明示停止（403）」か「退避を試み続ける（529）」の二択のみ。
+// 不正値は安全側（403＝明示停止）へ倒す（設計書 §7.2）。
+const BOTH_UNUSABLE_STATUSES = new Set([403, 529]);
+
+// openaiBridge.enabled が偽のまま degradeMapping.enabled を真にする構成は禁止しない
+// （Fable 週次サブキャップだけの枯渇は bridge 無しでも fallbackModel で救済できる）が、
+// fallbackModel の最終要素まで同じ枯渇プールに当たる構成では無言待ちになるため、
+// 気づけるように1行だけ通知する（設計書 §7.3-4・§14.2）。
+const DEGRADE_MAPPING_WITHOUT_BRIDGE_NOTICE =
+  'degradeMapping enabled without openaiBridge; 529 mapping applies to Claude-internal fallback only';
+
+// codexStatusUrl を捨てたときの理由（設計書 §7.2）。openaiBridge.url の fail-safe と
+// 同じ言い回しに揃える（'openaiBridge.url must be loopback; branch disabled'）。
+// 設定値そのものは載せない: この行は運用ログへ出るため、利用者が書いた URL を
+// そのまま転記しない。
+const CODEX_STATUS_URL_NOT_LOOPBACK_NOTICE =
+  'degradeMapping.codexStatusUrl must be loopback; codex status section disabled';
+const CODEX_STATUS_URL_INVALID_NOTICE =
+  'degradeMapping.codexStatusUrl is not a usable url; codex status section disabled';
+
+function positiveNumber(value, fallback) {
+  return typeof value === 'number' && Number.isFinite(value) && value > 0 ? value : fallback;
+}
+
+// new URL().hostname は IPv6 リテラルを角括弧つき（'[::1]'）で返すため、
+// LOOPBACK_HOSTS（素の '::1'）と突き合わせる前に角括弧を外す（レビュー指摘2）。
+// WHATWG URL は '[0:0:0:0:0:0:0:1]' を '[::1]' へ正規化するので、展開形も同じ経路で
+// 許可される。IPv4 射影（'::ffff:127.0.0.1' → '[::ffff:7f00:1]'）と未指定アドレス
+// （'[::]'）は許可リストに無いので拒否側へ倒れる（安全側）。
+function unbracketHostname(hostname) {
+  return hostname.startsWith('[') && hostname.endsWith(']') ? hostname.slice(1, -1) : hostname;
+}
+
+// codexStatusUrl は openaiBridge.url と同じくループバックに限る（設計書 §7.2）。
+// 非ループバック・解析不能・型違いはいずれも null（＝Codex 節を出さない）へ倒したうえで、
+// 「なぜ捨てたか」を notice として返す（黙って捨てない＝レビュー指摘3）。
+// 未指定（null / undefined）は既定そのものなので notice を出さない。
+function normalizeCodexStatusUrl(value) {
+  if (value === null || value === undefined) return { value: null, notice: null };
+  if (typeof value !== 'string' || value === '') {
+    return { value: null, notice: CODEX_STATUS_URL_INVALID_NOTICE };
+  }
+  let hostname;
+  try {
+    hostname = new URL(value).hostname;
+  } catch {
+    return { value: null, notice: CODEX_STATUS_URL_INVALID_NOTICE };
+  }
+  if (!LOOPBACK_HOSTS.has(unbracketHostname(hostname))) {
+    return { value: null, notice: CODEX_STATUS_URL_NOT_LOOPBACK_NOTICE };
+  }
+  return { value, notice: null };
+}
+
+// セクションが無い／キーが無い／型が違う、のいずれでも「無効」に倒れる（設計書 §7.3-3）。
+// 判定式は settings.degradeMapping.enabled === true の1つだけにするため、
+// enabled は真偽値の true だけを受け付ける（'true' や 1 は無効）。
+export function normalizeDegradeMapping(raw) {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return DISABLED_DEGRADE_MAPPING;
+  const codexStatusUrl = normalizeCodexStatusUrl(raw.codexStatusUrl);
+  return Object.freeze({
+    enabled: raw.enabled === true,
+    bothUnusableStatus: BOTH_UNUSABLE_STATUSES.has(raw.bothUnusableStatus)
+      ? raw.bothUnusableStatus
+      : DISABLED_DEGRADE_MAPPING.bothUnusableStatus,
+    gptPoolUnusableTtlMs: positiveNumber(raw.gptPoolUnusableTtlMs, DISABLED_DEGRADE_MAPPING.gptPoolUnusableTtlMs),
+    codexStatusUrl: codexStatusUrl.value,
+    codexStatusTimeoutMs: positiveNumber(raw.codexStatusTimeoutMs, DISABLED_DEGRADE_MAPPING.codexStatusTimeoutMs),
+    notices: Object.freeze(codexStatusUrl.notice ? [codexStatusUrl.notice] : []),
+  });
+}
+
+// 起動時と POST /internal/reload 時に出す通知（設計書 §7.2・§7.3-4）。呼び出し元は
+// src/proxy-server.js の2箇所（createProxyServer の初回解決直後と /internal/reload の
+// 再解決直後）だけであり、gpt-* の要求ごとには出さない。
+// resolveOpenAiBridgeSettings() は純粋に保ちたいので、ログ出力はこの関数へ分けてある。
+// warning（fail-safe の無効化）へは載せない: shouldRouteToOpenAiBridge() が warning の
+// 有無で reason を 'disabled' / 'parse-error' に振り分けており、通知を warning に
+// 混ぜると gpt-* 要求ごとに parse-error-fallback のログが増えてしまうため。
+// 返り値は実際に出した行の配列（何も出さないときは空配列）。degradeMapping を
+// 書いていない構成では必ず空配列になる＝既存挙動への影響ゼロ。
+export function logDegradeMappingConfigNotice(settings, logger) {
+  const degradeMapping = settings?.degradeMapping;
+  if (!degradeMapping) return [];
+  const reasons = [];
+  // (1) bridge 分岐が無効なまま写像だけを有効にした構成（設計書 §7.3-4）。
+  if (!settings.enabled && degradeMapping.enabled === true) {
+    reasons.push(DEGRADE_MAPPING_WITHOUT_BRIDGE_NOTICE);
+  }
+  // (2) 正規化で捨てた設定（非ループバック等の codexStatusUrl。設計書 §7.2）。
+  // fail-safe 3経路では degradeMapping ごと DISABLED_DEGRADE_MAPPING に倒れており
+  // notices は空なので、ここでも1行も出ない。
+  // notices が欠けた settings（正規化を通っていない手組みの値）でも投げない。
+  // この関数は起動経路で呼ばれるため、例外はプロセス起動そのものを壊す。
+  if (Array.isArray(degradeMapping.notices)) reasons.push(...degradeMapping.notices);
+  const lines = reasons.map(
+    reason => `${new Date().toISOString()} openai-bridge config-notice ${reason}`,
+  );
+  for (const line of lines) logger?.(line);
+  return lines;
+}
+
+function disabled(raw, warning, degradeMapping = DISABLED_DEGRADE_MAPPING) {
   return {
     enabled: false,
     url: raw.url,
@@ -32,13 +155,18 @@ function disabled(raw, warning) {
     connectTimeoutMs: raw.connectTimeoutMs,
     idleTimeoutMs: raw.idleTimeoutMs,
     connectRetries: raw.connectRetries,
+    degradeMapping,
     warning,
   };
 }
 
 export function resolveOpenAiBridgeSettings(config) {
   const raw = { ...DEFAULT_OPENAI_BRIDGE, ...(config?.openaiBridge || {}) };
-  if (!raw.enabled) return disabled(raw, null);
+  // 利用者が bridge 分岐を意図的に切っている経路だけは degradeMapping を正規化して返す。
+  // (b) の 529 写像は bridge を必要としないため、ClaudeRotator 単体構成を成立させる
+  // （設計書 §7.3-2・§14.2）。以下の fail-safe 3経路（modelPattern / url / 非ループバック）は
+  // 「設定を解釈できなかった」のだから隣接する新機能も信用せず、既定（無効）のままにする。
+  if (!raw.enabled) return disabled(raw, null, normalizeDegradeMapping(raw.degradeMapping));
   let modelPattern;
   try {
     modelPattern = new RegExp(raw.modelPattern);
@@ -63,6 +191,7 @@ export function resolveOpenAiBridgeSettings(config) {
     connectTimeoutMs: raw.connectTimeoutMs,
     idleTimeoutMs: raw.idleTimeoutMs,
     connectRetries: raw.connectRetries,
+    degradeMapping: normalizeDegradeMapping(raw.degradeMapping),
     warning: null,
   };
 }

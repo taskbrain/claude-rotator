@@ -1026,6 +1026,379 @@ describe('POST /internal/reload with openaiBridge', () => {
 });
 
 // ---------------------------------------------------------------------------
+// R3-2: openaiBridge.degradeMapping の設定解決（設計書 §7.1〜§7.3・§14.1〜§14.4）
+// ---------------------------------------------------------------------------
+
+// 既存の import 文（ファイル冒頭）は1行も書き換えない（受入条件: 本ファイルの削除行が0）。
+// ESM の import 宣言は位置に関係なく巻き上げられるため、追加分は別の import 文にする。
+import {
+  DEFAULT_OPENAI_BRIDGE,
+  DISABLED_DEGRADE_MAPPING,
+  logDegradeMappingConfigNotice,
+  normalizeDegradeMapping,
+} from '../src/openai-bridge.js';
+
+const enabledBridgeConfig = extra => ({
+  openaiBridge: { ...createDefaultConfig().openaiBridge, enabled: true, ...extra },
+});
+
+describe('normalizeDegradeMapping (R3-2 / 設計書 §7.3)', () => {
+  it('falls back to the disabled defaults when the section is absent or is not an object', () => {
+    // セクションが無い／型が違う、のいずれでも「無効」に倒れる（§7.3-3）。
+    for (const raw of [undefined, null, false, 0, '', 'degradeMapping', 42, [], [{ enabled: true }]]) {
+      assert.equal(
+        normalizeDegradeMapping(raw),
+        DISABLED_DEGRADE_MAPPING,
+        `${JSON.stringify(raw) ?? String(raw)} must resolve to the shared disabled constant`,
+      );
+    }
+  });
+
+  it('normalizes every key when the section is fully specified', () => {
+    assert.deepEqual(
+      normalizeDegradeMapping({
+        enabled: true,
+        bothUnusableStatus: 529,
+        gptPoolUnusableTtlMs: 30000,
+        codexStatusUrl: 'http://127.0.0.1:18765/healthz',
+        codexStatusTimeoutMs: 800,
+      }),
+      {
+        enabled: true,
+        bothUnusableStatus: 529,
+        gptPoolUnusableTtlMs: 30000,
+        codexStatusUrl: 'http://127.0.0.1:18765/healthz',
+        codexStatusTimeoutMs: 800,
+        notices: [],
+      },
+    );
+  });
+
+  it('keeps the remaining defaults when only enabled is written (R-14 の浅いマージの罠)', () => {
+    // DEFAULT_OPENAI_BRIDGE へ既定を置いていたら、この部分指定で他のキーが
+    // すべて undefined になる。専用の正規化関数を通すことでそれを避ける（§7.3-1 理由A）。
+    assert.deepEqual(normalizeDegradeMapping({ enabled: true }), {
+      enabled: true,
+      bothUnusableStatus: 403,
+      gptPoolUnusableTtlMs: 60000,
+      codexStatusUrl: null,
+      codexStatusTimeoutMs: 1500,
+      notices: [],
+    });
+  });
+
+  it('falls back to the safe side for wrong types and out-of-range values', () => {
+    // enabled は真偽値の true だけを受け付ける（判定式を1つに保つ＝§7.3-3）。
+    for (const value of ['true', 1, 'yes', {}, [], null]) {
+      assert.equal(normalizeDegradeMapping({ enabled: value }).enabled, false, `enabled:${JSON.stringify(value)}`);
+    }
+    // bothUnusableStatus は 403（明示停止）か 529（退避継続）のみ。不正値は 403 側へ倒す。
+    for (const value of [500, 429, '529', null, undefined, true]) {
+      assert.equal(normalizeDegradeMapping({ enabled: true, bothUnusableStatus: value }).bothUnusableStatus, 403);
+    }
+    assert.equal(normalizeDegradeMapping({ enabled: true, bothUnusableStatus: 529 }).bothUnusableStatus, 529);
+    // ミリ秒は有限の正数のみ。0・負・NaN・Infinity・文字列はすべて既定へ戻す。
+    for (const value of [0, -1, Number.NaN, Number.POSITIVE_INFINITY, '60000', null, {}]) {
+      assert.equal(normalizeDegradeMapping({ gptPoolUnusableTtlMs: value }).gptPoolUnusableTtlMs, 60000);
+      assert.equal(normalizeDegradeMapping({ codexStatusTimeoutMs: value }).codexStatusTimeoutMs, 1500);
+    }
+    assert.equal(normalizeDegradeMapping({ codexStatusTimeoutMs: 1 }).codexStatusTimeoutMs, 1, '有限の正数は通す');
+  });
+
+  it('accepts only loopback urls for codexStatusUrl', () => {
+    // openaiBridge.url と同じ規律（§7.2）。非ループバックは警告つきで null と同じ扱いにする。
+    for (const value of ['http://127.0.0.1:18765/healthz', 'http://localhost:18765/healthz']) {
+      assert.equal(normalizeDegradeMapping({ codexStatusUrl: value }).codexStatusUrl, value);
+    }
+    for (const value of ['http://evil.example.com/healthz', 'https://1.2.3.4/healthz', 'not a url', '', 123, null]) {
+      assert.equal(
+        normalizeDegradeMapping({ codexStatusUrl: value }).codexStatusUrl,
+        null,
+        `${JSON.stringify(value)} must not be fetched`,
+      );
+    }
+  });
+
+  it('accepts the IPv6 loopback for codexStatusUrl (bracketed and expanded)', () => {
+    // new URL('http://[::1]:18765/healthz').hostname は角括弧つきの '[::1]' を返すため、
+    // 素の '::1' を持つ許可リストと突き合わせる前に角括弧を外す必要がある
+    // （レビュー指摘2。修正前はこの URL が黙って null になっていた）。
+    for (const value of [
+      'http://[::1]:18765/healthz',
+      'http://[::1]/healthz',
+      // WHATWG URL が '[::1]' へ正規化する展開形。許可リストの素の '::1' と一致する。
+      'http://[0:0:0:0:0:0:0:1]:18765/healthz',
+    ]) {
+      assert.equal(normalizeDegradeMapping({ codexStatusUrl: value }).codexStatusUrl, value, value);
+      assert.deepEqual(normalizeDegradeMapping({ codexStatusUrl: value }).notices, [], value);
+    }
+    // ループバック以外の IPv6 は拒否側へ倒す。'[::]'（未指定アドレス）と
+    // '[::ffff:127.0.0.1]'（IPv4 射影。hostname は '[::ffff:7f00:1]' へ正規化される）も
+    // 許可リストに無いので通さない。
+    for (const value of [
+      'http://[fe80::1]:18765/healthz',
+      'http://[2001:db8::1]/healthz',
+      'http://[::]/healthz',
+      'http://[::ffff:127.0.0.1]/healthz',
+    ]) {
+      assert.equal(normalizeDegradeMapping({ codexStatusUrl: value }).codexStatusUrl, null, value);
+    }
+  });
+
+  it('records why a codexStatusUrl was dropped instead of discarding it silently', () => {
+    // 非ループバックを黙って捨てない（レビュー指摘3）。理由は notices に載せ、
+    // 起動時と reload 時に logDegradeMappingConfigNotice() が1行で出す（§7.2）。
+    for (const value of ['http://evil.example.com/healthz', 'https://1.2.3.4/healthz', 'http://[fe80::1]/healthz']) {
+      assert.deepEqual(
+        normalizeDegradeMapping({ codexStatusUrl: value }).notices,
+        ['degradeMapping.codexStatusUrl must be loopback; codex status section disabled'],
+        value,
+      );
+    }
+    for (const value of ['not a url', '', 123, {}, true]) {
+      assert.deepEqual(
+        normalizeDegradeMapping({ codexStatusUrl: value }).notices,
+        ['degradeMapping.codexStatusUrl is not a usable url; codex status section disabled'],
+        JSON.stringify(value) ?? String(value),
+      );
+    }
+    // 未指定は既定そのものなので通知しない（既定構成で1行も出さないための条件）。
+    for (const raw of [{}, { codexStatusUrl: null }, { codexStatusUrl: undefined }, { enabled: true }]) {
+      assert.deepEqual(normalizeDegradeMapping(raw).notices, [], JSON.stringify(raw));
+    }
+    assert.deepEqual(DISABLED_DEGRADE_MAPPING.notices, []);
+    // notices も凍結する（消費側が実行時に書き換えられない）。
+    assert.equal(Object.isFrozen(normalizeDegradeMapping({ codexStatusUrl: 'http://evil.example.com' }).notices), true);
+  });
+
+  it('returns a frozen section so a consumer cannot flip enabled at runtime', () => {
+    const normalized = normalizeDegradeMapping({ enabled: false });
+    assert.equal(Object.isFrozen(normalized), true);
+    assert.throws(() => { 'use strict'; normalized.enabled = true; }, TypeError);
+    assert.equal(normalized.enabled, false);
+  });
+});
+
+describe('resolveOpenAiBridgeSettings degradeMapping (R3-2 / 設計書 §7.3-2)', () => {
+  it('exposes the normalized section on the enabled path', () => {
+    const settings = resolveOpenAiBridgeSettings(enabledBridgeConfig({
+      degradeMapping: { enabled: true, bothUnusableStatus: 529 },
+    }));
+    assert.equal(settings.enabled, true);
+    assert.equal(settings.warning, null);
+    assert.deepEqual(settings.degradeMapping, {
+      enabled: true,
+      bothUnusableStatus: 529,
+      gptPoolUnusableTtlMs: 60000,
+      codexStatusUrl: null,
+      codexStatusTimeoutMs: 1500,
+      notices: [],
+    });
+  });
+
+  it('exposes the shared disabled section on the enabled path when nothing is written', () => {
+    const settings = resolveOpenAiBridgeSettings(enabledBridgeConfig());
+    assert.equal(settings.enabled, true);
+    assert.equal(settings.degradeMapping, DISABLED_DEGRADE_MAPPING);
+  });
+});
+
+describe('OSS 独立性', () => {
+  it('degradeMapping 未指定なら無効になる', () => {
+    // 新規インストールの config.json（createDefaultConfig）にはセクションが無い。
+    // 生成物を1バイトも変えないため、既定側にキーを足していないことも固定する（§7.3-1 理由B）。
+    assert.equal(createDefaultConfig().openaiBridge.degradeMapping, undefined);
+    assert.equal(DEFAULT_OPENAI_BRIDGE.degradeMapping, undefined);
+    assert.equal(Object.prototype.hasOwnProperty.call(DEFAULT_OPENAI_BRIDGE, 'degradeMapping'), false);
+
+    const fromDefaults = resolveOpenAiBridgeSettings(createDefaultConfig());
+    assert.equal(fromDefaults.degradeMapping, DISABLED_DEGRADE_MAPPING, 'セクションが無い');
+    assert.equal(fromDefaults.degradeMapping.enabled, false);
+
+    // キーが無い／型が違う場合も同じく無効へ倒れる。
+    assert.equal(resolveOpenAiBridgeSettings(enabledBridgeConfig({ degradeMapping: {} })).degradeMapping.enabled, false);
+    assert.equal(
+      resolveOpenAiBridgeSettings(enabledBridgeConfig({ degradeMapping: 'enabled' })).degradeMapping,
+      DISABLED_DEGRADE_MAPPING,
+    );
+    assert.equal(resolveOpenAiBridgeSettings({}).degradeMapping, DISABLED_DEGRADE_MAPPING);
+    assert.equal(resolveOpenAiBridgeSettings(undefined).degradeMapping, DISABLED_DEGRADE_MAPPING);
+  });
+
+  it('fail-safe 3経路では degradeMapping も無効になる', () => {
+    // 設定を解釈できなかったのだから、隣接する新機能も信用しない（§7.3-2）。
+    const degradeMapping = { enabled: true, bothUnusableStatus: 529, gptPoolUnusableTtlMs: 1000 };
+    const failSafeCases = [
+      ['modelPattern', { modelPattern: '([unclosed' }, /modelPattern/],
+      ['url', { url: 'not-a-url' }, /openaiBridge\.url/],
+      ['non-loopback', { url: 'http://evil.example.com:80' }, /loopback/],
+    ];
+    for (const [name, override, warningPattern] of failSafeCases) {
+      const settings = resolveOpenAiBridgeSettings(enabledBridgeConfig({ ...override, degradeMapping }));
+      assert.equal(settings.enabled, false, `${name}: 分岐は無効化される`);
+      assert.match(settings.warning, warningPattern, name);
+      assert.equal(settings.degradeMapping, DISABLED_DEGRADE_MAPPING, `${name}: 写像だけが生き残ってはならない`);
+      assert.equal(settings.degradeMapping.enabled, false, name);
+    }
+  });
+
+  it('openaiBridge 無効でも degradeMapping は正規化される', () => {
+    // 構成①（ClaudeRotator 単体）の成立。(b) の 529 写像は bridge を必要としない（§14.2）。
+    const settings = resolveOpenAiBridgeSettings({
+      openaiBridge: {
+        enabled: false,
+        degradeMapping: { enabled: true, gptPoolUnusableTtlMs: 30000 },
+      },
+    });
+    assert.equal(settings.enabled, false, 'gpt-* の分岐そのものは起きない');
+    assert.equal(settings.warning, null, 'fail-safe ではないので warning は立てない');
+    assert.equal(settings.degradeMapping.enabled, true);
+    assert.equal(settings.degradeMapping.gptPoolUnusableTtlMs, 30000);
+    assert.equal(settings.degradeMapping.bothUnusableStatus, 403);
+
+    // warning に通知を載せていないこと（載せると reason が 'disabled' から 'parse-error' へ
+    // 変わり、gpt-* 要求ごとに parse-error-fallback のログが増える）。
+    const routing = shouldRouteToOpenAiBridge(Buffer.from('{"model":"gpt-6-astra"}'), settings);
+    assert.equal(routing.route, false);
+    assert.equal(routing.reason, 'disabled', 'degradeMapping を有効にしても現行のログ分類を変えない');
+  });
+});
+
+describe('degradeMapping の config-notice (設計書 §7.3-4)', () => {
+  it('logs exactly one notice line when degradeMapping is enabled without openaiBridge', () => {
+    const settings = resolveOpenAiBridgeSettings({
+      openaiBridge: { enabled: false, degradeMapping: { enabled: true } },
+    });
+    const lines = [];
+    const returned = logDegradeMappingConfigNotice(settings, line => lines.push(line));
+    assert.equal(lines.length, 1, '警告は1行だけ');
+    assert.deepEqual(returned, lines, '返り値は実際に出した行の配列');
+    assert.match(
+      lines[0],
+      /^\d{4}-\d{2}-\d{2}T[\d:.]+Z openai-bridge config-notice degradeMapping enabled without openaiBridge; 529 mapping applies to Claude-internal fallback only$/,
+    );
+  });
+
+  it('logs one line per dropped codexStatusUrl (§7.2)', () => {
+    // 非ループバック URL を黙って捨てない（レビュー指摘3）。bridge 分岐が有効なので
+    // §7.3-4 の「bridge 無しで写像だけ有効」の行は出ず、この1行だけになる。
+    const settings = resolveOpenAiBridgeSettings(enabledBridgeConfig({
+      degradeMapping: { enabled: true, codexStatusUrl: 'http://evil.example.com/healthz' },
+    }));
+    assert.equal(settings.degradeMapping.codexStatusUrl, null, '取得先としては使わない');
+    const lines = [];
+    const returned = logDegradeMappingConfigNotice(settings, line => lines.push(line));
+    assert.equal(lines.length, 1);
+    assert.deepEqual(returned, lines);
+    assert.match(
+      lines[0],
+      /^\d{4}-\d{2}-\d{2}T[\d:.]+Z openai-bridge config-notice degradeMapping\.codexStatusUrl must be loopback; codex status section disabled$/,
+    );
+    // 利用者が書いた URL そのものはログへ転記しない。
+    assert.equal(lines[0].includes('evil.example.com'), false);
+  });
+
+  it('logs both notices when the bridge is off and the codexStatusUrl is unusable', () => {
+    const settings = resolveOpenAiBridgeSettings({
+      openaiBridge: {
+        enabled: false,
+        degradeMapping: { enabled: true, codexStatusUrl: 'http://[fe80::1]:18765/healthz' },
+      },
+    });
+    const lines = [];
+    assert.equal(logDegradeMappingConfigNotice(settings, line => lines.push(line)).length, 2);
+    assert.match(lines[0], /degradeMapping enabled without openaiBridge/);
+    assert.match(lines[1], /degradeMapping\.codexStatusUrl must be loopback/);
+  });
+
+  it('logs nothing for a loopback IPv6 codexStatusUrl', () => {
+    // 修正前は [::1] が黙って捨てられていた（レビュー指摘2）。いまは値が残り通知も出ない。
+    const settings = resolveOpenAiBridgeSettings(enabledBridgeConfig({
+      degradeMapping: { enabled: true, codexStatusUrl: 'http://[::1]:18765/healthz' },
+    }));
+    assert.equal(settings.degradeMapping.codexStatusUrl, 'http://[::1]:18765/healthz');
+    assert.deepEqual(logDegradeMappingConfigNotice(settings, () => assert.fail('must not log')), []);
+  });
+
+  it('logs nothing when the notice does not apply', () => {
+    const cases = [
+      ['bridge も写像も有効', resolveOpenAiBridgeSettings(enabledBridgeConfig({ degradeMapping: { enabled: true } }))],
+      ['写像が無効', resolveOpenAiBridgeSettings({ openaiBridge: { enabled: false } })],
+      ['既定（新規インストール）', resolveOpenAiBridgeSettings(createDefaultConfig())],
+      ['fail-safe 経路', resolveOpenAiBridgeSettings(enabledBridgeConfig({
+        modelPattern: '([unclosed',
+        degradeMapping: { enabled: true },
+      }))],
+    ];
+    for (const [name, settings] of cases) {
+      const lines = [];
+      assert.deepEqual(logDegradeMappingConfigNotice(settings, line => lines.push(line)), [], name);
+      assert.deepEqual(lines, [], name);
+    }
+  });
+
+  it('does not throw without a logger or without settings', () => {
+    const settings = resolveOpenAiBridgeSettings({ openaiBridge: { enabled: false, degradeMapping: { enabled: true } } });
+    assert.match(logDegradeMappingConfigNotice(settings)[0], /config-notice/, 'logger 省略でも行を返す');
+    assert.deepEqual(logDegradeMappingConfigNotice(undefined, () => { throw new Error('must not log'); }), []);
+    assert.deepEqual(logDegradeMappingConfigNotice({}, () => { throw new Error('must not log'); }), []);
+    // 正規化を通っていない手組みの settings（notices 欠落）でも投げない。この関数は
+    // createProxyServer の起動経路で呼ばれるため、例外は起動そのものを壊す。
+    assert.deepEqual(logDegradeMappingConfigNotice({ enabled: true, degradeMapping: { enabled: true } }), []);
+    assert.deepEqual(
+      logDegradeMappingConfigNotice({ enabled: false, degradeMapping: { enabled: true } }).length,
+      1,
+      'notices が無くても §7.3-4 の行は出る',
+    );
+  });
+});
+
+describe('POST /internal/reload と degradeMapping', () => {
+  // src/proxy-server.js:327-336 の再読込手順（config.openaiBridge を差し替えてから
+  // resolveOpenAiBridgeSettings を呼び直す）をそのまま再現する。degradeMapping は
+  // openaiBridge セクションの下にあるので、src/cli.js:370 の reloadOpenAiBridge にも
+  // reload の配線にも1行も足さずに反映される（§7.1）。解決済みの settings は
+  // createProxyServer の外へ露出しないため、HTTP 経由ではなくこの単位で固定する。
+  const applyReload = (config, nextOpenaiBridge) => {
+    config.openaiBridge = nextOpenaiBridge !== undefined ? nextOpenaiBridge : { ...DEFAULT_OPENAI_BRIDGE };
+    return resolveOpenAiBridgeSettings(config);
+  };
+
+  it('picks up a degradeMapping change on reload without touching cli/config wiring', () => {
+    const config = { openaiBridge: { ...createDefaultConfig().openaiBridge, enabled: true } };
+    assert.equal(resolveOpenAiBridgeSettings(config).degradeMapping.enabled, false, '起動時は無効');
+
+    const enabled = applyReload(config, {
+      ...config.openaiBridge,
+      degradeMapping: { enabled: true, bothUnusableStatus: 529 },
+    });
+    assert.equal(enabled.degradeMapping.enabled, true, 'reload で有効になる');
+    assert.equal(enabled.degradeMapping.bothUnusableStatus, 529);
+    assert.equal(enabled.degradeMapping.gptPoolUnusableTtlMs, 60000);
+
+    // 制約3（可逆性）: プロセスを止めずに1分以内で現行挙動へ戻せること。
+    const reverted = applyReload(config, { ...config.openaiBridge, degradeMapping: { enabled: false } });
+    assert.equal(reverted.degradeMapping.enabled, false, 'reload で即座に無効へ戻せる');
+  });
+
+  it('reverts to the disabled degradeMapping once the openaiBridge section disappears', () => {
+    const config = {
+      openaiBridge: {
+        ...createDefaultConfig().openaiBridge,
+        enabled: true,
+        degradeMapping: { enabled: true },
+      },
+    };
+    assert.equal(resolveOpenAiBridgeSettings(config).degradeMapping.enabled, true);
+
+    // reloadOpenAiBridge が undefined を返す＝セクション・config.json が消えた状態。
+    const afterRemoval = applyReload(config, undefined);
+    assert.equal(afterRemoval.enabled, false);
+    assert.equal(afterRemoval.degradeMapping, DISABLED_DEGRADE_MAPPING);
+  });
+});
+
+// ---------------------------------------------------------------------------
 // テストヘルパ（test/proxy-server.test.js の既存パターンを流用）
 // ---------------------------------------------------------------------------
 

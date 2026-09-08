@@ -8762,6 +8762,111 @@ describe('createProxyServer', () => {
   });
 });
 
+// ---------------------------------------------------------------------------
+// R3-2 の配線: degradeMapping の config-notice を起動時と /internal/reload 時に出す
+// （設計書 §7.2・§7.3-4）。通知文言そのものの検査は test/openai-bridge.test.js 側にあり、
+// ここでは「本番の呼び出し元が実在すること」と「既定構成では1行も出ないこと」だけを固定する。
+// ---------------------------------------------------------------------------
+describe('openai-bridge degradeMapping config-notice の配線', () => {
+  const CONFIG_NOTICE = 'openai-bridge config-notice';
+
+  function startProxy({ config, logLines, reloadOpenAiBridge = null }) {
+    return listen(createProxyServer({
+      accountManager: new AccountManager({
+        accounts: [{ id: 'acct_1', name: 'a@example.com', type: 'oauth' }],
+        now: () => 1000,
+      }),
+      secretStore: new MemorySecretStore(),
+      config: { upstream: 'http://127.0.0.1:1', usagePolling: { enabled: false }, ...config },
+      reloadOpenAiBridge,
+      logger: line => logLines.push(line),
+    }));
+  }
+
+  it('emits the notice once at startup when degradeMapping is enabled without openaiBridge', async () => {
+    const logLines = [];
+    const proxy = await startProxy({
+      logLines,
+      config: { openaiBridge: { enabled: false, degradeMapping: { enabled: true } } },
+    });
+    cleanupAfterTest(async () => close(proxy.server));
+
+    const notices = logLines.filter(line => line.includes(CONFIG_NOTICE));
+    assert.equal(notices.length, 1, '起動時に1行だけ出る');
+    assert.match(notices[0], /degradeMapping enabled without openaiBridge/);
+  });
+
+  it('emits the notice at startup when a non-loopback codexStatusUrl is dropped', async () => {
+    const logLines = [];
+    const proxy = await startProxy({
+      logLines,
+      config: {
+        openaiBridge: {
+          enabled: true,
+          url: 'http://127.0.0.1:18765',
+          degradeMapping: { enabled: true, codexStatusUrl: 'http://evil.example.com/healthz' },
+        },
+      },
+    });
+    cleanupAfterTest(async () => close(proxy.server));
+
+    const notices = logLines.filter(line => line.includes(CONFIG_NOTICE));
+    assert.equal(notices.length, 1);
+    assert.match(notices[0], /degradeMapping\.codexStatusUrl must be loopback/);
+    assert.equal(notices[0].includes('evil.example.com'), false, '設定値そのものは転記しない');
+  });
+
+  it('stays silent for configurations that do not use degradeMapping', async () => {
+    // 既存挙動への影響ゼロ: degradeMapping を書いていない構成では起動でも reload でも
+    // config-notice を1行も出さない。
+    for (const openaiBridge of [
+      undefined,
+      { enabled: false },
+      { enabled: true, url: 'http://127.0.0.1:18765' },
+      // fail-safe 経路（modelPattern のコンパイル失敗）では degradeMapping ごと無効になる。
+      { enabled: true, url: 'http://127.0.0.1:18765', modelPattern: '([unclosed', degradeMapping: { enabled: true } },
+    ]) {
+      const logLines = [];
+      const proxy = await startProxy({
+        logLines,
+        config: openaiBridge === undefined ? {} : { openaiBridge },
+        reloadOpenAiBridge: async () => openaiBridge,
+      });
+      cleanupAfterTest(async () => close(proxy.server));
+      const reload = await requestJson(`${proxy.url}/internal/reload`, { method: 'POST' });
+
+      assert.equal(reload.status, 200);
+      assert.deepEqual(
+        logLines.filter(line => line.includes(CONFIG_NOTICE)),
+        [],
+        JSON.stringify(openaiBridge) ?? 'openaiBridge 未指定',
+      );
+    }
+  });
+
+  it('re-emits the notice after POST /internal/reload turns degradeMapping on', async () => {
+    const logLines = [];
+    let nextOpenaiBridge = { enabled: false };
+    const proxy = await startProxy({
+      logLines,
+      config: { openaiBridge: nextOpenaiBridge },
+      reloadOpenAiBridge: async () => nextOpenaiBridge,
+    });
+    cleanupAfterTest(async () => close(proxy.server));
+    assert.deepEqual(logLines.filter(line => line.includes(CONFIG_NOTICE)), [], '起動時は無効なので出ない');
+
+    nextOpenaiBridge = { enabled: false, degradeMapping: { enabled: true } };
+    const reload = await requestJson(`${proxy.url}/internal/reload`, { method: 'POST' });
+    assert.equal(reload.status, 200);
+    assert.equal(logLines.filter(line => line.includes(CONFIG_NOTICE)).length, 1, 'reload で1行出る');
+
+    // 可逆性: reload で戻せば以後は出ない（新たな行が増えない）。
+    nextOpenaiBridge = { enabled: false, degradeMapping: { enabled: false } };
+    assert.equal((await requestJson(`${proxy.url}/internal/reload`, { method: 'POST' })).status, 200);
+    assert.equal(logLines.filter(line => line.includes(CONFIG_NOTICE)).length, 1, '無効へ戻したら増えない');
+  });
+});
+
 async function listen(server) {
   await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
   server.unref?.();
