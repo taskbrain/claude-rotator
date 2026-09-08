@@ -1,3 +1,5 @@
+import { sanitizeAccountLabel } from './degrade-state.js';
+
 export function progressBar(ratio, width = 10) {
   if (ratio == null || Number.isNaN(Number(ratio))) return '-'.repeat(width);
   const normalized = Math.max(0, Math.min(1, Number(ratio)));
@@ -38,6 +40,10 @@ export function renderStatus(status, options = {}) {
   const cards = (status.accounts || []).map(account => renderAccountCard(account, status, now));
   lines.push(...renderAccountCards(cards, columns));
   if (cards.length > 0) lines.push('');
+
+  // Codex section (design doc 9.6). It is drawn only when the caller passed codex
+  // data; without it nothing is appended and the output stays byte-identical.
+  lines.push(...renderCodexSection(options.codex, now));
 
   lines.push('Events');
   for (const event of (status.events || []).slice(0, 8)) {
@@ -267,4 +273,120 @@ function formatEventTime(value) {
   const parsed = Date.parse(value);
   if (!Number.isFinite(parsed)) return String(value);
   return formatDate(parsed);
+}
+
+// ---------------------------------------------------------------------------
+// Codex section of `claude-rotator status` (design doc 9.6 / 13.3).
+//
+// `options.codex` is produced by the CLI and is one of:
+//   null / undefined      no codexStatusUrl is configured, nothing is drawn
+//   { ok: false, reason } the health fetch failed, one line is drawn
+//   { ok: true, health }  the codex-rotator health JSON
+//
+// The health JSON is written by another process, so it is treated as hostile
+// input: `contract`, `pool.state` and the `pool.accounts` array are required and
+// anything else degrades to the single "codex: unreachable (invalid payload)"
+// line, every optional key is drawn only when present, an unknown `contract`
+// version is never an error, and the whole block is wrapped in a guard so that a
+// broken payload can only cost this section - never the Claude side of the screen.
+// Only `label` and `state` are ever drawn, and `label` must match the contract
+// pattern, so an email address in the payload can never reach a status screen
+// that operators paste into reports.
+
+const CODEX_SECTION_LABEL = 'Codex Rotator';
+// Same column as the `current:` field of the Claude Rotator header line.
+const CODEX_HEADER_WIDTH = 39;
+const CODEX_LABEL_WIDTH = 20;
+const CODEX_INVALID_PAYLOAD = 'invalid payload';
+const CODEX_UNKNOWN_LABEL = '(unknown)';
+// The same character class terminalGraphemeWidth() skips when measuring width.
+// Here the characters are removed instead of skipped: these strings come from
+// another process, so they must not be able to move the cursor or hide text.
+const CODEX_UNSAFE_CHARACTERS = new RegExp(ZERO_WIDTH_CHARACTER.source, 'gu');
+
+function renderCodexSection(codex, now) {
+  if (!codex || typeof codex !== 'object') return [];
+  try {
+    if (codex.ok !== true) return renderCodexUnreachable(codex.reason);
+    return renderCodexHealth(codex.health, now) || renderCodexUnreachable(CODEX_INVALID_PAYLOAD);
+  } catch {
+    // A payload that throws while being read (a getter that raises, a label whose
+    // toString is null) must not take the status screen down with it.
+    return renderCodexUnreachable(CODEX_INVALID_PAYLOAD);
+  }
+}
+
+function renderCodexUnreachable(reason) {
+  const text = `codex: unreachable (${codexText(reason, 'no data')})`;
+  return [`${terminalPadEnd(CODEX_SECTION_LABEL, CODEX_HEADER_WIDTH)}${text}`, ''];
+}
+
+// Returns null when the payload lacks the keys the contract makes mandatory
+// (design doc 13.3: `contract`, `pool.state`, `accounts`), so the caller can fall
+// back to the one-line form instead of drawing a half-empty section.
+function renderCodexHealth(health, now) {
+  if (!health || typeof health !== 'object' || Array.isArray(health)) return null;
+  if (health.contract === undefined || health.contract === null) return null;
+  const pool = health.pool;
+  if (!pool || typeof pool !== 'object' || Array.isArray(pool)) return null;
+  if (typeof pool.state !== 'string' || !Array.isArray(pool.accounts)) return null;
+
+  const lines = [renderCodexPoolHeader(pool, now)];
+  for (const account of pool.accounts) lines.push(renderCodexAccountRow(account, now));
+  if (pool.observation?.cliConsumptionVisible === false) {
+    lines.push('  note: CLI-driven usage is not included in these numbers');
+  }
+  if (pool.accounts.length > 0) lines.push('  note: accounts are shown by label');
+  lines.push('');
+  return lines;
+}
+
+function renderCodexPoolHeader(pool, now) {
+  const available = codexNumber(pool.accountsAvailable);
+  const total = codexNumber(pool.accountsTotal);
+  const counts = available == null || total == null ? '' : ` (${available}/${total} available)`;
+  const state = codexText(pool.state, 'unknown');
+  return `${terminalPadEnd(CODEX_SECTION_LABEL, CODEX_HEADER_WIDTH)}pool: ${state}${counts}${renderCodexReset(pool.resetAt, now)}`;
+}
+
+function renderCodexAccountRow(account, now) {
+  const source = account && typeof account === 'object' ? account : {};
+  const primary = codexNumber(source.primaryUsedPercent);
+  const secondary = codexNumber(source.secondaryUsedPercent);
+  const windowMins = codexNumber(source.windowDurationMins);
+  // The health JSON never promises a fixed window (design doc 13.3): the label is
+  // derived from windowDurationMins when it is there and omitted when it is not.
+  const window = windowMins == null || windowMins <= 0 ? '' : ` (${formatDuration(windowMins * 60000)})`;
+  const state = codexText(source.state, '');
+  return `  ${terminalPadEnd(codexLabel(source.label), CODEX_LABEL_WIDTH)} ${progressBar(primary == null ? null : primary / 100, 10)}`
+    + ` ${codexPercent(primary)}${secondary == null ? '' : ` 2nd ${codexPercent(secondary)}`}${window}`
+    + `${state ? `  ${state}` : ''}${renderCodexReset(source.resetAt, now)}`;
+}
+
+// The label is the only account identifier the contract allows, and it is bounded
+// by `^[a-z0-9][a-z0-9_-]{0,31}$` (design doc 13.3). Everything else - an email
+// address above all - is replaced by the shared `<invalid>` marker rather than
+// drawn, so the pattern is the thing that keeps identifiers off this screen.
+function codexLabel(value) {
+  return sanitizeAccountLabel(typeof value === 'string' ? value : null) ?? CODEX_UNKNOWN_LABEL;
+}
+
+function renderCodexReset(value, now) {
+  const at = typeof value === 'number' ? value : Date.parse(typeof value === 'string' ? value : '');
+  if (!Number.isFinite(at)) return '';
+  return `  reset in ${formatDuration(at - now)} -> ${formatDate(at)}`;
+}
+
+function codexPercent(percent) {
+  return percent == null ? ' --%' : `${Math.round(percent).toString().padStart(3)}%`;
+}
+
+function codexNumber(value) {
+  return typeof value === 'number' && Number.isFinite(value) ? value : null;
+}
+
+function codexText(value, fallback) {
+  if (typeof value !== 'string') return fallback;
+  const cleaned = value.replace(CODEX_UNSAFE_CHARACTERS, '');
+  return cleaned || fallback;
 }

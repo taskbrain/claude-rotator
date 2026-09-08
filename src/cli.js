@@ -26,6 +26,7 @@ import {
   duplicateRefreshTokenAccountIds,
 } from './secret-store.js';
 import { renderStatus } from './monitor.js';
+import { resolveOpenAiBridgeSettings } from './openai-bridge.js';
 import { readCurrentClaudeCredentials } from './claude-credentials.js';
 import { fetchProfile, isTokenExpiringSoon, refreshAccessToken } from './oauth.js';
 import {
@@ -102,6 +103,21 @@ export async function runCli(argv = [], deps = {}) {
     if (command === 'help' || command === '--help' || command === '-h') {
       write(helpText());
       return 0;
+    }
+
+    // Codex section of the status screen (design doc 9.6). It is added in front of
+    // the existing branch instead of inside it, so the pre-existing rendering path
+    // below stays untouched: with no codexStatusUrl configured readCodexStatus()
+    // returns null, this branch falls through, and the output is byte-identical.
+    if (command === 'status') {
+      const codex = deps.readCodexStatus
+        ? await deps.readCodexStatus()
+        : await readCodexStatus({ deps, env });
+      if (codex) {
+        const status = deps.readStatus ? await deps.readStatus() : await readStatus();
+        write(renderStatus(status, { codex }));
+        return 0;
+      }
     }
 
     if (command === 'status') {
@@ -1341,6 +1357,113 @@ async function readStatus() {
 async function readHealth({ signal } = {}) {
   const config = await loadOrCreateConfig();
   return getJson(internalApiUrl(config, '/internal/health'), { signal });
+}
+
+// Design doc 9.6: the Codex section of `claude-rotator status` is fetched here and
+// nowhere else. The proxy server never reaches out to codex-rotator, so a missing,
+// slow or broken codex-rotator can only cost this one block of the status screen.
+// Returns null when no Codex section should be drawn at all.
+async function readCodexStatus({ deps = {}, env = process.env } = {}) {
+  const config = deps.loadConfig ? await deps.loadConfig() : await loadConfig(getConfigPath(env));
+  // `enabled` is the single switch for the whole degradeMapping feature (design
+  // doc 7.2), so a configured codexStatusUrl alone never makes this CLI reach out.
+  // An absent, unparsable or non-loopback codexStatusUrl has already been forced to
+  // null by resolveOpenAiBridgeSettings(), so a non-loopback GET is never issued.
+  const { enabled, codexStatusUrl, codexStatusTimeoutMs } = resolveOpenAiBridgeSettings(config).degradeMapping;
+  if (enabled !== true || !codexStatusUrl) return null;
+  try {
+    const response = await fetchCodexHealth(codexStatusUrl, codexStatusTimeoutMs);
+    if (response.status < 200 || response.status >= 300) {
+      return { ok: false, reason: `http ${response.status}` };
+    }
+    const health = JSON.parse(response.text);
+    if (!health || typeof health !== 'object' || Array.isArray(health)) {
+      return { ok: false, reason: 'invalid response' };
+    }
+    return { ok: true, health };
+  } catch (error) {
+    return { ok: false, reason: codexStatusFailureReason(error, codexStatusTimeoutMs) };
+  }
+}
+
+// The Codex fetch gets its own transport instead of reusing requestJson(): that
+// helper settles only on the request object's 'error' and on the response 'end',
+// so a codex-rotator that sends headers and then drops the socket would leave its
+// promise pending forever and hang `claude-rotator status` (R-15). Here every
+// terminal event settles the promise exactly once, an unref'd timer bounds the
+// whole exchange, and the body is capped so a runaway response cannot be buffered
+// without limit. The Claude-side readers are deliberately left untouched.
+const CODEX_STATUS_MAX_BYTES = 256 * 1024;
+
+export function fetchCodexHealth(url, timeoutMs) {
+  return new Promise((resolve, reject) => {
+    const target = new URL(url);
+    // Declared before the timer: http.request() throws synchronously for a URL its
+    // client cannot use (a non-http: scheme above all), and the timer callback must
+    // never reach an uninitialised binding - that would surface as an uncaught
+    // ReferenceError and kill the process instead of degrading one status block.
+    let request = null;
+    let settled = false;
+    const settle = (error, value) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      request?.destroy();
+      if (error) reject(error);
+      else resolve(value);
+    };
+    const timer = setTimeout(() => settle(codexStatusError('timeout', 'TimeoutError')), timeoutMs);
+    timer.unref?.();
+
+    try {
+      request = http.request(target, { method: 'GET' }, response => {
+        const chunks = [];
+        let size = 0;
+        response.on('data', chunk => {
+          size += chunk.length;
+          if (size > CODEX_STATUS_MAX_BYTES) {
+            settle(codexStatusError('response too large'));
+            return;
+          }
+          chunks.push(chunk);
+        });
+        response.on('end', () => settle(null, {
+          status: response.statusCode,
+          text: Buffer.concat(chunks).toString('utf8'),
+        }));
+        // 'aborted' and 'close' cover the case requestJson() misses: headers arrived,
+        // then the peer dropped the connection before the body ended.
+        response.on('aborted', () => settle(codexStatusError('connection closed')));
+        response.on('close', () => settle(codexStatusError('connection closed')));
+        response.on('error', error => settle(error));
+      });
+    } catch {
+      // Settle here so the timer is cleared and the caller renders the one-line
+      // form. resolveOpenAiBridgeSettings() already rejects such urls, so this is
+      // the second line of defence rather than the expected path.
+      settle(codexStatusError('invalid url'));
+      return;
+    }
+    request.on('error', error => settle(error));
+    request.on('timeout', () => settle(codexStatusError('timeout', 'TimeoutError')));
+    request.setTimeout(timeoutMs);
+    request.end();
+  });
+}
+
+function codexStatusError(message, name = 'CodexStatusError') {
+  return Object.assign(new Error(message), { name });
+}
+
+// This reason is printed on the status screen, which operators paste into reports,
+// so it carries neither the response body nor the configured URL.
+function codexStatusFailureReason(error, timeoutMs) {
+  if (error?.name === 'TimeoutError' || error?.name === 'AbortError' || error?.code === 'ABORT_ERR') {
+    return `timeout ${timeoutMs}ms`;
+  }
+  if (error instanceof SyntaxError) return 'invalid response';
+  if (error?.name === 'CodexStatusError') return error.message;
+  return typeof error?.code === 'string' ? error.code.toLowerCase() : 'unreachable';
 }
 
 async function postJson(path, body) {

@@ -105,7 +105,7 @@ describe('shouldRouteToOpenAiBridge', () => {
     assert.match(settingsRemote.warning, /loopback/);
   });
 
-  it('never parses the body when the bridge is disabled (レビュー指摘8)', () => {
+  it('never parses the body when the bridge is disabled (regression)', () => {
     // safeParseBody() は内部で JSON.parse() を呼ぶ。無効時に早期 return していれば、
     // JSON.parse は一度も呼ばれない。呼び出し回数を直接計測して確認する
     // （戻り値だけでは disabled 時に parsed が返らないことしか確認できず、
@@ -165,7 +165,7 @@ async function callThroughRotator({ bridgeHandler, requestBody, settingsOverride
 }
 
 // ---------------------------------------------------------------------------
-// httpRequestImpl を差し替えるための最小フェイク（Task 26 追試: レビュー指摘6・7）
+// httpRequestImpl を差し替えるための最小フェイク（idle-timeout・背圧の回帰テスト用）
 // 実ネットワークに頼らず、接続確立・応答・データイベントを手動で駆動する。
 // ---------------------------------------------------------------------------
 
@@ -371,7 +371,7 @@ describe('forwardToOpenAiBridge', () => {
     assert.ok(lines.every(l => !/secret text/.test(l)));
   });
 
-  it('propagates a client abort to the upstream bridge connection (production shape: req fully drained before forward, レビュー指摘1)', async () => {
+  it('propagates a client abort to the upstream bridge connection (production shape: req fully drained before forward, regression)', async () => {
     let bridgeReqAborted = false;
     const { server: bridge, port } = await startFakeBridge((req, res) => {
       req.on('aborted', () => { bridgeReqAborted = true; });
@@ -415,7 +415,7 @@ describe('forwardToOpenAiBridge', () => {
     assert.ok(lines.some(l => /outcome=client-abort/.test(l)), lines.join('\n'));
   });
 
-  it('pins the upstream host/port to settings.url even for an absolute-form req.url (レビュー指摘3)', async () => {
+  it('pins the upstream host/port to settings.url even for an absolute-form req.url (regression)', async () => {
     // HTTP のリクエストラインは絶対形式（proxy形式）を取り得る。req.url をそのまま
     // `new URL(req.url, settings.url)` に渡すと、絶対URLが base を無視して接続先
     // ホストを乗っ取ってしまう。hostname/port は必ず settings.url 由来であることを固定する。
@@ -456,8 +456,8 @@ describe('forwardToOpenAiBridge', () => {
     assert.equal(seenPath, '/v1/messages?beta=true', 'the bridge must only see the path/query; the evil.example.com host from the absolute-form request line must never reach it');
   });
 
-  it('does not retry a connection reset that arrives after the request was accepted, even immediately (double-send risk, レビュー再検証指摘1で挙動修正)', async () => {
-    // 旧テスト（レビュー指摘2時点）は「接続直後の即時リセットなら安全に再試行できる」
+  it('does not retry a connection reset that arrives after the request was accepted, even immediately (double-send risk, regression)', async () => {
+    // 旧テストは「接続直後の即時リセットなら安全に再試行できる」
     // という前提で connectionCount>=2・200 を期待していたが、実測（/tmp/dbg.js 相当の
     // 検証）で、小さな本文はローカルループバック上では socket の 'connect' →
     // ClientRequest の 'finish'（全データをOSへ渡し終えた合図）が、RST由来の
@@ -533,7 +533,7 @@ describe('forwardToOpenAiBridge', () => {
     assert.equal(result.outcome, 'bridge-stream-error');
   });
 
-  it('does not retry once the request body has been fully flushed to the bridge, even before any response arrives (no double-send, レビュー再検証指摘1)', async () => {
+  it('does not retry once the request body has been fully flushed to the bridge, even before any response arrives (no double-send, regression)', async () => {
     // upstream.end(body) は接続直後に本文を送り切るため、リクエスト全体（ヘッダ＋
     // 本文）の送信完了（'finish'）後の ECONNRESET は「bridge が本文を全受信した後に
     // 落ちた」可能性があり、再試行すると二重送信（Pro 枠の二重消費）になる。
@@ -570,7 +570,7 @@ describe('forwardToOpenAiBridge', () => {
     assert.equal(res.statusCode, 403);
   });
 
-  it('ignores an upstream error that fires after finish() has already settled a client abort (レビュー再検証指摘2)', async () => {
+  it('ignores an upstream error that fires after finish() has already settled a client abort (regression)', async () => {
     // onClientGone() は currentUpstream.destroy() を呼ぶ。実機（Node 22）では
     // ClientRequest の destroy() 由来の 'error'（ECONNRESET/socket hang up）が
     // 遅れて発火することがあり、settled ガードが無いと res.headersSent===false の
@@ -606,7 +606,7 @@ describe('forwardToOpenAiBridge', () => {
     assert.equal(requestImplCalls, 1, 'an error firing after finish() has already settled must never open a retry connection');
   });
 
-  it('logs a connect-retry line before re-attempting a refused connection (レビュー指摘5)', async () => {
+  it('logs a connect-retry line before re-attempting a refused connection (regression)', async () => {
     const settings = resolveOpenAiBridgeSettings({
       openaiBridge: { enabled: true, url: 'http://127.0.0.1:1', modelPattern: '^gpt-', connectTimeoutMs: 3000, idleTimeoutMs: 3000, connectRetries: 1 },
     });
@@ -627,7 +627,7 @@ describe('forwardToOpenAiBridge', () => {
     assert.ok(lines.some(l => /outcome=bridge-unreachable/.test(l)), lines.join('\n'));
   });
 
-  it('logs the synthesized 403 status for an idle-timeout, not the placeholder "-" (レビュー指摘6)', async () => {
+  it('logs the synthesized 403 status for an idle-timeout, not the placeholder "-" (regression)', async () => {
     // 旧実装は sendSynthetic() を呼んだ後に res.headersSent を再評価していたため、
     // sendSynthetic 自身が headersSent を true にしてしまい、実際には403を送っている
     // のにログの status が null（"-"）になるバグがあった。sendSynthetic 前に
@@ -650,7 +650,7 @@ describe('forwardToOpenAiBridge', () => {
     assert.match(logLine, /status=403/);
   });
 
-  it('pauses the upstream response and resumes on drain when the client write buffer is full (レビュー指摘7)', async () => {
+  it('pauses the upstream response and resumes on drain when the client write buffer is full (regression)', async () => {
     const manual = createManualUpstream();
     const req = fakeIncomingRequest();
     const res = fakeServerResponse();
@@ -716,7 +716,7 @@ describe('forwardToOpenAiBridge', () => {
 // ---------------------------------------------------------------------------
 
 describe('POST /internal/reload with openaiBridge', () => {
-  it('reverts to the default (disabled) bridge config once the section/config.json disappears on reload (レビュー指摘4)', async () => {
+  it('reverts to the default (disabled) bridge config once the section/config.json disappears on reload (regression)', async () => {
     // reloadOpenAiBridge が undefined を返す状況（openaiBridge セクションが config.json
     // から削除された、または config.json 自体が無い）を模す。旧実装は falsy を
     // 「変更なし」と誤認し、削除後も古い（有効な）設定を保持し続けるバグがあった。
@@ -799,7 +799,7 @@ describe('POST /internal/reload with openaiBridge', () => {
     }
   });
 
-  it('logs the openaiBridge config-warning only once at startup, not per request (レビュー指摘5)', async () => {
+  it('logs the openaiBridge config-warning only once at startup, not per request (regression)', async () => {
     const anthropicSeen = [];
     const anthropic = await listen(http.createServer(async (req, res) => {
       const chunks = [];
@@ -869,7 +869,7 @@ describe('POST /internal/reload with openaiBridge', () => {
     }
   });
 
-  it('does not log parse-error-fallback for a bodyless request, but does for a malformed non-empty body (レビュー指摘5)', async () => {
+  it('does not log parse-error-fallback for a bodyless request, but does for a malformed non-empty body (regression)', async () => {
     const anthropicSeen = [];
     const anthropic = await listen(http.createServer(async (req, res) => {
       const chunks = [];
@@ -1122,7 +1122,7 @@ describe('normalizeDegradeMapping (R3-2 / 設計書 §7.3)', () => {
   it('accepts the IPv6 loopback for codexStatusUrl (bracketed and expanded)', () => {
     // new URL('http://[::1]:18765/healthz').hostname は角括弧つきの '[::1]' を返すため、
     // 素の '::1' を持つ許可リストと突き合わせる前に角括弧を外す必要がある
-    // （レビュー指摘2。修正前はこの URL が黙って null になっていた）。
+    // （修正前はこの URL が黙って null になっていた）。
     for (const value of [
       'http://[::1]:18765/healthz',
       'http://[::1]/healthz',
@@ -1146,7 +1146,7 @@ describe('normalizeDegradeMapping (R3-2 / 設計書 §7.3)', () => {
   });
 
   it('records why a codexStatusUrl was dropped instead of discarding it silently', () => {
-    // 非ループバックを黙って捨てない（レビュー指摘3）。理由は notices に載せ、
+    // 非ループバックを黙って捨てない。理由は notices に載せ、
     // 起動時と reload 時に logDegradeMappingConfigNotice() が1行で出す（§7.2）。
     for (const value of ['http://evil.example.com/healthz', 'https://1.2.3.4/healthz', 'http://[fe80::1]/healthz']) {
       assert.deepEqual(
@@ -1280,7 +1280,7 @@ describe('degradeMapping の config-notice (設計書 §7.3-4)', () => {
   });
 
   it('logs one line per dropped codexStatusUrl (§7.2)', () => {
-    // 非ループバック URL を黙って捨てない（レビュー指摘3）。bridge 分岐が有効なので
+    // 非ループバック URL を黙って捨てない。bridge 分岐が有効なので
     // §7.3-4 の「bridge 無しで写像だけ有効」の行は出ず、この1行だけになる。
     const settings = resolveOpenAiBridgeSettings(enabledBridgeConfig({
       degradeMapping: { enabled: true, codexStatusUrl: 'http://evil.example.com/healthz' },
@@ -1312,7 +1312,7 @@ describe('degradeMapping の config-notice (設計書 §7.3-4)', () => {
   });
 
   it('logs nothing for a loopback IPv6 codexStatusUrl', () => {
-    // 修正前は [::1] が黙って捨てられていた（レビュー指摘2）。いまは値が残り通知も出ない。
+    // 修正前は [::1] が黙って捨てられていた。いまは値が残り通知も出ない。
     const settings = resolveOpenAiBridgeSettings(enabledBridgeConfig({
       degradeMapping: { enabled: true, codexStatusUrl: 'http://[::1]:18765/healthz' },
     }));
@@ -2504,7 +2504,7 @@ describe('forwardToOpenAiBridge > 書換後のイベント順序 (R4-1 / 設計�
 });
 
 // ---------------------------------------------------------------------------
-// R4-1 再検証の指摘への回帰テスト（astra-reviewer / 2026-09-08）
+// R4-1 の再検証で見つかった2件の回帰テスト（2026-09-08）
 //   ① x-ombr-contract が無い・不正な応答は、過去に学習した (pool)=unusable が
 //      残っていても書き換えない（契約 §C3.7-1 の後方互換原則）
 //   ② 403 の本文の「最早回復時刻」は GPT 側と Claude 側の早いほうを出す
@@ -2638,5 +2638,51 @@ describe('forwardToOpenAiBridge > 403 本文の最早回復時刻 (R4-1 再検�
       assert.equal(response.status, 403);
       assert.match(JSON.parse(text).error.message, new RegExp(`Earliest recovery: ${FAR_FUTURE_RESET_AT}\\.$`));
     }
+  });
+});
+
+// Opus review NEW-1: http.request() cannot speak any scheme but http: and throws
+// synchronously, so a loopback https url has to be dropped at settings-resolution
+// time - with a notice, like every other discarded value (design doc 7.2).
+describe('degradeMapping codexStatusUrl scheme', () => {
+  it('drops a non-http scheme even on loopback, with a notice', () => {
+    for (const value of [
+      'https://127.0.0.1:18765/healthz',
+      'https://localhost:18765/healthz',
+      'https://[::1]:18765/healthz',
+    ]) {
+      const normalized = normalizeDegradeMapping({ enabled: true, codexStatusUrl: value });
+      assert.equal(normalized.codexStatusUrl, null, value);
+      assert.deepEqual(
+        normalized.notices,
+        ['degradeMapping.codexStatusUrl must use http: scheme; codex status section disabled'],
+        value,
+      );
+    }
+  });
+
+  it('keeps loopback http urls untouched', () => {
+    for (const value of ['http://127.0.0.1:18765/healthz', 'http://[::1]/healthz']) {
+      const normalized = normalizeDegradeMapping({ enabled: true, codexStatusUrl: value });
+      assert.equal(normalized.codexStatusUrl, value, value);
+      assert.deepEqual(normalized.notices, [], value);
+    }
+  });
+
+  it('logs the dropped scheme without copying the configured url', () => {
+    const settings = resolveOpenAiBridgeSettings({
+      openaiBridge: {
+        enabled: true,
+        url: 'http://127.0.0.1:18765',
+        degradeMapping: { enabled: true, codexStatusUrl: 'https://127.0.0.1:18765/healthz' },
+      },
+    });
+    const lines = [];
+
+    assert.equal(settings.degradeMapping.codexStatusUrl, null);
+    logDegradeMappingConfigNotice(settings, line => lines.push(line));
+    assert.equal(lines.length, 1);
+    assert.match(lines[0], /degradeMapping\.codexStatusUrl must use http: scheme; codex status section disabled$/);
+    assert.equal(lines[0].includes('healthz'), false);
   });
 });

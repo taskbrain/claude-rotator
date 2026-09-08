@@ -211,3 +211,193 @@ function modelAwareStatus() {
   };
   return status;
 }
+
+// Codex section of `claude-rotator status` (design doc section 9.6 / 13.3).
+// claude-rotator only ever reads the codex-rotator health JSON: every key is
+// optional, an unknown contract version is not an error, and a missing or broken
+// payload must never break the Claude side of the screen.
+describe('codex status section', () => {
+  const now = Date.parse('2026-06-04T09:00:00Z');
+
+  it('renders the codex pool header and one row per codex account', () => {
+    const output = renderStatus(sampleStatus(), {
+      now,
+      columns: 120,
+      codex: { ok: true, health: codexHealth() },
+    });
+
+    assert.match(output, /Codex Rotator\s+pool: exhausted \(0\/2 available\)\s+reset in 1h -> 06\/04 19:00 JST/);
+    assert.match(output, /pro-a\s+█████████░\s+97% 2nd\s+41% \(7d\)\s+exhausted\s+reset in 1h -> 06\/04 19:00 JST/);
+    assert.match(output, /pro-b\s+███░░░░░░░\s+31%\s+available/);
+    assert.match(output, /note: accounts are shown by label/);
+    // The Claude side is rendered exactly as before.
+    assert.match(output, /a@example\.com\s+exhausted/);
+    assert.match(output, /Events/);
+  });
+
+  it('renders the CLI-consumption note only when the pool reports it', () => {
+    const visible = codexHealth();
+    visible.pool.observation.cliConsumptionVisible = true;
+
+    assert.match(
+      renderStatus(sampleStatus(), { now, columns: 120, codex: { ok: true, health: codexHealth() } }),
+      /note: CLI-driven usage is not included in these numbers/,
+    );
+    assert.doesNotMatch(
+      renderStatus(sampleStatus(), { now, columns: 120, codex: { ok: true, health: visible } }),
+      /note: CLI-driven usage is not included in these numbers/,
+    );
+  });
+
+  it('renders a single unreachable line when the health fetch failed', () => {
+    const output = renderStatus(sampleStatus(), {
+      now,
+      columns: 120,
+      codex: { ok: false, reason: 'timeout 1500ms' },
+    });
+
+    assert.match(output, /Codex Rotator\s+codex: unreachable \(timeout 1500ms\)/);
+    assert.doesNotMatch(output, /pool:/);
+    assert.match(output, /a@example\.com\s+exhausted/);
+    assert.match(output, /Events/);
+  });
+
+  it('OSS independence: no codex data means the status output is byte-identical', () => {
+    const baseline = renderStatus(sampleStatus(), { now, columns: 100 });
+
+    assert.equal(renderStatus(sampleStatus(), { now, columns: 100, codex: null }), baseline);
+    assert.equal(renderStatus(sampleStatus(), { now, columns: 100, codex: undefined }), baseline);
+    assert.doesNotMatch(baseline, /Codex Rotator/);
+  });
+
+  it('draws the optional keys only when they are present', () => {
+    const output = renderStatus(sampleStatus(), {
+      now,
+      columns: 120,
+      codex: { ok: true, health: { contract: 1, pool: { state: 'unknown', accounts: [{ label: 'pro-a' }] } } },
+    });
+
+    assert.match(output, /Codex Rotator\s+pool: unknown/);
+    assert.match(output, /pro-a\s+----------\s+--%/);
+    assert.doesNotMatch(output, /undefined|NaN/);
+  });
+
+  it('degrades to one line when a contract-mandated key is missing', () => {
+    const payloads = [
+      {},
+      { contract: 1 },
+      { pool: { state: 'available', accounts: [] } },
+      { contract: 1, pool: null },
+      { contract: 1, pool: { accounts: [] } },
+      { contract: 1, pool: { state: 'available' } },
+      { contract: 1, pool: { state: 'available', accounts: 'not-an-array' } },
+      { contract: 1, pool: { state: 42, accounts: [] } },
+    ];
+
+    for (const health of payloads) {
+      const output = renderStatus(sampleStatus(), { now, columns: 120, codex: { ok: true, health } });
+      assert.match(output, /Codex Rotator\s+codex: unreachable \(invalid payload\)/);
+      assert.doesNotMatch(output, /pool:/);
+      assert.match(output, /a@example\.com\s+exhausted/);
+      assert.match(output, /Events/);
+    }
+  });
+
+  it('never crashes on a payload built to break string conversion', () => {
+    const health = codexHealth();
+    health.pool.accounts[0].label = { toString: null };
+    health.pool.accounts[1].state = { toString: null };
+
+    const output = renderStatus(sampleStatus(), { now, columns: 120, codex: { ok: true, health } });
+
+    assert.match(output, /Codex Rotator/);
+    assert.match(output, /a@example\.com\s+exhausted/);
+    assert.match(output, /Events/);
+    assert.doesNotMatch(output, /\[object Object\]/);
+  });
+
+  it('replaces a label that does not match the contract pattern', () => {
+    const health = codexHealth();
+    health.pool.accounts[0].label = 'codex-account@example.invalid';
+    health.pool.accounts[1].label = `pro-b${String.fromCharCode(0x200b)}`;
+
+    const output = renderStatus(sampleStatus(), { now, columns: 120, codex: { ok: true, health } });
+
+    assert.match(output, /<invalid>\s+█████████░/);
+    assert.match(output, /<invalid>\s+███░░░░░░░/);
+    assert.doesNotMatch(output, /@example\.invalid/);
+    assert.doesNotMatch(output, /pro-b/);
+  });
+
+  it('strips control and zero-width characters from codex states', () => {
+    const zeroWidth = String.fromCharCode(0x200b);
+    const bell = String.fromCharCode(0x07);
+    const health = codexHealth();
+    health.pool.accounts[0].state = `exhaus${bell}ted`;
+    health.pool.state = `exhaus${zeroWidth}ted`;
+
+    const output = renderStatus(sampleStatus(), { now, columns: 120, codex: { ok: true, health } });
+
+    assert.match(output, /pro-a\s+█████████░/);
+    assert.match(output, /exhausted/);
+    assert.match(output, /pool: exhausted/);
+    assert.ok(!output.includes(zeroWidth), 'zero-width characters must not reach the terminal');
+    assert.ok(!output.includes(bell), 'control characters must not reach the terminal');
+  });
+
+  it('degrades to one line when reading the payload throws', () => {
+    const health = codexHealth();
+    Object.defineProperty(health.pool, 'observation', {
+      get() { throw new Error('hostile payload'); },
+    });
+
+    const output = renderStatus(sampleStatus(), { now, columns: 120, codex: { ok: true, health } });
+
+    assert.match(output, /Codex Rotator\s+codex: unreachable \(invalid payload\)/);
+    assert.match(output, /a@example\.com\s+exhausted/);
+    assert.match(output, /Events/);
+  });
+
+  it('never renders an email-like identifier even when the health JSON carries one', () => {
+    const health = codexHealth();
+    health.pool.accounts[0].display = 'codex-account@example.invalid';
+    health.pool.accounts[0].email = 'codex-account@example.invalid';
+
+    const output = renderStatus(sampleStatus(), { now, columns: 120, codex: { ok: true, health } });
+
+    assert.match(output, /pro-a\s+█████████░/);
+    assert.doesNotMatch(output, /example\.invalid/);
+  });
+});
+
+// Dummy codex-rotator health payload. Labels are placeholders on purpose: by
+// contract the health JSON carries no email address, and this fixture must not
+// introduce one.
+function codexHealth() {
+  return {
+    status: 'ok',
+    contract: 1,
+    pool: {
+      state: 'exhausted',
+      accountsTotal: 2,
+      accountsAvailable: 0,
+      resetAt: '2026-06-04T10:00:00Z',
+      observation: { mode: 'passive', source: 'response-header', cliConsumptionVisible: false },
+      accounts: [
+        {
+          label: 'pro-a',
+          state: 'exhausted',
+          primaryUsedPercent: 97,
+          secondaryUsedPercent: 41,
+          windowDurationMins: 10080,
+          resetAt: '2026-06-04T10:00:00Z',
+        },
+        {
+          label: 'pro-b',
+          state: 'available',
+          primaryUsedPercent: 31,
+        },
+      ],
+    },
+  };
+}

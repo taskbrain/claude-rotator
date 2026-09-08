@@ -1806,3 +1806,388 @@ function createIo() {
     output: () => text,
   };
 }
+
+import { renderStatus } from '../src/monitor.js';
+import { fetchCodexHealth } from '../src/cli.js';
+
+// `claude-rotator status` grows a Codex section (design doc section 9.6). The
+// fetch lives in the CLI only: proxy-server never talks to codex-rotator, and a
+// missing, slow or malformed codex-rotator may only cost this one block.
+describe('codex status section (CLI)', () => {
+  const claudeStatus = {
+    currentAccount: 'acct_1',
+    currentAccountName: 'a@example.com',
+    accounts: [{
+      id: 'acct_1',
+      name: 'a@example.com',
+      status: 'active',
+      quota: { unified5h: 0.76, unified7d: 0.4 },
+      usage: { totalRequests: 1 },
+    }],
+    events: [],
+  };
+  const readStatus = async () => claudeStatus;
+
+  it('OSS independence: prints the current output verbatim when no codexStatusUrl is set', async () => {
+    const io = createIo();
+
+    const code = await runCli(['status'], {
+      ...io,
+      readStatus,
+      loadConfig: async () => ({ openaiBridge: { enabled: true, url: 'http://127.0.0.1:18765' } }),
+    });
+
+    assert.equal(code, 0);
+    assert.equal(io.output(), renderStatus(claudeStatus));
+    assert.doesNotMatch(io.output(), /Codex Rotator/);
+  });
+
+  it('renders the codex section from the codex-rotator health endpoint', async () => {
+    const paths = [];
+    const server = http.createServer((request, response) => {
+      paths.push(request.url);
+      response.writeHead(200, { 'Content-Type': 'application/json' });
+      response.end(JSON.stringify({
+        contract: 1,
+        pool: {
+          state: 'available',
+          accountsTotal: 1,
+          accountsAvailable: 1,
+          observation: { cliConsumptionVisible: false },
+          accounts: [{ label: 'pro-a', state: 'available', primaryUsedPercent: 12 }],
+        },
+      }));
+    });
+    const port = await listenOnCodexLoopback(server);
+
+    try {
+      const io = createIo();
+      const code = await runCli(['status'], {
+        ...io,
+        readStatus,
+        loadConfig: async () => codexStatusConfig(`http://127.0.0.1:${port}/healthz`),
+      });
+
+      assert.equal(code, 0);
+      assert.deepEqual(paths, ['/healthz']);
+      assert.match(io.output(), /Codex Rotator\s+pool: available \(1\/1 available\)/);
+      assert.match(io.output(), /pro-a\s+█░░░░░░░░░\s+12%\s+available/);
+      assert.match(io.output(), /note: CLI-driven usage is not included in these numbers/);
+      assert.match(io.output(), /a@example\.com\s+active/);
+    } finally {
+      await closeCodexServer(server);
+    }
+  });
+
+  it('OSS independence: a closed codex-rotator port degrades to one line', async () => {
+    const port = await unusedCodexLoopbackPort();
+    const io = createIo();
+    const startedAt = Date.now();
+
+    const code = await runCli(['status'], {
+      ...io,
+      readStatus,
+      loadConfig: async () => codexStatusConfig(`http://127.0.0.1:${port}/healthz`, 400),
+    });
+
+    assert.equal(code, 0);
+    assert.match(io.output(), /Codex Rotator\s+codex: unreachable \(/);
+    assert.match(io.output(), /a@example\.com\s+active/);
+    assert.match(io.output(), /5h ███████░░░  76%/);
+    assert.ok(Date.now() - startedAt < 5000, 'status must not hang on an absent codex-rotator');
+  });
+
+  it('OSS independence: a codex-rotator that never answers is cut off at the configured deadline', async () => {
+    const sockets = new Set();
+    const server = http.createServer(() => {});
+    server.on('connection', socket => sockets.add(socket));
+    const port = await listenOnCodexLoopback(server);
+
+    try {
+      const io = createIo();
+      const startedAt = Date.now();
+
+      const code = await runCli(['status'], {
+        ...io,
+        readStatus,
+        loadConfig: async () => codexStatusConfig(`http://127.0.0.1:${port}/healthz`, 250),
+      });
+      const elapsed = Date.now() - startedAt;
+
+      assert.equal(code, 0);
+      assert.match(io.output(), /Codex Rotator\s+codex: unreachable \(timeout 250ms\)/);
+      assert.match(io.output(), /a@example\.com\s+active/);
+      assert.ok(elapsed >= 200, `the deadline must be honoured, waited ${elapsed}ms`);
+      assert.ok(elapsed < 5000, `status must not hang on a silent codex-rotator, waited ${elapsed}ms`);
+    } finally {
+      for (const socket of sockets) socket.destroy();
+      await closeCodexServer(server);
+    }
+  });
+
+  it('degrades to one line when the health response is not JSON', async () => {
+    const server = http.createServer((request, response) => {
+      response.writeHead(200, { 'Content-Type': 'application/json' });
+      response.end('<html>not json</html>');
+    });
+    const port = await listenOnCodexLoopback(server);
+
+    try {
+      const io = createIo();
+      const code = await runCli(['status'], {
+        ...io,
+        readStatus,
+        loadConfig: async () => codexStatusConfig(`http://127.0.0.1:${port}/healthz`),
+      });
+
+      assert.equal(code, 0);
+      assert.match(io.output(), /Codex Rotator\s+codex: unreachable \(invalid response\)/);
+      assert.doesNotMatch(io.output(), /not json/);
+      assert.match(io.output(), /a@example\.com\s+active/);
+    } finally {
+      await closeCodexServer(server);
+    }
+  });
+
+  it('degrades to one line on an error status without echoing the response body', async () => {
+    const server = http.createServer((request, response) => {
+      response.writeHead(500, { 'Content-Type': 'application/json' });
+      response.end(JSON.stringify({ error: 'secret-looking-detail' }));
+    });
+    const port = await listenOnCodexLoopback(server);
+
+    try {
+      const io = createIo();
+      const code = await runCli(['status'], {
+        ...io,
+        readStatus,
+        loadConfig: async () => codexStatusConfig(`http://127.0.0.1:${port}/healthz`),
+      });
+
+      assert.equal(code, 0);
+      assert.match(io.output(), /Codex Rotator\s+codex: unreachable \(http 500\)/);
+      assert.doesNotMatch(io.output(), /secret-looking-detail/);
+    } finally {
+      await closeCodexServer(server);
+    }
+  });
+
+  it('still draws the section when the health JSON carries only the required keys', async () => {
+    const server = http.createServer((request, response) => {
+      response.writeHead(200, { 'Content-Type': 'application/json' });
+      response.end(JSON.stringify({ status: 'ok', contract: 99, pool: { state: 'available', accounts: [] } }));
+    });
+    const port = await listenOnCodexLoopback(server);
+
+    try {
+      const io = createIo();
+      const code = await runCli(['status'], {
+        ...io,
+        readStatus,
+        loadConfig: async () => codexStatusConfig(`http://127.0.0.1:${port}/healthz`),
+      });
+
+      assert.equal(code, 0);
+      assert.match(io.output(), /Codex Rotator\s+pool: available$/m);
+      assert.doesNotMatch(io.output(), /undefined|NaN/);
+      assert.match(io.output(), /a@example\.com\s+active/);
+    } finally {
+      await closeCodexServer(server);
+    }
+  });
+
+  it('never prints an email-like identifier returned by the health endpoint', async () => {
+    const server = http.createServer((request, response) => {
+      response.writeHead(200, { 'Content-Type': 'application/json' });
+      response.end(JSON.stringify({
+        contract: 1,
+        pool: {
+          state: 'available',
+          accounts: [{
+            label: 'pro-a',
+            state: 'available',
+            display: 'codex-account@example.invalid',
+            email: 'codex-account@example.invalid',
+          }],
+        },
+      }));
+    });
+    const port = await listenOnCodexLoopback(server);
+
+    try {
+      const io = createIo();
+      const code = await runCli(['status'], {
+        ...io,
+        readStatus,
+        loadConfig: async () => codexStatusConfig(`http://127.0.0.1:${port}/healthz`),
+      });
+
+      assert.equal(code, 0);
+      assert.match(io.output(), /pro-a/);
+      assert.doesNotMatch(io.output(), /example\.invalid/);
+    } finally {
+      await closeCodexServer(server);
+    }
+  });
+
+  it('settles when codex-rotator drops the socket after sending headers', async () => {
+    const server = http.createServer((request, response) => {
+      response.writeHead(200, { 'Content-Type': 'application/json', 'Content-Length': '4096' });
+      response.write('{"contract":1,"pool":{"state":"avail');
+      response.socket.destroy();
+    });
+    const port = await listenOnCodexLoopback(server);
+
+    try {
+      const io = createIo();
+      const startedAt = Date.now();
+
+      const code = await runCli(['status'], {
+        ...io,
+        readStatus,
+        loadConfig: async () => codexStatusConfig(`http://127.0.0.1:${port}/healthz`, 5000),
+      });
+      const elapsed = Date.now() - startedAt;
+
+      assert.equal(code, 0);
+      assert.match(io.output(), /Codex Rotator\s+codex: unreachable \(/);
+      assert.match(io.output(), /a@example\.com\s+active/);
+      assert.ok(elapsed < 2000, `a dropped connection must settle at once, waited ${elapsed}ms`);
+    } finally {
+      await closeCodexServer(server);
+    }
+  });
+
+  it('degrades to one line when the health JSON lacks a contract-mandated key', async () => {
+    const server = http.createServer((request, response) => {
+      response.writeHead(200, { 'Content-Type': 'application/json' });
+      response.end(JSON.stringify({ status: 'ok' }));
+    });
+    const port = await listenOnCodexLoopback(server);
+
+    try {
+      const io = createIo();
+      const code = await runCli(['status'], {
+        ...io,
+        readStatus,
+        loadConfig: async () => codexStatusConfig(`http://127.0.0.1:${port}/healthz`),
+      });
+
+      assert.equal(code, 0);
+      assert.match(io.output(), /Codex Rotator\s+codex: unreachable \(invalid payload\)/);
+      assert.match(io.output(), /a@example\.com\s+active/);
+    } finally {
+      await closeCodexServer(server);
+    }
+  });
+
+  it('OSS independence: degradeMapping disabled means no request and no section', async () => {
+    let requests = 0;
+    const server = http.createServer((request, response) => {
+      requests += 1;
+      response.writeHead(200, { 'Content-Type': 'application/json' });
+      response.end('{}');
+    });
+    const port = await listenOnCodexLoopback(server);
+
+    try {
+      const io = createIo();
+      const config = codexStatusConfig(`http://127.0.0.1:${port}/healthz`);
+      config.openaiBridge.degradeMapping.enabled = false;
+
+      const code = await runCli(['status'], { ...io, readStatus, loadConfig: async () => config });
+
+      assert.equal(code, 0);
+      assert.equal(requests, 0);
+      assert.equal(io.output(), renderStatus(claudeStatus));
+      assert.doesNotMatch(io.output(), /Codex Rotator/);
+    } finally {
+      await closeCodexServer(server);
+    }
+  });
+
+  it('never fetches a non-loopback codexStatusUrl', async () => {
+    const io = createIo();
+
+    const code = await runCli(['status'], {
+      ...io,
+      readStatus,
+      loadConfig: async () => codexStatusConfig('http://198.51.100.7:18765/healthz'),
+    });
+
+    assert.equal(code, 0);
+    assert.equal(io.output(), renderStatus(claudeStatus));
+    assert.doesNotMatch(io.output(), /Codex Rotator/);
+  });
+});
+
+// Opus review NEW-1: http.request() throws synchronously for a url its client
+// cannot use. The fetch has to survive that without leaving a timer armed on an
+// uninitialised request binding, which used to surface as an uncaught
+// ReferenceError and took the whole process down instead of one status block.
+describe('codex health fetch guard', () => {
+  it('rejects at once and arms no late timer when the http client refuses the url', async () => {
+    const startedAt = Date.now();
+
+    await assert.rejects(fetchCodexHealth('https://127.0.0.1:9999/healthz', 30), /invalid url/);
+    const elapsed = Date.now() - startedAt;
+    // Outlive the deadline: a timer left armed on the failed request would fire here.
+    await new Promise(resolve => setTimeout(resolve, 120));
+
+    assert.ok(elapsed < 500, `a refused url must settle at once, waited ${elapsed}ms`);
+  });
+
+  it('never issues a request for a non-http codexStatusUrl and keeps the output verbatim', async () => {
+    const io = createIo();
+
+    const code = await runCli(['status'], {
+      ...io,
+      readStatus: async () => ({
+        currentAccount: 'acct_1',
+        currentAccountName: 'a@example.com',
+        accounts: [{
+          id: 'acct_1',
+          name: 'a@example.com',
+          status: 'active',
+          quota: { unified5h: 0.76, unified7d: 0.4 },
+          usage: { totalRequests: 1 },
+        }],
+        events: [],
+      }),
+      loadConfig: async () => codexStatusConfig('https://127.0.0.1:18765/healthz'),
+    });
+
+    assert.equal(code, 0);
+    assert.doesNotMatch(io.output(), /Codex Rotator/);
+    assert.match(io.output(), /a@example\.com\s+active/);
+  });
+});
+
+function codexStatusConfig(codexStatusUrl, codexStatusTimeoutMs = 2000) {
+  return {
+    openaiBridge: {
+      enabled: true,
+      url: 'http://127.0.0.1:18765',
+      degradeMapping: { enabled: true, codexStatusUrl, codexStatusTimeoutMs },
+    },
+  };
+}
+
+async function listenOnCodexLoopback(server) {
+  await new Promise((resolve, reject) => {
+    server.once('error', reject);
+    server.listen(0, '127.0.0.1', resolve);
+  });
+  return server.address().port;
+}
+
+async function closeCodexServer(server) {
+  await new Promise(resolve => server.close(resolve));
+}
+
+async function unusedCodexLoopbackPort() {
+  const server = http.createServer(() => {});
+  const port = await listenOnCodexLoopback(server);
+  await closeCodexServer(server);
+  return port;
+}

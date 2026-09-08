@@ -68,13 +68,17 @@ const CODEX_STATUS_URL_NOT_LOOPBACK_NOTICE =
   'degradeMapping.codexStatusUrl must be loopback; codex status section disabled';
 const CODEX_STATUS_URL_INVALID_NOTICE =
   'degradeMapping.codexStatusUrl is not a usable url; codex status section disabled';
+// http.request() は http: 以外のスキームを扱えず、同期 throw する。
+// 取得時に落とすのではなく設定解決の時点で捨て、理由を notice で残す。
+const CODEX_STATUS_URL_SCHEME_NOTICE =
+  'degradeMapping.codexStatusUrl must use http: scheme; codex status section disabled';
 
 function positiveNumber(value, fallback) {
   return typeof value === 'number' && Number.isFinite(value) && value > 0 ? value : fallback;
 }
 
 // new URL().hostname は IPv6 リテラルを角括弧つき（'[::1]'）で返すため、
-// LOOPBACK_HOSTS（素の '::1'）と突き合わせる前に角括弧を外す（レビュー指摘2）。
+// LOOPBACK_HOSTS（素の '::1'）と突き合わせる前に角括弧を外す。
 // WHATWG URL は '[0:0:0:0:0:0:0:1]' を '[::1]' へ正規化するので、展開形も同じ経路で
 // 許可される。IPv4 射影（'::ffff:127.0.0.1' → '[::ffff:7f00:1]'）と未指定アドレス
 // （'[::]'）は許可リストに無いので拒否側へ倒れる（安全側）。
@@ -84,7 +88,7 @@ function unbracketHostname(hostname) {
 
 // codexStatusUrl は openaiBridge.url と同じくループバックに限る（設計書 §7.2）。
 // 非ループバック・解析不能・型違いはいずれも null（＝Codex 節を出さない）へ倒したうえで、
-// 「なぜ捨てたか」を notice として返す（黙って捨てない＝レビュー指摘3）。
+// 「なぜ捨てたか」を notice として返す（黙って捨てない）。
 // 未指定（null / undefined）は既定そのものなので notice を出さない。
 function normalizeCodexStatusUrl(value) {
   if (value === null || value === undefined) return { value: null, notice: null };
@@ -99,6 +103,11 @@ function normalizeCodexStatusUrl(value) {
   }
   if (!LOOPBACK_HOSTS.has(unbracketHostname(hostname))) {
     return { value: null, notice: CODEX_STATUS_URL_NOT_LOOPBACK_NOTICE };
+  }
+  // ループバック判定の後に置く: 非ループバックの https を「まずループバックでない」と
+  // 説明する既存の規律を変えないため。ここまで来た値は解析済みなので再解析は投げない。
+  if (new URL(value).protocol !== 'http:') {
+    return { value: null, notice: CODEX_STATUS_URL_SCHEME_NOTICE };
   }
   return { value, notice: null };
 }
@@ -218,7 +227,7 @@ export function shouldRouteToOpenAiBridge(body, settings) {
   if (!settings?.enabled) {
     // fail-safe（仕様書 4.2.2 節 b）で無効化された場合は 'parse-error' として記録し、
     // 設定どおりの通常オフ（'disabled'）と区別する（呼び出し側のログ outcome=parse-error-fallback）。
-    // 無効時は body を一切パースしない（レビュー指摘8: 無駄なパースを避ける早期return）。
+    // 無効時は body を一切パースしない（無駄なパースを避ける早期 return）。
     return { route: false, model: null, reason: settings?.warning ? 'parse-error' : 'disabled' };
   }
   const parsed = safeParseBody(body);
@@ -247,7 +256,7 @@ function sendSynthetic(res, reason) {
 
 // req.url は絶対形式（proxy形式のリクエストライン。例: `http://evil.example.com/v1/messages`）
 // を取り得る。`new URL(req.url, base)` は第一引数が絶対URLだと base を無視するため、
-// そのまま settings.url へ渡すと接続先ホストが req.url 側に乗っ取られる（レビュー指摘3）。
+// そのまま settings.url へ渡すと接続先ホストが req.url 側に乗っ取られる。
 // hostname/port は必ず settings.url 由来にし、req.url からは pathname/search だけを取る
 // （src/proxy-server.js の configuredUpstreamTarget と同型）。
 function pinnedUpstreamTarget(requestUrl, bridgeUrl) {
@@ -292,7 +301,7 @@ const RETRYABLE_CONNECT_ERROR_CODES = new Set(['ECONNREFUSED', 'ECONNRESET', 'EN
 
 // gptPoolState は任意引数である（設計書 §11.1 R3-4）。渡さない呼び出しは現行と完全に
 // 同一に振る舞い、ログへ1フィールドも足さない（§14.4）。渡すのは src/proxy-server.js が
-// degradeMapping.enabled を真と解決したときだけで、生成・破棄もそちらが受け持つ（D-13）。
+// degradeMapping.enabled を真と解決したときだけで、生成・破棄もそちらが受け持つ。
 // claudeAllUnusable も任意引数である（設計書 §11.1 R4-1 の補足）。**真偽値ではなく関数**を
 // 受け取るのは、要求の開始時点ではなく **bridge の応答ヘッダを受け取った時点の台帳**で
 // 判定するためである（要求から応答までの間に口座が回復しうる）。渡さない呼び出しは
@@ -323,8 +332,7 @@ export function forwardToOpenAiBridge({
     // upstream（ClientRequest）の 'finish' が一度でも発火したら true。'finish' は
     // リクエスト全体（ヘッダ＋本文）がOSへ渡され切った時点で発火するため、これが
     // 立った後の接続エラーは「bridge が本文を受信済みの可能性がある」ことを意味し、
-    // 再試行すると二重送信（Pro枠の二重消費）になり得るため再試行しない
-    // （レビュー再検証指摘1）。
+    // 再試行すると二重送信（Pro枠の二重消費）になり得るため再試行しない。
     // 実測（Node 22・ループバック）では、接続が確立しさえすれば小さな本文は
     // RST 由来の 'error' より先に 'finish' が発火する。つまりこのフラグが false の
     // ままなのはソケットが接続しなかった場合（ECONNREFUSED/ENOTFOUND）だけであり、
@@ -437,7 +445,7 @@ export function forwardToOpenAiBridge({
 
     // クライアント切断の検出。readBody() で本文を読み切ってから forward するため
     // （src/proxy-server.js）、この時点で req は既に complete===true になっており
-    // 'aborted' はもう発火しない（レビュー指摘1）。res 側の 'close'
+    // 'aborted' はもう発火しない。res 側の 'close'
     // （クライアントが切断し、かつまだ res.end() していない場合に発火する）で検出する。
     const onClientGone = () => {
       currentUpstream?.destroy();
@@ -458,9 +466,9 @@ export function forwardToOpenAiBridge({
           method: req.method,
           headers,
           // リクエストごとに使い捨てる（プールしない）。keep-alive の使い回しによる
-          // ECONNRESET を避ける（レビュー指摘2）。new http.Agent() を毎回生成すると
+          // ECONNRESET を避ける。new http.Agent() を毎回生成すると
           // ソケットプールが個別に残り続けるため、Node 標準の「プールしない」指定
-          // である agent:false を使う（レビュー再検証指摘4）。
+          // である agent:false を使う。
           agent: false,
         },
         upstreamRes => {
@@ -483,7 +491,7 @@ export function forwardToOpenAiBridge({
           }
           // ヘッダを受け取った時点で「アイドル」の窓を仕切り直す
           // （res.destroyed ガードの後ろに置き、切断済みクライアント宛にタイマーを
-          // 張ったまま宙に浮かせない。レビュー再検証指摘3）。
+          // 張ったまま宙に浮かせない）。
           armIdleTimer();
           const responseHeaders = {};
           for (const [key, value] of Object.entries(upstreamRes.headers)) {
@@ -538,8 +546,7 @@ export function forwardToOpenAiBridge({
           res.writeHead(upstreamRes.statusCode || 200, responseHeaders);
           // SSE の逐次透過: 受け取り次第そのまま書き出す（バッファリングしない）。
           // クライアントが既に切断済みなら書き込まず upstream も畳む。res.write() が
-          // false（バックプレッシャ）を返したら upstream を一時停止し、drain で再開する
-          // （レビュー指摘7）。
+          // false（バックプレッシャ）を返したら upstream を一時停止し、drain で再開する。
           upstreamRes.on('data', chunk => {
             armIdleTimer();
             if (res.destroyed) {
@@ -593,8 +600,7 @@ export function forwardToOpenAiBridge({
       upstream.on('error', error => {
         // finish() 確定後（クライアント切断・タイムアウト等で既に処理済み）に
         // 発火した 'error'（例: destroy() 由来の ECONNRESET/socket hang up）は
-        // 無視する。res 相手が既にいない状態で再試行・応答書込みを行わない
-        // （レビュー再検証指摘2）。
+        // 無視する。res 相手が既にいない状態で再試行・応答書込みを行わない。
         if (settled) return;
         // ヘッダ送出後は新しいステータスを返せない（仕様書 4.2.3 節）。応答は既に
         // 始まっていて上流側で壊れたのだから、不達ではなくストリーム障害である（§9.4）。
@@ -604,8 +610,8 @@ export function forwardToOpenAiBridge({
           return;
         }
         // まだ bridge からの応答を何も受け取っておらず、かつリクエスト全体（本文含む）
-        // の送信が完了していない場合に限り settings.connectRetries まで再試行する
-        // （レビュー指摘2・再検証指摘1）。requestFullySent===true の場合、本文は
+        // の送信が完了していない場合に限り settings.connectRetries まで再試行する。
+        // requestFullySent===true の場合、本文は
         // 既に bridge へ渡り切っている（受信済みの可能性がある）ため、再試行すると
         // 二重送信（Pro 枠の二重消費）になり得るため再試行しない。
         if (!requestFullySent && attempt < maxConnectAttempts && RETRYABLE_CONNECT_ERROR_CODES.has(error?.code)) {
