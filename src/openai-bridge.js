@@ -11,6 +11,17 @@ const HOP_BY_HOP = new Set([
   'proxy-authenticate', 'proxy-authorization', 'te', 'trailer',
 ]);
 
+// 契約ヘッダ（x-ombr-*）は rotator と bridge の間だけで意味を持つ名前空間である。
+// 利用者（Claude Code）から届いた同名ヘッダをそのまま上流へ流すと、bridge が
+// 「rotator が名乗った値」と区別できず、契約の偽装を許すことになる。転送前に
+// 接頭辞一致（大文字小文字を区別しない）ですべて落とす。
+const CONTRACT_HEADER_PREFIX = 'x-ombr-';
+
+// 契約 §C4.6: bridge は非 SSE 要求の生存通知（102 Processing）を
+// 「rotator の idleTimeoutMs の 1/2 以下」の間隔で送る義務を負う。その 1/2 を計算する
+// ためには rotator が実際に使っている打ち切り時間を知る必要があるので、要求ヘッダで渡す。
+const IDLE_TIMEOUT_REQUEST_HEADER = 'x-ombr-idle-timeout-ms';
+
 // 追試4b（docs/research/11b_spike4b-nonretryable-status.md）で確定: bridge不達は403
 // permission_errorで統一する。502/504はClaude Codeが最大301回・指数バックオフで
 // 再試行し続け明示エラーにならないため使わない。
@@ -75,6 +86,20 @@ const CODEX_STATUS_URL_SCHEME_NOTICE =
 
 function positiveNumber(value, fallback) {
   return typeof value === 'number' && Number.isFinite(value) && value > 0 ? value : fallback;
+}
+
+// 転送要求から落とす契約ヘッダの判定。req.headers のキーは Node が小文字化するが、
+// 手組みの req（テスト・将来の呼び出し元）でも取りこぼさないよう明示的に畳む。
+function isContractHeader(name) {
+  return name.toLowerCase().startsWith(CONTRACT_HEADER_PREFIX);
+}
+
+// 設定が無効（未設定・非数値・0 以下）ならヘッダを付けない。付けないことが
+// 「rotator は値を名乗らなかった」の意味になり、bridge 側は自分の既定へ倒せる。
+// 値は10進整数の文字列にする（HTTP ヘッダに小数を載せない）。
+function idleTimeoutRequestHeaderValue(settings) {
+  const idleTimeoutMs = positiveNumber(settings?.idleTimeoutMs, null);
+  return idleTimeoutMs === null ? null : String(Math.trunc(idleTimeoutMs));
 }
 
 // new URL().hostname は IPv6 リテラルを角括弧つき（'[::1]'）で返すため、
@@ -318,9 +343,15 @@ export function forwardToOpenAiBridge({
   const target = pinnedUpstreamTarget(req.url, settings.url);
   const headers = {};
   for (const [key, value] of Object.entries(req.headers)) {
+    if (isContractHeader(key)) continue; // 利用者が名乗った x-ombr-* は転送しない（偽装防止）
     if (!HOP_BY_HOP.has(key.toLowerCase())) headers[key] = value; // Authorization/x-api-key は素通し
   }
   headers['content-length'] = String(Buffer.byteLength(body || Buffer.alloc(0)));
+  // 除去のあとに付けるので、利用者が同名ヘッダを送っていても rotator の値だけが残る。
+  // degradeMapping の有効・無効には依存させない（契約ヘッダの偽装防止も、生存通知の
+  // 周期を決めるための値の受け渡しも、写像機能の有無とは無関係な rotator の基本挙動）。
+  const idleTimeoutHeader = idleTimeoutRequestHeaderValue(settings);
+  if (idleTimeoutHeader !== null) headers[IDLE_TIMEOUT_REQUEST_HEADER] = idleTimeoutHeader;
 
   const maxConnectAttempts = 1 + Math.max(0, Number(settings.connectRetries) || 0);
 

@@ -3034,3 +3034,141 @@ describe('forwardToOpenAiBridge > 非 SSE の生存通知 102 Processing (R6-2 /
     assert.equal(lines.filter(line => / openai-bridge /.test(line)).length, 1, 'ログ行も増えない');
   });
 });
+
+// ---------------------------------------------------------------------------
+// R6-4: rotator → bridge の要求ヘッダ（契約 §C4.6 の生存通知の周期を決める値の受け渡しと、
+// 利用者が名乗った契約ヘッダの除去）。どちらも degradeMapping の有無に依存しない。
+// ---------------------------------------------------------------------------
+
+// 実 HTTP で往復し、偽 bridge が実際に受け取った要求ヘッダを返す。
+// 設定は createDefaultConfig() の openaiBridge そのまま（＝既定の idleTimeoutMs 30000）で
+// 組み立て、url と enabled だけを差し替える。
+async function forwardWithClientHeaders({ clientHeaders = {}, openaiBridgeOverride = {} } = {}) {
+  let seen = null;
+  const { server: bridge, port } = await startFakeBridge(async (req, res) => {
+    for await (const chunk of req) void chunk;
+    seen = req.headers;
+    res.writeHead(200, { 'Content-Type': 'application/json' }).end('{"ok":true}');
+  });
+  const settings = resolveOpenAiBridgeSettings({
+    openaiBridge: {
+      ...createDefaultConfig().openaiBridge,
+      enabled: true,
+      url: `http://127.0.0.1:${port}`,
+      ...openaiBridgeOverride,
+    },
+  });
+  const front = http.createServer(async (req, res) => {
+    const chunks = [];
+    for await (const chunk of req) chunks.push(chunk);
+    const body = Buffer.concat(chunks);
+    await forwardToOpenAiBridge({ req, res, body, model: safeParseModel(body), settings });
+  });
+  await new Promise(resolve => front.listen(0, '127.0.0.1', resolve));
+  const response = await fetch(`http://127.0.0.1:${front.address().port}/v1/messages`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', ...clientHeaders },
+    body: '{"model":"gpt-6-astra"}',
+  });
+  const text = await response.text();
+  front.close();
+  bridge.close();
+  return { seen, response, text };
+}
+
+// http.Server は受信ヘッダ名を必ず小文字へ畳むため、実 HTTP では「大文字混じりの
+// 契約ヘッダ」を再現できない。除去の判定が大文字小文字を区別しないことは、req を
+// 手組みして httpRequestImpl が受け取った headers を直接見ることで固定する。
+async function forwardedUpstreamHeaders({ requestHeaders = {}, openaiBridgeOverride = {} } = {}) {
+  let seen = null;
+  const requestImpl = options => {
+    seen = options.headers;
+    const upstream = new EventEmitter();
+    upstream.destroyed = false;
+    upstream.destroy = () => { upstream.destroyed = true; };
+    // ヘッダを捕まえるのが目的なので、接続前失敗で即座に確定させる（タイマーを残さない）。
+    upstream.end = () => {
+      process.nextTick(() => upstream.emit('error', Object.assign(new Error('refused'), { code: 'ECONNREFUSED' })));
+    };
+    return upstream;
+  };
+  const settings = resolveOpenAiBridgeSettings({
+    openaiBridge: {
+      ...createDefaultConfig().openaiBridge,
+      enabled: true,
+      url: 'http://127.0.0.1:1',
+      ...openaiBridgeOverride,
+    },
+  });
+  await forwardToOpenAiBridge({
+    req: fakeIncomingRequest({ headers: requestHeaders }),
+    res: fakeServerResponse(),
+    body: Buffer.from('{"model":"gpt-6-astra"}'),
+    model: 'gpt-6-astra',
+    settings,
+    httpRequestImpl: requestImpl,
+  });
+  return seen;
+}
+
+function contractHeaderNames(headers) {
+  return Object.keys(headers).filter(name => name.toLowerCase().startsWith('x-ombr-')).sort();
+}
+
+describe('forwardToOpenAiBridge > R6-4 契約ヘッダの送出と利用者ヘッダの除去', () => {
+  it('(a) sends the rotator idle timeout as x-ombr-idle-timeout-ms with the default settings', async () => {
+    const { seen, response } = await forwardWithClientHeaders();
+    assert.equal(response.status, 200);
+    assert.equal(seen['x-ombr-idle-timeout-ms'], '30000', '既定の idleTimeoutMs を10進整数文字列で名乗る');
+    assert.deepEqual(contractHeaderNames(seen), ['x-ombr-idle-timeout-ms'], '契約ヘッダはこの1本だけ');
+  });
+
+  it('(b) reflects a configured idleTimeoutMs in the forwarded contract header', async () => {
+    const { seen } = await forwardWithClientHeaders({ openaiBridgeOverride: { idleTimeoutMs: 45000 } });
+    assert.equal(seen['x-ombr-idle-timeout-ms'], '45000');
+  });
+
+  it('(c) drops client supplied x-ombr-* headers and pins the rotator value', async () => {
+    // 実 HTTP 経路（server が小文字へ畳んだあと）。
+    const { seen } = await forwardWithClientHeaders({
+      clientHeaders: { 'X-OMBR-Idle-Timeout-Ms': '5', 'x-ombr-pool-state': 'exhausted' },
+    });
+    assert.equal(seen['x-ombr-idle-timeout-ms'], '30000', '利用者の 5 ではなく rotator の値が届く');
+    assert.equal(seen['x-ombr-pool-state'], undefined, '契約ヘッダの偽装は bridge まで届かない');
+    assert.deepEqual(contractHeaderNames(seen), ['x-ombr-idle-timeout-ms']);
+
+    // 手組みの req（大文字混じりのまま）でも同じ結果になる＝判定は大文字小文字を区別しない。
+    const upstreamHeaders = await forwardedUpstreamHeaders({
+      requestHeaders: { 'X-OMBR-Idle-Timeout-Ms': '5', 'X-Ombr-Pool-State': 'exhausted' },
+    });
+    assert.equal(upstreamHeaders['x-ombr-idle-timeout-ms'], '30000');
+    assert.deepEqual(contractHeaderNames(upstreamHeaders), ['x-ombr-idle-timeout-ms']);
+  });
+
+  it('(d) keeps forwarding client headers outside the x-ombr- namespace', async () => {
+    const { seen } = await forwardWithClientHeaders({
+      clientHeaders: {
+        'x-request-id': 'req-0001',
+        'x-api-key': 'claude-rotator-local-gateway',
+        'anthropic-version': '2023-06-01',
+        'x-ombr-pool-state': 'exhausted',
+      },
+    });
+    assert.equal(seen['x-request-id'], 'req-0001', '接頭辞が違うヘッダは従来どおり素通しする');
+    assert.equal(seen['x-api-key'], 'claude-rotator-local-gateway');
+    assert.equal(seen['anthropic-version'], '2023-06-01');
+    assert.equal(seen['x-ombr-pool-state'], undefined, '除去は x-ombr- 接頭辞だけに効く');
+  });
+
+  it('(e) behaves the same whether degradeMapping is off (default) or on', async () => {
+    // 契約ヘッダの偽装防止と生存通知の値の受け渡しは、写像機能の有無と無関係な基本挙動である。
+    const clientHeaders = { 'X-OMBR-Idle-Timeout-Ms': '5', 'x-ombr-pool-state': 'exhausted' };
+    const off = await forwardWithClientHeaders({ clientHeaders });
+    const on = await forwardWithClientHeaders({ clientHeaders, openaiBridgeOverride: { degradeMapping: { enabled: true } } });
+
+    for (const { seen } of [off, on]) {
+      assert.equal(seen['x-ombr-idle-timeout-ms'], '30000');
+      assert.deepEqual(contractHeaderNames(seen), ['x-ombr-idle-timeout-ms']);
+    }
+  });
+});
