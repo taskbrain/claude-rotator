@@ -479,6 +479,20 @@ describe('mapClaudeExhaustion', () => {
     );
     assert.equal(output.degradeLog.mapReason, 'both_pools_unusable');
     assert.equal(output.degradeLog.mapPath, 'd');
+    // R4-5: 403 で止めた行から回復時刻を本文を開かずに読めるようにする（設計書 §9.3 resetAt）。
+    assert.equal(output.degradeLog.resetAt, RESET_AT);
+  });
+
+  it('leaves resetAt out of the trace when only Claude is exhausted (529 は回復時刻を持たない)', () => {
+    const output = mapClaudeExhaustion(candidate429(), {
+      enabled: true,
+      claudeAllUnusable: true,
+      gptPoolState: 'unknown',
+      claudeResetAt: RESET_AT,
+      mapPath: 'a',
+    });
+    assert.equal(output.statusCode, 529);
+    assert.equal(output.degradeLog.resetAt, undefined, '値の無いキーはログ行に出さない（§9.2）');
   });
 
   it('rewrites content-length, drops content-encoding and keeps the other headers', () => {

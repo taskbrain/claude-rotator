@@ -9281,8 +9281,10 @@ describe('Claude 全枯渇 429 の 529 写像を7系統へ結線する (R4-2/R4-
     timeoutMs: 3_000,
   });
 
-  // 写像したときだけ出る痕跡（degradeLog）。mapPath はこの行でしか観測できない。
-  const mapLines = logLines => logLines.filter(line => / claude-exhaustion-map /.test(line));
+  // 写像したときだけ出る痕跡（degradeLog）。R4-5 で暫定行を廃止し、その要求の proxy ログ行へ併記する形にしたので、ここも proxy 行を見る。
+  // **proxy ログ行を持たない経路（P-b / P-d / P-g）では痕跡が残らない**ため、
+  // それらのケースは応答（status・上流が付けた x-path-test ヘッダ）で経路を固定する。
+  const mapLines = logLines => logLines.filter(line => / proxy account=/.test(line) && /mapReason=/.test(line));
   const lastMapLine = logLines => mapLines(logLines).at(-1);
 
   const exhaustedBody = '{"type":"error","error":{"type":"overloaded_error"}}';
@@ -9374,8 +9376,14 @@ describe('Claude 全枯渇 429 の 529 写像を7系統へ結線する (R4-2/R4-
     assert.equal(response.status, 529);
     assert.equal(response.body.error.type, 'overloaded_error');
     assert.deepEqual(seen, []);
-    assert.match(lastMapLine(logLines), /mapPath=d/);
-    assert.match(lastMapLine(logLines), /mappedFrom=429 mappedFromType=rate_limit_error mappedTo=529/);
+    // P-d（sendUnavailableAccounts）は c0f79d4 の時点から proxy ログ行を1行も出さない
+    // 経路であり、R4-5 は「既存の行へ併記する」タスクなので痕跡の残し先が無い。
+    // 経路の固定は「上流へ1件も送っていない」＋「529 の本文」で行う。
+    assert.deepEqual(
+      logLines.filter(line => / proxy account=/.test(line)),
+      [],
+      'P-d はログ行を持たない（写像の痕跡も残らない＝R4-5 の残課題）',
+    );
   });
 
   it('4-d: leaves the 503 credential branch of P-d untouched', async () => {
@@ -9535,8 +9543,26 @@ describe('Claude 全枯渇 429 の 529 写像を7系統へ結線する (R4-2/R4-
     assert.deepEqual(upstreamSeen, ['Bearer access-token-1'], '再生であって再送ではない');
     assert.equal(response.status, 529);
     assert.equal(response.body.error.type, 'overloaded_error');
-    assert.match(lastMapLine(logLines), /mapPath=b/);
-    assert.match(lastMapLine(logLines), /mappedFrom=429 mappedFromType=rate_limit_error mappedTo=529/);
+    assert.equal(response.headers['x-replay-test'], 'map-b', '再生された応答であること＝P-b');
+    // P-b の proxy 行は「上流が 429 を返した時点」（quota-retry）で既に書き終えている
+    // ので、後から起きる再生の写像はその行へは載せられない。529 を返した事実は
+    // claude-exhaustion-replay の1行が持つ（指揮官判断 D-17）。
+    assert.match(
+      logLines.filter(line => / proxy account=/.test(line)).at(-1),
+      / status=429 /,
+      '再生元の上流応答の行は 429 のまま残る',
+    );
+    const replayLines = logLines.filter(line => / claude-exhaustion-replay /.test(line));
+    assert.equal(replayLines.length, 1, '写像した再生は1行だけ残す');
+    assert.match(
+      replayLines[0],
+      /^\d{4}-\d{2}-\d{2}T[\d:.]+Z claude-exhaustion-replay account=acct_1 method=POST path=\/v1\/messages status=529 durationMs=0 outcome=quota-exhausted-replay upstreamStatus=429 gptPoolState=unknown claudePoolState=all-exhausted mappedFrom=429 mappedFromType=rate_limit_error mappedTo=529 mapReason=all_claude_accounts_exhausted mapPath=b$/,
+      '既存 proxy 行と同じ形＋§9.3 の順序で写像フィールドを併記する',
+    );
+    assert.ok(
+      logLines.indexOf(replayLines[0]) > logLines.findLastIndex(line => / proxy account=/.test(line)),
+      '再生元の 429 行の後に出る',
+    );
   });
 
   it('4-b: keeps the replayed upstream headers and only replaces the body', async () => {
@@ -9552,12 +9578,18 @@ describe('Claude 全枯渇 429 の 529 写像を7系統へ結線する (R4-2/R4-
   });
 
   it('5-b: replays the upstream 429 unchanged while degradeMapping is unset (§14.4)', async () => {
-    const { response, originalBody } = await runReactiveReplayScenario({ degradeMapping: null });
+    const { response, originalBody, logLines } = await runReactiveReplayScenario({ degradeMapping: null });
 
     assert.equal(response.status, 429);
     assert.deepEqual(response.body, originalBody);
     assert.equal(response.headers['x-replay-test'], 'map-b');
+    assert.deepEqual(
+      logLines.filter(line => /claude-exhaustion-replay/.test(line)),
+      [],
+      '無効な構成では replay 行も出ない（ログは現行と一致）',
+    );
   });
+
 
   // -------------------------------------------------------------------------
   // R4-4: P-c（利用不可口座での実送信）と P-e（通常ローテーションの素通し）
@@ -9843,8 +9875,11 @@ describe('Claude 全枯渇 429 の 529 写像を7系統へ結線する (R4-2/R4-
 
     assert.equal(response.status, 529);
     assert.equal(response.body.error.type, 'overloaded_error');
-    assert.equal(response.headers['x-path-test'], 'p-g1');
-    assert.match(lastMapLine(logLines), /mapPath=g/);
+    assert.equal(response.headers['x-path-test'], 'p-g1', '上流ヘッダが残るので経路を固定できる');
+    // 台帳から消えた口座の要求は c0f79d4 の時点から proxy ログ行を出さない
+    // （recordProxyRequest が accounts.includes(account) で守られている）ため、
+    // 痕跡の残し先が無い（R4-5 の残課題）。
+    assert.deepEqual(logLines.filter(line => / proxy account=/.test(line)), []);
   });
 
   it('4-g1: does not let finishStaleAccountResponse rewrite or append after the mapping', async () => {
@@ -9859,7 +9894,9 @@ describe('Claude 全枯渇 429 の 529 写像を7系統へ結線する (R4-2/R4-
       response.headers['content-length'],
       String(Buffer.byteLength(response.bodyText)),
     );
-    assert.equal(mapLines(logLines).length, 1, '写像は1回だけ（res.headersSent 後は写像しない）');
+    // 写像が2回起きれば本文が二重に書かれて上の2つが壊れる（res.headersSent 後は
+    // 写像しない＝§8.6）。P-g はログ行を持たないので、検証は応答側で行う。
+    assert.equal(logLines.filter(line => /mapReason=/.test(line)).length, 0, 'P-g は痕跡行を持たない');
   });
 
   it('4-g: never maps a stale 200', async () => {
@@ -9924,7 +9961,206 @@ describe('Claude 全枯渇 429 の 529 写像を7系統へ結線する (R4-2/R4-
     const response = await pending;
     assert.equal(response.status, 529);
     assert.equal(response.body.error.type, 'overloaded_error');
-    assert.equal(response.headers['x-path-test'], 'p-g2');
-    assert.match(lastMapLine(logLines), /mapPath=g/);
+    assert.equal(response.headers['x-path-test'], 'p-g2', '上流ヘッダが残るので経路を固定できる');
+    // P-g1 と同じく、台帳から消えた口座の要求は proxy ログ行を持たない（R4-5 の残課題）。
+    assert.deepEqual(logLines.filter(line => / proxy account=/.test(line)), []);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// R4-5: 写像した要求の「既存の proxy ログ行」へ、写像フィールドを併記すること。
+//
+// 設計書 §9.1「529 と偽装する以上、実際の上流ステータスを必ず同じ行に残す」
+// （受入条件7）を、暫定行ではなく本来のログ行で満たす。
+// 追記は §9.3 の順序で、値があるキーだけを末尾へ足す。写像しなかった要求と
+// degradeMapping を書いていない構成では、行は現行（c0f79d4）と文字列一致する（§14.4）。
+// ---------------------------------------------------------------------------
+describe('写像フィールドを既存の proxy ログ行へ併記する (R4-5 / 設計書 §9.3・§9.5)', () => {
+  const ENABLED = { enabled: true };
+  // c0f79d4 時点の proxy 行の形（末尾に何も足さない）。requestId / errorType は
+  // 任意なので、この正規表現は「追記フィールドが1つも無いこと」を見ている。
+  const LEGACY_PROXY_LINE = /^\d{4}-\d{2}-\d{2}T[\d:.]+Z proxy account=\S+ method=\S+ path=\S+ status=\S+ durationMs=\d+ outcome=[a-z-]+(?: requestId=\S+)?(?: errorType=\S+)?$/;
+
+  async function startProxy({
+    accountManager,
+    secretStore = new MemorySecretStore(),
+    upstreamUrl = 'http://127.0.0.1:1',
+    logLines = [],
+    degradeMapping = ENABLED,
+    bridgeUrl = null,
+  }) {
+    const bridge = bridgeUrl
+      ? {
+        enabled: true,
+        url: bridgeUrl,
+        modelPattern: '^gpt-',
+        connectTimeoutMs: 1000,
+        idleTimeoutMs: 1000,
+        connectRetries: 0,
+      }
+      : { enabled: false };
+    const proxy = await listen(createProxyServer({
+      accountManager,
+      secretStore,
+      config: {
+        upstream: upstreamUrl,
+        usagePolling: { enabled: false },
+        openaiBridge: { ...bridge, ...(degradeMapping ? { degradeMapping } : {}) },
+      },
+      currentCredentialReader: async () => null,
+      logger: line => logLines.push(line),
+    }));
+    cleanupAfterTest(async () => close(proxy.server));
+    return proxy;
+  }
+
+  const ask = (proxy, model = 'sonnet') => requestJson(`${proxy.url}/v1/messages`, {
+    method: 'POST',
+    body: JSON.stringify({ model }),
+    headers: { 'content-type': 'application/json' },
+    timeoutMs: 3_000,
+  });
+
+  const proxyLines = logLines => logLines.filter(line => / proxy account=/.test(line));
+
+  // P-a（局所合成の 429）。上流へは一度も送らないので proxy 行は1本だけになる。
+  async function runExhaustedAccountScenario({ degradeMapping = ENABLED } = {}) {
+    const upstream = await listen(http.createServer((req, res) => {
+      req.resume();
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end('{}');
+    }));
+    cleanupAfterTest(async () => close(upstream.server));
+    const secretStore = new MemorySecretStore();
+    await secretStore.set('acct_1', { accessToken: 'access-token-1' });
+    const accountManager = new AccountManager({
+      accounts: [{ id: 'acct_1', type: 'oauth' }],
+      now: () => 1000,
+    });
+    accountManager.updateQuota('acct_1', {
+      'anthropic-ratelimit-unified-5h-utilization': '1',
+      'anthropic-ratelimit-unified-5h-reset': '10',
+    });
+    const logLines = [];
+    const proxy = await startProxy({
+      accountManager, secretStore, upstreamUrl: upstream.url, logLines, degradeMapping,
+    });
+
+    const response = await ask(proxy);
+    return { response, logLines };
+  }
+
+  // P-e（通常ローテーションの素通し）。bridge を先に1往復させると (pool)=unusable を
+  // 学習し、同じ 429 が 403 へ写像される（設計書 §8.7）。
+  async function runPassthroughScenario({ accounts, degradeMapping = ENABLED, warmBridge = false } = {}) {
+    const upstreamBody = JSON.stringify({
+      type: 'error', error: { type: 'rate_limit_error', message: 'upstream throttled' },
+    });
+    const upstream = await listen(http.createServer((req, res) => {
+      req.resume();
+      res.writeHead(429, { 'Content-Type': 'application/json' });
+      res.end(upstreamBody);
+    }));
+    cleanupAfterTest(async () => close(upstream.server));
+    let bridgeUrl = null;
+    if (warmBridge) {
+      const exhaustedBody = '{"type":"error","error":{"type":"overloaded_error"}}';
+      const bridge = await listen(http.createServer((req, res) => {
+        req.resume();
+        res.writeHead(529, {
+          'Content-Type': 'application/json',
+          'content-length': String(Buffer.byteLength(exhaustedBody)),
+          'x-ombr-contract': '1',
+          'x-ombr-degrade-reason': 'codex_pool_exhausted',
+          'x-ombr-degrade-scope': 'pool',
+          'x-ombr-pool-state': 'exhausted',
+          'x-ombr-upstream-status': '429',
+          'x-ombr-reset-at': '2099-01-01T00:00:00Z',
+        });
+        res.end(exhaustedBody);
+      }));
+      cleanupAfterTest(async () => close(bridge.server));
+      bridgeUrl = bridge.url;
+    }
+    const secretStore = new MemorySecretStore();
+    for (const account of accounts) {
+      await secretStore.set(account.id, { accessToken: `access-token-${account.id}` });
+    }
+    const accountManager = new AccountManager({ accounts, now: () => 1000 });
+    const logLines = [];
+    const proxy = await startProxy({
+      accountManager, secretStore, upstreamUrl: upstream.url, logLines, degradeMapping, bridgeUrl,
+    });
+    if (warmBridge) {
+      assert.equal((await ask(proxy, 'gpt-6-astra')).status, 529, '前提: (pool)=unusable を学習させる');
+    }
+
+    const response = await ask(proxy);
+    return { response, logLines, upstreamBody };
+  }
+
+  it('R4-5-1: keeps the real upstream status on the very line that returned 529 (P-a / 受入条件7)', async () => {
+    const { response, logLines } = await runExhaustedAccountScenario();
+
+    assert.equal(response.status, 529);
+    const line = proxyLines(logLines).at(-1);
+    assert.match(
+      line,
+      / status=529 durationMs=\d+ outcome=quota-exhausted-local upstreamStatus=429 gptPoolState=unknown claudePoolState=all-exhausted mappedFrom=429 mappedFromType=rate_limit_error mappedTo=529 mapReason=all_claude_accounts_exhausted mapPath=a$/,
+      '返した status（529）と実際の上流ステータス（429）が同じ1行に並ぶ（§9.3 の順序）',
+    );
+    assert.equal(proxyLines(logLines).length, 1, 'P-a は行を増やさない（既存の1行へ併記する）');
+  });
+
+  it('R4-5-2: records mappedTo=403, mapReason and resetAt when both pools are unusable', async () => {
+    const { response, logLines } = await runPassthroughScenario({
+      accounts: [{ id: 'acct_1', type: 'oauth' }],
+      warmBridge: true,
+    });
+
+    assert.equal(response.status, 403);
+    const line = proxyLines(logLines).at(-1);
+    assert.match(line, / status=403 /, '返した status が行の status になる');
+    assert.match(line, / upstreamStatus=429 resetAt=\S+ gptPoolState=unusable claudePoolState=all-exhausted /);
+    // mappedFromType はヘッダ送出点（P-c / P-e / P-g1）では本文がまだ届いていないので
+    // 出ない。「値があるキーだけを載せる」（§9.2）の当然の帰結である。
+    assert.match(line, /mappedFrom=429 mappedTo=403 mapReason=both_pools_unusable mapPath=e$/);
+  });
+
+  it('R4-5-3: leaves a non-mapped 429 line exactly as it is today (§14.4)', async () => {
+    const { response, logLines, upstreamBody } = await runPassthroughScenario({
+      accounts: [{ id: 'acct_1', type: 'oauth' }, { id: 'acct_2', type: 'oauth' }],
+    });
+
+    assert.equal(response.status, 429, '他口座が使えるので写像しない');
+    assert.equal(response.bodyText, upstreamBody);
+    assert.ok(proxyLines(logLines).length > 0, '比較対象の行が実際に出ている');
+    for (const line of proxyLines(logLines)) assert.match(line, LEGACY_PROXY_LINE);
+    assert.deepEqual(
+      logLines.filter(line => /claude-exhaustion-replay/.test(line)),
+      [],
+      '写像しない要求では P-b の replay 行も出ない',
+    );
+  });
+
+  it('R4-5-4: leaves every proxy line unchanged while degradeMapping is unset (§14.4)', async () => {
+    const passthrough = await runPassthroughScenario({
+      accounts: [{ id: 'acct_1', type: 'oauth' }],
+      degradeMapping: null,
+    });
+    const synthesised = await runExhaustedAccountScenario({ degradeMapping: null });
+
+    assert.equal(passthrough.response.status, 429);
+    assert.equal(synthesised.response.status, 429);
+    const lines = [...proxyLines(passthrough.logLines), ...proxyLines(synthesised.logLines)];
+    assert.equal(lines.length, 2);
+    for (const line of lines) assert.match(line, LEGACY_PROXY_LINE);
+  });
+
+  it('R4-5-5: no longer writes the interim claude-exhaustion-map line', async () => {
+    const { response, logLines } = await runExhaustedAccountScenario();
+
+    assert.equal(response.status, 529, '写像そのものは起きている');
+    assert.deepEqual(logLines.filter(line => line.includes('claude-exhaustion-map')), []);
   });
 });

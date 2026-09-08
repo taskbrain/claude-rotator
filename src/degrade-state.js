@@ -358,9 +358,8 @@ export function mapClaudeExhaustion(candidate, ctx = {}) {
 
   const bothUnusable = gptPoolState === 'unusable';
   const status = bothUnusable && ctx.bothUnusableStatus !== 529 ? 403 : 529;
-  const body = Buffer.from(buildDegradeBody(status, {
-    resetAts: bothUnusable ? [ctx.gptResetAt, ctx.claudeResetAt] : [],
-  }));
+  const resetAts = bothUnusable ? [ctx.gptResetAt, ctx.claudeResetAt] : [];
+  const body = Buffer.from(buildDegradeBody(status, { resetAts }));
   const headers = withoutBodyHeaders(candidate.headers);
   headers['content-type'] = 'application/json';
   headers['content-length'] = String(body.length);
@@ -371,6 +370,9 @@ export function mapClaudeExhaustion(candidate, ctx = {}) {
     body,
     degradeLog: {
       ...degradeLog,
+      // R4-5: 403 で止めた行から「いつ回復するか」を本文を開かずに読めるようにする
+      // （設計書 §9.3 の resetAt）。両プール利用可能な 529 では回復時刻を持たない。
+      resetAt: earliestResetAt(resetAts) || undefined,
       mappedFrom: from,
       mappedFromType: bodyErrorType(candidate.body),
       mappedTo: status,

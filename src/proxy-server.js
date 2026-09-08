@@ -299,14 +299,10 @@ export function createProxyServer({
         ? claudeEarliestResetAt(accountManager, modelFamily)
         : null,
     });
-    // R4-5（writeProxyLog への写像フィールド追記）までの最小配線。実際に書き換えた
-    // ときだけ1行足す。写像しなかった要求では1行も増えない＝既存ログは不変である。
-    if (mapped?.degradeLog?.mapReason) {
-      logger?.(
-        `${new Date().toISOString()} claude-exhaustion-map`
-        + `${formatLogMeta(buildBridgeLogMeta(null, mapped.degradeLog))}`,
-      );
-    }
+    // R4-5: 痕跡（degradeLog）はここでは書き出さない。呼び出し側が mapped.degradeLog を
+    // そのまま recordProxyRequest へ渡し、**その要求の既存の proxy ログ行**へ併記する
+    // （設計書 §9.1・§9.5(c)・受入条件7）。行を増やさないので、写像しなかった要求と
+    // degradeMapping を書いていない構成ではログは1文字も変わらない（§14.4）。
     return mapped;
   };
 
@@ -1902,6 +1898,8 @@ async function forwardWithRotation({
   const maxAttempts = Math.max(1, accountManager.accounts.length);
   const attemptedAccountIds = new Set();
   let lastRetryableResponse = null;
+  // 再生する応答を作った口座（P-b の replay 行の account= に使う。写像したときだけ読む）。
+  let lastRetryableAccountId = null;
   let reactiveQuotaRetryUsed = false;
   let reactiveQuotaSource = null;
   let reactiveReplayTargets = null;
@@ -1917,12 +1915,29 @@ async function forwardWithRotation({
     ? (candidate, options) => exhaustionMapper(candidate, { modelFamily, ...options })
     : null;
   // P-b: 直前の上流応答の再生（R-20 の 11 か所）。再生する候補を必ずこの1関数へ通す。
-  const sendLastRetryable = () => sendBufferedResponse(
-    res,
-    mapExhaustion
+  const sendLastRetryable = () => {
+    const mapped = mapExhaustion
       ? mapExhaustion(lastRetryableResponse, { mapPath: 'b', headersSent: res.headersSent })
-      : lastRetryableResponse,
-  );
+      : lastRetryableResponse;
+    // R4-5（指揮官判断 D-17）: 再生元の 429 の proxy 行は、この写像が起きる前に
+    // 書き終わっている（forwardOnce の recordProxyRequest）。そのままでは 529 / 403 を
+    // 返した事実がログのどこにも残らないので、**写像したときだけ**1行足す。
+    // 台帳（accountManager.recordProxyRequest）は経由しないのでイベントは増えない。
+    // 写像しなかった再生と degradeMapping を書いていない構成では1行も増えない（§14.4）。
+    if (mapped?.degradeLog?.mapReason) {
+      logger?.(
+        `${new Date().toISOString()} claude-exhaustion-replay`
+        + ` account=${lastRetryableAccountId || '-'}`
+        + ` method=${req.method}`
+        + ` path=${new URL(req.url, 'http://claude-rotator.local').pathname}`
+        + ` status=${mapped.statusCode}`
+        + ' durationMs=0'
+        + ' outcome=quota-exhausted-replay'
+        + `${degradeLogFields(mapped.degradeLog)}`,
+      );
+    }
+    sendBufferedResponse(res, mapped);
+  };
 
   for (let attempt = 0; attempt < maxAttempts; attempt++) {
     if (req.aborted || res.destroyed) return;
@@ -2182,7 +2197,11 @@ async function forwardWithRotation({
           reactiveReplayTargets = retryResult.reactiveReplayTargets;
           reactiveReplayAuthorization = retryResult.reactiveReplayAuthorization;
         }
-        lastRetryableResponse = retryResult.passthroughResponse || retryResult.syntheticResponse || lastRetryableResponse;
+        const retryReplacement = retryResult.passthroughResponse || retryResult.syntheticResponse;
+        if (retryReplacement) {
+          lastRetryableResponse = retryReplacement;
+          lastRetryableAccountId = account?.id || null;
+        }
         if (req.aborted || res.destroyed) return;
         continue;
       }
@@ -2195,7 +2214,11 @@ async function forwardWithRotation({
         reactiveReplayTargets = result.reactiveReplayTargets;
         reactiveReplayAuthorization = result.reactiveReplayAuthorization;
       }
-      lastRetryableResponse = result.passthroughResponse || result.syntheticResponse || lastRetryableResponse;
+      const replacement = result.passthroughResponse || result.syntheticResponse;
+      if (replacement) {
+        lastRetryableResponse = replacement;
+        lastRetryableAccountId = account?.id || null;
+      }
       if (req.aborted || res.destroyed) return;
       continue;
     }
@@ -2655,6 +2678,11 @@ async function forwardOnce({
   let reactiveReplayTargets = null;
   let reactiveReplayAuthorization = null;
 
+  // R4-5: この要求で実際に写像が起きたときの痕跡。下の recordProxyRequest へ渡し、
+  // **この要求の proxy ログ行**へ §9.3 のフィールドを併記する（設計書 §9.5(c)）。
+  // 写像しなければ null のままなので、ログ行は現行と1文字も変わらない（§14.4）。
+  let degradeLog = null;
+
   // 応答ヘッダ送出点（P-c :writeUpstreamResponseHead / P-e / P-g1）の単一の判定。
   // 写像したときは自分で本文まで書き切り、`false` を返して上流チャンクを流さない
   // （流すと 529 の本文の後ろへ上流 429 の本文が継ぎ足され、Content-Length も壊れる）。
@@ -2665,6 +2693,7 @@ async function forwardOnce({
         { mapPath, headersSent: res.headersSent },
       );
       if (mapped && mapped.statusCode !== upstreamRes.statusCode) {
+        if (mapped.degradeLog?.mapReason) degradeLog = mapped.degradeLog;
         sendBufferedResponse(res, mapped);
         return false;
       }
@@ -2818,6 +2847,13 @@ async function forwardOnce({
     }
   }
 
+  // P-f の再生はこの下（bufferedPassthrough の分岐）で書き出すが、写像はログより先に
+  // 決めておく。そうしないと 529 を返した行に痕跡が載らない（§9.1・受入条件7）。
+  const bufferedReplay = bufferedPassthrough && exhaustionMapper && !req.aborted && !res.destroyed
+    ? exhaustionMapper(upstreamResponse, { mapPath: 'f', headersSent: res.headersSent })
+    : null;
+  if (bufferedReplay?.degradeLog?.mapReason) degradeLog = bufferedReplay.degradeLog;
+
   if (accountManager.accounts.includes(account)) {
     recordProxyRequest({
       accountManager,
@@ -2828,8 +2864,11 @@ async function forwardOnce({
       statusCode: upstreamResponse.statusCode,
       requestId: headerValue(upstreamResponse.headers['request-id'])
         || headerValue(upstreamResponse.headers['x-request-id']),
+      // outcome は上流で実際に起きたこと（rate-limit-passthrough 等）のままにする。
+      // 何へ書き換えたかは同じ行の mappedTo / mapReason が持つ（§9.4 は bridge 経路の分岐）。
       outcome: outcomeForResponse(outcome, upstreamResponse.statusCode),
       durationMs: Date.now() - startedAt,
+      degradeLog,
     });
   }
 
@@ -2847,10 +2886,9 @@ async function forwardOnce({
   if (bufferedPassthrough) {
     // P-f: 反応的枠確認が「未確認」に終わったときの再生。直前の markRateLimited() の
     // 後に評価されるので、ここでも全枯渇へ変わる最後の 429 が写像される（設計書 §4.2）。
+    // 写像の判定自体は上の bufferedReplay で済ませてある（順序を変えただけで挙動は同じ）。
     if (!req.aborted && !res.destroyed) {
-      sendBufferedResponse(res, exhaustionMapper
-        ? exhaustionMapper(upstreamResponse, { mapPath: 'f', headersSent: res.headersSent })
-        : upstreamResponse);
+      sendBufferedResponse(res, bufferedReplay || upstreamResponse);
     }
     return { retryNextAccount: false };
   }
@@ -3191,21 +3229,42 @@ function recordProxyRequest({
   outcome,
   durationMs,
   errorType = null,
+  // R4-5: 写像した要求の痕跡（mapClaudeExhaustion の戻り値 degradeLog）。任意引数なので
+  // 渡さなければ現行と完全に同一に振る舞う（設計書 §14.4）。
+  degradeLog = null,
 }) {
+  // 写像した要求では、クライアントへ実際に返した status（mappedTo）を記録する。
+  // 写像前の実ステータスは同じ行の upstreamStatus / mappedFrom に必ず残るので、
+  // 「529 と偽装した行から本当の上流ステータスが読める」（§9.1・受入条件7）。
+  const sentStatusCode = degradeLog?.mappedTo ?? statusCode;
   const event = accountManager.recordProxyRequest({
     account: account.id,
     method,
     path,
-    statusCode,
+    statusCode: sentStatusCode,
     requestId,
     outcome,
     durationMs,
     errorType,
   });
-  writeProxyLog(logger, event);
+  writeProxyLog(logger, event, degradeLog);
 }
 
-function writeProxyLog(logger, event) {
+/**
+ * 写像した要求のログ行へ足すフィールド（設計書 §9.3 の順序で、値があるキーだけ）。
+ * upstreamStatus には写像前の実ステータスを入れる。P-a / P-d のように rotator が
+ * 局所合成した 429 でも、「その要求が本来返そうとしていた status」を指す点は同じである。
+ * 写像しなかった要求（mapReason が無い）では空文字列を返し、行は現行と一致する。
+ */
+function degradeLogFields(degradeLog) {
+  if (!degradeLog?.mapReason) return '';
+  return formatLogMeta(buildBridgeLogMeta(
+    { upstreamStatus: degradeLog.mappedFrom, resetAt: degradeLog.resetAt },
+    degradeLog,
+  ));
+}
+
+function writeProxyLog(logger, event, degradeLog = null) {
   if (!logger) return;
   const fields = [
     `${event.at} proxy`,
@@ -3218,7 +3277,8 @@ function writeProxyLog(logger, event) {
   ];
   if (event.requestId) fields.push(`requestId=${event.requestId}`);
   if (event.errorType) fields.push(`errorType=${event.errorType}`);
-  logger(fields.join(' '));
+  // 追記は必ず末尾へ（§9.2）。値が1つも無ければ行は現行とバイト単位で同一になる。
+  logger(`${fields.join(' ')}${degradeLogFields(degradeLog)}`);
 }
 
 function syntheticUpstreamErrorResponse(error) {
@@ -3260,6 +3320,12 @@ function sendCurrentQuotaUnavailableResponse({
   }
 
   const response = syntheticQuotaExhaustedResponse(account, reason);
+  // P-a: 合成した 429 を書き出す唯一の位置（設計書 §4.2）。写像はログより先に決める。
+  // ログ行の status は実際に返した値（529 / 403）にし、写像前の 429 は同じ行の
+  // upstreamStatus / mappedFrom として残す（§9.5(c)・受入条件7）。
+  const mapped = exhaustionMapper
+    ? exhaustionMapper(response, { mapPath: 'a', headersSent: res.headersSent })
+    : response;
   recordProxyRequest({
     accountManager,
     logger,
@@ -3269,12 +3335,9 @@ function sendCurrentQuotaUnavailableResponse({
     statusCode: response.statusCode,
     outcome: 'quota-exhausted-local',
     durationMs: 0,
+    degradeLog: mapped?.degradeLog || null,
   });
-  // P-a: 合成した 429 を書き出す唯一の位置（設計書 §4.2）。ログの statusCode は
-  // 写像前の 429 のままにする（実際に起きた事象を残す＝受入条件7）。
-  sendBufferedResponse(res, exhaustionMapper
-    ? exhaustionMapper(response, { mapPath: 'a', headersSent: res.headersSent })
-    : response);
+  sendBufferedResponse(res, mapped);
   return true;
 }
 
