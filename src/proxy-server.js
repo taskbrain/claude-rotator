@@ -21,7 +21,14 @@ import {
 import { createNativeClaudeRefresher } from './native-claude-refresher.js';
 import { isFableScopeIdentity, parseRateLimitHeaders } from './quota.js';
 import { duplicateRefreshTokenAccountIds } from './secret-store.js';
-import { claudeAllUnusable, claudeEarliestResetAt, createGptPoolState } from './degrade-state.js';
+import {
+  buildBridgeLogMeta,
+  claudeAllUnusable,
+  claudeEarliestResetAt,
+  createGptPoolState,
+  formatLogMeta,
+  mapClaudeExhaustion,
+} from './degrade-state.js';
 import {
   DEFAULT_OPENAI_BRIDGE,
   forwardToOpenAiBridge,
@@ -257,6 +264,52 @@ export function createProxyServer({
     : null);
   let gptPoolState = createGptPoolStateFor(openaiBridgeSettings);
 
+  // 設計書 §4.2 案b-2・契約 §C10.4: 「Claude の口座がもう使えない」として 429 を
+  // 書き出す**すべての**経路（P-a〜P-g の7系統）が、書き出す直前に必ずここを通る。
+  // 経路ごとの個別書換ロジックは書かない（1か所でも漏れると「ある条件でだけ退避
+  // しない」という再現困難な不具合になるため）。
+  //
+  // degradeMapping が無効な構成では呼び出し側へ渡さない（下の forwardWithRotation
+  // の条件つきスプレッド）ので、応答もログも現行とバイト単位で同一になる（§14.4）。
+  // ここでも enabled をもう一度見るのは、POST /internal/reload で無効化された直後の
+  // 進行中要求が古い判定へ落ちないようにするためである。
+  const applyClaudeExhaustionMapping = (candidate, {
+    mapPath = null,
+    modelFamily = null,
+    headersSent = false,
+  } = {}) => {
+    const mapping = openaiBridgeSettings.degradeMapping;
+    if (mapping?.enabled !== true || !candidate) return candidate;
+    // 判定根拠は accountManager の台帳（isAvailable）であって応答の見た目ではない
+    // （設計書 §4.3・契約 §C10.4）。GPT 側は学習済みの (pool) 鍵だけを見る。
+    const pool = gptPoolState ? gptPoolState.read().pool : null;
+    const gptState = pool?.state || 'unknown';
+    const allUnusable = claudeAllUnusable(accountManager, modelFamily);
+    const mapped = mapClaudeExhaustion(candidate, {
+      enabled: true,
+      mapPath,
+      headersSent,
+      claudeAllUnusable: allUnusable,
+      gptPoolState: gptState,
+      bothUnusableStatus: mapping.bothUnusableStatus,
+      gptResetAt: pool?.resetAt || null,
+      // 403 の本文へ載せる「最早回復時刻」にしか使わない（§8.7）。判定には使わない
+      // ので、403 になりうる組み合わせのときだけ台帳を引く。
+      claudeResetAt: allUnusable && gptState === 'unusable'
+        ? claudeEarliestResetAt(accountManager, modelFamily)
+        : null,
+    });
+    // R4-5（writeProxyLog への写像フィールド追記）までの最小配線。実際に書き換えた
+    // ときだけ1行足す。写像しなかった要求では1行も増えない＝既存ログは不変である。
+    if (mapped?.degradeLog?.mapReason) {
+      logger?.(
+        `${new Date().toISOString()} claude-exhaustion-map`
+        + `${formatLogMeta(buildBridgeLogMeta(null, mapped.degradeLog))}`,
+      );
+    }
+    return mapped;
+  };
+
   const server = http.createServer(async (req, res) => {
     try {
       if (!isTrustedLocalHttpRequest(req)) {
@@ -478,6 +531,11 @@ export function createProxyServer({
         upstreamConnectTimeoutMs,
         upstreamConnectRetries,
         upstreamConnectRetryDelayMs,
+        // degradeMapping.enabled が真のときだけ渡す（未指定＝現行と完全に同一の経路。
+        // 設計書 §14.4「exhaustionMapper を渡さない forwardOnce が現行と同一に振る舞う」）。
+        ...(openaiBridgeSettings.degradeMapping?.enabled === true
+          ? { exhaustionMapper: applyClaudeExhaustionMapping }
+          : {}),
       });
       await persistState();
     } catch (error) {
@@ -1839,6 +1897,7 @@ async function forwardWithRotation({
   upstreamConnectTimeoutMs,
   upstreamConnectRetries,
   upstreamConnectRetryDelayMs,
+  exhaustionMapper = null,
 }) {
   const maxAttempts = Math.max(1, accountManager.accounts.length);
   const attemptedAccountIds = new Set();
@@ -1852,6 +1911,18 @@ async function forwardWithRotation({
   // suffix must still route away from a Fable-exhausted account, unlike the
   // strict `requestModelFamily` used to gate reactive Usage confirmation.
   const modelFamily = routingModelFamily(body);
+  // 設計書 §4.2: 7系統すべてが通る単一の判定点。modelFamily をここで束ねてから
+  // 下位（P-a / P-c〜P-g）へ渡す。null なら下位も一切受け取らない＝現行と同一。
+  const mapExhaustion = exhaustionMapper
+    ? (candidate, options) => exhaustionMapper(candidate, { modelFamily, ...options })
+    : null;
+  // P-b: 直前の上流応答の再生（R-20 の 11 か所）。再生する候補を必ずこの1関数へ通す。
+  const sendLastRetryable = () => sendBufferedResponse(
+    res,
+    mapExhaustion
+      ? mapExhaustion(lastRetryableResponse, { mapPath: 'b', headersSent: res.headersSent })
+      : lastRetryableResponse,
+  );
 
   for (let attempt = 0; attempt < maxAttempts; attempt++) {
     if (req.aborted || res.destroyed) return;
@@ -1867,7 +1938,7 @@ async function forwardWithRotation({
       : accountManager.getActiveAccount(modelFamily);
     if (!account) {
       if (reactiveQuotaRetryUsed && lastRetryableResponse) {
-        sendBufferedResponse(res, lastRetryableResponse);
+        sendLastRetryable();
         return;
       }
       if (sendCurrentQuotaUnavailableResponse({
@@ -1876,9 +1947,10 @@ async function forwardWithRotation({
         accountManager,
         logger,
         modelFamily,
+        exhaustionMapper: mapExhaustion,
       })) return;
       if (lastRetryableResponse) {
-        sendBufferedResponse(res, lastRetryableResponse);
+        sendLastRetryable();
         return;
       }
       if (await forwardCurrentUnavailableAccount({
@@ -1898,8 +1970,9 @@ async function forwardWithRotation({
         upstreamConnectRetries,
         upstreamConnectRetryDelayMs,
         modelFamily,
+        exhaustionMapper: mapExhaustion,
       })) return;
-      sendUnavailableAccounts(res, accountManager);
+      sendUnavailableAccounts(res, accountManager, mapExhaustion);
       return;
     }
 
@@ -1914,8 +1987,8 @@ async function forwardWithRotation({
         candidate: account,
       })
     ) {
-      if (lastRetryableResponse) sendBufferedResponse(res, lastRetryableResponse);
-      else sendUnavailableAccounts(res, accountManager);
+      if (lastRetryableResponse) sendLastRetryable();
+      else sendUnavailableAccounts(res, accountManager, mapExhaustion);
       return;
     }
 
@@ -1939,7 +2012,7 @@ async function forwardWithRotation({
     } catch (error) {
       if (reactiveQuotaRetryUsed && lastRetryableResponse) {
         if (req.aborted || res.destroyed) return;
-        sendBufferedResponse(res, lastRetryableResponse);
+        sendLastRetryable();
         return;
       }
       if (error?.code === 'NATIVE_REFRESH_OUTCOME_UNKNOWN') {
@@ -1953,7 +2026,7 @@ async function forwardWithRotation({
     if (req.aborted || res.destroyed) return;
     if (!accountManager.accounts.includes(account)) {
       if (reactiveQuotaRetryUsed && lastRetryableResponse) {
-        sendBufferedResponse(res, lastRetryableResponse);
+        sendLastRetryable();
         return;
       }
       continue;
@@ -1970,7 +2043,7 @@ async function forwardWithRotation({
         secret,
       })
     ) {
-      sendBufferedResponse(res, lastRetryableResponse);
+      sendLastRetryable();
       return;
     }
     if (!secret) {
@@ -2000,7 +2073,7 @@ async function forwardWithRotation({
     if (req.aborted || res.destroyed) return;
     if (!accountManager.accounts.includes(account)) {
       if (reactiveQuotaRetryUsed && lastRetryableResponse) {
-        sendBufferedResponse(res, lastRetryableResponse);
+        sendLastRetryable();
         return;
       }
       continue;
@@ -2017,12 +2090,12 @@ async function forwardWithRotation({
         secret: freshSecret,
       })
     ) {
-      sendBufferedResponse(res, lastRetryableResponse);
+      sendLastRetryable();
       return;
     }
     if (attemptedAccountIds.has(account.id)) {
-      if (lastRetryableResponse) sendBufferedResponse(res, lastRetryableResponse);
-      else sendUnavailableAccounts(res, accountManager);
+      if (lastRetryableResponse) sendLastRetryable();
+      else sendUnavailableAccounts(res, accountManager, mapExhaustion);
       return;
     }
     attemptedAccountIds.add(account.id);
@@ -2047,9 +2120,10 @@ async function forwardWithRotation({
       upstreamConnectTimeoutMs,
       upstreamConnectRetries,
       upstreamConnectRetryDelayMs,
+      exhaustionMapper: mapExhaustion,
     });
     if (!accountManager.accounts.includes(account)) {
-      finishStaleAccountResponse(res, result.passthroughResponse);
+      finishStaleAccountResponse(res, result.passthroughResponse, mapExhaustion);
       return;
     }
     if (result.retryAfterRefresh) {
@@ -2090,9 +2164,10 @@ async function forwardWithRotation({
         upstreamConnectTimeoutMs,
         upstreamConnectRetries,
         upstreamConnectRetryDelayMs,
+        exhaustionMapper: mapExhaustion,
       });
       if (!accountManager.accounts.includes(account)) {
-        finishStaleAccountResponse(res, retryResult.passthroughResponse);
+        finishStaleAccountResponse(res, retryResult.passthroughResponse, mapExhaustion);
         return;
       }
       if (retryResult.retryAfterRefresh) {
@@ -2129,7 +2204,7 @@ async function forwardWithRotation({
 
   if (!res.headersSent) {
     if (reactiveQuotaRetryUsed && lastRetryableResponse) {
-      sendBufferedResponse(res, lastRetryableResponse);
+      sendLastRetryable();
       return;
     }
     if (sendCurrentQuotaUnavailableResponse({
@@ -2138,9 +2213,10 @@ async function forwardWithRotation({
       accountManager,
       logger,
       modelFamily,
+      exhaustionMapper: mapExhaustion,
     })) return;
     if (lastRetryableResponse) {
-      sendBufferedResponse(res, lastRetryableResponse);
+      sendLastRetryable();
       return;
     }
     if (await forwardCurrentUnavailableAccount({
@@ -2160,8 +2236,9 @@ async function forwardWithRotation({
       upstreamConnectRetries,
       upstreamConnectRetryDelayMs,
       modelFamily,
+      exhaustionMapper: mapExhaustion,
     })) return;
-    sendUnavailableAccounts(res, accountManager);
+    sendUnavailableAccounts(res, accountManager, mapExhaustion);
   }
 }
 
@@ -2182,6 +2259,7 @@ async function forwardCurrentUnavailableAccount({
   upstreamConnectRetries,
   upstreamConnectRetryDelayMs,
   modelFamily = null,
+  exhaustionMapper = null,
 }) {
   if (sendCurrentQuotaUnavailableResponse({
     req,
@@ -2189,6 +2267,7 @@ async function forwardCurrentUnavailableAccount({
     accountManager,
     logger,
     modelFamily,
+    exhaustionMapper,
   })) return true;
 
   const account = accountManager.getFallbackAccount();
@@ -2250,6 +2329,7 @@ async function forwardCurrentUnavailableAccount({
     upstreamConnectTimeoutMs,
     upstreamConnectRetries,
     upstreamConnectRetryDelayMs,
+    exhaustionMapper,
   });
   return true;
 }
@@ -2563,6 +2643,7 @@ async function forwardOnce({
   upstreamConnectTimeoutMs,
   upstreamConnectRetries,
   upstreamConnectRetryDelayMs,
+  exhaustionMapper = null,
 }) {
   const target = configuredUpstreamTarget(req.url, upstream);
   const headers = buildUpstreamHeaders(req.headers, account, secret);
@@ -2573,6 +2654,24 @@ async function forwardOnce({
   let reactiveQuotaSource = null;
   let reactiveReplayTargets = null;
   let reactiveReplayAuthorization = null;
+
+  // 応答ヘッダ送出点（P-c :writeUpstreamResponseHead / P-e / P-g1）の単一の判定。
+  // 写像したときは自分で本文まで書き切り、`false` を返して上流チャンクを流さない
+  // （流すと 529 の本文の後ろへ上流 429 の本文が継ぎ足され、Content-Length も壊れる）。
+  const writeMappedOrHead = (upstreamRes, mapPath) => {
+    if (exhaustionMapper && upstreamRes.statusCode === 429) {
+      const mapped = exhaustionMapper(
+        { statusCode: upstreamRes.statusCode, headers: upstreamRes.headers, body: null },
+        { mapPath, headersSent: res.headersSent },
+      );
+      if (mapped && mapped.statusCode !== upstreamRes.statusCode) {
+        sendBufferedResponse(res, mapped);
+        return false;
+      }
+    }
+    writeUpstreamResponseHead(res, upstreamRes);
+    return true;
+  };
 
   let upstreamResponse;
   try {
@@ -2592,8 +2691,9 @@ async function forwardOnce({
       },
       onResponse(upstreamRes) {
         if (!accountManager.accounts.includes(account)) {
-          writeUpstreamResponseHead(res, upstreamRes);
-          return true;
+          // P-g1: 応答ヘッダが届いた時点で口座が台帳から消えていた（reload）。
+          // ここを結線しないと、この 429 は写像されないまま素通しされる（設計書 §4.2 v1.3 訂正）。
+          return writeMappedOrHead(upstreamRes, 'g');
         }
         const responseQuotaEvidence = unifiedQuotaHeaderEvidence(
           upstreamRes.headers,
@@ -2646,8 +2746,11 @@ async function forwardOnce({
           }
         }
 
-        writeUpstreamResponseHead(res, upstreamRes);
-        return true;
+        // P-c（passthroughErrors=true＝利用不可口座での実送信）と
+        // P-e（通常ローテーションの rate-limit-passthrough）の共通の書き出し位置。
+        // P-e では直前の markRateLimited() が済んでいるので、台帳を全枯渇へ変える
+        // 最後の 429 も、その同じ応答の中で写像される（設計書 §4.2）。
+        return writeMappedOrHead(upstreamRes, passthroughErrors ? 'c' : 'e');
       },
       onChunk(chunk) {
         if (!res.destroyed) res.write(chunk);
@@ -2679,7 +2782,7 @@ async function forwardOnce({
   }
 
   if (!accountManager.accounts.includes(account)) {
-    finishStaleAccountResponse(res, upstreamResponse);
+    finishStaleAccountResponse(res, upstreamResponse, exhaustionMapper);
     return { retryNextAccount: false, passthroughResponse: upstreamResponse };
   }
 
@@ -2694,7 +2797,7 @@ async function forwardOnce({
       })
       : { confirmed: false, replayTargets: new Map(), replayAuthorization: null };
     if (!accountManager.accounts.includes(account)) {
-      finishStaleAccountResponse(res, upstreamResponse);
+      finishStaleAccountResponse(res, upstreamResponse, exhaustionMapper);
       return { retryNextAccount: false, passthroughResponse: upstreamResponse };
     }
     if (confirmation.confirmed && !req.aborted && !res.destroyed) {
@@ -2742,7 +2845,13 @@ async function forwardOnce({
   }
 
   if (bufferedPassthrough) {
-    if (!req.aborted && !res.destroyed) sendBufferedResponse(res, upstreamResponse);
+    // P-f: 反応的枠確認が「未確認」に終わったときの再生。直前の markRateLimited() の
+    // 後に評価されるので、ここでも全枯渇へ変わる最後の 429 が写像される（設計書 §4.2）。
+    if (!req.aborted && !res.destroyed) {
+      sendBufferedResponse(res, exhaustionMapper
+        ? exhaustionMapper(upstreamResponse, { mapPath: 'f', headersSent: res.headersSent })
+        : upstreamResponse);
+    }
     return { retryNextAccount: false };
   }
 
@@ -2766,10 +2875,16 @@ function writeUpstreamResponseHead(res, upstreamRes) {
   res.writeHead(upstreamRes.statusCode || 200, responseHeaders);
 }
 
-function finishStaleAccountResponse(res, upstreamResponse) {
+function finishStaleAccountResponse(res, upstreamResponse, exhaustionMapper = null) {
   if (res.destroyed || res.writableEnded) return;
-  if (!res.headersSent && upstreamResponse) sendBufferedResponse(res, upstreamResponse);
-  else res.end();
+  // P-g2: onResponse が false を返して本文をバッファした後（quota-retry /
+  // reactive-quota-pending）に口座が消えた場合だけ、ここが 429 を書き出す。
+  // P-g1 を通った要求は res.headersSent が真なので、二重には書き換わらない（§8.6）。
+  if (!res.headersSent && upstreamResponse) {
+    sendBufferedResponse(res, exhaustionMapper
+      ? exhaustionMapper(upstreamResponse, { mapPath: 'g', headersSent: res.headersSent })
+      : upstreamResponse);
+  } else res.end();
 }
 
 function configuredUpstreamTarget(requestTarget, upstream) {
@@ -3122,7 +3237,14 @@ function syntheticUpstreamErrorResponse(error) {
   };
 }
 
-function sendCurrentQuotaUnavailableResponse({ req, res, accountManager, logger, modelFamily = null }) {
+function sendCurrentQuotaUnavailableResponse({
+  req,
+  res,
+  accountManager,
+  logger,
+  modelFamily = null,
+  exhaustionMapper = null,
+}) {
   let account = accountManager.getCurrentAccount();
   // Use the modelFamily-aware reason so a non-matching-family request never
   // gets handed a misleading scoped claim (e.g. `seven_day_fable`) when it
@@ -3148,7 +3270,11 @@ function sendCurrentQuotaUnavailableResponse({ req, res, accountManager, logger,
     outcome: 'quota-exhausted-local',
     durationMs: 0,
   });
-  sendBufferedResponse(res, response);
+  // P-a: 合成した 429 を書き出す唯一の位置（設計書 §4.2）。ログの statusCode は
+  // 写像前の 429 のままにする（実際に起きた事象を残す＝受入条件7）。
+  sendBufferedResponse(res, exhaustionMapper
+    ? exhaustionMapper(response, { mapPath: 'a', headersSent: res.headersSent })
+    : response);
   return true;
 }
 
@@ -3305,7 +3431,7 @@ function sendJson(res, status, body) {
   res.end(JSON.stringify(body));
 }
 
-function sendUnavailableAccounts(res, accountManager = null) {
+function sendUnavailableAccounts(res, accountManager = null, exhaustionMapper = null) {
   const current = accountManager?.getCurrentAccount();
   const reason = current ? accountManager.unavailableReason(current) : null;
   if (isCredentialUnavailable(reason)) {
@@ -3330,10 +3456,22 @@ function sendUnavailableAccounts(res, accountManager = null) {
     }));
     return;
   }
-  sendJson(res, 429, {
+  // P-d の 429 分岐。503 分岐（認証情報が使えない）は上で return 済みなので
+  // 自動的に写像対象外になる（契約 §C10.4 補足②。個別の除外条件を書かない）。
+  const body = {
     type: 'error',
     error: { type: 'rate_limit_error', message: 'All configured accounts are unavailable.' },
-  });
+  };
+  const mapped = exhaustionMapper?.({
+    statusCode: 429,
+    headers: { 'Content-Type': 'application/json' },
+    body: Buffer.from(JSON.stringify(body)),
+  }, { mapPath: 'd', headersSent: res.headersSent });
+  if (mapped && mapped.statusCode !== 429) {
+    sendBufferedResponse(res, mapped);
+    return;
+  }
+  sendJson(res, 429, body);
 }
 
 function shortErrorMessage(error) {

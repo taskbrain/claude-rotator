@@ -9226,3 +9226,705 @@ describe('openai-bridge へ渡す Claude 側台帳の判定 (R4-1 / 設計書 §
     );
   });
 });
+
+// ---------------------------------------------------------------------------
+// R4-2 / R4-3 / R4-4 / R4-6 の配線: Claude 全枯渇の 429 を 529（両プールとも利用
+// 不可なら 403）へ写像する単一判定関数 mapClaudeExhaustion を、429 を書き出す
+// 7系統すべて（設計書 §4.2 の P-a〜P-g）へ結線したこと。
+//
+// 判定そのものの検査は test/degrade-state.test.js にあり、ここでは「本番の各終端
+// 経路が実際にその1関数を通ること」を実 TCP で固定する（設計書 §11.3 受入条件
+// 4-a〜4-g・5-a〜5-c）。既存ケースは1件も削除・書換していない（§14.4）。
+// ---------------------------------------------------------------------------
+describe('Claude 全枯渇 429 の 529 写像を7系統へ結線する (R4-2/R4-3/R4-4/R4-6 / 設計書 §4.2)', () => {
+  const ENABLED = { enabled: true };
+
+  async function startProxy({
+    accountManager,
+    secretStore = new MemorySecretStore(),
+    upstreamUrl = 'http://127.0.0.1:1',
+    logLines = [],
+    degradeMapping = ENABLED,
+    bridgeUrl = null,
+    usageFetcher = null,
+  }) {
+    const bridge = bridgeUrl
+      ? {
+        enabled: true,
+        url: bridgeUrl,
+        modelPattern: '^gpt-',
+        connectTimeoutMs: 1000,
+        idleTimeoutMs: 1000,
+        connectRetries: 0,
+      }
+      : { enabled: false };
+    const proxy = await listen(createProxyServer({
+      accountManager,
+      secretStore,
+      config: {
+        upstream: upstreamUrl,
+        usagePolling: { enabled: false },
+        openaiBridge: { ...bridge, ...(degradeMapping ? { degradeMapping } : {}) },
+      },
+      currentCredentialReader: async () => null,
+      ...(usageFetcher ? { usageFetcher } : {}),
+      logger: line => logLines.push(line),
+    }));
+    cleanupAfterTest(async () => close(proxy.server));
+    return proxy;
+  }
+
+  const ask = (proxy, model = 'sonnet') => requestJson(`${proxy.url}/v1/messages`, {
+    method: 'POST',
+    body: JSON.stringify({ model }),
+    headers: { 'content-type': 'application/json' },
+    timeoutMs: 3_000,
+  });
+
+  // 写像したときだけ出る痕跡（degradeLog）。mapPath はこの行でしか観測できない。
+  const mapLines = logLines => logLines.filter(line => / claude-exhaustion-map /.test(line));
+  const lastMapLine = logLines => mapLines(logLines).at(-1);
+
+  const exhaustedBody = '{"type":"error","error":{"type":"overloaded_error"}}';
+
+  // (pool)=unusable を学習させるための偽 bridge（契約 §C10.3 T3）。
+  async function startExhaustedBridge() {
+    const bridge = await listen(http.createServer((req, res) => {
+      req.resume();
+      res.writeHead(529, {
+        'Content-Type': 'application/json',
+        'content-length': String(Buffer.byteLength(exhaustedBody)),
+        'x-ombr-contract': '1',
+        'x-ombr-degrade-reason': 'codex_pool_exhausted',
+        'x-ombr-degrade-scope': 'pool',
+        'x-ombr-pool-state': 'exhausted',
+        'x-ombr-upstream-status': '429',
+        'x-ombr-reset-at': '2099-01-01T00:00:00Z',
+      });
+      res.end(exhaustedBody);
+    }));
+    cleanupAfterTest(async () => close(bridge.server));
+    return bridge;
+  }
+
+  // 上流に一度も届かない構成（P-a / P-d は上流へ送らずに 429 を作る）。
+  async function startUnusedUpstream() {
+    const seen = [];
+    const upstream = await listen(http.createServer((req, res) => {
+      seen.push(req.headers.authorization);
+      req.resume();
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end('{}');
+    }));
+    cleanupAfterTest(async () => close(upstream.server));
+    return { upstream, seen };
+  }
+
+  // -------------------------------------------------------------------------
+  // R4-2: P-a（局所合成の 429）と P-d（sendUnavailableAccounts の 429 分岐）
+  // -------------------------------------------------------------------------
+
+  it('4-a: maps the locally synthesised quota 429 (P-a) to 529 overloaded_error', async () => {
+    const { upstream, seen } = await startUnusedUpstream();
+    const secretStore = new MemorySecretStore();
+    await secretStore.set('acct_1', { accessToken: 'access-token-1' });
+    const accountManager = new AccountManager({
+      accounts: [{ id: 'acct_1', type: 'oauth' }],
+      now: () => 1000,
+    });
+    accountManager.updateQuota('acct_1', {
+      'anthropic-ratelimit-unified-5h-utilization': '1',
+      'anthropic-ratelimit-unified-5h-reset': '10',
+    });
+    const logLines = [];
+    const proxy = await startProxy({
+      accountManager, secretStore, upstreamUrl: upstream.url, logLines,
+    });
+
+    const response = await ask(proxy);
+
+    assert.equal(response.status, 529, '全枠切れの合成 429 は Astra へ退避させる');
+    assert.equal(response.body.error.type, 'overloaded_error');
+    assert.equal(response.body.error.message, 'All Claude accounts are exhausted.');
+    assert.deepEqual(seen, [], 'P-a は上流へ送らない');
+    assert.match(lastMapLine(logLines), /mapPath=a/);
+    assert.match(lastMapLine(logLines), /mappedFrom=429 mappedFromType=rate_limit_error mappedTo=529/);
+    assert.match(lastMapLine(logLines), /mapReason=all_claude_accounts_exhausted/);
+    assert.equal(
+      response.headers['content-length'],
+      String(Buffer.byteLength(response.bodyText)),
+      'Content-Length は写像後の本文長へ入れ替える（§8.7 手順3）',
+    );
+  });
+
+  it('4-d: maps the sendUnavailableAccounts 429 branch (P-d) to 529', async () => {
+    const { upstream, seen } = await startUnusedUpstream();
+    // 資格情報が1つも無いので forwardCurrentUnavailableAccount は送信せずに false を返し、
+    // P-d の 429 分岐へ落ちる（reason は temporary_throttle なので P-a は発火しない）。
+    const accountManager = new AccountManager({
+      accounts: [{ id: 'acct_1', type: 'oauth' }],
+      now: () => 1000,
+    });
+    accountManager.markRateLimited('acct_1', 60);
+    const logLines = [];
+    const proxy = await startProxy({ accountManager, upstreamUrl: upstream.url, logLines });
+
+    const response = await ask(proxy);
+
+    assert.equal(response.status, 529);
+    assert.equal(response.body.error.type, 'overloaded_error');
+    assert.deepEqual(seen, []);
+    assert.match(lastMapLine(logLines), /mapPath=d/);
+    assert.match(lastMapLine(logLines), /mappedFrom=429 mappedFromType=rate_limit_error mappedTo=529/);
+  });
+
+  it('4-d: leaves the 503 credential branch of P-d untouched', async () => {
+    const { upstream } = await startUnusedUpstream();
+    const accountManager = new AccountManager({
+      accounts: [{ id: 'acct_1', type: 'oauth' }],
+      now: () => 1000,
+    });
+    accountManager.markError('acct_1', 'authentication_error', 'OAuth token rejected');
+    const logLines = [];
+    const proxy = await startProxy({ accountManager, upstreamUrl: upstream.url, logLines });
+
+    const response = await ask(proxy);
+
+    assert.equal(response.status, 503, '認証の問題は 529 で逃がさない（契約 §C10.4 補足②）');
+    assert.equal(response.body.error.type, 'api_error');
+    assert.deepEqual(mapLines(logLines), [], '写像そのものが起きない');
+  });
+
+  it('5-b: keeps the P-a response at 429 while degradeMapping is unset (§14.4)', async () => {
+    const { upstream } = await startUnusedUpstream();
+    const secretStore = new MemorySecretStore();
+    await secretStore.set('acct_1', { accessToken: 'access-token-1' });
+    const accountManager = new AccountManager({
+      accounts: [{ id: 'acct_1', type: 'oauth' }],
+      now: () => 1000,
+    });
+    accountManager.updateQuota('acct_1', {
+      'anthropic-ratelimit-unified-5h-utilization': '1',
+      'anthropic-ratelimit-unified-5h-reset': '10',
+    });
+    const logLines = [];
+    const proxy = await startProxy({
+      accountManager, secretStore, upstreamUrl: upstream.url, logLines, degradeMapping: null,
+    });
+
+    const response = await ask(proxy);
+
+    assert.equal(response.status, 429, '既定（未指定）では現行どおり 429 を返す');
+    assert.equal(response.body.error.type, 'rate_limit_error');
+    assert.equal(response.headers['anthropic-ratelimit-unified-status'], 'rejected');
+    assert.deepEqual(mapLines(logLines), []);
+  });
+
+  it('5-c: never maps while no account is registered at all', async () => {
+    const { upstream } = await startUnusedUpstream();
+    const accountManager = new AccountManager({ accounts: [], now: () => 1000 });
+    const logLines = [];
+    const proxy = await startProxy({ accountManager, upstreamUrl: upstream.url, logLines });
+
+    const response = await ask(proxy);
+
+    assert.equal(response.status, 429, '口座0件（インストール直後）は「全枯渇」とみなさない');
+    assert.equal(response.body.error.message, 'All configured accounts are unavailable.');
+    assert.deepEqual(mapLines(logLines), []);
+  });
+
+  it('5-a: never maps the P-a 429 while an un-polled peer account is still usable', async () => {
+    // acct_2 は使用量が未取得なので switchTargetScore() は null を返す（R-10）。
+    // getRoutingAvailability().state を判定根拠にすると「使えない」と誤判定して
+    // 過剰に 529 を返すが、isAvailable() を根拠にすれば写像は起きない（設計書 §4.2）。
+    const { upstream, seen } = await startUnusedUpstream();
+    const secretStore = new MemorySecretStore();
+    await secretStore.set('acct_1', { accessToken: 'access-token-1' });
+    await secretStore.set('acct_2', { accessToken: 'access-token-2' });
+    const accountManager = new AccountManager({
+      accounts: [{ id: 'acct_1', type: 'oauth' }, { id: 'acct_2', type: 'oauth' }],
+      now: () => 1000,
+    });
+    accountManager.updateQuota('acct_1', {
+      'anthropic-ratelimit-unified-5h-utilization': '1',
+      'anthropic-ratelimit-unified-5h-reset': '10',
+    });
+    const logLines = [];
+    const proxy = await startProxy({
+      accountManager, secretStore, upstreamUrl: upstream.url, logLines,
+    });
+
+    const response = await ask(proxy);
+
+    assert.equal(response.status, 429, '写像せず現行どおりの 429 を返す');
+    assert.equal(response.body.error.type, 'rate_limit_error');
+    assert.equal(
+      accountManager.isAvailable(accountManager.find('acct_2')),
+      true,
+      '判定根拠は isAvailable（台帳）であって応答の見た目でも routing state でもない',
+    );
+    assert.deepEqual(seen, []);
+    assert.deepEqual(mapLines(logLines), []);
+  });
+
+  // -------------------------------------------------------------------------
+  // R4-3: P-b（lastRetryableResponse の再生）
+  // -------------------------------------------------------------------------
+
+  // 反応的枠確認が「確認済み」になった後、唯一の再生先が選択前に throttled になり、
+  // 直前の上流 429 がそのまま再生される経路（設計書 §4.2 の P-b）。
+  async function runReactiveReplayScenario({ degradeMapping = ENABLED } = {}) {
+    const upstreamSeen = [];
+    const originalBody = {
+      type: 'error', error: { type: 'rate_limit_error', message: 'replay target disappeared' },
+    };
+    const upstream = await listen(http.createServer((req, res) => {
+      req.resume();
+      upstreamSeen.push(req.headers.authorization);
+      if (req.headers.authorization === 'Bearer access-token-1') {
+        res.writeHead(429, { 'Content-Type': 'application/json', 'x-replay-test': 'map-b' });
+        res.end(JSON.stringify(originalBody));
+        return;
+      }
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ ok: true }));
+    }));
+    cleanupAfterTest(async () => close(upstream.server));
+    const secretStore = new MemorySecretStore();
+    await secretStore.set('acct_1', { accessToken: 'access-token-1' });
+    await secretStore.set('acct_2', { accessToken: 'access-token-2' });
+    const accountManager = new AccountManager({
+      accounts: [{ id: 'acct_1', type: 'oauth' }, { id: 'acct_2', type: 'oauth' }],
+    });
+    accountManager.updateQuota('acct_2', { 'anthropic-ratelimit-unified-5h-utilization': '0.1' });
+    const originalIsAvailable = accountManager.isAvailable.bind(accountManager);
+    let armThrottle = false;
+    let throttleScheduled = false;
+    accountManager.isAvailable = (account, modelFamily = null) => {
+      const available = originalIsAvailable(account, modelFamily);
+      if (armThrottle && account?.id === 'acct_2' && available && !throttleScheduled) {
+        throttleScheduled = true;
+        queueMicrotask(() => accountManager.markRateLimited('acct_2', 60));
+      }
+      return available;
+    };
+    const logLines = [];
+    const proxy = await startProxy({
+      accountManager,
+      secretStore,
+      upstreamUrl: upstream.url,
+      logLines,
+      degradeMapping,
+      usageFetcher: async () => {
+        armThrottle = true;
+        return {
+          scoped_weekly: [{
+            key: 'fable', label: 'Fable', utilization: 1, resets_at: futureReset(),
+          }],
+        };
+      },
+    });
+
+    const response = await ask(proxy, 'claude-fable-5');
+    return { response, logLines, upstreamSeen, originalBody };
+  }
+
+  it('4-b: maps the replayed lastRetryableResponse 429 (P-b) to 529', async () => {
+    const { response, logLines, upstreamSeen } = await runReactiveReplayScenario();
+
+    assert.deepEqual(upstreamSeen, ['Bearer access-token-1'], '再生であって再送ではない');
+    assert.equal(response.status, 529);
+    assert.equal(response.body.error.type, 'overloaded_error');
+    assert.match(lastMapLine(logLines), /mapPath=b/);
+    assert.match(lastMapLine(logLines), /mappedFrom=429 mappedFromType=rate_limit_error mappedTo=529/);
+  });
+
+  it('4-b: keeps the replayed upstream headers and only replaces the body', async () => {
+    const { response } = await runReactiveReplayScenario();
+
+    assert.equal(response.headers['x-replay-test'], 'map-b', '上流のヘッダは残す');
+    assert.equal(response.headers['content-type'], 'application/json');
+    assert.equal(
+      response.headers['content-length'],
+      String(Buffer.byteLength(response.bodyText)),
+      'content-* だけは写像後の本文に合わせて入れ替える（§8.7 手順2・3）',
+    );
+  });
+
+  it('5-b: replays the upstream 429 unchanged while degradeMapping is unset (§14.4)', async () => {
+    const { response, originalBody } = await runReactiveReplayScenario({ degradeMapping: null });
+
+    assert.equal(response.status, 429);
+    assert.deepEqual(response.body, originalBody);
+    assert.equal(response.headers['x-replay-test'], 'map-b');
+  });
+
+  // -------------------------------------------------------------------------
+  // R4-4: P-c（利用不可口座での実送信）と P-e（通常ローテーションの素通し）
+  // -------------------------------------------------------------------------
+
+  // markRateLimited 済みの単一口座＋資格情報あり ⇒ forwardCurrentUnavailableAccount が
+  // passthroughErrors:true で1回だけ実送信する（設計書 §4.2 の P-c）。
+  async function runUnavailableAccountSendScenario({
+    upstreamStatus = 429,
+    degradeMapping = ENABLED,
+  } = {}) {
+    const upstreamBody = upstreamStatus === 200
+      ? JSON.stringify({ ok: true })
+      : JSON.stringify({ type: 'error', error: { type: 'rate_limit_error', message: 'upstream said 429' } });
+    const upstreamSeen = [];
+    const upstream = await listen(http.createServer((req, res) => {
+      req.resume();
+      upstreamSeen.push(req.headers.authorization);
+      res.writeHead(upstreamStatus, { 'Content-Type': 'application/json', 'x-path-test': 'p-c' });
+      res.end(upstreamBody);
+    }));
+    cleanupAfterTest(async () => close(upstream.server));
+    const secretStore = new MemorySecretStore();
+    await secretStore.set('acct_1', { accessToken: 'access-token-1' });
+    const accountManager = new AccountManager({
+      accounts: [{ id: 'acct_1', type: 'oauth' }],
+      now: () => 1000,
+    });
+    accountManager.markRateLimited('acct_1', 60);
+    const logLines = [];
+    const proxy = await startProxy({
+      accountManager, secretStore, upstreamUrl: upstream.url, logLines, degradeMapping,
+    });
+
+    const response = await ask(proxy);
+    return { response, logLines, upstreamSeen, upstreamBody };
+  }
+
+  it('4-c: maps the 429 sent from an unavailable account (P-c) to 529', async () => {
+    const { response, logLines, upstreamSeen } = await runUnavailableAccountSendScenario();
+
+    assert.deepEqual(upstreamSeen, ['Bearer access-token-1'], '利用不可口座でも1回は実送信する');
+    assert.equal(response.status, 529);
+    assert.equal(response.body.error.type, 'overloaded_error');
+    assert.equal(response.headers['x-path-test'], 'p-c');
+    assert.match(lastMapLine(logLines), /mapPath=c/);
+  });
+
+  it('4-c: never maps a 200 from the unavailable-account send (退避のラダーを潰さない)', async () => {
+    const { response, logLines, upstreamBody } = await runUnavailableAccountSendScenario({
+      upstreamStatus: 200,
+    });
+
+    assert.equal(response.status, 200);
+    assert.equal(response.bodyText, upstreamBody);
+    assert.deepEqual(mapLines(logLines), []);
+  });
+
+  it('4-c: never maps a 5xx from the unavailable-account send', async () => {
+    const { response, logLines, upstreamBody } = await runUnavailableAccountSendScenario({
+      upstreamStatus: 503,
+    });
+
+    assert.equal(response.status, 503);
+    assert.equal(response.bodyText, upstreamBody);
+    assert.deepEqual(mapLines(logLines), []);
+  });
+
+  // 通常ローテーション（passthroughErrors:false）で上流 429 を素通しする経路。
+  // markRateLimited() が同じ応答の中で先に走るため、「台帳を全枯渇へ変える最後の
+  // 1件」がその場で写像される（設計書 §4.2 の P-e）。
+  async function runRateLimitPassthroughScenario({
+    accounts,
+    degradeMapping = ENABLED,
+    bridgeUrl = null,
+    warmBridge = false,
+  } = {}) {
+    const upstreamBody = JSON.stringify({
+      type: 'error', error: { type: 'rate_limit_error', message: 'upstream throttled' },
+    });
+    const upstreamSeen = [];
+    const upstream = await listen(http.createServer((req, res) => {
+      req.resume();
+      upstreamSeen.push(req.headers.authorization);
+      res.writeHead(429, { 'Content-Type': 'application/json', 'x-path-test': 'p-e' });
+      res.end(upstreamBody);
+    }));
+    cleanupAfterTest(async () => close(upstream.server));
+    const secretStore = new MemorySecretStore();
+    for (const account of accounts) {
+      await secretStore.set(account.id, { accessToken: `access-token-${account.id}` });
+    }
+    const accountManager = new AccountManager({ accounts, now: () => 1000 });
+    const logLines = [];
+    const proxy = await startProxy({
+      accountManager, secretStore, upstreamUrl: upstream.url, logLines, degradeMapping, bridgeUrl,
+    });
+    if (warmBridge) {
+      // (pool)=unusable を学習させる1往復（Claude 側の台帳はまだ全枯渇ではない）。
+      const warm = await requestJson(`${proxy.url}/v1/messages`, {
+        method: 'POST',
+        body: JSON.stringify({ model: 'gpt-6-astra' }),
+        headers: { 'content-type': 'application/json' },
+        timeoutMs: 3_000,
+      });
+      assert.equal(warm.status, 529, '前提: bridge の 529 は素通しされ (pool) が学習される');
+    }
+
+    const response = await ask(proxy);
+    return { response, logLines, upstreamSeen, upstreamBody, accountManager };
+  }
+
+  it('4-e: maps the very 429 that turns the ledger fully unusable (P-e)', async () => {
+    const { response, logLines, upstreamSeen, accountManager } = await runRateLimitPassthroughScenario({
+      accounts: [{ id: 'acct_1', type: 'oauth' }],
+    });
+
+    assert.deepEqual(upstreamSeen, ['Bearer access-token-acct_1']);
+    assert.equal(response.status, 529, 'markRateLimited() の後に判定するので同じ応答で写像される');
+    assert.equal(response.body.error.type, 'overloaded_error');
+    assert.equal(response.headers['x-path-test'], 'p-e');
+    assert.equal(accountManager.isAvailable(accountManager.find('acct_1')), false);
+    assert.match(lastMapLine(logLines), /mapPath=e/);
+  });
+
+  it('5-a: passes the P-e 429 through untouched while a peer account is still usable', async () => {
+    const { response, logLines, upstreamBody } = await runRateLimitPassthroughScenario({
+      accounts: [{ id: 'acct_1', type: 'oauth' }, { id: 'acct_2', type: 'oauth' }],
+    });
+
+    assert.equal(response.status, 429, '単一口座の一時 429 は写像しない');
+    assert.equal(response.bodyText, upstreamBody);
+    assert.deepEqual(mapLines(logLines), []);
+  });
+
+  it('5-b: passes the P-e 429 through byte-for-byte while degradeMapping is unset (§14.4)', async () => {
+    const { response, logLines, upstreamBody } = await runRateLimitPassthroughScenario({
+      accounts: [{ id: 'acct_1', type: 'oauth' }],
+      degradeMapping: null,
+    });
+
+    assert.equal(response.status, 429);
+    assert.equal(response.bodyText, upstreamBody);
+    assert.equal(response.headers['x-path-test'], 'p-e');
+    assert.deepEqual(mapLines(logLines), []);
+  });
+
+  it('4-i: stops with 403 permission_error once the GPT pool is known unusable too', async () => {
+    const bridge = await startExhaustedBridge();
+    const { response, logLines } = await runRateLimitPassthroughScenario({
+      accounts: [{ id: 'acct_1', type: 'oauth' }],
+      bridgeUrl: bridge.url,
+      warmBridge: true,
+    });
+
+    assert.equal(response.status, 403, '529 では無言で固まる（M-6）ので明示停止する');
+    assert.equal(response.body.error.type, 'permission_error');
+    assert.match(
+      response.body.error.message,
+      /^All Claude accounts and the Codex pool are unavailable\. Earliest recovery: /,
+    );
+    assert.equal(
+      response.headers['content-length'],
+      String(Buffer.byteLength(response.bodyText)),
+      '403 本文の長さと Content-Length が一致する（受入条件 4-j）',
+    );
+    assert.match(lastMapLine(logLines), /mapPath=e/);
+    assert.match(lastMapLine(logLines), /gptPoolState=unusable /);
+    assert.match(lastMapLine(logLines), /mappedTo=403 mapReason=both_pools_unusable/);
+  });
+
+  // -------------------------------------------------------------------------
+  // R4-6: P-f（反応的枠確認が未確認に終わった再生）と P-g（reload で消えた口座）
+  // -------------------------------------------------------------------------
+
+  async function runReactivePendingScenario({ accounts, fableUtilization, degradeMapping = ENABLED }) {
+    const upstreamBody = JSON.stringify({
+      type: 'error', error: { type: 'rate_limit_error', message: 'fable throttled' },
+    });
+    const upstreamSeen = [];
+    const upstream = await listen(http.createServer((req, res) => {
+      req.resume();
+      upstreamSeen.push(req.headers.authorization);
+      if (req.headers.authorization === 'Bearer access-token-acct_1') {
+        res.writeHead(429, { 'Content-Type': 'application/json', 'x-path-test': 'p-f' });
+        res.end(upstreamBody);
+        return;
+      }
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ ok: true }));
+    }));
+    cleanupAfterTest(async () => close(upstream.server));
+    const secretStore = new MemorySecretStore();
+    for (const account of accounts) {
+      await secretStore.set(account.id, { accessToken: `access-token-${account.id}` });
+    }
+    const accountManager = new AccountManager({ accounts });
+    // 先頭以外は再生先の候補になれるよう使用量を入れておく（switchTargetScore が
+    // null の口座は snapshotKnownAvailableAlternates が候補にしない＝R-10）。
+    for (const account of accounts.slice(1)) {
+      accountManager.updateQuota(account.id, { 'anthropic-ratelimit-unified-5h-utilization': '0.1' });
+    }
+    const logLines = [];
+    const proxy = await startProxy({
+      accountManager,
+      secretStore,
+      upstreamUrl: upstream.url,
+      logLines,
+      degradeMapping,
+      usageFetcher: async () => ({
+        scoped_weekly: [{
+          key: 'fable', label: 'Fable', utilization: fableUtilization, resets_at: futureReset(),
+        }],
+      }),
+    });
+
+    const response = await ask(proxy, 'claude-fable-5');
+    return { response, logLines, upstreamSeen, upstreamBody };
+  }
+
+  it('4-f: maps the buffered replay of an unconfirmed reactive 429 (P-f) to 529', async () => {
+    const { response, logLines, upstreamSeen } = await runReactivePendingScenario({
+      accounts: [{ id: 'acct_1', type: 'oauth' }],
+      fableUtilization: 0.1,
+    });
+
+    assert.deepEqual(upstreamSeen, ['Bearer access-token-acct_1'], '未確認なので再生だけを行う');
+    assert.equal(response.status, 529);
+    assert.equal(response.body.error.type, 'overloaded_error');
+    assert.equal(response.headers['x-path-test'], 'p-f');
+    assert.match(lastMapLine(logLines), /mapPath=f/);
+  });
+
+  it('4-f: never maps once the reactive confirmation succeeds and the request is replayed', async () => {
+    const { response, logLines, upstreamSeen } = await runReactivePendingScenario({
+      accounts: [{ id: 'acct_1', type: 'oauth' }, { id: 'acct_2', type: 'oauth' }],
+      fableUtilization: 1,
+    });
+
+    assert.equal(response.status, 200, '確認できた（quota-retry）経路は次の口座へ回す');
+    assert.deepEqual(upstreamSeen, ['Bearer access-token-acct_1', 'Bearer access-token-acct_2']);
+    assert.deepEqual(mapLines(logLines), []);
+  });
+
+  // (g1) 応答ヘッダが届いた時点で口座が台帳から消えていた場合。
+  async function runStaleHeadScenario({ upstreamStatus = 429, degradeMapping = ENABLED } = {}) {
+    let releaseResponse;
+    const responseGate = new Promise(resolve => { releaseResponse = resolve; });
+    let markUpstreamStarted;
+    const upstreamStarted = new Promise(resolve => { markUpstreamStarted = resolve; });
+    const upstreamBody = upstreamStatus === 200
+      ? JSON.stringify({ ok: true })
+      : JSON.stringify({ type: 'error', error: { type: 'rate_limit_error', message: 'stale head' } });
+    const upstream = await listen(http.createServer(async (req, res) => {
+      req.resume();
+      markUpstreamStarted();
+      await responseGate;
+      res.writeHead(upstreamStatus, { 'Content-Type': 'application/json', 'x-path-test': 'p-g1' });
+      res.end(upstreamBody);
+    }));
+    cleanupAfterTest(async () => {
+      releaseResponse?.();
+      await close(upstream.server);
+    });
+    const secretStore = new MemorySecretStore();
+    await secretStore.set('acct_1', { accessToken: 'access-token-1' });
+    const accountManager = new AccountManager({ accounts: [{ id: 'acct_1', type: 'oauth' }] });
+    const logLines = [];
+    const proxy = await startProxy({
+      accountManager, secretStore, upstreamUrl: upstream.url, logLines, degradeMapping,
+    });
+
+    const pending = ask(proxy);
+    await upstreamStarted;
+    accountManager.replaceAccounts([{ id: 'acct_2', type: 'oauth' }]);
+    accountManager.markRateLimited('acct_2', 60);
+    releaseResponse();
+    return { response: await pending, logLines, upstreamBody };
+  }
+
+  it('4-g1: maps a 429 whose account had already left the ledger when the head arrived', async () => {
+    const { response, logLines } = await runStaleHeadScenario();
+
+    assert.equal(response.status, 529);
+    assert.equal(response.body.error.type, 'overloaded_error');
+    assert.equal(response.headers['x-path-test'], 'p-g1');
+    assert.match(lastMapLine(logLines), /mapPath=g/);
+  });
+
+  it('4-g1: does not let finishStaleAccountResponse rewrite or append after the mapping', async () => {
+    const { response, logLines } = await runStaleHeadScenario();
+
+    assert.equal(
+      response.bodyText,
+      '{"type":"error","error":{"type":"overloaded_error","message":"All Claude accounts are exhausted."}}',
+      '上流 429 の本文が後ろへ継ぎ足されない',
+    );
+    assert.equal(
+      response.headers['content-length'],
+      String(Buffer.byteLength(response.bodyText)),
+    );
+    assert.equal(mapLines(logLines).length, 1, '写像は1回だけ（res.headersSent 後は写像しない）');
+  });
+
+  it('4-g: never maps a stale 200', async () => {
+    const { response, logLines, upstreamBody } = await runStaleHeadScenario({ upstreamStatus: 200 });
+
+    assert.equal(response.status, 200);
+    assert.equal(response.bodyText, upstreamBody);
+    assert.deepEqual(mapLines(logLines), []);
+  });
+
+  it('5-b: passes the stale 429 through while degradeMapping is unset (§14.4)', async () => {
+    const { response, logLines, upstreamBody } = await runStaleHeadScenario({ degradeMapping: null });
+
+    assert.equal(response.status, 429);
+    assert.equal(response.bodyText, upstreamBody);
+    assert.deepEqual(mapLines(logLines), []);
+  });
+
+  // (g2) onResponse が false を返して本文をバッファした後（quota-retry）に消えた場合。
+  it('4-g2: maps the buffered 429 replayed by finishStaleAccountResponse', async () => {
+    let releaseBody;
+    const bodyGate = new Promise(resolve => { releaseBody = resolve; });
+    const resetAt = String(Math.floor(Date.parse(futureReset()) / 1000));
+    const upstreamBody = JSON.stringify({
+      type: 'error', error: { type: 'rate_limit_error', message: 'stale body' },
+    });
+    const upstream = await listen(http.createServer(async (req, res) => {
+      req.resume();
+      res.writeHead(429, {
+        'Content-Type': 'application/json',
+        'x-path-test': 'p-g2',
+        'anthropic-ratelimit-unified-5h-utilization': '1',
+        'anthropic-ratelimit-unified-5h-reset': resetAt,
+      });
+      res.flushHeaders();
+      await bodyGate;
+      res.end(upstreamBody);
+    }));
+    cleanupAfterTest(async () => {
+      releaseBody?.();
+      await close(upstream.server);
+    });
+    const secretStore = new MemorySecretStore();
+    await secretStore.set('acct_1', { accessToken: 'access-token-1' });
+    const accountManager = new AccountManager({ accounts: [{ id: 'acct_1', type: 'oauth' }] });
+    const logLines = [];
+    const proxy = await startProxy({
+      accountManager, secretStore, upstreamUrl: upstream.url, logLines,
+    });
+
+    const pending = ask(proxy);
+    const applied = await waitForStatus(
+      () => accountManager.find('acct_1').quota.unified5h,
+      utilization => utilization === 1,
+      500,
+    );
+    assert.equal(applied, 1, '前提: 応答ヘッダは口座がまだ台帳にあるうちに届いている');
+    accountManager.replaceAccounts([{ id: 'acct_2', type: 'oauth' }]);
+    accountManager.markRateLimited('acct_2', 60);
+    releaseBody();
+
+    const response = await pending;
+    assert.equal(response.status, 529);
+    assert.equal(response.body.error.type, 'overloaded_error');
+    assert.equal(response.headers['x-path-test'], 'p-g2');
+    assert.match(lastMapLine(logLines), /mapPath=g/);
+  });
+});
