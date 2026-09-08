@@ -1,5 +1,7 @@
 import http from 'node:http';
 
+import { buildBridgeLogMeta, formatLogMeta, parseBridgeContract } from './degrade-state.js';
+
 const LOOPBACK_HOSTS = new Set(['127.0.0.1', 'localhost', '::1']);
 
 const HOP_BY_HOP = new Set([
@@ -255,6 +257,33 @@ function pinnedUpstreamTarget(requestUrl, bridgeUrl) {
   return target;
 }
 
+// 設計書 §9.3: degradeReason は bridge の x-ombr-degrade-reason 由来だが、
+// 「不達のとき（＝契約ヘッダを1つも受け取れなかったとき）は rotator 自身が §9.4 の値を
+// 入れる」。値は outcome の snake_case（degradeReason だけは snake_case ＝ §9.3 の但し書き）。
+const ROTATOR_DEGRADE_REASONS = Object.freeze({
+  'bridge-unreachable': 'bridge_unreachable',
+  'bridge-connect-timeout': 'bridge_connect_timeout',
+  'bridge-idle-timeout': 'bridge_idle_timeout',
+  'bridge-stream-error': 'bridge_stream_error',
+});
+
+// ログ行は空白区切りの key=value なので、値に空白・改行を残さない（契約 §C3.1）。
+// src/degrade-state.js の logToken と同型（あちらは内部関数なので公開されていない）。
+function logToken(value) {
+  return String(value).replace(/\s+/g, '_').slice(0, 64);
+}
+
+// 設計書 §9: エラー種別（error.code）と message をログへ残す。現行は ENOTFOUND /
+// ECONNRESET / EPIPE をすべて応答本文の 'connection refused' へ丸めており、ログからも
+// 区別できなかった。**応答本文の文言は変えない**（§8.9「HTTP 応答は不変」）。
+// 丸めを解消するのはログ側だけであり、追記は末尾へ・値があるときだけ行う（§9.2）。
+function errorLogFields(error) {
+  const fields = {};
+  if (error?.code) fields.errorCode = logToken(error.code);
+  if (error?.message) fields.errorMessage = logToken(error.message);
+  return fields;
+}
+
 // 本文送信前（＝bridge からの応答を一切受け取っていない）の接続確立失敗に限り再試行する。
 // 応答を受け取った後（res.headersSent === true）に再試行すると、二重処理のリスクが生まれる。
 const RETRYABLE_CONNECT_ERROR_CODES = new Set(['ECONNREFUSED', 'ECONNRESET', 'ENOTFOUND']);
@@ -292,21 +321,50 @@ export function forwardToOpenAiBridge({ req, res, body, model, settings, logger,
       clearTimeout(idleTimer);
     };
 
-    const finish = (outcome, status) => {
+    // bridge が返した契約ヘッダ（x-ombr-*）の解析結果。応答ヘッダを受け取るまでは null。
+    let contract = null;
+
+    // 設計書 §14.4「degradeMapping 無効時に openai-bridge のログ行が現行と同一である
+    // （追記フィールドが1つも出ないこと）」。追記は写像機能を有効にした構成だけの挙動であり、
+    // 既定（無効）の利用者のログは outcome 名の改名以外は1文字も変わらない。
+    const metaEnabled = settings?.degradeMapping?.enabled === true;
+
+    // 設計書 §9.3 のフィールドを「値があるときだけ」末尾へ足す形に組み立てる。
+    const logMeta = (outcome, extra = {}) => {
+      if (!metaEnabled) return null;
+      // 契約 §C3.7-1: x-ombr-contract の無い応答は「契約前の bridge」なので、契約由来の
+      // 値は1つも載せない（他の x-ombr-* が付いていても信用しない）。この場合でも、
+      // rotator 自身が観測した事実（§9.4 の degradeReason・エラー種別）は残す＝§9.5(d)。
+      const parsed = contract?.contract ? contract : null;
+      return {
+        ...buildBridgeLogMeta({
+          ...(parsed || {}),
+          // bridge 自身が理由を名乗っていればそれを優先する（実データ）。名乗っていない
+          // 障害（不達・タイムアウト・ストリーム障害）だけ rotator 側の値を入れる。
+          reason: parsed?.reason ?? ROTATOR_DEGRADE_REASONS[outcome] ?? null,
+        }),
+        ...extra,
+      };
+    };
+
+    const finish = (outcome, status, meta = null) => {
       if (settled) return;
       settled = true;
       clearTimers();
       logger?.(
         `${new Date().toISOString()} openai-bridge model=${model || '-'} method=${req.method} `
-        + `path=${target.pathname} status=${status ?? '-'} durationMs=${Date.now() - startedAt} outcome=${outcome}`,
+        + `path=${target.pathname} status=${status ?? '-'} durationMs=${Date.now() - startedAt} outcome=${outcome}`
+        + formatLogMeta(meta),
       );
       resolve({ outcome, status: status ?? null });
     };
 
-    // アイドルタイムアウト（403 permission_error・outcome=bridge-timeout 側）。
-    // 接続確立の直後（ヘッダ待ち）から、以後の各チャンク受信のたびに再武装する。
-    // 「接続はできたが応答が全く無い」場合もこの一本のタイマーだけで検出できる
-    // （connect の成否だけを見る connectTimer とは責務を分ける）。
+    // アイドルタイムアウト（outcome=bridge-idle-timeout。応答ヘッダの前後を問わない＝§9.4）。
+    // 接続確立の直後（ヘッダ待ち）から、以後の各チャンク受信のたびに再武装するので、
+    // 「接続はできたが応答が全く無い」場合と「200 を受け取った後にチャンクが来ない」場合
+    // （§8.10）の両方をこの一本のタイマーだけで検出できる（connect の成否だけを見る
+    // connectTimer とは責務を分ける）。ヘッダ送出後の発火では 403 を合成できず切断だけになる。
+    // 無音はここで拾い、ストリームの実障害は bridge-stream-error として別に扱う。
     const armIdleTimer = () => {
       clearTimeout(idleTimer);
       idleTimer = setTimeout(() => {
@@ -314,7 +372,7 @@ export function forwardToOpenAiBridge({ req, res, body, model, settings, logger,
         const willSend = !res.headersSent;
         if (willSend) sendSynthetic(res, 'idle timeout');
         else res.destroy();
-        finish('bridge-timeout', willSend ? BRIDGE_UNREACHABLE_STATUS : null);
+        finish('bridge-idle-timeout', willSend ? BRIDGE_UNREACHABLE_STATUS : null, logMeta('bridge-idle-timeout'));
       }, settings.idleTimeoutMs);
     };
 
@@ -324,7 +382,7 @@ export function forwardToOpenAiBridge({ req, res, body, model, settings, logger,
     // （クライアントが切断し、かつまだ res.end() していない場合に発火する）で検出する。
     const onClientGone = () => {
       currentUpstream?.destroy();
-      finish('client-abort', null);
+      finish('client-abort', null, logMeta('client-abort'));
     };
     // 'aborted' は readBody() 前に切断された場合の保険として残す（副作用なし・二重発火は finish が防ぐ）。
     req.on('aborted', onClientGone);
@@ -347,6 +405,10 @@ export function forwardToOpenAiBridge({ req, res, body, model, settings, logger,
           agent: false,
         },
         upstreamRes => {
+          // 応答ヘッダを受け取った時点で契約ヘッダを解析しておく（設計書 §9.3）。
+          // 値域外・未知の値はすべて null へ倒れるので、ここから先のログは
+          // 「bridge が名乗った正しい値」だけを載せる。
+          contract = parseBridgeContract(upstreamRes.headers);
           if (res.destroyed) {
             upstream.destroy();
             return;
@@ -378,25 +440,29 @@ export function forwardToOpenAiBridge({ req, res, body, model, settings, logger,
           upstreamRes.on('end', () => {
             clearTimers();
             res.end();
-            finish('forwarded', upstreamRes.statusCode || 200);
+            finish('forwarded', upstreamRes.statusCode || 200, logMeta('forwarded'));
           });
-          upstreamRes.on('error', () => {
+          // 応答ストリームの実障害（ECONNRESET・socket hang up 等）。無音は含まない
+          // （無音は bridge-idle-timeout。設計書 §9.4）。
+          upstreamRes.on('error', error => {
             clearTimers();
             res.destroy();
-            finish('bridge-timeout', null);
+            finish('bridge-stream-error', null, logMeta('bridge-stream-error', errorLogFields(error)));
           });
         },
       );
       currentUpstream = upstream;
       upstream.once('finish', () => { requestFullySent = true; });
 
-      // 接続確立前のタイムアウト（403 permission_error・outcome=bridge-unreachable 側）。
+      // 接続確立前のタイムアウト（403 permission_error・outcome=bridge-connect-timeout）。
+      // 接続拒否・DNS 失敗（bridge-unreachable）とは意味が違う——ポートは開いているのに
+      // 受け付けられていない状態を指す（設計書 §9.4）。
       // TCP の接続確立（socket の 'connect'）が起きるまでだけを計測する。確立後は
       // ヘッダ待ち・チャンク間の無応答を問わずすべて idleTimer の責務にする。
       connectTimer = setTimeout(() => {
         upstream.destroy();
         sendSynthetic(res, 'connect timeout');
-        finish('bridge-unreachable', BRIDGE_UNREACHABLE_STATUS);
+        finish('bridge-connect-timeout', BRIDGE_UNREACHABLE_STATUS, logMeta('bridge-connect-timeout'));
       }, settings.connectTimeoutMs);
 
       upstream.once('socket', socket => {
@@ -416,10 +482,11 @@ export function forwardToOpenAiBridge({ req, res, body, model, settings, logger,
         // 無視する。res 相手が既にいない状態で再試行・応答書込みを行わない
         // （レビュー再検証指摘2）。
         if (settled) return;
-        // ヘッダ送出後は新しいステータスを返せない（仕様書 4.2.3 節）
+        // ヘッダ送出後は新しいステータスを返せない（仕様書 4.2.3 節）。応答は既に
+        // 始まっていて上流側で壊れたのだから、不達ではなくストリーム障害である（§9.4）。
         if (res.headersSent) {
           res.destroy();
-          finish('bridge-unreachable', null);
+          finish('bridge-stream-error', null, logMeta('bridge-stream-error', errorLogFields(error)));
           return;
         }
         // まだ bridge からの応答を何も受け取っておらず、かつリクエスト全体（本文含む）
@@ -436,8 +503,9 @@ export function forwardToOpenAiBridge({ req, res, body, model, settings, logger,
           attemptConnect(attempt + 1);
           return;
         }
+        // 応答本文は現行のまま（丸めたまま）にし、種別はログの errorCode で判別する（§8.9・§9）。
         sendSynthetic(res, 'connection refused');
-        finish('bridge-unreachable', BRIDGE_UNREACHABLE_STATUS);
+        finish('bridge-unreachable', BRIDGE_UNREACHABLE_STATUS, logMeta('bridge-unreachable', errorLogFields(error)));
       });
 
       upstream.end(body);

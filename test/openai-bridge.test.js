@@ -28,7 +28,7 @@ describe('openaiBridge defaults', () => {
     assert.equal(config.openaiBridge.url, 'http://127.0.0.1:18765');
     assert.equal(config.openaiBridge.modelPattern, '^gpt-|^o[0-9]|^openai/');
     assert.equal(config.openaiBridge.connectTimeoutMs, 5000, '接続確立前のタイムアウト（outcome=bridge-unreachable 側。ステータスは403で統一）');
-    assert.equal(config.openaiBridge.idleTimeoutMs, 30000, '接続確立後のアイドルタイムアウト（outcome=bridge-timeout 側。ステータスは403で統一）');
+    assert.equal(config.openaiBridge.idleTimeoutMs, 30000, '接続確立後のアイドルタイムアウト（outcome=bridge-idle-timeout 側。ステータスは403で統一）');
     assert.equal(config.openaiBridge.connectRetries, 0, '既定では接続前失敗も再試行しない');
     assert.equal(config.openaiBridge.timeoutMs, undefined, 'v3 で 3 キーへ分割済み。旧キーは残さない');
   });
@@ -322,20 +322,20 @@ describe('forwardToOpenAiBridge', () => {
     assert.equal(response.status, 403, '接続確立後の無応答も403で統一する（502/504は再試行対象のため不採用）');
     assert.match(text, /openai-bridge unreachable/);
     assert.match(text, /idle timeout/);
-    assert.ok(lines.some(l => /outcome=bridge-timeout/.test(l)), lines.join('\n'));
+    assert.ok(lines.some(l => /outcome=bridge-idle-timeout/.test(l)), lines.join('\n'));
   });
 
   it('unifies the HTTP status to 403 but keeps connect failure and idle timeout distinguishable via outcome', async () => {
     // 仕様書 4.2.1 節・4.2.4 節（v3、追試4b・2026-09-07反映）: 接続確立前と確立後は
     // 別障害であり、設定キーは分かれている。HTTPステータスは403で統一するが、
-    // ログの outcome（bridge-unreachable / bridge-timeout）で両者を取り違えないことを固定する。
+    // ログの outcome（bridge-unreachable / bridge-idle-timeout）で両者を取り違えないことを固定する。
     const { response, lines } = await callThroughRotator({
       requestBody: '{"model":"gpt-6-astra"}',
       settingsOverride: { connectTimeoutMs: 5000, idleTimeoutMs: 150 },
       bridgeHandler: () => { /* accepts, never responds */ },
     });
     assert.equal(response.status, 403);
-    assert.ok(lines.some(l => /outcome=bridge-timeout/.test(l)), lines.join('\n'));
+    assert.ok(lines.some(l => /outcome=bridge-idle-timeout/.test(l)), lines.join('\n'));
     assert.ok(lines.every(l => !/outcome=bridge-unreachable/.test(l)), lines.join('\n'));
   });
 
@@ -530,7 +530,7 @@ describe('forwardToOpenAiBridge', () => {
 
     assert.equal(requestImplCalls, 1, 'a failure after the response head was already forwarded must never open a retry connection');
     const result = await donePromise;
-    assert.equal(result.outcome, 'bridge-unreachable');
+    assert.equal(result.outcome, 'bridge-stream-error');
   });
 
   it('does not retry once the request body has been fully flushed to the bridge, even before any response arrives (no double-send, レビュー再検証指摘1)', async () => {
@@ -643,9 +643,9 @@ describe('forwardToOpenAiBridge', () => {
       req, res, body: Buffer.from('{"model":"gpt-6-astra"}'), model: 'gpt-6-astra', settings,
       logger: l => lines.push(l), httpRequestImpl: manual.requestImpl,
     });
-    assert.equal(result.outcome, 'bridge-timeout');
+    assert.equal(result.outcome, 'bridge-idle-timeout');
     assert.equal(result.status, 403, 'a synthesized 403 must be reported as the log status, not null');
-    const logLine = lines.find(l => /outcome=bridge-timeout/.test(l));
+    const logLine = lines.find(l => /outcome=bridge-idle-timeout/.test(l));
     assert.ok(logLine, lines.join('\n'));
     assert.match(logLine, /status=403/);
   });
@@ -1440,3 +1440,390 @@ async function requestJson(url, options = {}) {
   });
   return response;
 }
+
+// ---------------------------------------------------------------------------
+// R3-3: outcome の分岐（設計書 §9.4）とログ meta の併記（§9.3）
+//
+// 既存ケースは1件も削除・書換しない（§14.4）。以下はすべて新規追加である。
+// ---------------------------------------------------------------------------
+
+// 接続確立前で止まったままの upstream。socket は 'connecting' のまま 'connect' を
+// 永久に発火しないので、connectTimer だけが発火する（＝bridge-connect-timeout）。
+function createStalledUpstream() {
+  let callback = null;
+  let upstream = null;
+  const requestImpl = (options, cb) => {
+    callback = cb;
+    upstream = new EventEmitter();
+    upstream.destroyed = false;
+    upstream.destroy = () => { upstream.destroyed = true; };
+    upstream.end = () => {
+      process.nextTick(() => {
+        const socket = new EventEmitter();
+        socket.connecting = true;
+        upstream.emit('socket', socket);
+      });
+    };
+    return upstream;
+  };
+  return { requestImpl, getCallback: () => callback, getUpstream: () => upstream };
+}
+
+function bridgeSettings(overrides = {}) {
+  return resolveOpenAiBridgeSettings({
+    openaiBridge: {
+      enabled: true,
+      url: 'http://127.0.0.1:1',
+      modelPattern: '^gpt-',
+      connectTimeoutMs: 2000,
+      idleTimeoutMs: 2000,
+      connectRetries: 0,
+      // §9.3 の追記は写像機能を有効にした構成だけの挙動（§14.4）。既定は無効なので、
+      // 追記を検証するケースではここで明示的に有効化する。
+      degradeMapping: { enabled: true },
+      ...overrides,
+    },
+  });
+}
+
+// ログ行の outcome=... 以降（追記された meta の部分）だけを取り出す。
+function metaTail(line, outcome) {
+  const marker = `outcome=${outcome}`;
+  const at = line.indexOf(marker);
+  return at === -1 ? null : line.slice(at + marker.length);
+}
+
+describe('forwardToOpenAiBridge outcome branches (設計書 §9.4)', () => {
+  it('reports bridge-unreachable with the real error code when the connection is refused', async () => {
+    // 接続そのものが確立できない＝codex-rotator のプロセスが動いていない（§9.4）。
+    const settings = bridgeSettings({ connectTimeoutMs: 500, idleTimeoutMs: 500 });
+    const lines = [];
+    const front = http.createServer(async (req, res) => {
+      const chunks = [];
+      for await (const c of req) chunks.push(c);
+      await forwardToOpenAiBridge({ req, res, body: Buffer.concat(chunks), model: 'gpt-6-astra', settings, logger: l => lines.push(l) });
+    });
+    await new Promise(resolve => front.listen(0, '127.0.0.1', resolve));
+    const response = await fetch(`http://127.0.0.1:${front.address().port}/v1/messages`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{"model":"gpt-6-astra"}',
+    });
+    const body = await response.json();
+    front.close();
+
+    assert.equal(response.status, 403, 'HTTP 応答は現行のまま（§8.9）');
+    assert.match(body.error.message, /openai-bridge unreachable: connection refused/, '応答本文の文言は変えない');
+    const line = lines.find(l => /outcome=bridge-unreachable/.test(l));
+    assert.ok(line, lines.join('\n'));
+    assert.match(line, /degradeReason=bridge_unreachable/, '不達のときは rotator 自身が degradeReason を入れる（§9.3）');
+    assert.match(line, /errorCode=ECONNREFUSED/, 'ログにはエラー種別を残す');
+    assert.match(line, /errorMessage=connect_ECONNREFUSED/, 'message も残す（空白は _ に潰す）');
+  });
+
+  it('keeps ENOTFOUND distinguishable in the log while the response body stays rounded (丸めの解消)', async () => {
+    // 現行は ENOTFOUND / ECONNRESET / EPIPE をすべて応答本文の 'connection refused' へ
+    // 丸めていた。応答本文は不変のまま、ログの errorCode で種別を判別できるようにする。
+    const manual = createManualUpstream();
+    const req = fakeIncomingRequest();
+    const res = fakeServerResponse();
+    const lines = [];
+    const done = forwardToOpenAiBridge({
+      req, res, body: Buffer.from('{"model":"gpt-6-astra"}'), model: 'gpt-6-astra',
+      settings: bridgeSettings(), logger: l => lines.push(l), httpRequestImpl: manual.requestImpl,
+    });
+    await new Promise(resolve => setImmediate(resolve));
+    manual.getUpstream().emit('error', Object.assign(new Error('getaddrinfo ENOTFOUND nowhere.invalid'), { code: 'ENOTFOUND' }));
+    const result = await done;
+
+    assert.equal(result.outcome, 'bridge-unreachable');
+    assert.equal(result.status, 403);
+    assert.equal(res.statusCode, 403);
+    const line = lines.find(l => /outcome=bridge-unreachable/.test(l));
+    assert.match(line, /errorCode=ENOTFOUND/, 'ログでは ECONNREFUSED と ENOTFOUND を取り違えない');
+    assert.match(line, /errorMessage=getaddrinfo_ENOTFOUND_nowhere.invalid/);
+  });
+
+  it('reports bridge-connect-timeout when the socket never finishes connecting', async () => {
+    // ポートは開いているが受け付けられていない状態（§9.4）。bridge-unreachable から分離する。
+    const stalled = createStalledUpstream();
+    const req = fakeIncomingRequest();
+    const res = fakeServerResponse();
+    const lines = [];
+    const result = await forwardToOpenAiBridge({
+      req, res, body: Buffer.from('{"model":"gpt-6-astra"}'), model: 'gpt-6-astra',
+      settings: bridgeSettings({ connectTimeoutMs: 20, idleTimeoutMs: 5000 }),
+      logger: l => lines.push(l), httpRequestImpl: stalled.requestImpl,
+    });
+
+    assert.equal(result.outcome, 'bridge-connect-timeout');
+    assert.equal(result.status, 403, 'HTTP 応答は現行のまま 403（§8.9）');
+    assert.equal(stalled.getUpstream().destroyed, true);
+    const line = lines.find(l => /outcome=bridge-connect-timeout/.test(l));
+    assert.ok(line, lines.join('\n'));
+    assert.match(line, /status=403/);
+    assert.match(line, /degradeReason=bridge_connect_timeout/);
+    assert.ok(lines.every(l => !/outcome=bridge-unreachable/.test(l)), '接続拒否と取り違えない');
+  });
+
+  it('reports bridge-idle-timeout when the bridge goes silent after starting a 200 (§8.10)', async () => {
+    // 「200 を受け取った後にチャンクが 30,000ms 来ない」ケース。ここでは注入した
+    // idleTimeoutMs=25ms が本番の 30,000ms の役を務める（タイマーは設定注入で短縮する）。
+    const manual = createManualUpstream();
+    const req = fakeIncomingRequest();
+    const res = fakeServerResponse();
+    const lines = [];
+    const done = forwardToOpenAiBridge({
+      req, res, body: Buffer.from('{"model":"gpt-6-astra"}'), model: 'gpt-6-astra',
+      settings: bridgeSettings({ idleTimeoutMs: 25 }), logger: l => lines.push(l), httpRequestImpl: manual.requestImpl,
+    });
+    await new Promise(resolve => setImmediate(resolve));
+    manual.getCallback()(fakeUpstreamResponse(200, { 'content-type': 'text/event-stream' }));
+    const result = await done;
+
+    assert.equal(result.outcome, 'bridge-idle-timeout', '無音は stream-error ではなく idle-timeout（§8.10）');
+    assert.equal(result.status, null, 'ヘッダ送出後は 403 を合成できず切断するだけになる');
+    assert.equal(res.destroyed, true);
+    const line = lines.find(l => /outcome=bridge-idle-timeout/.test(l));
+    assert.ok(line, lines.join('\n'));
+    assert.match(line, /status=-/);
+    assert.match(line, /degradeReason=bridge_idle_timeout/);
+  });
+
+  it('still reports bridge-idle-timeout (403) when nothing arrives before the response head', async () => {
+    const manual = createManualUpstream();
+    const req = fakeIncomingRequest();
+    const res = fakeServerResponse();
+    const lines = [];
+    const result = await forwardToOpenAiBridge({
+      req, res, body: Buffer.from('{"model":"gpt-6-astra"}'), model: 'gpt-6-astra',
+      settings: bridgeSettings({ idleTimeoutMs: 20 }), logger: l => lines.push(l), httpRequestImpl: manual.requestImpl,
+    });
+
+    assert.equal(result.outcome, 'bridge-idle-timeout');
+    assert.equal(result.status, 403);
+    assert.equal(res.statusCode, 403);
+    assert.match(lines.find(l => /outcome=bridge-idle-timeout/.test(l)), /degradeReason=bridge_idle_timeout/);
+  });
+
+  it('reports bridge-stream-error when the upstream response breaks mid-stream', async () => {
+    // ストリーム途中の実障害（ECONNRESET 等）。無音（idle-timeout）とは別物である（§9.4）。
+    const manual = createManualUpstream();
+    const req = fakeIncomingRequest();
+    const res = fakeServerResponse();
+    const lines = [];
+    const done = forwardToOpenAiBridge({
+      req, res, body: Buffer.from('{"model":"gpt-6-astra"}'), model: 'gpt-6-astra',
+      settings: bridgeSettings(), logger: l => lines.push(l), httpRequestImpl: manual.requestImpl,
+    });
+    await new Promise(resolve => setImmediate(resolve));
+    const upstreamRes = fakeUpstreamResponse(200, { 'content-type': 'text/event-stream' });
+    manual.getCallback()(upstreamRes);
+    upstreamRes.emit('data', Buffer.from('event: message_start\n\n'));
+    upstreamRes.emit('error', Object.assign(new Error('aborted'), { code: 'ECONNRESET' }));
+    const result = await done;
+
+    assert.equal(result.outcome, 'bridge-stream-error');
+    assert.equal(result.status, null);
+    const line = lines.find(l => /outcome=bridge-stream-error/.test(l));
+    assert.ok(line, lines.join('\n'));
+    assert.match(line, /errorCode=ECONNRESET/);
+    assert.ok(lines.every(l => !/outcome=bridge-idle-timeout/.test(l)), '実障害を無音と取り違えない');
+  });
+
+  it('reports bridge-stream-error when the upstream request errors after the head was sent', async () => {
+    // EPIPE 等が応答開始後に上がる経路。現行はここも bridge-unreachable だった。
+    const manual = createManualUpstream();
+    const req = fakeIncomingRequest();
+    const res = fakeServerResponse();
+    const lines = [];
+    const done = forwardToOpenAiBridge({
+      req, res, body: Buffer.from('{"model":"gpt-6-astra"}'), model: 'gpt-6-astra',
+      settings: bridgeSettings(), logger: l => lines.push(l), httpRequestImpl: manual.requestImpl,
+    });
+    await new Promise(resolve => setImmediate(resolve));
+    manual.getCallback()(fakeUpstreamResponse(200, {}));
+    manual.getUpstream().emit('error', Object.assign(new Error('write EPIPE'), { code: 'EPIPE' }));
+    const result = await done;
+
+    assert.equal(result.outcome, 'bridge-stream-error', '応答開始後の障害は unreachable ではない');
+    assert.equal(result.status, null);
+    assert.match(lines.find(l => /outcome=bridge-stream-error/.test(l)), /errorCode=EPIPE/);
+  });
+});
+
+describe('forwardToOpenAiBridge log meta (設計書 §9.3)', () => {
+  it('appends the x-ombr-* meta in the §9.3 order, for keys that have a value only', async () => {
+    const { response, lines } = await callThroughRotator({
+      requestBody: '{"model":"gpt-6-astra"}',
+      settingsOverride: { degradeMapping: { enabled: true } },
+      bridgeHandler: (req, res) => {
+        res.writeHead(529, {
+          'Content-Type': 'application/json',
+          'x-ombr-contract': '1',
+          'x-ombr-degrade-reason': 'codex_pool_exhausted',
+          'x-ombr-pool-state': 'exhausted',
+          'x-ombr-degrade-scope': 'pool',
+          'x-ombr-upstream-status': '429',
+          'x-ombr-upstream-sent': 'yes',
+          'x-ombr-cached': 'no',
+          'x-ombr-account': 'pro-b',
+          'x-ombr-reset-at': '2026-09-08T13:00:00Z',
+          'x-ombr-primary-used-percent': '97.5',
+          'x-ombr-secondary-used-percent': '12.5',
+        }).end('{"type":"error"}');
+      },
+    });
+
+    assert.equal(response.status, 529, '応答は1バイトも変えない（素通し）');
+    const line = lines.find(l => /outcome=forwarded/.test(l));
+    assert.ok(line, lines.join('\n'));
+    assert.equal(
+      metaTail(line, 'forwarded'),
+      ' bridgeContract=1 degradeReason=codex_pool_exhausted poolState=exhausted degradeScope=pool'
+      + ' upstreamStatus=429 upstreamSent=yes bridgeCached=no accountLabel=pro-b'
+      + ' resetAt=2026-09-08T13:00:00Z primaryUsedPercent=97.5 secondaryUsedPercent=12.5',
+      '§9.3 の表の順序どおりに、値があるキーだけを末尾へ追記する',
+    );
+    assert.match(line, /status=529 durationMs=\d+ outcome=forwarded /, '既存フィールドの順序・名前・書式は変えない');
+  });
+
+  it('omits the keys the bridge did not send (partial headers)', async () => {
+    const { lines } = await callThroughRotator({
+      requestBody: '{"model":"gpt-6-astra"}',
+      settingsOverride: { degradeMapping: { enabled: true } },
+      bridgeHandler: (req, res) => {
+        res.writeHead(200, { 'Content-Type': 'application/json', 'x-ombr-contract': '1', 'x-ombr-pool-state': 'ok' }).end('{}');
+      },
+    });
+    const line = lines.find(l => /outcome=forwarded/.test(l));
+    assert.equal(metaTail(line, 'forwarded'), ' bridgeContract=1 poolState=ok');
+  });
+
+  it('drops values outside the contract enumeration instead of logging them verbatim', async () => {
+    // bridge 側の不具合で識別子が混入しても状態にもログにも残さない（契約 §C3.4）。
+    const { lines } = await callThroughRotator({
+      requestBody: '{"model":"gpt-6-astra"}',
+      settingsOverride: { degradeMapping: { enabled: true } },
+      bridgeHandler: (req, res) => {
+        res.writeHead(200, {
+          'Content-Type': 'application/json',
+          'x-ombr-contract': '1',
+          'x-ombr-degrade-reason': 'someone@example.com',
+          'x-ombr-account': 'someone@example.com',
+        }).end('{}');
+      },
+    });
+    const line = lines.find(l => /outcome=forwarded/.test(l));
+    assert.equal(metaTail(line, 'forwarded'), ' bridgeContract=1 degradeReason=unknown accountLabel=<invalid>');
+    assert.ok(!/example\.com/.test(line), '列挙外の値は原文のままログへ出さない');
+  });
+
+  it('logs a line identical to the current format when the bridge sends no x-ombr-* header (不変性)', async () => {
+    // §9.2: 値が1つも無ければ行は現行とバイト単位で同一になる。
+    const { lines } = await callThroughRotator({
+      requestBody: '{"model":"gpt-6-astra"}',
+      bridgeHandler: (req, res) => res.writeHead(200, { 'Content-Type': 'application/json' }).end('{}'),
+    });
+    const line = lines.find(l => /openai-bridge/.test(l));
+    assert.match(
+      line,
+      /^\d{4}-\d{2}-\d{2}T[\d:.]+Z openai-bridge model=gpt-6-astra method=POST path=\/v1\/messages status=200 durationMs=\d+ outcome=forwarded$/,
+      '契約ヘッダが無い応答では追記が1つも無く、現行と完全に同じ行になる',
+    );
+  });
+
+  it('logs a line identical to the current format for client-abort (不変性)', async () => {
+    const manual = createManualUpstream();
+    const req = fakeIncomingRequest();
+    const res = fakeServerResponse();
+    const lines = [];
+    const done = forwardToOpenAiBridge({
+      req, res, body: Buffer.from('{"model":"gpt-6-astra"}'), model: 'gpt-6-astra',
+      settings: bridgeSettings(), logger: l => lines.push(l), httpRequestImpl: manual.requestImpl,
+    });
+    await new Promise(resolve => setImmediate(resolve));
+    res.emit('close');
+    const result = await done;
+
+    assert.equal(result.outcome, 'client-abort');
+    assert.match(
+      lines.find(l => /openai-bridge/.test(l)),
+      /^\d{4}-\d{2}-\d{2}T[\d:.]+Z openai-bridge model=gpt-6-astra method=POST path=\/v1\/messages status=- durationMs=\d+ outcome=client-abort$/,
+    );
+  });
+});
+
+describe('OSS 独立性 > degradeMapping 無効時に openai-bridge のログ行が現行と同一である (§14.4)', () => {
+  // 現行（3ae4aeb 時点）のログ行の形。差分は outcome 名の改名だけであること。
+  const CURRENT_FORMAT = /^\d{4}-\d{2}-\d{2}T[\d:.]+Z openai-bridge model=gpt-6-astra method=POST path=\/v1\/messages status=\d+ durationMs=\d+ outcome=forwarded$/;
+
+  it('appends nothing when degradeMapping is disabled, even if the bridge sends every x-ombr-* header', async () => {
+    const { lines } = await callThroughRotator({
+      requestBody: '{"model":"gpt-6-astra"}',
+      // settingsOverride を渡さない＝既定（degradeMapping 無効）。OSS 利用者の構成。
+      bridgeHandler: (req, res) => {
+        res.writeHead(529, {
+          'Content-Type': 'application/json',
+          'x-ombr-contract': '1',
+          'x-ombr-degrade-reason': 'codex_pool_exhausted',
+          'x-ombr-pool-state': 'exhausted',
+          'x-ombr-degrade-scope': 'pool',
+          'x-ombr-upstream-status': '429',
+        }).end('{"type":"error"}');
+      },
+    });
+    const line = lines.find(l => /openai-bridge/.test(l));
+    assert.match(line, CURRENT_FORMAT, '無効時は追記フィールドが1つも出ない（ログ行の文字列一致）');
+  });
+
+  it('appends nothing for a failure outcome either when degradeMapping is disabled', async () => {
+    // degradeReason=bridge_* / errorCode / errorMessage も追記であり、無効時は出さない
+    // （§9.3 は無効時にも出すとは定めていないので安全側へ倒す）。
+    const manual = createManualUpstream();
+    const req = fakeIncomingRequest();
+    const res = fakeServerResponse();
+    const lines = [];
+    const done = forwardToOpenAiBridge({
+      req, res, body: Buffer.from('{"model":"gpt-6-astra"}'), model: 'gpt-6-astra',
+      settings: bridgeSettings({ degradeMapping: undefined }),
+      logger: l => lines.push(l), httpRequestImpl: manual.requestImpl,
+    });
+    await new Promise(resolve => setImmediate(resolve));
+    manual.getUpstream().emit('error', Object.assign(new Error('getaddrinfo ENOTFOUND nowhere.invalid'), { code: 'ENOTFOUND' }));
+    const result = await done;
+
+    assert.equal(result.outcome, 'bridge-unreachable');
+    assert.match(
+      lines.find(l => /openai-bridge/.test(l)),
+      /^\d{4}-\d{2}-\d{2}T[\d:.]+Z openai-bridge model=gpt-6-astra method=POST path=\/v1\/messages status=403 durationMs=\d+ outcome=bridge-unreachable$/,
+      '無効時は degradeReason も errorCode も出さない',
+    );
+  });
+
+  it('appends nothing when x-ombr-contract is missing, even with degradeMapping enabled (契約 §C3.7-1)', async () => {
+    const { lines } = await callThroughRotator({
+      requestBody: '{"model":"gpt-6-astra"}',
+      settingsOverride: { degradeMapping: { enabled: true } },
+      bridgeHandler: (req, res) => {
+        // 契約版を名乗らない bridge。他の x-ombr-* が付いていても信用しない。
+        res.writeHead(200, {
+          'Content-Type': 'application/json',
+          'x-ombr-pool-state': 'ok',
+          'x-ombr-degrade-scope': 'pool',
+          'x-ombr-account': 'pro-b',
+        }).end('{}');
+      },
+    });
+    assert.match(lines.find(l => /openai-bridge/.test(l)), CURRENT_FORMAT);
+  });
+
+  it('appends the meta once the bridge declares x-ombr-contract and degradeMapping is enabled', async () => {
+    const { lines } = await callThroughRotator({
+      requestBody: '{"model":"gpt-6-astra"}',
+      settingsOverride: { degradeMapping: { enabled: true } },
+      bridgeHandler: (req, res) => {
+        res.writeHead(200, { 'Content-Type': 'application/json', 'x-ombr-contract': '1', 'x-ombr-pool-state': 'ok' }).end('{}');
+      },
+    });
+    assert.equal(metaTail(lines.find(l => /outcome=forwarded/.test(l)), 'forwarded'), ' bridgeContract=1 poolState=ok');
+  });
+});
