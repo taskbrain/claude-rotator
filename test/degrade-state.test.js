@@ -465,6 +465,7 @@ describe('mapClaudeExhaustion', () => {
     const output = mapClaudeExhaustion(candidate429(), {
       enabled: true,
       claudeAllUnusable: true,
+      commonFamilyAllUnusable: true,
       gptPoolState: 'unusable',
       gptResetAt: LATER_RESET_AT,
       claudeResetAt: RESET_AT,
@@ -507,7 +508,12 @@ describe('mapClaudeExhaustion', () => {
 
   it('honours bothUnusableStatus=529 (止めずに待つ設定)', () => {
     const output = mapClaudeExhaustion(candidate429(), {
-      enabled: true, claudeAllUnusable: true, gptPoolState: 'unusable', bothUnusableStatus: 529, mapPath: 'a',
+      enabled: true,
+      claudeAllUnusable: true,
+      commonFamilyAllUnusable: true,
+      gptPoolState: 'unusable',
+      bothUnusableStatus: 529,
+      mapPath: 'a',
     });
     assert.equal(output.statusCode, 529);
     assert.equal(JSON.parse(output.body.toString('utf8')).error.type, 'overloaded_error');
@@ -539,6 +545,62 @@ describe('mapClaudeExhaustion', () => {
     );
     assert.equal(output.statusCode, 529);
     assert.equal(output.degradeLog.mappedFromType, undefined);
+  });
+
+  // -------------------------------------------------------------------------
+  // 403 への昇格は「要求モデル系列の枯渇」だけを根拠にしない（設計書 §4.2）。
+  // Fable 週次サブキャップだけが全口座で切れている状態は、共通枠（Opus 等）が
+  // 残っている限り「Claude が使えない」ではないので 529 に留める。
+  // -------------------------------------------------------------------------
+  it('keeps 529 when only the requested model family is exhausted (共通枠が残っている)', () => {
+    const output = mapClaudeExhaustion(candidate429(), {
+      enabled: true,
+      claudeAllUnusable: true,        // 要求系列（Fable）は全口座で枯渇
+      commonFamilyAllUnusable: false, // 共通枠はまだ残っている＝Opus へ退避できる
+      gptPoolState: 'unusable',
+      gptResetAt: LATER_RESET_AT,
+      claudeResetAt: RESET_AT,
+      mapPath: 'a',
+    });
+
+    assert.equal(output.statusCode, 529, '共通枠が残っているのに 403 で止めない');
+    const body = JSON.parse(output.body.toString('utf8'));
+    assert.equal(body.error.type, 'overloaded_error');
+    assert.equal(body.error.message, 'All Claude accounts are exhausted.');
+    assert.equal(output.degradeLog.mappedTo, 529);
+    assert.equal(output.degradeLog.mapReason, 'all_claude_accounts_exhausted');
+    assert.equal(output.degradeLog.resetAt, undefined, '529 は回復時刻を持たない（§9.2）');
+    assert.equal(output.degradeLog.gptPoolState, 'unusable', 'GPT 側の観測はそのまま痕跡に残す');
+  });
+
+  it('escalates to 403 once the common quota is exhausted too', () => {
+    const output = mapClaudeExhaustion(candidate429(), {
+      enabled: true,
+      claudeAllUnusable: true,
+      commonFamilyAllUnusable: true,
+      gptPoolState: 'unusable',
+      gptResetAt: LATER_RESET_AT,
+      claudeResetAt: RESET_AT,
+      mapPath: 'a',
+    });
+
+    assert.equal(output.statusCode, 403);
+    assert.equal(JSON.parse(output.body.toString('utf8')).error.type, 'permission_error');
+    assert.equal(output.degradeLog.mapReason, 'both_pools_unusable');
+    assert.equal(output.degradeLog.resetAt, RESET_AT);
+  });
+
+  it('stays at 529 when commonFamilyAllUnusable is omitted (判断がつかないときは退避側へ倒す)', () => {
+    // 系列を区別する情報を渡さない呼び出しには 403（恒久拒否）の根拠が無いので、
+    // 未指定は false 扱いにして 529（＝まだ退避できる側）へ倒す。本番の呼び出し元は
+    // 常に明示的に渡すので、この既定値で挙動は変わらない。
+    const output = mapClaudeExhaustion(candidate429(), {
+      enabled: true, claudeAllUnusable: true, gptPoolState: 'unusable', mapPath: 'a',
+    });
+    assert.equal(output.statusCode, 529);
+    assert.equal(JSON.parse(output.body.toString('utf8')).error.type, 'overloaded_error');
+    assert.equal(output.degradeLog.mapReason, 'all_claude_accounts_exhausted');
+    assert.equal(output.degradeLog.resetAt, undefined, '529 は回復時刻を持たない（§9.2）');
   });
 });
 
@@ -700,7 +762,7 @@ describe('buildBridgeLogMeta', () => {
 });
 
 // ---------------------------------------------------------------------------
-// astra-reviewer 指摘1〜4 の回帰（2026-09-08）
+// 契約適合まわりの回帰テスト4件（2026-09-08）
 // 契約 §C3.2（値域）・§C3.7（契約前 bridge）・§C10.3（学習対象）に合わせる。
 // ---------------------------------------------------------------------------
 
@@ -897,7 +959,7 @@ describe('指摘4: degrade-reason は列挙値だけを受理する（識別子�
   it('unusable として保持する reason も正規化後の値になる', () => {
     const state = createGptPoolState({ now: () => 1000 });
     state.observe(
-      parseBridgeContract(headers({ 'x-ombr-degrade-reason': 'quota exhausted for sakane@example.com' })),
+      parseBridgeContract(headers({ 'x-ombr-degrade-reason': 'quota exhausted for user-a@example.com' })),
       529,
       'gpt-6-astra',
     );
@@ -950,7 +1012,7 @@ describe('createGptPoolState > read() は観測していないモデル鍵を作
 });
 
 // ---------------------------------------------------------------------------
-// 契約 v1.5（project-d5 提案 C-20260908-D5-03・当方 ACK）:
+// 契約 v1.5（bridge 側からの提案 C-20260908-D5-03 を当方 ACK 済み）:
 // 新しい reason `codex_credentials_unavailable` と pool-state `credentials-unavailable`。
 // rotator の扱いは `codex_needs_login` と**完全に同一**にする（403 を素通しし、
 // (pool) は利用不可として学習する＝設計書 §8.8。403 書換の根拠にはしない）。

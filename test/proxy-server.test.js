@@ -8959,13 +8959,13 @@ async function requestJson(url, options = {}) {
 
 // ---------------------------------------------------------------------------
 // R3-4 の配線: GPT プール状態の生成・受け渡しと、/internal/reload での破棄
-// （設計書 §11.1 R3-4、指揮官判断 D-13）。
+// （設計書 §11.1 R3-4）。
 //
 // 状態機械そのものの検査は test/degrade-state.test.js と test/openai-bridge.test.js に
 // あり、ここでは「本番の生成元・受け渡し・reload での破棄が実在すること」だけを固定する。
 // 既存ケースは1件も削除・書換しない（§14.4）。以下はすべて新規追加である。
 // ---------------------------------------------------------------------------
-describe('openai-bridge の GPT プール状態の配線 (R3-4 / 指揮官判断 D-13)', () => {
+describe('openai-bridge の GPT プール状態の配線 (R3-4)', () => {
   // 契約ヘッダ付きの 529（＝(pool) を unusable にする）と、契約ヘッダ無しの 200
   // （＝学習しないので、そのとき保持している状態がログにそのまま出る）を切り替える偽 bridge。
   async function startContractBridge() {
@@ -9224,6 +9224,24 @@ describe('openai-bridge へ渡す Claude 側台帳の判定 (R4-1 / 設計書 §
       /^\d{4}-\d{2}-\d{2}T[\d:.]+Z openai-bridge model=gpt-6-astra method=POST path=\/v1\/messages status=529 durationMs=\d+ outcome=forwarded$/,
       'ログ行も現行と文字列一致する（claudePoolState も出ない）',
     );
+  });
+
+  it('treats a Fable-only sub-cap exhaustion as "Claude is still usable" (共通枠で問う)', async () => {
+    // gpt-* 経路は最初から modelFamily を持たない（null＝共通枠）で台帳へ問う。
+    // Fable 週次サブキャップだけが切れていても Opus へ退避できるので 403 にしない。
+    const logLines = [];
+    const { accountManager, askAstra, lastBridgeLine } = await startProxyFor({
+      accounts: [{ id: 'acct_1', name: 'a@example.com', type: 'oauth' }],
+      logLines,
+    });
+    accountManager.applyUsage('acct_1', {
+      scoped_weekly: [{ key: 'fable', label: 'Fable', utilization: 1, resets_at: futureReset() }],
+    });
+    assert.equal(accountManager.isAvailable(accountManager.find('acct_1'), 'fable'), false, '前提: Fable では使えない');
+    assert.equal(accountManager.isAvailable(accountManager.find('acct_1'), null), true, '前提: 共通枠では使える');
+
+    assert.equal((await askAstra()).status, 529, 'Fable サブキャップだけでは 403 にしない');
+    assert.match(lastBridgeLine(), /claudePoolState=available/);
   });
 });
 
@@ -9546,7 +9564,7 @@ describe('Claude 全枯渇 429 の 529 写像を7系統へ結線する (R4-2/R4-
     assert.equal(response.headers['x-replay-test'], 'map-b', '再生された応答であること＝P-b');
     // P-b の proxy 行は「上流が 429 を返した時点」（quota-retry）で既に書き終えている
     // ので、後から起きる再生の写像はその行へは載せられない。529 を返した事実は
-    // claude-exhaustion-replay の1行が持つ（指揮官判断 D-17）。
+    // claude-exhaustion-replay の1行が持つ。
     assert.match(
       logLines.filter(line => / proxy account=/.test(line)).at(-1),
       / status=429 /,
@@ -9759,6 +9777,103 @@ describe('Claude 全枯渇 429 の 529 写像を7系統へ結線する (R4-2/R4-
     assert.match(lastMapLine(logLines), /mapPath=e/);
     assert.match(lastMapLine(logLines), /gptPoolState=unusable /);
     assert.match(lastMapLine(logLines), /mappedTo=403 mapReason=both_pools_unusable/);
+  });
+
+  // -------------------------------------------------------------------------
+  // 403 昇格の根拠は「要求モデル系列の枯渇」ではなく「共通枠の枯渇」（設計書 §4.2）。
+  // Fable 週次サブキャップだけが全口座で切れている状態は、GPT プールが使えなくても
+  // Opus へ退避できるので 529 に留める（403 にすると Claude Code が止まってしまう）。
+  // -------------------------------------------------------------------------
+  async function runFableSubCapScenario({ exhaustCommonQuota = false } = {}) {
+    const bridge = await startExhaustedBridge();
+    const { upstream, seen } = await startUnusedUpstream();
+    const secretStore = new MemorySecretStore();
+    await secretStore.set('acct_1', { accessToken: 'access-token-acct_1' });
+    const accountManager = new AccountManager({
+      accounts: [{ id: 'acct_1', type: 'oauth' }],
+      now: () => 1000,
+    });
+    // 共通枠（5h/7d・トークン/リクエスト）は残したまま Fable サブキャップだけを使い切る。
+    accountManager.applyUsage('acct_1', {
+      scoped_weekly: [{ key: 'fable', label: 'Fable', utilization: 1, resets_at: futureReset() }],
+    });
+    const logLines = [];
+    const proxy = await startProxy({
+      accountManager, secretStore, upstreamUrl: upstream.url, logLines, bridgeUrl: bridge.url,
+    });
+    // (pool)=unusable を学習させる1往復（この時点の共通枠はまだ残っている）。
+    const warm = await requestJson(`${proxy.url}/v1/messages`, {
+      method: 'POST',
+      body: JSON.stringify({ model: 'gpt-6-astra' }),
+      headers: { 'content-type': 'application/json' },
+      timeoutMs: 3_000,
+    });
+    assert.equal(warm.status, 529, '前提: bridge の 529 は素通しされ (pool) が学習される');
+    if (exhaustCommonQuota) {
+      accountManager.updateQuota('acct_1', {
+        'anthropic-ratelimit-unified-5h-utilization': '1',
+        'anthropic-ratelimit-unified-5h-reset': '10',
+      });
+    }
+
+    const response = await ask(proxy, 'claude-fable-5');
+    return { response, logLines, seen, accountManager };
+  }
+
+  it('4-i: keeps the Fable request at 529 while only the Fable sub-cap is exhausted', async () => {
+    const { response, logLines, seen, accountManager } = await runFableSubCapScenario();
+    const account = accountManager.find('acct_1');
+
+    assert.equal(accountManager.isAvailable(account, 'fable'), false, '前提: Fable では全口座が使えない');
+    assert.equal(accountManager.isAvailable(account, null), true, '前提: 共通枠ではまだ使える');
+    assert.equal(response.status, 529, 'Opus へ退避できるので 403 で止めない');
+    assert.equal(response.body.error.type, 'overloaded_error');
+    assert.equal(response.body.error.message, 'All Claude accounts are exhausted.');
+    assert.deepEqual(seen, [], 'P-a は上流へ送らない');
+    assert.match(lastMapLine(logLines), /mapPath=a/);
+    assert.match(lastMapLine(logLines), /gptPoolState=unusable /, 'GPT 側が使えない事実は痕跡に残す');
+    assert.match(lastMapLine(logLines), /mappedTo=529 mapReason=all_claude_accounts_exhausted/);
+  });
+
+  it('4-i: escalates the Fable request to 403 once the common quota is exhausted too', async () => {
+    const { response, logLines, accountManager } = await runFableSubCapScenario({ exhaustCommonQuota: true });
+
+    assert.equal(accountManager.isAvailable(accountManager.find('acct_1'), null), false, '前提: 共通枠も枯渇');
+    assert.equal(response.status, 403, '退避先が本当に無いときだけ明示停止する');
+    assert.equal(response.body.error.type, 'permission_error');
+    assert.match(
+      response.body.error.message,
+      /^All Claude accounts and the Codex pool are unavailable\./,
+    );
+    assert.match(lastMapLine(logLines), /mappedTo=403 mapReason=both_pools_unusable/);
+  });
+
+  // 403 の根拠が共通枠の枯渇である以上、本文へ載せる「最早回復時刻」も共通枠で問う。
+  // 要求系列（Fable 週次サブキャップ）で引くと、共通枠より遠いリセット時刻を表示して
+  // しまい、実際にはもっと早く再開できるのに「まだ待たされる」と誤解させる。
+  it('4-i: reports the common-quota recovery time in the 403 body, not the far Fable weekly reset', async () => {
+    const { response, accountManager } = await runFableSubCapScenario({ exhaustCommonQuota: true });
+    const earliestResetFor = modelFamily => accountManager
+      .getRoutingAvailability(modelFamily)
+      .map(entry => entry?.availableAt)
+      .filter(Boolean)
+      .sort()[0];
+    const commonReset = earliestResetFor(null);
+    const fableReset = earliestResetFor('fable');
+
+    assert.ok(commonReset && fableReset, '前提: どちらの問い方でも回復時刻が読める');
+    assert.ok(commonReset < fableReset, '前提: 共通枠のほうが Fable 週次より早く回復する');
+    assert.equal(response.status, 403);
+    assert.equal(
+      response.body.error.message,
+      `All Claude accounts and the Codex pool are unavailable. Earliest recovery: ${commonReset}.`,
+      '403 の根拠と同じ共通枠のリセットを載せる',
+    );
+    assert.equal(
+      response.body.error.message.includes(fableReset),
+      false,
+      '要求系列（Fable 週次）の遠いリセットは載せない',
+    );
   });
 
   // -------------------------------------------------------------------------

@@ -243,7 +243,7 @@ export function createProxyServer({
 
   // openaiBridge の設定解決結果はここでキャッシュする（起動時に1回、以後は
   // POST /internal/reload のときだけ再計算する）。毎リクエスト resolveOpenAiBridgeSettings()
-  // を呼び直すと正規表現の再コンパイルとログの洪水（レビュー指摘5）を招く。
+  // を呼び直すと正規表現の再コンパイルとログの洪水を招く。
   let openaiBridgeSettings = resolveOpenAiBridgeSettings(config);
   if (openaiBridgeSettings.warning) {
     logger?.(`${new Date().toISOString()} openai-bridge config-warning ${openaiBridgeSettings.warning}`);
@@ -255,7 +255,7 @@ export function createProxyServer({
   // GPT プール状態（設計書 §11.1 R3-4・契約 §C10.2）。プロセス内メモリだけで持ち、
   // degradeMapping が無効な構成では生成しない（null＝forwardToOpenAiBridge へも渡らず、
   // 応答もログも現行と完全に同一になる＝§14.4）。
-  // 指揮官判断 D-13: POST /internal/reload では設定を読み直すだけでなく、学習済みの
+  // 設計判断: POST /internal/reload では設定を読み直すだけでなく、学習済みの
   // 状態も破棄して作り直す。ロールバック（無効化→reload→再有効化）で古い unusable が
   // 残ると、実際には回復しているのに最大 gptPoolUnusableTtlMs の間 403 で止めてしまう。
   // 未知（unknown）は「利用可能扱い」なので、破棄は常に安全側へ倒れる。
@@ -285,18 +285,30 @@ export function createProxyServer({
     const pool = gptPoolState ? gptPoolState.read().pool : null;
     const gptState = pool?.state || 'unknown';
     const allUnusable = claudeAllUnusable(accountManager, modelFamily);
+    // 403（恒久拒否）へ昇格してよいかは**共通枠**（modelFamily 無し）で問い直す。
+    // scopeMatchesModelFamily() は modelFamily=null のとき Fable 週次サブキャップを
+    // 無視するので、「Fable のサブキャップだけが全口座で切れているが共通枠は残って
+    // いる」状態はここで false になり、403 ではなく 529 のまま Opus へ退避できる
+    // （§4.2。gpt-* 経路が最初から null で問うているのと同じ根拠）。
+    // modelFamily が無い要求では同じ判定なので台帳を二度引かない。
+    const commonAllUnusable = allUnusable
+      ? (modelFamily ? claudeAllUnusable(accountManager, null) : true)
+      : false;
     const mapped = mapClaudeExhaustion(candidate, {
       enabled: true,
       mapPath,
       headersSent,
       claudeAllUnusable: allUnusable,
+      commonFamilyAllUnusable: commonAllUnusable,
       gptPoolState: gptState,
       bothUnusableStatus: mapping.bothUnusableStatus,
       gptResetAt: pool?.resetAt || null,
       // 403 の本文へ載せる「最早回復時刻」にしか使わない（§8.7）。判定には使わない
-      // ので、403 になりうる組み合わせのときだけ台帳を引く。
-      claudeResetAt: allUnusable && gptState === 'unusable'
-        ? claudeEarliestResetAt(accountManager, modelFamily)
+      // ので、403 になりうる組み合わせのときだけ台帳を引く。403 の根拠は**共通枠**の
+      // 枯渇なので、回復時刻も共通枠（modelFamily 無し）で問う。要求系列で引くと、
+      // Fable 週次サブキャップのように共通枠より遠いリセットを表示してしまう。
+      claudeResetAt: commonAllUnusable && gptState === 'unusable'
+        ? claudeEarliestResetAt(accountManager, null)
         : null,
     });
     // R4-5: 痕跡（degradeLog）はここでは書き出さない。呼び出し側が mapped.degradeLog を
@@ -395,12 +407,12 @@ export function createProxyServer({
           // openaiBridge セクションが無い、または config.json 自体が無い場合
           // （reloadOpenAiBridge が undefined を返す）は既定（オフ）へ戻す。
           // 旧実装は falsy を「変更なし」と誤認し、削除後も古い（有効な）
-          // 設定を保持し続けるバグがあった（レビュー指摘4）。
+          // 設定を保持し続けるバグがあった。
           config.openaiBridge = nextOpenaiBridge !== undefined
             ? nextOpenaiBridge
             : { ...DEFAULT_OPENAI_BRIDGE };
           openaiBridgeSettings = resolveOpenAiBridgeSettings(config);
-          // D-13: 学習済みの GPT プール状態を破棄して作り直す（無効化されたときは
+          // 学習済みの GPT プール状態を破棄して作り直す（無効化されたときは
           // 破棄だけを行う）。reload 後は必ず学習前＝unknown から始まる。
           gptPoolState = createGptPoolStateFor(openaiBridgeSettings);
           logger?.(
@@ -465,7 +477,7 @@ export function createProxyServer({
         return;
       }
       const body = await readBody(req);
-      // openaiBridgeSettings はキャッシュ済み（起動時・reload 時にのみ再計算。レビュー指摘5）。
+      // openaiBridgeSettings はキャッシュ済み（起動時・reload 時にのみ再計算）。
       // config-warning のログもここでは出さず、起動時・reload 時に1回だけ出す。
       const openaiBridgeRouting = shouldRouteToOpenAiBridge(body, openaiBridgeSettings);
       if (openaiBridgeRouting.route) {
@@ -494,8 +506,8 @@ export function createProxyServer({
         });
         return;
       }
-      // 本文が空（HEAD/GET 等）の要求は JSON パース失敗と区別できないため無ログにする
-      // （レビュー指摘5）。実際に本文があってパースに失敗した場合、または
+      // 本文が空（HEAD/GET 等）の要求は JSON パース失敗と区別できないため無ログに
+      // する。実際に本文があってパースに失敗した場合、または
       // modelPattern コンパイル失敗で分岐が無効化された場合だけを記録する。
       if (
         openaiBridgeRouting.reason === 'parse-error'
@@ -1919,7 +1931,7 @@ async function forwardWithRotation({
     const mapped = mapExhaustion
       ? mapExhaustion(lastRetryableResponse, { mapPath: 'b', headersSent: res.headersSent })
       : lastRetryableResponse;
-    // R4-5（指揮官判断 D-17）: 再生元の 429 の proxy 行は、この写像が起きる前に
+    // R4-5: 再生元の 429 の proxy 行は、この写像が起きる前に
     // 書き終わっている（forwardOnce の recordProxyRequest）。そのままでは 529 / 403 を
     // 返した事実がログのどこにも残らないので、**写像したときだけ**1行足す。
     // 台帳（accountManager.recordProxyRequest）は経由しないのでイベントは増えない。

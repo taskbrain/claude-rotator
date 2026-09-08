@@ -18,8 +18,8 @@ const DEGRADE_REASONS = new Set([
   'codex_needs_login', 'codex_pool_mixed', 'codex_no_account_for_model',
   'codex_upstream_overloaded', 'codex_upstream_error', 'codex_upstream_unreachable',
   'codex_upstream_timeout', 'bridge_internal_error', 'request_invalid', 'request_too_large',
-  // 契約 v1.5（project-d5 提案 C-20260908-D5-03・当方 ACK）。rotator の扱いは
-  // codex_needs_login と完全に同じにする（403 を素通しし、(pool) は失効として学習する）。
+  // 契約 v1.5 で追加。rotator の扱いは codex_needs_login と完全に同じにする
+  // （403 を素通しし、(pool) は失効として学習する）。
   'codex_credentials_unavailable',
 ]);
 const UNKNOWN_DEGRADE_REASON = 'unknown';
@@ -336,10 +336,19 @@ function withoutBodyHeaders(headers) {
 
 /**
  * Claude 全枯渇の写像（設計書 §8.6・§8.7、契約 §C10.4）。7系統の終端経路すべてがこの関数を通る。
+ *
+ * ctx は「枯渇」を2つの粒度で受け取る:
+ *   - claudeAllUnusable       … **要求モデル系列**で全口座が使えないか（529 への写像の可否）
+ *   - commonFamilyAllUnusable … **共通枠**（系列を問わない）で全口座が使えないか（403 への昇格の可否。
+ *                               未指定は false 扱い＝403 へ昇格しない）
+ * 両者が分かれているのは、Fable 週次サブキャップだけが全口座で切れている状態を
+ * 「Claude がもう使えない」と誤認しないためである（§4.2）。その状態では Opus へ
+ * 退避できるので 529 に留め、403（恒久拒否）へは昇格させない。
+ *
  * @param {{statusCode:number, headers:object, body:Buffer}|null} candidate これから返そうとしている応答。
- * @param {{enabled?:boolean, claudeAllUnusable?:boolean, gptPoolState?:string, mapPath?:string,
- *          bothUnusableStatus?:number, headersSent?:boolean, gptResetAt?:string|null,
- *          claudeResetAt?:string|null}} ctx
+ * @param {{enabled?:boolean, claudeAllUnusable?:boolean, commonFamilyAllUnusable?:boolean,
+ *          gptPoolState?:string, mapPath?:string, bothUnusableStatus?:number, headersSent?:boolean,
+ *          gptResetAt?:string|null, claudeResetAt?:string|null}} ctx
  * @returns {object|null} 写像しない場合も degradeLog（痕跡）を添えて返す。enabled が偽なら入力をそのまま返す。
  */
 export function mapClaudeExhaustion(candidate, ctx = {}) {
@@ -356,7 +365,13 @@ export function mapClaudeExhaustion(candidate, ctx = {}) {
     return { ...candidate, degradeLog };
   }
 
-  const bothUnusable = gptPoolState === 'unusable';
+  // 403 へ昇格してよいのは「GPT プールが使えない」かつ「**共通枠まで**全口座が
+  // 使えない」ときだけ。commonFamilyAllUnusable を渡さない呼び出しには系列を区別
+  // する情報が無く、判断がつかないときは 529（＝まだ退避できる側）へ倒す既存規律に
+  // 従うので、未指定は false（＝403 へ昇格しない）として扱う。本番の呼び出し元は
+  // 常に明示的に渡す（src/proxy-server.js）。
+  const commonUnusable = ctx.commonFamilyAllUnusable === true;
+  const bothUnusable = gptPoolState === 'unusable' && commonUnusable;
   const status = bothUnusable && ctx.bothUnusableStatus !== 529 ? 403 : 529;
   const resetAts = bothUnusable ? [ctx.gptResetAt, ctx.claudeResetAt] : [];
   const body = Buffer.from(buildDegradeBody(status, { resetAts }));

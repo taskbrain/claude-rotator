@@ -137,7 +137,7 @@ const MODE_TABLE = Object.freeze({
     summary: '529 overloaded_error / codex_attempt_limit / pool-state=degraded / reset-at なし',
   },
   'needs-login': {
-    // §D2 S7b / CR-N: 全口座が失効。坂根氏決定 S-10 により 403 で止める。
+    // §D2 S7b / CR-N: 全口座が失効。運用方針: 全口座の認証失効時は 403 で停止する。
     // ローカルの認証情報が無い状態を再現するので上流へは送っていない（none / no）。
     kind: 'json',
     status: 403,
