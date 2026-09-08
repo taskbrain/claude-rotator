@@ -9114,3 +9114,115 @@ describe('openai-bridge の GPT プール状態の配線 (R3-4 / 指揮官判断
     );
   });
 });
+
+// ---------------------------------------------------------------------------
+// R4-1 の配線: Claude 側台帳の判定を gpt-* 経路へ「関数」で渡す
+// （設計書 §11.1 R4-1 の補足・§4.2）。
+//
+// 書換の判定そのものは test/degrade-state.test.js と test/openai-bridge.test.js が
+// 網羅している。ここでは「本番の呼び出しが台帳を実際に見ていること」と
+// 「見る時点が応答受領時であること（要求ごとに評価し直すこと）」だけを固定する。
+// 既存ケースは1件も削除・書換しない（§14.4）。以下はすべて新規追加である。
+// ---------------------------------------------------------------------------
+describe('openai-bridge へ渡す Claude 側台帳の判定 (R4-1 / 設計書 §4.2)', () => {
+  // 全口座枯渇（scope=pool の 529）を常に返す偽 bridge。
+  async function startExhaustedBridge() {
+    return listen(http.createServer((req, res) => {
+      req.resume();
+      res.writeHead(529, {
+        'Content-Type': 'application/json',
+        'content-length': Buffer.byteLength('{"type":"error","error":{"type":"overloaded_error"}}'),
+        'x-ombr-contract': '1',
+        'x-ombr-degrade-reason': 'codex_pool_exhausted',
+        'x-ombr-degrade-scope': 'pool',
+        'x-ombr-pool-state': 'exhausted',
+        'x-ombr-upstream-status': '429',
+        'x-ombr-reset-at': '2099-01-01T00:00:00Z',
+      });
+      res.end('{"type":"error","error":{"type":"overloaded_error"}}');
+    }));
+  }
+
+  async function startProxyFor({ accounts, logLines, degradeMapping = { enabled: true } }) {
+    const bridge = await startExhaustedBridge();
+    cleanupAfterTest(async () => close(bridge.server));
+    const accountManager = new AccountManager({ accounts, now: () => 1000 });
+    const proxy = await listen(createProxyServer({
+      accountManager,
+      secretStore: new MemorySecretStore(),
+      config: {
+        upstream: 'http://127.0.0.1:1',
+        usagePolling: { enabled: false },
+        openaiBridge: {
+          enabled: true,
+          url: bridge.url,
+          modelPattern: '^gpt-',
+          connectTimeoutMs: 1000,
+          idleTimeoutMs: 1000,
+          connectRetries: 0,
+          ...(degradeMapping ? { degradeMapping } : {}),
+        },
+      },
+      logger: line => logLines.push(line),
+    }));
+    cleanupAfterTest(async () => close(proxy.server));
+    const askAstra = () => requestJson(`${proxy.url}/v1/messages`, {
+      method: 'POST',
+      body: JSON.stringify({ model: 'gpt-6-astra' }),
+      headers: { authorization: `Bearer ${LOCAL_GATEWAY_AUTH_TOKEN}`, 'content-type': 'application/json' },
+    });
+    return { accountManager, askAstra, lastBridgeLine: () => logLines.filter(l => / openai-bridge model=/.test(l)).at(-1) };
+  }
+
+  it('re-evaluates the ledger per response: 529 while an account is usable, 403 once every account is not', async () => {
+    const logLines = [];
+    const { accountManager, askAstra, lastBridgeLine } = await startProxyFor({
+      accounts: [{ id: 'acct_1', name: 'a@example.com', type: 'oauth' }],
+      logLines,
+    });
+
+    const usable = await askAstra();
+    assert.equal(usable.status, 529, 'Claude が使えるうちは Opus へ退避させる（素通し）');
+    assert.match(lastBridgeLine(), /claudePoolState=available/);
+
+    // 同じプロセス・同じ設定のまま台帳だけを全枯渇にする。
+    accountManager.markRateLimited('acct_1', 60);
+
+    const exhausted = await askAstra();
+    assert.equal(exhausted.status, 403, '両プール利用不可なので明示停止する');
+    assert.equal(exhausted.body.error.type, 'permission_error');
+    assert.match(
+      exhausted.body.error.message,
+      /All Claude accounts and the Codex pool are unavailable\. Earliest recovery: 1970-01-01T00:01:01\.000Z\./,
+      '最早回復時刻は GPT 側（2099年）と Claude 側（now+60s）の早いほう＝Claude 側を出す',
+    );
+    assert.match(lastBridgeLine(), /outcome=forwarded-mapped /);
+    assert.match(lastBridgeLine(), /claudePoolState=all-exhausted mappedFrom=529 .*mappedTo=403 mapReason=both_pools_unusable/);
+    assert.match(lastBridgeLine(), / status=403 .*upstreamStatus=429/, '実際の上流ステータスを同じ行に残す（受入条件7）');
+  });
+
+  it('never rewrites while no account is registered at all (インストール直後の保険)', async () => {
+    const logLines = [];
+    const { askAstra, lastBridgeLine } = await startProxyFor({ accounts: [], logLines });
+
+    assert.equal((await askAstra()).status, 529, '口座0件は「全枯渇」とみなさない（設計書 §4.2）');
+    assert.match(lastBridgeLine(), /claudePoolState=available/);
+  });
+
+  it('passes no ledger probe at all while degradeMapping is disabled (§14.4)', async () => {
+    const logLines = [];
+    const { accountManager, askAstra, lastBridgeLine } = await startProxyFor({
+      accounts: [{ id: 'acct_1', name: 'a@example.com', type: 'oauth' }],
+      logLines,
+      degradeMapping: null,
+    });
+    accountManager.markRateLimited('acct_1', 60);
+
+    assert.equal((await askAstra()).status, 529, '既定の構成では書換が起きない');
+    assert.match(
+      lastBridgeLine(),
+      /^\d{4}-\d{2}-\d{2}T[\d:.]+Z openai-bridge model=gpt-6-astra method=POST path=\/v1\/messages status=529 durationMs=\d+ outcome=forwarded$/,
+      'ログ行も現行と文字列一致する（claudePoolState も出ない）',
+    );
+  });
+});

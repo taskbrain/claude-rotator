@@ -18,12 +18,19 @@ const DEGRADE_REASONS = new Set([
   'codex_needs_login', 'codex_pool_mixed', 'codex_no_account_for_model',
   'codex_upstream_overloaded', 'codex_upstream_error', 'codex_upstream_unreachable',
   'codex_upstream_timeout', 'bridge_internal_error', 'request_invalid', 'request_too_large',
+  // 契約 v1.5（project-d5 提案 C-20260908-D5-03・当方 ACK）。rotator の扱いは
+  // codex_needs_login と完全に同じにする（403 を素通しし、(pool) は失効として学習する）。
+  'codex_credentials_unavailable',
 ]);
 const UNKNOWN_DEGRADE_REASON = 'unknown';
 
-const POOL_STATES = new Set(['ok', 'degraded', 'exhausted', 'needs-login', 'mixed', 'no-account-for-model']);
+const POOL_STATES = new Set([
+  'ok', 'degraded', 'exhausted', 'needs-login', 'mixed', 'no-account-for-model',
+  // 契約 v1.5。needs-login と同じ扱い（利用不可として学習するが 403 書換の根拠にはしない）。
+  'credentials-unavailable',
+]);
 const DEGRADE_SCOPES = new Set(['pool', 'model', 'account']);
-const UNUSABLE_POOL_STATES = new Set(['exhausted', 'needs-login', 'mixed']);
+const UNUSABLE_POOL_STATES = new Set(['exhausted', 'needs-login', 'mixed', 'credentials-unavailable']);
 const AVAILABLE_POOL_STATES = new Set(['ok', 'degraded']);
 // 403 への書換を許すのは「いま返そうとしている応答」がこの2状態のときだけ（設計書 §8.7 条件①）。
 const MAPPABLE_POOL_STATES = new Set(['exhausted', 'mixed']);
@@ -34,6 +41,7 @@ const REASON_DEFAULT_SCOPE = new Map([
   ['codex_account_exhausted', 'account'],
   ['codex_attempt_limit', 'pool'],
   ['codex_needs_login', 'pool'],
+  ['codex_credentials_unavailable', 'pool'],
   ['codex_pool_mixed', 'pool'],
   ['codex_no_account_for_model', 'model'],
   ['codex_upstream_overloaded', 'pool'],
@@ -156,10 +164,21 @@ export function createGptPoolState({ now = () => Date.now(), unusableTtlMs = DEF
   const pool = unknownEntry();
   const models = new Map();
 
+  const modelKey = model => (typeof model === 'string' && model.length > 0 ? model : null);
+
+  // 学習（observe）だけがモデル鍵を作る。read() から作ると、bridge へ投げたモデル名の
+  // 分だけ Map が単調に増え、snapshot() にも一度も観測していないモデルが並ぶ。
   const modelEntry = model => {
-    if (typeof model !== 'string' || model.length === 0) return null;
-    if (!models.has(model)) models.set(model, unknownEntry());
-    return models.get(model);
+    const key = modelKey(model);
+    if (key === null) return null;
+    if (!models.has(key)) models.set(key, unknownEntry());
+    return models.get(key);
+  };
+
+  // 参照専用（鍵を作らない）。未観測なら null を返し、呼び出し側が unknown を組み立てる。
+  const lookupModelEntry = model => {
+    const key = modelKey(model);
+    return key === null ? null : models.get(key) || null;
   };
 
   // T6（resetAt 到来）と T7（resetAt を持たない unusable が TTL 経過）だけが時間による解除。
@@ -229,10 +248,10 @@ export function createGptPoolState({ now = () => Date.now(), unusableTtlMs = DEF
       return result(null);
     },
 
-    /** 期限切れを反映した現在値を返す。 */
+    /** 期限切れを反映した現在値を返す。未観測のモデルは unknown を返すだけで、鍵は作らない。 */
     read(model = null) {
       expire(pool);
-      const forModel = expire(modelEntry(model));
+      const forModel = expire(lookupModelEntry(model));
       return { pool: entryView(pool), model: entryView(forModel || unknownEntry()) };
     },
 
@@ -261,6 +280,19 @@ function earliestResetAt(values) {
   const valid = (values || []).filter(value => validResetAt(typeof value === 'string' ? value : null));
   if (valid.length === 0) return null;
   return valid.reduce((earliest, value) => (Date.parse(value) < Date.parse(earliest) ? value : earliest));
+}
+
+/**
+ * Claude 側の台帳から「最も早い回復見込み時刻」を取り出す（設計書 §8.7 の本文生成）。
+ * **全枯渇かどうかの判定には使わない**——判定は claudeAllUnusable（isAvailable）が正本であり
+ * （§4.2）、ここで getRoutingAvailability を使うのは表示用の availableAt を読むためだけである。
+ * 取得できなければ null を返し、本文は GPT 側の reset-at だけで組み立てられる。
+ * @returns {string|null} RFC3339（UTC）。
+ */
+export function claudeEarliestResetAt(accountManager, modelFamily = null) {
+  if (typeof accountManager?.getRoutingAvailability !== 'function') return null;
+  const entries = accountManager.getRoutingAvailability(modelFamily) || [];
+  return earliestResetAt(entries.map(entry => entry?.availableAt));
 }
 
 /**
@@ -357,6 +389,11 @@ export function decideBridgeResponse(parsed, ctx = {}) {
   if (ctx.bothUnusableStatus !== undefined && ctx.bothUnusableStatus !== 403) {
     return { rewrite: false, reason: 'both-unusable-status-is-not-403' };
   }
+  // 契約 §C3.7-1・§C10 の後方互換原則: x-ombr-contract を持たない（または値が不正な）
+  // 応答は「契約前の bridge」であり、現行とまったく同じ意味に扱う＝一切書き換えない。
+  // これが無いと、過去に学習した (pool)=unusable が TTL 内に残っているあいだ、
+  // 契約ヘッダを持たない 529 まで 403 へ書き換えてしまう（再検証 FAIL ①）。
+  if (!parsed || parsed.contract === null) return { rewrite: false, reason: 'no-contract-header' };
   if (Number(ctx.upstreamStatus) !== 529) return { rewrite: false, reason: 'status-not-529' };
   if (!MAPPABLE_POOL_STATES.has(parsed?.poolState)) {
     return { rewrite: false, reason: 'pool-state-not-exhausted-or-mixed' };

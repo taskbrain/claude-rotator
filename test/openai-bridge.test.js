@@ -2186,3 +2186,457 @@ describe('OSS 独立性 > gptPoolState を渡さない forwardToOpenAiBridge が
     );
   });
 });
+
+// ---------------------------------------------------------------------------
+// R4-1: (c) 両プール利用不可のときだけ bridge の 529 を 403 へ書き換える
+//        （設計書 §8.7 / 契約 v1.4 §C10.5 の4条件・§C10.7）
+//
+// 既存ケースは1件も削除・書換しない（§14.4）。以下はすべて新規追加である。
+// 偽 bridge は契約 v1.4 の状態表をそのまま返す test/helpers/fake-bridge.js を使う。
+// ---------------------------------------------------------------------------
+
+import { startFakeBridge as startContractBridge } from './helpers/fake-bridge.js';
+import { buildDegradeBody, parseBridgeContract } from '../src/degrade-state.js';
+
+// 学習した unusable が read() の期限切れ判定で消えないよう、十分に先の時刻を使う。
+const FAR_FUTURE_RESET_AT = '2099-01-01T00:00:00Z';
+
+/**
+ * 契約 v1.4 のモードを返す偽 bridge を立て、forwardToOpenAiBridge を1回だけ通す。
+ * Claude 側の台帳は「関数」で注入する（応答ヘッダ受領時点で評価される＝設計書 §11.1 R4-1 補足）。
+ */
+async function callWithLedger({
+  mode,
+  requestBody = '{"model":"gpt-6-astra"}',
+  degradeMapping = { enabled: true },
+  claudeAllUnusable = null,
+  claudeResetAt = null,
+  gptPoolState = createGptPoolState(),
+  resetAt = FAR_FUTURE_RESET_AT,
+}) {
+  const bridge = await startContractBridge({ port: 0, mode, resetAt });
+  const settings = resolveOpenAiBridgeSettings({
+    openaiBridge: {
+      enabled: true,
+      url: bridge.url,
+      modelPattern: '^gpt-',
+      connectTimeoutMs: 2000,
+      idleTimeoutMs: 2000,
+      connectRetries: 0,
+      ...(degradeMapping ? { degradeMapping } : {}),
+    },
+  });
+  const lines = [];
+  const front = http.createServer(async (req, res) => {
+    const chunks = [];
+    for await (const chunk of req) chunks.push(chunk);
+    const body = Buffer.concat(chunks);
+    await forwardToOpenAiBridge({
+      req,
+      res,
+      body,
+      model: safeParseModel(body),
+      settings,
+      logger: line => lines.push(line),
+      // 未指定＝現行と同一の経路であることを保つため、渡すときだけキーを足す。
+      ...(gptPoolState ? { gptPoolState } : {}),
+      ...(claudeAllUnusable ? { claudeAllUnusable } : {}),
+      ...(claudeResetAt ? { claudeResetAt } : {}),
+    });
+  });
+  await new Promise(resolve => front.listen(0, '127.0.0.1', resolve));
+  const response = await fetch(`http://127.0.0.1:${front.address().port}/v1/messages`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', 'anthropic-version': '2023-06-01' },
+    body: requestBody,
+  });
+  const text = await response.text();
+  front.close();
+  await bridge.close();
+  return { response, text, lines, gptPoolState, bridgeLine: lines.find(l => / openai-bridge model=/.test(l)) };
+}
+
+const allClaudeExhausted = () => true;
+const someClaudeAvailable = () => false;
+
+describe('forwardToOpenAiBridge > 529 → 403 の書換 (R4-1 / 設計書 §8.7)', () => {
+  it('(a) rewrites the exhausted 529 to 403 permission_error when every Claude account is unusable', async () => {
+    const { response, text, bridgeLine } = await callWithLedger({
+      mode: 'exhausted',
+      claudeAllUnusable: allClaudeExhausted,
+    });
+
+    assert.equal(response.status, 403, '両プール利用不可なので明示停止する（M-5）');
+    const body = JSON.parse(text);
+    assert.equal(body.error.type, 'permission_error');
+    assert.equal(
+      body.error.message,
+      `All Claude accounts and the Codex pool are unavailable. Earliest recovery: ${FAR_FUTURE_RESET_AT}.`,
+      '本文に「両方とも使えないこと」と最も早い回復見込みを入れる（§8.7）',
+    );
+    assert.equal(
+      response.headers.get('content-length'),
+      String(Buffer.byteLength(text)),
+      'Content-Length は上流 529 の本文長ではなく、自作した 403 本文の長さと一致する',
+    );
+    assert.equal(response.headers.get('content-type'), 'application/json');
+    assert.equal(response.headers.get('content-encoding'), null);
+    // 上流の契約ヘッダ（hop-by-hop ではない）はそのまま残る＝診断のため。
+    assert.equal(response.headers.get('x-ombr-pool-state'), 'exhausted');
+
+    assert.match(bridgeLine, / status=403 /, '書き換えた後のステータスを status に出す');
+    assert.equal(
+      metaTail(bridgeLine, 'forwarded-mapped'),
+      ' bridgeContract=1 degradeReason=codex_pool_exhausted poolState=exhausted degradeScope=pool'
+      + ` upstreamStatus=429 upstreamSent=yes accountLabel=acct-a resetAt=${FAR_FUTURE_RESET_AT}`
+      + ' gptPoolState=unusable gptModelState=unknown claudePoolState=all-exhausted'
+      + ' mappedFrom=529 mappedFromType=overloaded_error mappedTo=403 mapReason=both_pools_unusable',
+      '実際の上流ステータス（529・429）を必ず同じ行に残す（§9.1・受入条件7）',
+    );
+  });
+
+  it('(b) forwards the exhausted 529 untouched while any Claude account is still usable', async () => {
+    const { response, text, bridgeLine } = await callWithLedger({
+      mode: 'exhausted',
+      claudeAllUnusable: someClaudeAvailable,
+    });
+
+    assert.equal(response.status, 529, 'Claude が使えるなら Opus へ退避させる（素通し）');
+    assert.match(text, /codex pool exhausted/, '本文は bridge のものをそのまま返す');
+    assert.match(bridgeLine, /outcome=forwarded /, '書換なしの outcome は forwarded のまま');
+    assert.match(bridgeLine, /gptPoolState=unusable gptModelState=unknown claudePoolState=available/);
+    assert.equal(/mapped(From|To)=/.test(bridgeLine), false, '写像していないので mapped* は出さない');
+  });
+
+  it('(c) rewrites the mixed 529 to 403 as well (§C10.7 規則2・境界の反対側)', async () => {
+    const { response, text, bridgeLine } = await callWithLedger({
+      mode: 'mixed',
+      claudeAllUnusable: allClaudeExhausted,
+    });
+
+    assert.equal(response.status, 403, 'pool-state: mixed も書換の対象（§8.7 条件①）');
+    assert.equal(JSON.parse(text).error.type, 'permission_error');
+    assert.match(bridgeLine, /degradeReason=codex_pool_mixed poolState=mixed/);
+    assert.match(bridgeLine, /mapReason=both_pools_unusable/);
+  });
+
+  it('(d) never rewrites nor learns from an attempt-limit 529 (pool-state: degraded)', async () => {
+    const { response, text, bridgeLine, gptPoolState } = await callWithLedger({
+      mode: 'attempt-limit',
+      claudeAllUnusable: allClaudeExhausted,
+    });
+
+    assert.equal(response.status, 529, '未試行の口座が残っているので止めない（§C10.5 の「根拠にならないもの」）');
+    assert.match(text, /codex attempt limit/);
+    assert.equal(gptPoolState.snapshot().pool.state, 'unknown', 'T5: 学習もしない');
+    assert.match(bridgeLine, /outcome=forwarded /);
+    assert.equal(/mapped(From|To)=/.test(bridgeLine), false);
+  });
+
+  it('(e) forwards the no-account 403 (scope=model) untouched and leaves (pool) alone', async () => {
+    const { response, text, gptPoolState, bridgeLine } = await callWithLedger({
+      mode: 'no-account',
+      claudeAllUnusable: allClaudeExhausted,
+    });
+
+    assert.equal(response.status, 403, '元から 403 なので作り替えない（素通し）');
+    assert.match(text, /no Codex account is assigned/, '本文も bridge のまま');
+    assert.equal(gptPoolState.snapshot().pool.state, 'unknown', 'scope=model は (pool) を汚さない（T4）');
+    assert.equal(gptPoolState.read('gpt-6-astra').model.state, 'unusable');
+    assert.match(bridgeLine, /outcome=forwarded /);
+    assert.equal(/mapped(From|To)=/.test(bridgeLine), false);
+  });
+
+  it('(f) forwards the needs-login 403 untouched (§8.8: CR は素通しするだけ)', async () => {
+    const { response, text, gptPoolState, bridgeLine } = await callWithLedger({
+      mode: 'needs-login',
+      claudeAllUnusable: allClaudeExhausted,
+    });
+
+    assert.equal(response.status, 403);
+    assert.match(text, /codex login required/, '本文は bridge のまま（rotator は作り替えない）');
+    assert.equal(gptPoolState.snapshot().pool.state, 'unusable', '学習だけは起きる（T3）');
+    assert.match(bridgeLine, /outcome=forwarded /);
+    assert.equal(/mapped(From|To)=/.test(bridgeLine), false);
+  });
+
+  it('(g) forwards a legacy 429 without contract headers untouched (§C3.7-1)', async () => {
+    const { response, text, gptPoolState, bridgeLine } = await callWithLedger({
+      mode: 'legacy',
+      claudeAllUnusable: allClaudeExhausted,
+    });
+
+    assert.equal(response.status, 429, '契約前 bridge の応答は現行とまったく同じ意味に扱う');
+    assert.equal(JSON.parse(text).error.type, 'rate_limit_error');
+    assert.equal(gptPoolState.snapshot().pool.state, 'unknown');
+    assert.equal(/bridgeContract=/.test(bridgeLine), false, '契約由来の値は1つも載せない');
+    assert.equal(/mapped(From|To)=/.test(bridgeLine), false);
+  });
+
+  it('(h) changes nothing at all while degradeMapping is disabled (§14.4)', async () => {
+    // 既定の構成。gptPoolState と claudeAllUnusable を渡しても、写像機能が無効なら
+    // 観測も評価も書換もログ追記も起きない。
+    const { response, text, bridgeLine, gptPoolState } = await callWithLedger({
+      mode: 'exhausted',
+      degradeMapping: null,
+      claudeAllUnusable: () => {
+        throw new Error('claudeAllUnusable must not be evaluated while degradeMapping is disabled');
+      },
+    });
+
+    assert.equal(response.status, 529);
+    assert.match(text, /codex pool exhausted/);
+    assert.equal(gptPoolState.snapshot().pool.state, 'unknown');
+    assert.match(
+      bridgeLine,
+      /^\d{4}-\d{2}-\d{2}T[\d:.]+Z openai-bridge model=gpt-6-astra method=POST path=\/v1\/messages status=529 durationMs=\d+ outcome=forwarded$/,
+      'ログ行は現行と文字列一致する（追記フィールドが1つも出ない）',
+    );
+  });
+
+  it('(i) keeps the 529 as-is when bothUnusableStatus is configured to 529', async () => {
+    const { response, text, bridgeLine } = await callWithLedger({
+      mode: 'exhausted',
+      degradeMapping: { enabled: true, bothUnusableStatus: 529 },
+      claudeAllUnusable: allClaudeExhausted,
+    });
+
+    assert.equal(response.status, 529, '設定で 529 を選んだ構成では書換そのものを行わない（§8.7）');
+    assert.match(text, /codex pool exhausted/, '本文も上流のまま（自作の本文へ差し替えない）');
+    assert.match(bridgeLine, /outcome=forwarded /);
+    assert.equal(/mapped(From|To)=/.test(bridgeLine), false);
+  });
+});
+
+describe('forwardToOpenAiBridge > 書換後のイベント順序 (R4-1 / 設計書 §8.7 手順5〜7)', () => {
+  // 上流応答を手で駆動して、書換の「後」に届くイベントを1つずつ確かめる。
+  function driveRewrite({ upstreamHeaders, claudeAllUnusable = () => true } = {}) {
+    const manual = createManualUpstream();
+    const req = fakeIncomingRequest();
+    const res = fakeServerResponse();
+    const lines = [];
+    const done = forwardToOpenAiBridge({
+      req,
+      res,
+      body: Buffer.from('{"model":"gpt-6-astra"}'),
+      model: 'gpt-6-astra',
+      settings: bridgeSettings(),
+      logger: line => lines.push(line),
+      httpRequestImpl: manual.requestImpl,
+      gptPoolState: createGptPoolState(),
+      claudeAllUnusable,
+    });
+    const upstreamRes = fakeUpstreamResponse(529, {
+      'content-type': 'application/json',
+      'Content-Length': '999',
+      'content-encoding': 'gzip',
+      'x-ombr-contract': '1',
+      'x-ombr-degrade-reason': 'codex_pool_exhausted',
+      'x-ombr-degrade-scope': 'pool',
+      'x-ombr-pool-state': 'exhausted',
+      'x-ombr-upstream-status': '429',
+      'x-ombr-reset-at': FAR_FUTURE_RESET_AT,
+      ...upstreamHeaders,
+    });
+    return { manual, req, res, lines, done, upstreamRes };
+  }
+
+  it('drops the upstream content-length / content-encoding / content-type and writes its own', async () => {
+    const { manual, res, done, upstreamRes } = driveRewrite();
+    await new Promise(resolve => setImmediate(resolve));
+    manual.getCallback()(upstreamRes);
+
+    const expected = buildDegradeBody(403, { resetAts: [FAR_FUTURE_RESET_AT] });
+    assert.equal(res.statusCode, 403);
+    const keys = Object.keys(res.headers).map(key => key.toLowerCase());
+    assert.equal(keys.filter(key => key === 'content-length').length, 1, '大小文字違いの重複を残さない');
+    assert.equal(keys.includes('content-encoding'), false, '上流の content-encoding を落とす（本文を作り替えたため）');
+    assert.equal(res.headers['Content-Type'], 'application/json');
+    assert.equal(
+      res.headers['Content-Length'],
+      String(Buffer.byteLength(expected)),
+      '上流 529 の Content-Length（999）が残るとクライアントが本文を待ち続ける（§8.7 手順2）',
+    );
+    assert.equal(res.writableEnded, true);
+    assert.equal(manual.getUpstream().destroyed, true, '上流本文は読まずに接続を畳む');
+    assert.equal((await done).outcome, 'forwarded-mapped');
+  });
+
+  it('survives upstream chunks, end and errors that arrive after the rewrite', async () => {
+    const { manual, res, done, upstreamRes, lines } = driveRewrite();
+    await new Promise(resolve => setImmediate(resolve));
+    manual.getCallback()(upstreamRes);
+    const result = await done;
+
+    // 破棄由来の 'error' を誰も受けないと未捕捉例外になり、rotator ごと落ちる（§8.7 手順6）。
+    upstreamRes.emit('error', Object.assign(new Error('aborted'), { code: 'ECONNRESET' }));
+    // 'data' / 'end' を装着していないので、遅れて届くチャンクは
+    // ERR_STREAM_WRITE_AFTER_END を起こす経路そのものが無い（§8.7 手順7）。
+    upstreamRes.emit('data', Buffer.from('late chunk'));
+    upstreamRes.emit('end');
+    manual.getUpstream().emit('error', Object.assign(new Error('socket hang up'), { code: 'ECONNRESET' }));
+    await new Promise(resolve => setImmediate(resolve));
+
+    assert.equal(result.outcome, 'forwarded-mapped');
+    assert.equal(result.status, 403);
+    assert.deepEqual(res.writes, [], '書換後に上流のバイト列を1つも書かない');
+    assert.equal(
+      lines.filter(line => / openai-bridge model=/.test(line)).length,
+      1,
+      'finish() は1回だけ（二重ログ・二重解決なし）',
+    );
+  });
+
+  it('does not rewrite and does not crash when the Claude ledger probe throws', async () => {
+    // 台帳の判定で例外が出ても、未捕捉例外にせず「Claude は使える」側へ倒す（安全側）。
+    const { manual, res, done, upstreamRes } = driveRewrite({
+      claudeAllUnusable: () => { throw new Error('ledger unavailable'); },
+    });
+    await new Promise(resolve => setImmediate(resolve));
+    manual.getCallback()(upstreamRes);
+
+    assert.equal(res.statusCode, 529, '判定できないなら退避を試みる側へ倒す');
+    // 素通し経路なので data / end が装着されている（上流本文をそのまま流し切る）。
+    upstreamRes.emit('end');
+    const result = await done;
+    assert.equal(result.outcome, 'forwarded');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// R4-1 再検証の指摘への回帰テスト（astra-reviewer / 2026-09-08）
+//   ① x-ombr-contract が無い・不正な応答は、過去に学習した (pool)=unusable が
+//      残っていても書き換えない（契約 §C3.7-1 の後方互換原則）
+//   ② 403 の本文の「最早回復時刻」は GPT 側と Claude 側の早いほうを出す
+// ---------------------------------------------------------------------------
+
+// 学習済みの (pool)=unusable を持つ状態を作る（契約 §C10.3 T3）。
+function poolStateLearnedAsUnusable() {
+  const gptPoolState = createGptPoolState();
+  gptPoolState.observe(
+    parseBridgeContract({
+      'x-ombr-contract': '1',
+      'x-ombr-degrade-reason': 'codex_pool_exhausted',
+      'x-ombr-degrade-scope': 'pool',
+      'x-ombr-pool-state': 'exhausted',
+      'x-ombr-reset-at': FAR_FUTURE_RESET_AT,
+    }),
+    529,
+    'gpt-6-astra',
+  );
+  assert.equal(gptPoolState.snapshot().pool.state, 'unusable', 'precondition');
+  return gptPoolState;
+}
+
+/** 任意のハンドラを持つ偽 bridge を通して1回だけ転送する（契約ヘッダを自由に欠かせる）。 */
+async function callHandlerWithLedger({ bridgeHandler, gptPoolState, claudeAllUnusable, claudeResetAt = null }) {
+  const { server: bridge, port } = await startFakeBridge(bridgeHandler);
+  const settings = resolveOpenAiBridgeSettings({
+    openaiBridge: {
+      enabled: true,
+      url: `http://127.0.0.1:${port}`,
+      modelPattern: '^gpt-',
+      connectTimeoutMs: 2000,
+      idleTimeoutMs: 2000,
+      connectRetries: 0,
+      degradeMapping: { enabled: true },
+    },
+  });
+  const lines = [];
+  const front = http.createServer(async (req, res) => {
+    const chunks = [];
+    for await (const chunk of req) chunks.push(chunk);
+    const body = Buffer.concat(chunks);
+    await forwardToOpenAiBridge({
+      req,
+      res,
+      body,
+      model: safeParseModel(body),
+      settings,
+      logger: line => lines.push(line),
+      gptPoolState,
+      claudeAllUnusable,
+      ...(claudeResetAt ? { claudeResetAt } : {}),
+    });
+  });
+  await new Promise(resolve => front.listen(0, '127.0.0.1', resolve));
+  const response = await fetch(`http://127.0.0.1:${front.address().port}/v1/messages`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: '{"model":"gpt-6-astra"}',
+  });
+  const text = await response.text();
+  front.close();
+  bridge.close();
+  return { response, text, bridgeLine: lines.find(l => / openai-bridge model=/.test(l)) };
+}
+
+// 契約ヘッダ以外は「書換の4条件を満たす」形をした 529 を返す（x-ombr-contract だけを操作する）。
+function exhaustedHandlerWithContract(contractHeaderValue) {
+  const body = '{"type":"error","error":{"type":"overloaded_error"}}';
+  return (req, res) => {
+    req.resume();
+    res.writeHead(529, {
+      'Content-Type': 'application/json',
+      'Content-Length': Buffer.byteLength(body),
+      ...(contractHeaderValue === null ? {} : { 'x-ombr-contract': contractHeaderValue }),
+      'x-ombr-degrade-reason': 'codex_pool_exhausted',
+      'x-ombr-degrade-scope': 'pool',
+      'x-ombr-pool-state': 'exhausted',
+      'x-ombr-upstream-status': '429',
+    }).end(body);
+  };
+}
+
+describe('forwardToOpenAiBridge > 契約ヘッダの無い応答は書き換えない (R4-1 再検証①)', () => {
+  for (const [label, contractHeaderValue] of [
+    ['x-ombr-contract が無い', null],
+    ['x-ombr-contract が不正値（abc）', 'abc'],
+    ['x-ombr-contract が 0', '0'],
+  ]) {
+    it(`forwards the 529 untouched when ${label}, even with a learned (pool)=unusable`, async () => {
+      const gptPoolState = poolStateLearnedAsUnusable();
+      const { response, text, bridgeLine } = await callHandlerWithLedger({
+        bridgeHandler: exhaustedHandlerWithContract(contractHeaderValue),
+        gptPoolState,
+        claudeAllUnusable: allClaudeExhausted,
+      });
+
+      assert.equal(response.status, 529, '契約前 bridge の応答は現行とまったく同じ意味に扱う（§C3.7-1）');
+      assert.equal(JSON.parse(text).error.type, 'overloaded_error', '本文も上流のまま');
+      assert.equal(/mapped(From|To)=/.test(bridgeLine), false, '過去の学習だけを根拠に書き換えない');
+      assert.equal(/bridgeContract=/.test(bridgeLine), false, '契約由来の値は1つも載せない');
+    });
+  }
+});
+
+describe('forwardToOpenAiBridge > 403 本文の最早回復時刻 (R4-1 再検証②)', () => {
+  const CLAUDE_RESET_AT = '2026-09-08T13:00:00Z';
+
+  it('prefers the Claude side reset time when it is earlier than the Codex one', async () => {
+    const { response, text } = await callWithLedger({
+      mode: 'exhausted',
+      claudeAllUnusable: allClaudeExhausted,
+      claudeResetAt: () => CLAUDE_RESET_AT,
+    });
+
+    assert.equal(response.status, 403);
+    assert.equal(
+      JSON.parse(text).error.message,
+      `All Claude accounts and the Codex pool are unavailable. Earliest recovery: ${CLAUDE_RESET_AT}.`,
+      `GPT 側の ${FAR_FUTURE_RESET_AT} ではなく、早いほうの Claude 側を出す`,
+    );
+  });
+
+  it('falls back to the Codex reset time when the Claude side cannot be determined', async () => {
+    for (const claudeResetAt of [() => null, () => { throw new Error('ledger unavailable'); }]) {
+      const { response, text } = await callWithLedger({
+        mode: 'exhausted',
+        claudeAllUnusable: allClaudeExhausted,
+        claudeResetAt,
+      });
+      assert.equal(response.status, 403);
+      assert.match(JSON.parse(text).error.message, new RegExp(`Earliest recovery: ${FAR_FUTURE_RESET_AT}\\.$`));
+    }
+  });
+});

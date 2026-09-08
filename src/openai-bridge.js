@@ -1,6 +1,8 @@
 import http from 'node:http';
 
-import { buildBridgeLogMeta, formatLogMeta, parseBridgeContract } from './degrade-state.js';
+import {
+  buildBridgeLogMeta, decideBridgeResponse, formatLogMeta, parseBridgeContract,
+} from './degrade-state.js';
 
 const LOOPBACK_HOSTS = new Set(['127.0.0.1', 'localhost', '::1']);
 
@@ -291,7 +293,18 @@ const RETRYABLE_CONNECT_ERROR_CODES = new Set(['ECONNREFUSED', 'ECONNRESET', 'EN
 // gptPoolState は任意引数である（設計書 §11.1 R3-4）。渡さない呼び出しは現行と完全に
 // 同一に振る舞い、ログへ1フィールドも足さない（§14.4）。渡すのは src/proxy-server.js が
 // degradeMapping.enabled を真と解決したときだけで、生成・破棄もそちらが受け持つ（D-13）。
-export function forwardToOpenAiBridge({ req, res, body, model, settings, logger, httpRequestImpl = http.request, gptPoolState = null }) {
+// claudeAllUnusable も任意引数である（設計書 §11.1 R4-1 の補足）。**真偽値ではなく関数**を
+// 受け取るのは、要求の開始時点ではなく **bridge の応答ヘッダを受け取った時点の台帳**で
+// 判定するためである（要求から応答までの間に口座が回復しうる）。渡さない呼び出しは
+// 現行と完全に同一に振る舞い、403 への書換も claudePoolState の追記も起きない（§14.4）。
+// claudeResetAt も同型の任意引数で、Claude 側の最も早い回復見込み時刻（RFC3339）を返す
+// 関数である。403 の本文へ「GPT 側と Claude 側の早いほう」を載せるためにだけ使い、
+// 書換の可否には影響しない。渡さなければ本文は GPT 側の reset-at だけで組み立てられる。
+export function forwardToOpenAiBridge({
+  req, res, body, model, settings, logger,
+  httpRequestImpl = http.request, gptPoolState = null,
+  claudeAllUnusable = null, claudeResetAt = null,
+}) {
   const startedAt = Date.now();
   const target = pinnedUpstreamTarget(req.url, settings.url);
   const headers = {};
@@ -341,8 +354,42 @@ export function forwardToOpenAiBridge({ req, res, body, model, settings, logger,
       return { gptPoolState: view.pool.state, gptModelState: view.model.state };
     };
 
+    // 応答ヘッダを受け取った時点で1回だけ評価した Claude 側台帳の判定（null＝未評価）。
+    // 評価済みの場合だけ claudePoolState をログへ載せる（§9.5(a) の完成形）。
+    let claudeExhausted = null;
+
+    // 台帳の判定は呼び出し側から注入された関数であり、ここは http の応答コールバックの
+    // 内側である。例外がそのまま抜けると未捕捉例外になり、未捕捉例外ハンドラを持たない
+    // rotator はプロセスごと落ちる（＝全 Claude セッション停止。§8.7 手順6 と同じ理由）。
+    // 判定できなかった場合は「Claude は使える」側＝退避を試みる側へ倒す（§8.7 の安全側）。
+    const evaluateClaudeLedger = () => {
+      if (typeof claudeAllUnusable !== 'function') return null;
+      try {
+        return claudeAllUnusable() === true;
+      } catch {
+        return null;
+      }
+    };
+
+    // 全枯渇と判定したときだけ問い合わせる（台帳を走査するので、素通しする応答では呼ばない）。
+    // ここも注入された関数なので、例外は捕まえて「時刻不明」へ倒す（本文から時刻が消えるだけ）。
+    const evaluateClaudeResetAt = () => {
+      if (typeof claudeResetAt !== 'function') return null;
+      try {
+        const value = claudeResetAt();
+        return typeof value === 'string' && value.length > 0 ? value : null;
+      } catch {
+        return null;
+      }
+    };
+
+    const claudePoolStateFields = () => (claudeExhausted === null
+      ? {}
+      : { claudePoolState: claudeExhausted ? 'all-exhausted' : 'available' });
+
     // 設計書 §9.3 のフィールドを「値があるときだけ」末尾へ足す形に組み立てる。
-    const logMeta = (outcome, extra = {}) => {
+    // 第3引数（写像の痕跡）は §9.3 の表の順序で並べたいので buildBridgeLogMeta 側へ渡す。
+    const logMeta = (outcome, extra = {}, mapped = null) => {
       if (!metaEnabled) return null;
       // 契約 §C3.7-1: x-ombr-contract の無い応答は「契約前の bridge」なので、契約由来の
       // 値は1つも載せない（他の x-ombr-* が付いていても信用しない）。この場合でも、
@@ -354,7 +401,7 @@ export function forwardToOpenAiBridge({ req, res, body, model, settings, logger,
           // bridge 自身が理由を名乗っていればそれを優先する（実データ）。名乗っていない
           // 障害（不達・タイムアウト・ストリーム障害）だけ rotator 側の値を入れる。
           reason: parsed?.reason ?? ROTATOR_DEGRADE_REASONS[outcome] ?? null,
-        }, poolStateFields()),
+        }, { ...poolStateFields(), ...claudePoolStateFields(), ...(mapped || {}) }),
         ...extra,
       };
     };
@@ -441,6 +488,52 @@ export function forwardToOpenAiBridge({ req, res, body, model, settings, logger,
           const responseHeaders = {};
           for (const [key, value] of Object.entries(upstreamRes.headers)) {
             if (!HOP_BY_HOP.has(key.toLowerCase())) responseHeaders[key] = value;
+          }
+          // ── R4-1: (c) 両プール利用不可のときだけ 529 を 403 へ書き換える（設計書 §8.7）──
+          // 判定は degrade-state.js の decideBridgeResponse に閉じてある（4条件のすべてが
+          // 成り立つときだけ真を返す）。ここでは「決まった手順で応答を作り替える」だけを行う。
+          if (metaEnabled) claudeExhausted = evaluateClaudeLedger();
+          // 学習済みの (pool)。gptPoolState を渡していない呼び出しでは 'unknown' 扱いになり、
+          // 条件③が成り立たないので書換は起きない。
+          const learnedPool = metaEnabled ? gptPoolState?.read(model).pool : null;
+          const decision = metaEnabled
+            ? decideBridgeResponse(contract, {
+              enabled: true,
+              upstreamStatus: upstreamRes.statusCode,
+              claudeAllUnusable: claudeExhausted === true,
+              gptPoolState: learnedPool?.state,
+              gptResetAt: learnedPool?.resetAt,
+              // 本文の「最早回復時刻」は GPT 側と Claude 側の早いほうを採る（§8.7）。
+              claudeResetAt: claudeExhausted === true ? evaluateClaudeResetAt() : null,
+              bothUnusableStatus: settings.degradeMapping.bothUnusableStatus,
+            })
+            : { rewrite: false };
+          if (decision.rewrite) {
+            const payload = Buffer.from(decision.body);
+            // 手順2: 上流の本文由来ヘッダを落とす。とくに 529 の本文長を持つ Content-Length を
+            // 残すとクライアントが本文を待ち続ける（transfer-encoding は HOP_BY_HOP で除去済み）。
+            for (const key of Object.keys(responseHeaders)) {
+              const lower = key.toLowerCase();
+              if (lower === 'content-length' || lower === 'content-encoding' || lower === 'content-type') {
+                delete responseHeaders[key];
+              }
+            }
+            // 手順3: 自作した本文に一致するヘッダを入れ直す。
+            responseHeaders['Content-Type'] = 'application/json';
+            responseHeaders['Content-Length'] = String(payload.length);
+            // 手順4。
+            res.writeHead(decision.status, responseHeaders);
+            res.end(payload);
+            // 手順5: finish() を destroy() より先に呼ぶ（settled=true にして、破棄由来の
+            // upstream 'error' で応答を二重に書かないようにする）。
+            finish('forwarded-mapped', decision.status, logMeta('forwarded-mapped', {}, decision.meta));
+            // 手順6: upstreamRes にはまだ 'error' ハンドラが無い。破棄由来の error を誰も
+            // 受けないと未捕捉例外になり、rotator がプロセスごと落ちる（＝全 Claude セッション停止）。
+            upstreamRes.on('error', () => {});
+            upstream.destroy();
+            // 手順7: data / end / error を装着する前に return する。装着しなければ
+            // 「書換後に上流チャンクが届いて ERR_STREAM_WRITE_AFTER_END になる」経路が存在しない。
+            return;
           }
           res.writeHead(upstreamRes.statusCode || 200, responseHeaders);
           // SSE の逐次透過: 受け取り次第そのまま書き出す（バッファリングしない）。

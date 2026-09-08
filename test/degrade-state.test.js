@@ -5,6 +5,7 @@ import {
   buildBridgeLogMeta,
   buildDegradeBody,
   claudeAllUnusable,
+  claudeEarliestResetAt,
   createGptPoolState,
   decideBridgeResponse,
   formatLogMeta,
@@ -895,5 +896,166 @@ describe('指摘4: degrade-reason は列挙値だけを受理する（識別子�
     const parsed = parseBridgeContract({ 'x-ombr-contract': '1' });
     assert.equal(parsed.reason, null);
     assert.equal(parsed.effectiveScope, 'model');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// R4-1 の付随修正: read() は観測していないモデル鍵を作らない（non_blocking 改善）
+//
+// read(model) は毎要求のログ組み立て（src/openai-bridge.js の poolStateFields）から
+// 呼ばれる。ここでエントリを作ると、bridge へ投げたモデル名の分だけ Map が単調に
+// 増え続け、snapshot() にも「一度も観測していないモデル」が unknown として並ぶ。
+// エントリを作ってよいのは observe()（＝実際に bridge から学習したとき）だけである。
+// ---------------------------------------------------------------------------
+describe('createGptPoolState > read() は観測していないモデル鍵を作らない (R4-1 付随)', () => {
+  it('does not add an entry to snapshot() for a model that was only read', () => {
+    const state = createGptPoolState({ now: () => 1000 });
+
+    const view = state.read('gpt-6-astra');
+    assert.equal(view.model.state, 'unknown', '未観測のモデルは unknown を返す（戻り値は変わらない）');
+    assert.deepEqual(state.snapshot().models, {}, 'read() だけではモデル鍵を作らない');
+
+    // 読み取りを何度繰り返しても増えない（毎要求 read() される経路の保護）。
+    for (const model of ['gpt-6-astra', 'gpt-5.6-sol', 'o3-mini']) state.read(model);
+    assert.deepEqual(state.snapshot().models, {});
+
+    // observe() だけがエントリを作る。
+    state.observe(
+      parseBridgeContract({
+        'x-ombr-contract': '1',
+        'x-ombr-degrade-reason': 'codex_no_account_for_model',
+        'x-ombr-degrade-scope': 'model',
+        'x-ombr-pool-state': 'no-account-for-model',
+      }),
+      403,
+      'gpt-6-astra',
+    );
+    assert.deepEqual(Object.keys(state.snapshot().models), ['gpt-6-astra']);
+    assert.equal(state.read('gpt-6-astra').model.state, 'unusable');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// 契約 v1.5（project-d5 提案 C-20260908-D5-03・当方 ACK）:
+// 新しい reason `codex_credentials_unavailable` と pool-state `credentials-unavailable`。
+// rotator の扱いは `codex_needs_login` と**完全に同一**にする（403 を素通しし、
+// (pool) は利用不可として学習する＝設計書 §8.8。403 書換の根拠にはしない）。
+// ---------------------------------------------------------------------------
+describe('契約 v1.5 > codex_credentials_unavailable は codex_needs_login と同一に扱う', () => {
+  const v15Headers = reason => ({
+    'x-ombr-contract': '1',
+    'x-ombr-degrade-reason': reason,
+    'x-ombr-degrade-scope': 'pool',
+    'x-ombr-pool-state': reason === 'codex_needs_login' ? 'needs-login' : 'credentials-unavailable',
+    'x-ombr-upstream-status': 'none',
+    'x-ombr-upstream-sent': 'no',
+  });
+
+  it('accepts the new enum values and behaves exactly like needs-login', () => {
+    const parsed = parseBridgeContract(v15Headers('codex_credentials_unavailable'));
+    assert.equal(parsed.reason, 'codex_credentials_unavailable', '列挙外へ丸めない（unknown にしない）');
+    assert.equal(parsed.poolState, 'credentials-unavailable', 'pool-state も受理する');
+    assert.equal(parsed.rawScope, 'pool');
+
+    // 学習は needs-login と同じ（T3: (pool) を利用不可にする）。
+    const state = createGptPoolState({ now: () => 1000 });
+    const result = state.observe(parsed, 403, 'gpt-6-astra');
+    assert.equal(result.transition, 'T3');
+    assert.equal(state.read().pool.state, 'unusable');
+    assert.equal(state.read().pool.reason, 'codex_credentials_unavailable');
+
+    // 403 の書換は起きない（元から 403 であり、pool-state も書換の対象2値ではない）。
+    assert.deepEqual(
+      decideBridgeResponse(parsed, {
+        enabled: true, upstreamStatus: 403, claudeAllUnusable: true,
+        gptPoolState: 'unusable', bothUnusableStatus: 403,
+      }),
+      { rewrite: false, reason: 'status-not-529' },
+    );
+
+    // reason だけが違う同型の応答（needs-login）と、学習の結果が一致すること。
+    const loginState = createGptPoolState({ now: () => 1000 });
+    loginState.observe(parseBridgeContract(v15Headers('codex_needs_login')), 403, 'gpt-6-astra');
+    assert.equal(loginState.read().pool.state, state.read().pool.state);
+  });
+
+  it('derives scope=pool from the reason even without an explicit x-ombr-degrade-scope', () => {
+    const parsed = parseBridgeContract({
+      'x-ombr-contract': '1',
+      'x-ombr-degrade-reason': 'codex_credentials_unavailable',
+      'x-ombr-pool-state': 'credentials-unavailable',
+    });
+    assert.equal(parsed.rawScope, null);
+    assert.equal(parsed.effectiveScope, 'pool', 'codex_needs_login と同じ既定 scope');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// R4-1 再検証①: 契約ヘッダを持たない応答は 403 へ書き換えない（契約 §C3.7-1）
+// ---------------------------------------------------------------------------
+describe('decideBridgeResponse > x-ombr-contract が無ければ書き換えない (R4-1 再検証①)', () => {
+  const rewritable = {
+    enabled: true, upstreamStatus: 529, claudeAllUnusable: true,
+    gptPoolState: 'unusable', bothUnusableStatus: 403,
+  };
+
+  it('requires a valid x-ombr-contract before rewriting', () => {
+    // 4条件をすべて満たす応答（契約ヘッダあり）は書き換える。
+    const withContract = parseBridgeContract({
+      'x-ombr-contract': '1',
+      'x-ombr-degrade-reason': 'codex_pool_exhausted',
+      'x-ombr-degrade-scope': 'pool',
+      'x-ombr-pool-state': 'exhausted',
+    });
+    assert.equal(decideBridgeResponse(withContract, rewritable).rewrite, true, 'precondition');
+
+    // x-ombr-contract だけを落とす／壊すと、他が同じでも書き換えない。
+    for (const contract of [undefined, 'abc', '0', '-1', '1e3']) {
+      const parsed = parseBridgeContract({
+        ...(contract === undefined ? {} : { 'x-ombr-contract': contract }),
+        'x-ombr-degrade-reason': 'codex_pool_exhausted',
+        'x-ombr-degrade-scope': 'pool',
+        'x-ombr-pool-state': 'exhausted',
+      });
+      assert.deepEqual(
+        decideBridgeResponse(parsed, rewritable),
+        { rewrite: false, reason: 'no-contract-header' },
+        `x-ombr-contract=${String(contract)}`,
+      );
+    }
+    assert.deepEqual(decideBridgeResponse(null, rewritable), { rewrite: false, reason: 'no-contract-header' });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// R4-1 再検証②: 403 本文の最早回復時刻に Claude 側を含める
+// ---------------------------------------------------------------------------
+describe('claudeEarliestResetAt (R4-1 再検証②)', () => {
+  const managerWith = entries => ({ getRoutingAvailability: () => entries });
+
+  it('returns the earliest availableAt across the ledger', () => {
+    assert.equal(
+      claudeEarliestResetAt(managerWith([
+        { state: 'waiting', availableAt: '2026-09-08T14:00:00.000Z' },
+        { state: 'waiting', availableAt: '2026-09-08T13:00:00.000Z' },
+        { state: 'unknown', availableAt: null },
+      ])),
+      '2026-09-08T13:00:00.000Z',
+    );
+  });
+
+  it('returns null when no account reports a usable recovery time', () => {
+    assert.equal(claudeEarliestResetAt(managerWith([{ state: 'unknown', availableAt: null }])), null);
+    assert.equal(claudeEarliestResetAt(managerWith([{ availableAt: 'not-a-time' }])), null);
+    assert.equal(claudeEarliestResetAt(managerWith([])), null);
+    assert.equal(claudeEarliestResetAt(null), null, '台帳が無い呼び出しでも投げない');
+    assert.equal(claudeEarliestResetAt({}), null);
+  });
+
+  it('feeds buildDegradeBody so the earlier of the two pools is shown', () => {
+    assert.match(
+      buildDegradeBody(403, { resetAts: ['2099-01-01T00:00:00Z', '2026-09-08T13:00:00Z'] }),
+      /Earliest recovery: 2026-09-08T13:00:00Z\./,
+    );
   });
 });

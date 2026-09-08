@@ -21,7 +21,7 @@ import {
 import { createNativeClaudeRefresher } from './native-claude-refresher.js';
 import { isFableScopeIdentity, parseRateLimitHeaders } from './quota.js';
 import { duplicateRefreshTokenAccountIds } from './secret-store.js';
-import { createGptPoolState } from './degrade-state.js';
+import { claudeAllUnusable, claudeEarliestResetAt, createGptPoolState } from './degrade-state.js';
 import {
   DEFAULT_OPENAI_BRIDGE,
   forwardToOpenAiBridge,
@@ -430,7 +430,18 @@ export function createProxyServer({
           settings: openaiBridgeSettings,
           logger,
           // degradeMapping.enabled が真のときだけ渡す（未指定＝現行と同一の経路）。
-          ...(gptPoolState ? { gptPoolState } : {}),
+          ...(gptPoolState ? {
+            gptPoolState,
+            // 関数で渡すのは、要求の開始時点ではなく bridge の応答ヘッダを受け取った
+            // 時点の台帳で判定するためである（設計書 §11.1 R4-1 の補足）。
+            // gpt-* の要求に Claude の modelFamily は無いので null（＝共通枠）で問う
+            // （§4.2）。Fable 週次サブキャップだけの枯渇では「Claude は使える」と判定され、
+            // 403 で止めずに 529 のまま Opus へ退避させる。
+            claudeAllUnusable: () => claudeAllUnusable(accountManager, null),
+            // 403 の本文へ載せる「最早回復時刻」の Claude 側の候補（§8.7）。
+            // 全枯渇と判定したときだけ呼ばれる。判定そのものには使わない。
+            claudeResetAt: () => claudeEarliestResetAt(accountManager, null),
+          } : {}),
         });
         return;
       }
