@@ -21,6 +21,10 @@ const DEGRADE_REASONS = new Set([
   // 契約 v1.5 で追加。rotator の扱いは codex_needs_login と完全に同じにする
   // （403 を素通しし、(pool) は失効として学習する）。
   'codex_credentials_unavailable',
+  // 契約 v1.6.3 で追加。非 SSE 集約が総時間上限に達したときの 529（scope=model・pool-state 無し）。
+  // 列挙に載せるのは理由名をログへ残すためだけで、挙動は変えない（pool-state が無いので
+  // §C10.3 の学習には入らず、§8.7 条件①も満たさないため 403 への書換も起きない）。
+  'codex_aggregation_timeout',
 ]);
 const UNKNOWN_DEGRADE_REASON = 'unknown';
 

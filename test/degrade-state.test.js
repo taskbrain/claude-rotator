@@ -1135,3 +1135,56 @@ describe('claudeEarliestResetAt (R4-1 再検証②)', () => {
     );
   });
 });
+
+// ---------------------------------------------------------------------------
+// R6-6 / 契約 v1.6.3: 新しい reason `codex_aggregation_timeout`
+// （非 SSE 集約が総時間上限に達したときの 529。scope=model・pool-state 無し）。
+// rotator 側の変更は「理由名をログへ残せるようにする」ことだけで、挙動は一切変えない。
+// ---------------------------------------------------------------------------
+describe('契約 v1.6.3 > codex_aggregation_timeout は理由名として認識するだけで挙動を変えない (R6-6)', () => {
+  // bridge が実際に送る形（契約 §C3.4）。pool-state は付かない。
+  const timeoutHeaders = () => ({
+    'x-ombr-contract': '1',
+    'x-ombr-degrade-reason': 'codex_aggregation_timeout',
+    'x-ombr-degrade-scope': 'model',
+    'x-ombr-upstream-status': 'none',
+    'x-ombr-upstream-sent': 'yes',
+  });
+
+  it('accepts the new reason as an enum value (unknown へ丸めない)', () => {
+    const parsed = parseBridgeContract(timeoutHeaders());
+    assert.equal(parsed.reason, 'codex_aggregation_timeout');
+    assert.equal(parsed.rawScope, 'model');
+    assert.equal(parsed.effectiveScope, 'model', '既定 scope も model（(pool) を汚さない安全側）');
+    assert.equal(parsed.poolState, null, 'この理由に x-ombr-pool-state は付かない');
+  });
+
+  it('learns nothing — neither (pool) nor (pool, model) changes (契約 §C10.3 T9)', () => {
+    const state = createGptPoolState({ now: () => 1000 });
+    const result = state.observe(parseBridgeContract(timeoutHeaders()), 529, 'gpt-6-astra');
+    assert.equal(result.transition, null, 'pool-state を持たない応答からは学習しない');
+    const snapshot = state.snapshot();
+    assert.equal(snapshot.pool.state, 'unknown');
+    assert.equal(snapshot.pool.reason, null);
+    assert.equal(snapshot.models['gpt-6-astra'].state, 'unknown', 'モデル鍵も unknown のまま');
+    assert.equal(state.read('gpt-6-astra').model.state, 'unknown');
+  });
+
+  it('never rewrites the 529 to 403, even when every Claude account is unusable (設計書 §8.7 条件①)', () => {
+    const parsed = parseBridgeContract(timeoutHeaders());
+    assert.deepEqual(
+      decideBridgeResponse(parsed, bridgeCtx({ bothUnusableStatus: 403 })),
+      { rewrite: false, reason: 'pool-state-not-exhausted-or-mixed' },
+      'pool-state を持たないので4条件の①で落ちる（他の3条件は満たしている）',
+    );
+  });
+
+  it('writes the reason name into the log line (ログで理由を読めるようにする)', () => {
+    const meta = buildBridgeLogMeta(parseBridgeContract(timeoutHeaders()), {});
+    assert.equal(meta.degradeReason, 'codex_aggregation_timeout');
+    assert.equal(
+      formatLogMeta(meta),
+      ' bridgeContract=1 degradeReason=codex_aggregation_timeout degradeScope=model upstreamStatus=none upstreamSent=yes',
+    );
+  });
+});
