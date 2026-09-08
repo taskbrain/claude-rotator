@@ -453,6 +453,44 @@ claude-rotator status
 | `usagePolling.requestSpacingMs` | `1500` | 各リクエスト開始の最小間隔（429対策） |
 | `accounts` | `[]` | 登録済みアカウント。通常は `claude-rotator login` 等の CLI から追加し、直接編集は非推奨です |
 
+### GPT モデルとの相互退避（`openaiBridge.degradeMapping`）
+
+`openaiBridge` は、モデル名が `modelPattern`（既定 `^gpt-|^o[0-9]|^openai/`）に一致するリクエストだけを、ローカルで動く別の Anthropic 互換ブリッジ（例: openai-model-bridge）へ転送する任意の分岐です（`openaiBridge.enabled` の既定は `false`）。`degradeMapping` はその下に置く任意のセクションで、Claude Code 側の `fallbackModel` と組み合わせて次の3つを実現します。
+
+- **Claude 側の全アカウントが枠切れ** → 429 の代わりに **529** を返し、`fallbackModel` の次の要素（例: GPT モデル）へ退避させる
+- **GPT 側が枠切れ** → ブリッジが返した **529** をそのまま素通しし、`fallbackModel` の次の要素（例: `opus`）へ退避させる
+- **両方とも使えない** → **403** で明示的に停止する（既定）
+
+前提は2つあります。
+
+1. Claude Code 側に `fallbackModel` を設定していること（例: `"fallbackModel": ["gpt-6-astra", "opus"]`）。claude-rotator 自身がリクエストを別モデルへ翻訳して転送するわけではなく、退避を行うのは Claude Code です。
+2. 転送先のブリッジが契約ヘッダ `x-ombr-*`（`x-ombr-pool-state` / `-degrade-reason` / `-reset-at` など）を返すこと。返さないブリッジや、そもそもブリッジが動いていない環境では、GPT 側の状態を新たに学習しません。ただし例外があります——ブリッジが停止していても、停止前に学習した「GPT 側は使えない」という状態が TTL（`gptPoolUnusableTtlMs`、既定60秒）または回復見込み時刻まで残っている間は、Claude 側の全枯渇時に 403 へ写像されることがあります（学習状態は `POST /internal/reload` で初期化されます）。
+
+設定キー（セクションごと省略できます）:
+
+| キー | 既定値 | 意味 |
+|---|---|---|
+| `degradeMapping.enabled` | `false` | 写像・学習・403 書き換えの総合スイッチ。`false` なら現行と完全に同一の挙動 |
+| `degradeMapping.bothUnusableStatus` | `403` | Claude も GPT も使えないときのステータス。`403` = 明示停止、`529` = 退避を試み続ける。それ以外の値は `403` として扱います |
+| `degradeMapping.gptPoolUnusableTtlMs` | `60000`（60秒） | 回復見込み時刻を伴わない「GPT 側は使えない」という学習を、状態不明へ戻すまでの時間 |
+| `degradeMapping.codexStatusUrl` | `null` | `status` にブリッジ側の枠状況を表示するための取得先（loopback のみ）。`null` なら表示しません |
+| `degradeMapping.codexStatusTimeoutMs` | `1500` | 上記取得のタイムアウト（必ず有限値） |
+
+**既定は無効です。** `degradeMapping` を書かなければ挙動は現行とまったく同じで、新規インストール時に生成される `config.json` にもこのセクションは書き出されません。claude-rotator を単体で使う場合、何もする必要はありません。転送先のブリッジも任意であり、無くても claude-rotator は完全に動作します。
+
+動作の要点:
+
+- 単一アカウントの一時的な 429 は退避させません。529 へ写像するのは、アカウント台帳上そのモデル系列で使えるアカウントが1つも無いときだけです（アカウント未登録のときも写像しません）。
+- **本機能が生成する** 403 は、Claude 側の全枯渇と GPT 側の利用不可が同時に成立したときだけです。応答本文には、両者のうち最も早い回復見込み時刻を添えます。なお、ブリッジへの接続拒否・接続タイムアウト・アイドルタイムアウトは本機能とは無関係に従来どおり 403 を返します（`outcome` の値で区別できます）。
+- 学習した GPT 側の状態はメモリ上にだけ保持し、`POST /internal/reload`（設定の再読み込み）で初期化されます。
+- ログの `outcome` は `forwarded` / `forwarded-mapped`（529 を 403 へ書き換えた）/ `bridge-unreachable` / `bridge-connect-timeout` / `bridge-idle-timeout` / `bridge-stream-error` に分かれ、`degradeReason` `upstreamStatus` `gptPoolState` `claudePoolState` `mappedFrom` / `mappedTo` などを、値があるときだけ行末へ追記します（値が1つも無ければ行は従来と同一です）。
+
+注意:
+
+- 529 は Anthropic が本当に過負荷のときと同じ経路です。`fallbackModel` を設定していない利用者からは、通常の過負荷エラーと区別が付きません。次の要素へ切り替わるのは Claude Code が 529 を3回再試行した後で、これは `fallbackModel` に次の要素がある場合の挙動です。
+- `fallbackModel` の最終要素も同じ枯渇したプールに当たる構成では、Claude Code は指数バックオフ（約0.6秒→約74秒）で再試行を続けます。当リポジトリの実測では、150秒の観測窓内で終端せず、エラー表示も出ませんでした。`bothUnusableStatus` の既定を `403`（明示停止）にしているのはこのためで、`529` にすると同じ無言待ちが起こり得ます。`openaiBridge.enabled` が `false` のまま `degradeMapping.enabled` を `true` にする構成でも同じ限界があるため、起動時とリロード時に警告を1行出します（禁止はしません）。
+- ログにも `status` の表示にも、メールアドレスなどの識別子は出しません（アカウントはラベルだけを扱います）。
+
 ## ログと切り替え診断
 
 `status` / `monitor` の Events には、直近の proxy request が表示されます。
@@ -668,6 +706,8 @@ npm run lint
 ```
 
 macOS では、実際の Keychain に書き込む一部のテストがデフォルトで skip されます。`CLAUDE_ROTATOR_REAL_KEYCHAIN=1 npm test` を付けると実行できますが、Keychain の認証ダイアログが表示される場合があります（CI の macOS ジョブでは自動的に有効化されます）。
+
+このリポジトリは公開されています。社内向けの作業記録・設計メモ・セッション記録（`docs/sessions/` 配下など）はコミットしないでください。
 
 ローカル Node は `v18.10` 以上で動作します。開発時は CI と同じ Node 20 / 22 の両方を Docker で確認してください。
 
@@ -1163,6 +1203,44 @@ What the main keys mean:
 | `usagePolling.requestSpacingMs` | `1500` | Minimum delay between the start of each request (to reduce 429s) |
 | `accounts` | `[]` | Registered accounts. Normally added through the `claude-rotator login` CLI etc.; editing this directly is discouraged |
 
+#### Cross-Degradation with GPT Models (`openaiBridge.degradeMapping`)
+
+`openaiBridge` is an optional branch that forwards only the requests whose model name matches `modelPattern` (default `^gpt-|^o[0-9]|^openai/`) to another Anthropic-compatible bridge running locally (for example openai-model-bridge); `openaiBridge.enabled` defaults to `false`. `degradeMapping` is an optional section underneath it that, combined with Claude Code's `fallbackModel`, provides three behaviors:
+
+- **All Claude accounts exhausted** → return **529** instead of 429, so Claude Code falls back to the next entry of `fallbackModel` (for example a GPT model).
+- **The GPT side is exhausted** → pass the bridge's **529** through unchanged, so Claude Code falls back to the next entry (for example `opus`).
+- **Neither side is usable** → stop explicitly with **403** (default).
+
+Two prerequisites:
+
+1. Claude Code must have `fallbackModel` configured (for example `"fallbackModel": ["gpt-6-astra", "opus"]`). claude-rotator never translates a request into another model itself — Claude Code performs the fallback.
+2. The bridge must return the contract headers `x-ombr-*` (`x-ombr-pool-state` / `-degrade-reason` / `-reset-at`, etc.). Against a bridge that does not send them — or with no bridge running at all — no new GPT-side state is learned. One exception: even after the bridge stops, a previously learned "GPT side is unusable" state survives until its TTL (`gptPoolUnusableTtlMs`, 60 seconds by default) or its recovery time passes, and during that window a fully exhausted Claude side can still be mapped to 403 (the learned state is reset by `POST /internal/reload`).
+
+Configuration keys (the whole section may be omitted):
+
+| Key | Default | Meaning |
+|---|---|---|
+| `degradeMapping.enabled` | `false` | Master switch for the mapping, the learning, and the 403 rewrite. With `false` the behavior is identical to the current one |
+| `degradeMapping.bothUnusableStatus` | `403` | Status returned when neither Claude nor GPT is usable. `403` = stop explicitly, `529` = keep attempting to degrade. Any other value is treated as `403` |
+| `degradeMapping.gptPoolUnusableTtlMs` | `60000` (60 sec) | How long a "GPT side is unusable" observation without a recovery time is kept before it reverts to unknown |
+| `degradeMapping.codexStatusUrl` | `null` | Endpoint used to show the bridge's quota state in `status` (loopback only). `null` shows nothing |
+| `degradeMapping.codexStatusTimeoutMs` | `1500` | Timeout for that fetch (always finite) |
+
+**Disabled by default.** If you do not write `degradeMapping`, behavior is exactly as before, and the `config.json` generated on a fresh install does not contain this section either. Users running claude-rotator on its own need to do nothing. The bridge is optional too: claude-rotator works fully without it.
+
+How it behaves:
+
+- A temporary 429 from a single account never triggers a fallback. The 529 mapping applies only when the account ledger has no usable account left for that model family (and never when no account is registered).
+- The 403 **produced by this feature** is returned only when the Claude side is fully exhausted *and* the GPT side is known to be unusable at the same time. The response body carries the earliest expected recovery time of the two. Independently of this feature, a refused connection, a connect timeout, or an idle timeout against the bridge still returns 403 exactly as before (the `outcome` value tells them apart).
+- The learned GPT-side state lives in memory only and is reset by `POST /internal/reload` (config reload).
+- Log `outcome` values split into `forwarded` / `forwarded-mapped` (a 529 rewritten to 403) / `bridge-unreachable` / `bridge-connect-timeout` / `bridge-idle-timeout` / `bridge-stream-error`, and fields such as `degradeReason`, `upstreamStatus`, `gptPoolState`, `claudePoolState`, `mappedFrom` / `mappedTo` are appended at the end of the line only when they have a value (with no values, the line is identical to the current one).
+
+Caveats:
+
+- A 529 travels the same path as a genuine Anthropic overload. To a user with no `fallbackModel`, it is indistinguishable from an ordinary overload error. Claude Code moves to the next entry after retrying a 529 three times, and that behavior applies only while `fallbackModel` still has a next entry.
+- If the last entry of `fallbackModel` lands in the same exhausted pool, Claude Code keeps retrying with exponential backoff (about 0.6 sec growing to about 74 sec). In our measurements it neither terminated nor surfaced an error within the 150-second observation window. That is why `bothUnusableStatus` defaults to `403` (explicit stop); setting `529` can reproduce the same silent wait. Leaving `openaiBridge.enabled` at `false` while turning `degradeMapping.enabled` on has the same limitation, so a single warning line is logged at startup and on reload (the combination is not forbidden).
+- Neither the logs nor the `status` output ever contain email addresses or similar identifiers; accounts are handled by label only.
+
 ### Logs and Rotation Diagnostics
 
 `status` / `monitor`'s Events show the most recent proxy requests:
@@ -1380,6 +1458,8 @@ npm run lint
 ```
 
 On macOS, some tests that write to the real Keychain are skipped by default. Add `CLAUDE_ROTATOR_REAL_KEYCHAIN=1 npm test` to run them, though this may pop up a Keychain authentication dialog (the macOS CI job enables this automatically).
+
+This repository is public. Do not commit internal working notes, design memos, or session records (for example anything under `docs/sessions/`).
 
 Local development works on Node `v18.10` and later. If you want to check macOS/Ubuntu-independent behavior in development, also run the Docker command below to verify against Node 22.
 
