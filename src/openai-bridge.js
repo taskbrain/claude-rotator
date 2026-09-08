@@ -575,6 +575,28 @@ export function forwardToOpenAiBridge({
       currentUpstream = upstream;
       upstream.once('finish', () => { requestFullySent = true; });
 
+      // 非 SSE 要求の生存通知（契約 §C4.6）。非ストリーミング応答には SSE の開始マーカーに
+      // 相当する「流すもの」が無いため、bridge が上流の応答ヘッダを待っている間は rotator へ
+      // 1バイトも届かず、長考がアイドル判定を超えた時点で 403 を合成してしまう。bridge が
+      // 周期送出する 102 Processing を「bridge は生きている」の合図として受け取り、
+      // アイドルタイマーだけを再武装する。
+      //   - 下流へは転送しない（消費するだけ）。res へ1バイトも書かないので、Claude Code
+      //     から見た応答は 102 が無かった場合とバイト単位で同一であり、res.headersSent も
+      //     偽のままなので後から 403 を合成する能力・529→403 の書換も保たれる。
+      //   - 最終ステータス・outcome・ログ書式・設定キーはいずれも変えない（ログ行も足さない）。
+      //   - 101 Switching Protocols は対象外（Node の 'information' も 101 では発火しない）。
+      //   - connectTimer には触れない。接続確立の計測は socket の 'connect' だけが閉じる
+      //     ので、TCP 接続前の判定はこの再武装の影響を受けない。
+      //   - 102 が1つも来なければ従来どおり bridge-idle-timeout で切る（無応答の検出能力は不変）。
+      upstream.on('information', info => {
+        const informationalStatus = Number(info?.statusCode);
+        if (!Number.isInteger(informationalStatus)) return;
+        if (informationalStatus < 100 || informationalStatus > 199 || informationalStatus === 101) return;
+        // settled 後に武装すると、誰も止めないタイマーが後から destroy() を撃つ。
+        if (settled || res.destroyed) return;
+        armIdleTimer();
+      });
+
       // 接続確立前のタイムアウト（403 permission_error・outcome=bridge-connect-timeout）。
       // 接続拒否・DNS 失敗（bridge-unreachable）とは意味が違う——ポートは開いているのに
       // 受け付けられていない状態を指す（設計書 §9.4）。

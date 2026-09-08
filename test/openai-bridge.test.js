@@ -1,6 +1,7 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 import http from 'node:http';
+import net from 'node:net';
 import { EventEmitter } from 'node:events';
 
 import { AccountManager } from '../src/account-manager.js';
@@ -2684,5 +2685,352 @@ describe('degradeMapping codexStatusUrl scheme', () => {
     assert.equal(lines.length, 1);
     assert.match(lines[0], /degradeMapping\.codexStatusUrl must use http: scheme; codex status section disabled$/);
     assert.equal(lines[0].includes('healthz'), false);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// R6-2: 非 SSE 要求の生存通知（HTTP 102 Processing）
+// 契約 §C4.6（非 SSE 要求の生存通知）／§C13.4 テスト30。
+//
+// 非 SSE の応答には SSE の開始マーカーに相当する「流すもの」が無いため、bridge が上流
+// 応答ヘッダを待っている間、rotator には1バイトも届かない。放置すると bridge も上流も
+// 正常なのに長考がアイドル判定（既定 30,000ms）を超えた時点で rotator が 403 を合成する。
+// bridge は生存通知として 102 Processing を周期送出し、rotator は information（1xx。
+// 101 を除く）でアイドルタイマーを再武装する。102 は下流へ転送しない（消費のみ）ため、
+// Claude Code から見た応答は 102 が無い場合とバイト単位で同一になる。
+// 最終ステータス・outcome・ログ書式・設定キーはいずれも変えない。
+// ---------------------------------------------------------------------------
+
+// 実寸（アイドル 30,000ms・102 は 12,000ms ごと・生成 90,000ms）と同じ比のまま縮めた値。
+const PROCESSING_IDLE_MS = 400;
+const PROCESSING_INTERVAL_MS = PROCESSING_IDLE_MS / 2; // §C4.6 の 2「idleTimeoutMs の 1/2 以下」
+const PROCESSING_HEAD_DELAY_MS = PROCESSING_IDLE_MS * 3; // アイドルの3倍だけ応答ヘッダを遅らせる
+const PROCESSING_OK_BODY = JSON.stringify({ type: 'message', content: 'ok' });
+const PROCESSING_ERROR_BODY = JSON.stringify({ type: 'error', error: { type: 'api_error', message: 'upstream failed' } });
+
+/**
+ * 偽 bridge が 102 Processing を送る。ServerResponse#writeProcessing() は
+ * "HTTP/1.1 102 Processing\r\n\r\n" だけを書き、最終応答ヘッダを確定させない（§C4.6 の 1）。
+ * 返す counter で「実際に何回送ったか」をテスト側から確認する。
+ */
+function start102Heartbeat(res, { intervalMs = null, counter }) {
+  counter.sent += 1;
+  res.writeProcessing();
+  if (intervalMs === null) return () => {};
+  const timer = setInterval(() => {
+    counter.sent += 1;
+    res.writeProcessing();
+  }, intervalMs);
+  const stop = () => clearInterval(timer);
+  res.on('close', stop);
+  return stop;
+}
+
+/**
+ * 102 の送出パターンと最終応答の組み合わせで偽 bridge のハンドラを作る。
+ * heartbeat: 'none'（送らない）/ 'once'（1回だけ）/ 'periodic'（周期送出）
+ * ending:    'ok'（200 JSON）/ 'error'（500 JSON）/ 'destroy'（ソケットを切る）
+ */
+function processingBridge({ heartbeat = 'none', first102DelayMs = 0, headDelayMs = 0, ending = 'ok' }) {
+  const counter = { sent: 0 };
+  const pending = new Set();
+  const handler = (req, res) => {
+    req.resume();
+    let stopHeartbeat = () => {};
+    const beat = () => {
+      stopHeartbeat = start102Heartbeat(res, {
+        intervalMs: heartbeat === 'periodic' ? PROCESSING_INTERVAL_MS : null,
+        counter,
+      });
+    };
+    if (heartbeat !== 'none') {
+      if (first102DelayMs === 0) beat();
+      else {
+        const beatTimer = setTimeout(() => { pending.delete(beatTimer); beat(); }, first102DelayMs);
+        pending.add(beatTimer);
+      }
+    }
+    if (ending === 'silence') return; // 102 のあとは無音のまま保持する（対照）
+    const timer = setTimeout(() => {
+      pending.delete(timer);
+      stopHeartbeat(); // §C4.6 の 3: 上流応答ヘッダを受領した時点で送出を止める
+      if (ending === 'destroy') {
+        res.socket?.destroy();
+        return;
+      }
+      const body = ending === 'error' ? PROCESSING_ERROR_BODY : PROCESSING_OK_BODY;
+      res.writeHead(ending === 'error' ? 500 : 200, {
+        'content-type': 'application/json',
+        'content-length': Buffer.byteLength(body),
+      });
+      res.end(body);
+    }, headDelayMs);
+    pending.add(timer);
+  };
+  const cleanup = () => {
+    for (const timer of pending) clearTimeout(timer);
+    pending.clear();
+  };
+  return { handler, counter, cleanup };
+}
+
+/** 生ソケットで POST し、下流が受け取ったバイト列をそのまま返す（102 の混入を見るため）。 */
+function rawPost(port, body) {
+  return new Promise((resolve, reject) => {
+    const chunks = [];
+    const socket = net.createConnection({ host: '127.0.0.1', port }, () => {
+      socket.write(
+        'POST /v1/messages HTTP/1.1\r\n'
+        + `host: 127.0.0.1:${port}\r\n`
+        + 'content-type: application/json\r\n'
+        + 'anthropic-version: 2023-06-01\r\n'
+        + `content-length: ${Buffer.byteLength(body)}\r\n`
+        + 'connection: close\r\n\r\n'
+        + body,
+      );
+    });
+    socket.on('data', chunk => chunks.push(chunk));
+    socket.on('end', () => resolve(Buffer.concat(chunks).toString('utf8')));
+    socket.on('error', reject);
+  });
+}
+
+/** Date ヘッダだけは秒単位の実時刻なので、バイト比較の前に伏せる。 */
+function maskDateHeader(raw) {
+  return raw.replace(/\r\nDate: [^\r\n]+\r\n/, '\r\nDate: <masked>\r\n');
+}
+
+/**
+ * 偽 bridge を立て、forwardToOpenAiBridge を1回だけ通す（既存の callThroughRotator と
+ * 同型だが、outcome と生バイト列を返す点だけが違う）。
+ */
+async function callWith102Bridge({ bridge: bridgeSpec, idleTimeoutMs = PROCESSING_IDLE_MS, degradeMapping = null, raw = false }) {
+  const { server: bridgeServer, port } = await startFakeBridge(bridgeSpec.handler);
+  const settings = resolveOpenAiBridgeSettings({
+    openaiBridge: {
+      enabled: true,
+      url: `http://127.0.0.1:${port}`,
+      modelPattern: '^gpt-',
+      connectTimeoutMs: 2000,
+      idleTimeoutMs,
+      connectRetries: 0,
+      // 未指定＝現行と同一の経路であることを保つため、渡すときだけキーを足す。
+      ...(degradeMapping ? { degradeMapping } : {}),
+    },
+  });
+  const lines = [];
+  let resolveResult;
+  const settled = new Promise(resolve => { resolveResult = resolve; });
+  const front = http.createServer(async (req, res) => {
+    const chunks = [];
+    for await (const chunk of req) chunks.push(chunk);
+    const body = Buffer.concat(chunks);
+    resolveResult(await forwardToOpenAiBridge({
+      req, res, body, model: safeParseModel(body), settings, logger: line => lines.push(line),
+    }));
+  });
+  await new Promise(resolve => front.listen(0, '127.0.0.1', resolve));
+  const frontPort = front.address().port;
+  const requestBody = '{"model":"gpt-6-astra"}';
+
+  let response = null;
+  let text = null;
+  let rawText = null;
+  if (raw) {
+    rawText = await rawPost(frontPort, requestBody);
+  } else {
+    response = await fetch(`http://127.0.0.1:${frontPort}/v1/messages`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'anthropic-version': '2023-06-01' },
+      body: requestBody,
+    });
+    text = await response.text();
+  }
+  const result = await settled;
+  front.close();
+  bridgeServer.close();
+  bridgeSpec.cleanup();
+  return {
+    response, text, raw: rawText, lines, result,
+    bridgeLine: lines.find(line => / openai-bridge model=/.test(line)),
+    processingSent: bridgeSpec.counter.sent,
+  };
+}
+
+describe('forwardToOpenAiBridge > 非 SSE の生存通知 102 Processing (R6-2 / 契約 §C4.6)', () => {
+  it('(a) keeps the request alive while 102 keeps arriving, and never forwards 102 downstream', async () => {
+    // アイドルの3倍だけ応答ヘッダを遅らせる。102 が届かなければ必ず切られる長さである。
+    const bridge = processingBridge({ heartbeat: 'periodic', headDelayMs: PROCESSING_HEAD_DELAY_MS });
+    const { response, text, result, lines, bridgeLine, processingSent } = await callWith102Bridge({ bridge });
+
+    assert.equal(result.outcome, 'forwarded', '102 で再武装されるのでアイドル判定は発火しない');
+    assert.equal(result.status, 200);
+    assert.equal(response.status, 200);
+    assert.deepEqual(JSON.parse(text), JSON.parse(PROCESSING_OK_BODY));
+    assert.ok(processingSent >= 3, `102 が周期送出されていること (sent=${processingSent})`);
+    assert.match(bridgeLine, /status=200 durationMs=\d+ outcome=forwarded$/, 'ログ書式は不変（102 でフィールドを増やさない）');
+    assert.equal(
+      lines.filter(line => / openai-bridge /.test(line)).length,
+      1,
+      '102 の受信でログ行を増やさない（§C4.6 の「ログ書式は不変」）',
+    );
+  });
+
+  it('(a) the downstream bytes are identical to a run without any 102', async () => {
+    const withProcessing = processingBridge({ heartbeat: 'periodic', headDelayMs: PROCESSING_HEAD_DELAY_MS });
+    const withProcessingRun = await callWith102Bridge({ bridge: withProcessing, raw: true });
+    // 対照は 102 を1回も送らず、遅延なしで同じ本文を返す偽 bridge。
+    const control = processingBridge({ heartbeat: 'none', headDelayMs: 0 });
+    const controlRun = await callWith102Bridge({ bridge: control, raw: true });
+
+    assert.ok(withProcessingRun.processingSent >= 3, '102 は実際に流れている');
+    assert.equal(controlRun.processingSent, 0);
+    assert.equal(/HTTP\/1\.1 102/.test(withProcessingRun.raw), false, '102 は下流へ1バイトも流れない');
+    assert.equal(
+      maskDateHeader(withProcessingRun.raw),
+      maskDateHeader(controlRun.raw),
+      'Claude Code から見た応答は 102 が無かった場合とバイト単位で同一',
+    );
+  });
+
+  it('(b) still reports bridge-idle-timeout when only one 102 arrives and the bridge then goes silent', async () => {
+    // 「開始通知として1回だけ」では足りない（アイドルの窓を1つ買い直すだけ）ことと、
+    // 無応答の検出能力を失っていないことを同時に固定する。アイドルの半分だけ待ってから
+    // 1回だけ 102 を送るので、再武装が効いていれば打ち切りはアイドルの 1.5 倍付近まで
+    // 遅れ、それでも結局は切られる（タイマーは遅れる方向にしかぶれないので下限で見る）。
+    const bridge = processingBridge({
+      heartbeat: 'once', first102DelayMs: PROCESSING_IDLE_MS / 2, ending: 'silence',
+    });
+    const { response, text, result, bridgeLine, processingSent } = await callWith102Bridge({ bridge });
+
+    assert.equal(processingSent, 1);
+    assert.equal(result.outcome, 'bridge-idle-timeout');
+    assert.equal(result.status, 403);
+    assert.equal(response.status, 403);
+    assert.equal(JSON.parse(text).error.type, 'permission_error');
+    assert.match(bridgeLine, /status=403 durationMs=\d+ outcome=bridge-idle-timeout$/);
+    const durationMs = Number(/durationMs=(\d+)/.exec(bridgeLine)[1]);
+    assert.ok(
+      durationMs >= PROCESSING_IDLE_MS * 1.4,
+      `1回の 102 でアイドルの窓を1つ買い直していること (durationMs=${durationMs})`,
+    );
+  });
+
+  it('(b) the control without any 102 is cut at the same outcome, status and body', async () => {
+    const silent = processingBridge({ heartbeat: 'none', ending: 'silence' });
+    const silentRun = await callWith102Bridge({ bridge: silent });
+    const once = processingBridge({
+      heartbeat: 'once', first102DelayMs: PROCESSING_IDLE_MS / 2, ending: 'silence',
+    });
+    const onceRun = await callWith102Bridge({ bridge: once });
+
+    assert.equal(silentRun.result.outcome, 'bridge-idle-timeout');
+    assert.equal(onceRun.result.outcome, silentRun.result.outcome);
+    assert.equal(onceRun.result.status, silentRun.result.status);
+    assert.equal(onceRun.text, silentRun.text);
+  });
+
+  it('(c) a disconnect after 102 stays bridge-unreachable with the current body', async () => {
+    // 応答ヘッダより先に切られるので、102 が無い場合と同じく 403 を合成する。
+    const afterProcessing = processingBridge({
+      heartbeat: 'periodic', headDelayMs: PROCESSING_HEAD_DELAY_MS, ending: 'destroy',
+    });
+    const afterRun = await callWith102Bridge({ bridge: afterProcessing });
+    const control = processingBridge({ heartbeat: 'none', headDelayMs: 0, ending: 'destroy' });
+    const controlRun = await callWith102Bridge({ bridge: control });
+
+    assert.ok(afterRun.processingSent >= 3);
+    assert.equal(afterRun.result.outcome, 'bridge-unreachable', '102 は最終ステータスに影響しない');
+    assert.equal(afterRun.result.status, 403);
+    assert.equal(afterRun.result.outcome, controlRun.result.outcome);
+    assert.equal(afterRun.result.status, controlRun.result.status);
+    assert.equal(afterRun.text, controlRun.text, '本文も現行と一致する');
+  });
+
+  it('(c) a 5xx after 102 is forwarded unchanged, exactly like a 5xx without 102', async () => {
+    const afterProcessing = processingBridge({
+      heartbeat: 'periodic', headDelayMs: PROCESSING_HEAD_DELAY_MS, ending: 'error',
+    });
+    const afterRun = await callWith102Bridge({ bridge: afterProcessing });
+    const control = processingBridge({ heartbeat: 'none', headDelayMs: 0, ending: 'error' });
+    const controlRun = await callWith102Bridge({ bridge: control });
+
+    assert.ok(afterRun.processingSent >= 3);
+    assert.equal(afterRun.result.outcome, 'forwarded');
+    assert.equal(afterRun.result.status, 500);
+    assert.equal(afterRun.response.status, 500);
+    assert.equal(afterRun.result.outcome, controlRun.result.outcome);
+    assert.equal(afterRun.result.status, controlRun.result.status);
+    assert.equal(afterRun.text, controlRun.text);
+  });
+
+  it('(d) behaves the same whether degradeMapping is off (default) or on', async () => {
+    // 102 の消費は degradeMapping と無関係な rotator の基本挙動である
+    // （§C4.6 は bridge 側の設定フラグで制御する）。
+    const off = processingBridge({ heartbeat: 'periodic', headDelayMs: PROCESSING_HEAD_DELAY_MS });
+    const offRun = await callWith102Bridge({ bridge: off, degradeMapping: null });
+    const on = processingBridge({ heartbeat: 'periodic', headDelayMs: PROCESSING_HEAD_DELAY_MS });
+    const onRun = await callWith102Bridge({ bridge: on, degradeMapping: { enabled: true } });
+
+    for (const run of [offRun, onRun]) {
+      assert.equal(run.result.outcome, 'forwarded');
+      assert.equal(run.result.status, 200);
+      assert.deepEqual(JSON.parse(run.text), JSON.parse(PROCESSING_OK_BODY));
+      assert.ok(run.processingSent >= 3);
+    }
+    // 契約ヘッダの無い 200 では追記フィールドが1つも出ない（§14.4）。102 でも増えない。
+    assert.match(offRun.bridgeLine, /outcome=forwarded$/);
+    assert.match(onRun.bridgeLine, /outcome=forwarded$/);
+  });
+
+  it('never arms a new idle timer for a 102 that arrives after the request has settled', async () => {
+    // finish() 確定後に届いた 102 で再武装すると、誰も止めないタイマーが残り、
+    // 応答済みの res を後から destroy() で撃つ。settled ガードがそれを止めることを固定する。
+    const manual = createManualUpstream();
+    const req = fakeIncomingRequest();
+    const res = fakeServerResponse();
+    let destroyCalls = 0;
+    const innerDestroy = res.destroy;
+    res.destroy = () => { destroyCalls += 1; innerDestroy(); };
+    const lines = [];
+
+    // forwardToOpenAiBridge が張ったタイマーのうち、まだ生きているものを数える。
+    const live = new Set();
+    const realSetTimeout = globalThis.setTimeout;
+    const realClearTimeout = globalThis.clearTimeout;
+    globalThis.setTimeout = (fn, ms, ...args) => {
+      const handle = realSetTimeout((...fired) => { live.delete(handle); fn(...fired); }, ms, ...args);
+      live.add(handle);
+      return handle;
+    };
+    globalThis.clearTimeout = handle => { live.delete(handle); return realClearTimeout(handle); };
+
+    let result;
+    try {
+      const forwarded = forwardToOpenAiBridge({
+        req,
+        res,
+        body: Buffer.from('{"model":"gpt-6-astra"}'),
+        model: 'gpt-6-astra',
+        settings: bridgeSettings({ idleTimeoutMs: 30 }),
+        logger: line => lines.push(line),
+        httpRequestImpl: manual.requestImpl,
+      });
+      await new Promise(resolve => realSetTimeout(resolve, 10));
+      // 接続前失敗で確定させる（sendSynthetic 済み・res は destroy されていない）。
+      manual.getUpstream().emit('error', Object.assign(new Error('refused'), { code: 'ECONNREFUSED' }));
+      result = await forwarded;
+      // 確定後に遅れて届いた 102。
+      manual.getUpstream().emit('information', { statusCode: 102, statusMessage: 'Processing', headers: {} });
+    } finally {
+      globalThis.setTimeout = realSetTimeout;
+      globalThis.clearTimeout = realClearTimeout;
+    }
+
+    assert.equal(result.outcome, 'bridge-unreachable');
+    assert.equal(live.size, 0, '確定後の 102 でタイマーを張り直さない');
+    await new Promise(resolve => realSetTimeout(resolve, 90)); // idleTimeoutMs の3倍待つ
+    assert.equal(destroyCalls, 0, '応答済みの res を後から destroy() しない');
+    assert.equal(lines.filter(line => / openai-bridge /.test(line)).length, 1, 'ログ行も増えない');
   });
 });
