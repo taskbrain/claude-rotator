@@ -150,7 +150,7 @@ describe('parseBridgeContract', () => {
   });
 
   it('normalises an unknown reason to "unknown" and never invents a scope for it', () => {
-    // 指摘4: 原文を持ち回るとログへ識別子が混入しうるため、列挙値以外は保持しない。
+    // 原文を持ち回るとログへ識別子が混入しうるため、列挙値以外は保持しない。
     const parsed = parseBridgeContract({ 'x-ombr-degrade-reason': 'codex_brand_new_reason' });
     assert.equal(parsed.reason, 'unknown');
     assert.equal(parsed.effectiveScope, 'model', '挙動は変えない＝(pool) を汚さない側へ倒す');
@@ -751,7 +751,7 @@ describe('buildBridgeLogMeta', () => {
     const meta = buildBridgeLogMeta(parseBridgeContract({ 'x-ombr-degrade-reason': 'weird reason\nwith breaks' }), {
       mapReason: 'both pools\nunusable',
     });
-    assert.equal(meta.degradeReason, 'unknown', '列挙値以外の reason は原文を残さない（指摘4）');
+    assert.equal(meta.degradeReason, 'unknown', '列挙値以外の reason は原文を残さない');
     assert.equal(formatLogMeta(meta), ' degradeReason=unknown mapReason=both_pools_unusable');
   });
 
@@ -772,7 +772,7 @@ function withoutContract(source) {
   return next;
 }
 
-describe('指摘1: x-ombr-contract の無い応答からは学習しない（契約 §C3.7-1）', () => {
+describe('x-ombr-contract の無い応答からは学習しない（契約 §C3.7-1）', () => {
   it('契約前 bridge の 429/529/403 を何度観測しても両鍵とも unknown のまま', () => {
     const state = createGptPoolState({ now: () => 1000 });
     const parsed = parseBridgeContract(withoutContract(headers()));
@@ -827,7 +827,7 @@ describe('指摘1: x-ombr-contract の無い応答からは学習しない（契
   });
 });
 
-describe('指摘2: 学習対象は 4xx/5xx と HTTP 200 だけ（契約 §C10.3 T2・T8・T9）', () => {
+describe('学習対象は 4xx/5xx と HTTP 200 だけ（契約 §C10.3 T2・T8・T9）', () => {
   it('201・302・null・非整数のステータスからは枯渇を学習しない', () => {
     for (const status of [201, 204, 302, 304, null, undefined, '429', 429.5, NaN]) {
       const state = createGptPoolState({ now: () => 1000 });
@@ -864,7 +864,7 @@ describe('指摘2: 学習対象は 4xx/5xx と HTTP 200 だけ（契約 §C10.3 
   });
 });
 
-describe('指摘3: 値域検証（契約 §C3.2）', () => {
+describe('値域検証（契約 §C3.2）', () => {
   it('実在しない日付の reset-at を受理しない（Date.parse の繰り上げに頼らない）', () => {
     const invalid = [
       '2028-02-30T00:00:00Z', // 繰り上げで 3/1 になる
@@ -892,7 +892,7 @@ describe('指摘3: 値域検証（契約 §C3.2）', () => {
   });
 
   it('不正な reset-at を持つ枯渇は resetAt=null として TTL(60秒) で解除される', () => {
-    // 指摘3 の実害: 2028-02-30 を受理すると 60 秒後も枯渇が残り、GPT への退避を塞ぎ続ける。
+    // 実在しない日付を受理した場合の実害: 2028-02-30 を受理すると 60 秒後も枯渇が残り、GPT への退避を塞ぎ続ける。
     const { clock, now } = clockAt(1000);
     const state = createGptPoolState({ now, unusableTtlMs: 60000 });
     state.observe(parseBridgeContract(headers({ 'x-ombr-reset-at': '2028-02-30T00:00:00Z' })), 529, 'gpt-6-astra');
@@ -931,7 +931,7 @@ describe('指摘3: 値域検証（契約 §C3.2）', () => {
   });
 });
 
-describe('指摘4: degrade-reason は列挙値だけを受理する（識別子の混入を遮断）', () => {
+describe('degrade-reason は列挙値だけを受理する（識別子の混入を遮断）', () => {
   const DOCUMENTED_REASONS = [
     'codex_pool_exhausted', 'codex_account_exhausted', 'codex_attempt_limit',
     'codex_needs_login', 'codex_pool_mixed', 'codex_no_account_for_model',
