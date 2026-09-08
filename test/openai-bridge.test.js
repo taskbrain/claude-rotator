@@ -1827,3 +1827,362 @@ describe('OSS 独立性 > degradeMapping 無効時に openai-bridge のログ行
     assert.equal(metaTail(lines.find(l => /outcome=forwarded/.test(l)), 'forwarded'), ' bridgeContract=1 poolState=ok');
   });
 });
+
+// ---------------------------------------------------------------------------
+// R3-4: GPT プール状態の学習を配線する（設計書 §11.1 R3-4・§8.6、契約 v1.4 §C10.3）
+//
+// 学習は応答ヘッダの受領点で完結し、**応答は1バイトも変えない**（403 書換は R4-1）。
+// 既存ケースは1件も削除・書換しない（§14.4）。以下はすべて新規追加である。
+// 既存の import 文は書き換えず、追加分は別の import 文にする（ESM は巻き上げられる）。
+// ---------------------------------------------------------------------------
+
+import { createGptPoolState } from '../src/degrade-state.js';
+
+// 既存の callThroughRotator（:143）は1行も変えずに残し、gptPoolState を渡す経路だけを
+// 別のヘルパとして足す。偽 bridge は実 TCP で立てる（既存ヘルパと同じ流儀）。
+async function callWithPoolState({ bridgeHandler, requestBody, settingsOverride = {}, gptPoolState = null }) {
+  const { server: bridge, port } = await startFakeBridge(bridgeHandler);
+  const settings = resolveOpenAiBridgeSettings({
+    openaiBridge: {
+      enabled: true,
+      url: `http://127.0.0.1:${port}`,
+      modelPattern: '^gpt-',
+      connectTimeoutMs: 2000,
+      idleTimeoutMs: 2000,
+      connectRetries: 0,
+      ...settingsOverride,
+    },
+  });
+  const lines = [];
+  const front = http.createServer(async (req, res) => {
+    const chunks = [];
+    for await (const chunk of req) chunks.push(chunk);
+    const body = Buffer.concat(chunks);
+    await forwardToOpenAiBridge({
+      req,
+      res,
+      body,
+      model: safeParseModel(body),
+      settings,
+      logger: line => lines.push(line),
+      // 未指定＝現行と同一の経路であることを保つため、渡すときだけキーを足す。
+      ...(gptPoolState ? { gptPoolState } : {}),
+    });
+  });
+  await new Promise(resolve => front.listen(0, '127.0.0.1', resolve));
+  const response = await fetch(`http://127.0.0.1:${front.address().port}/v1/messages?beta=true`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', 'x-api-key': 'claude-rotator-local-gateway', 'anthropic-version': '2023-06-01' },
+    body: requestBody,
+  });
+  const text = await response.text();
+  front.close();
+  bridge.close();
+  return { response, text, lines };
+}
+
+// bridge が「契約ヘッダを1つも付けない」応答を返すハンドラ。契約 §C10.3 T9 により
+// 学習は起きないので、この応答を挟むと「そのとき保持している状態」をログで観測できる。
+function respondWithoutContract(req, res) {
+  req.resume();
+  res.writeHead(200, { 'Content-Type': 'application/json' }).end('{}');
+}
+
+function contractHandler(status, headers, body = '{"type":"error"}') {
+  return (req, res) => {
+    req.resume();
+    res.writeHead(status, { 'Content-Type': 'application/json', 'x-ombr-contract': '1', ...headers }).end(body);
+  };
+}
+
+describe('forwardToOpenAiBridge > GPT プール状態の学習 (R3-4 / 契約 §C10.3)', () => {
+  it('T2: learns available for both keys from a 200 with pool-state ok', async () => {
+    const gptPoolState = createGptPoolState({ now: () => 1000 });
+    const { response, text, lines } = await callWithPoolState({
+      gptPoolState,
+      requestBody: '{"model":"gpt-6-astra"}',
+      settingsOverride: { degradeMapping: { enabled: true } },
+      bridgeHandler: contractHandler(200, { 'x-ombr-pool-state': 'ok', 'x-ombr-account': 'pro-b' }, '{"ok":true}'),
+    });
+
+    assert.equal(response.status, 200, '応答は1バイトも変えない');
+    assert.equal(text, '{"ok":true}');
+    const view = gptPoolState.read('gpt-6-astra');
+    assert.equal(view.pool.state, 'available');
+    assert.equal(view.model.state, 'available');
+    assert.match(lines.find(l => /outcome=forwarded/.test(l)), /gptPoolState=available gptModelState=available/);
+  });
+
+  it('T3: learns (pool)=unusable with reason and resetAt from a 529 scope=pool exhausted', async () => {
+    const gptPoolState = createGptPoolState({ now: () => Date.parse('2026-09-08T12:00:00Z') });
+    const { response, text, lines } = await callWithPoolState({
+      gptPoolState,
+      requestBody: '{"model":"gpt-6-astra"}',
+      settingsOverride: { degradeMapping: { enabled: true } },
+      bridgeHandler: contractHandler(529, {
+        'x-ombr-degrade-reason': 'codex_pool_exhausted',
+        'x-ombr-degrade-scope': 'pool',
+        'x-ombr-pool-state': 'exhausted',
+        'x-ombr-upstream-status': '429',
+        'x-ombr-reset-at': '2026-09-08T13:00:00Z',
+      }),
+    });
+
+    assert.equal(response.status, 529, 'この段階では書き換えない（403 書換は R4-1）');
+    assert.equal(text, '{"type":"error"}', '本文もそのまま素通しする');
+    const view = gptPoolState.read('gpt-6-astra');
+    assert.deepEqual(
+      { state: view.pool.state, reason: view.pool.reason, resetAt: view.pool.resetAt },
+      { state: 'unusable', reason: 'codex_pool_exhausted', resetAt: '2026-09-08T13:00:00Z' },
+    );
+    assert.equal(view.model.state, 'unknown', '(pool, model) は変えない');
+    assert.match(lines.find(l => /outcome=forwarded/.test(l)), /gptPoolState=unusable gptModelState=unknown/);
+  });
+
+  it('T4: a 403 scope=model no-account-for-model marks only (pool, model) unusable', async () => {
+    const gptPoolState = createGptPoolState({ now: () => 1000 });
+    // 先に 200 を1回通して (pool)=available を学習させ、「不変」を意味のある形で検査する。
+    await callWithPoolState({
+      gptPoolState,
+      requestBody: '{"model":"gpt-6-astra"}',
+      settingsOverride: { degradeMapping: { enabled: true } },
+      bridgeHandler: contractHandler(200, { 'x-ombr-pool-state': 'ok' }, '{}'),
+    });
+    assert.equal(gptPoolState.read('gpt-6-astra').pool.state, 'available');
+
+    const { response } = await callWithPoolState({
+      gptPoolState,
+      requestBody: '{"model":"gpt-6-astra"}',
+      settingsOverride: { degradeMapping: { enabled: true } },
+      bridgeHandler: contractHandler(403, {
+        'x-ombr-degrade-reason': 'codex_no_account_for_model',
+        'x-ombr-degrade-scope': 'model',
+        'x-ombr-pool-state': 'no-account-for-model',
+      }),
+    });
+
+    assert.equal(response.status, 403, '応答は素通し');
+    const view = gptPoolState.read('gpt-6-astra');
+    assert.equal(view.model.state, 'unusable');
+    assert.equal(view.model.reason, 'codex_no_account_for_model');
+    assert.equal(view.pool.state, 'available', '(pool) は 403 書換の根拠にならないので変えない');
+    assert.equal(gptPoolState.read('gpt-5.6-sol').model.state, 'unknown', '他モデルへは波及しない');
+  });
+
+  it('T5: pool-state degraded (codex_attempt_limit) changes nothing and does not extend an existing unusable', async () => {
+    const gptPoolState = createGptPoolState({ now: () => Date.parse('2026-09-08T12:00:00Z') });
+    await callWithPoolState({
+      gptPoolState,
+      requestBody: '{"model":"gpt-6-astra"}',
+      settingsOverride: { degradeMapping: { enabled: true } },
+      bridgeHandler: contractHandler(529, {
+        'x-ombr-degrade-reason': 'codex_pool_exhausted',
+        'x-ombr-degrade-scope': 'pool',
+        'x-ombr-pool-state': 'exhausted',
+        'x-ombr-reset-at': '2026-09-08T13:00:00Z',
+      }),
+    });
+
+    await callWithPoolState({
+      gptPoolState,
+      requestBody: '{"model":"gpt-6-astra"}',
+      settingsOverride: { degradeMapping: { enabled: true } },
+      bridgeHandler: contractHandler(529, {
+        'x-ombr-degrade-reason': 'codex_attempt_limit',
+        'x-ombr-degrade-scope': 'pool',
+        'x-ombr-pool-state': 'degraded',
+        'x-ombr-reset-at': '2026-09-08T23:00:00Z',
+      }),
+    });
+
+    const view = gptPoolState.read('gpt-6-astra');
+    assert.equal(view.pool.state, 'unusable', '試行上限では unusable を解除しない');
+    assert.equal(view.pool.reason, 'codex_pool_exhausted', '理由を上書きしない');
+    assert.equal(view.pool.resetAt, '2026-09-08T13:00:00Z', 'resetAt を延命しない');
+  });
+
+  it('T9: learns nothing from a response without x-ombr-* headers (契約ヘッダなし → unknown のまま)', async () => {
+    const gptPoolState = createGptPoolState({ now: () => 1000 });
+    const { response, lines } = await callWithPoolState({
+      gptPoolState,
+      requestBody: '{"model":"gpt-6-astra"}',
+      settingsOverride: { degradeMapping: { enabled: true } },
+      bridgeHandler: respondWithoutContract,
+    });
+
+    assert.equal(response.status, 200);
+    assert.deepEqual(gptPoolState.snapshot().pool, { state: 'unknown', reason: null, resetAt: null, learnedAt: null });
+    assert.equal(gptPoolState.read('gpt-6-astra').model.state, 'unknown');
+    assert.equal(
+      metaTail(lines.find(l => /outcome=forwarded/.test(l)), 'forwarded'),
+      ' gptPoolState=unknown gptModelState=unknown',
+      '契約由来のフィールドは1つも出ず、保持している状態だけが載る',
+    );
+  });
+
+  it('T10: scope=account touches neither key (契約違反の応答でも安全側へ倒す)', async () => {
+    const gptPoolState = createGptPoolState({ now: () => 1000 });
+    const { response } = await callWithPoolState({
+      gptPoolState,
+      requestBody: '{"model":"gpt-6-astra"}',
+      settingsOverride: { degradeMapping: { enabled: true } },
+      bridgeHandler: contractHandler(529, {
+        'x-ombr-degrade-reason': 'codex_account_exhausted',
+        'x-ombr-degrade-scope': 'account',
+        'x-ombr-pool-state': 'exhausted',
+      }),
+    });
+
+    assert.equal(response.status, 529, '529 のまま素通しする');
+    const view = gptPoolState.read('gpt-6-astra');
+    assert.equal(view.pool.state, 'unknown');
+    assert.equal(view.model.state, 'unknown');
+  });
+
+  it('T8: an unreachable bridge changes nothing that was already learned', async () => {
+    const gptPoolState = createGptPoolState({ now: () => Date.parse('2026-09-08T12:00:00Z') });
+    await callWithPoolState({
+      gptPoolState,
+      requestBody: '{"model":"gpt-6-astra"}',
+      settingsOverride: { degradeMapping: { enabled: true } },
+      bridgeHandler: contractHandler(529, {
+        'x-ombr-degrade-reason': 'codex_needs_login',
+        'x-ombr-degrade-scope': 'pool',
+        'x-ombr-pool-state': 'needs-login',
+      }),
+    });
+    assert.equal(gptPoolState.read('gpt-6-astra').pool.state, 'unusable');
+
+    // 不達（S1・S2a・S2b）は状態を変えない。ログには保持中の値が載る（§9.5(d)）。
+    const manual = createManualUpstream();
+    const req = fakeIncomingRequest();
+    const res = fakeServerResponse();
+    const lines = [];
+    const done = forwardToOpenAiBridge({
+      req,
+      res,
+      body: Buffer.from('{"model":"gpt-6-astra"}'),
+      model: 'gpt-6-astra',
+      settings: bridgeSettings(),
+      logger: line => lines.push(line),
+      httpRequestImpl: manual.requestImpl,
+      gptPoolState,
+    });
+    await new Promise(resolve => setImmediate(resolve));
+    manual.getUpstream().emit('error', Object.assign(new Error('connect ECONNREFUSED'), { code: 'ECONNREFUSED' }));
+    const result = await done;
+
+    assert.equal(result.outcome, 'bridge-unreachable');
+    assert.equal(gptPoolState.read('gpt-6-astra').pool.state, 'unusable', '不達では学習も解除もしない');
+    assert.match(lines.find(l => /outcome=bridge-unreachable/.test(l)), /gptPoolState=unusable gptModelState=unknown/);
+  });
+
+  it('T6: releases the unusable state once resetAt has passed (時刻注入)', async () => {
+    let clock = Date.parse('2026-09-08T12:00:00Z');
+    const gptPoolState = createGptPoolState({ now: () => clock });
+    await callWithPoolState({
+      gptPoolState,
+      requestBody: '{"model":"gpt-6-astra"}',
+      settingsOverride: { degradeMapping: { enabled: true } },
+      bridgeHandler: contractHandler(529, {
+        'x-ombr-degrade-reason': 'codex_pool_exhausted',
+        'x-ombr-degrade-scope': 'pool',
+        'x-ombr-pool-state': 'exhausted',
+        'x-ombr-reset-at': '2026-09-08T13:00:00Z',
+      }),
+    });
+    assert.equal(gptPoolState.read('gpt-6-astra').pool.state, 'unusable');
+
+    clock = Date.parse('2026-09-08T13:00:01Z');
+    const { lines } = await callWithPoolState({
+      gptPoolState,
+      requestBody: '{"model":"gpt-6-astra"}',
+      settingsOverride: { degradeMapping: { enabled: true } },
+      bridgeHandler: respondWithoutContract,
+    });
+
+    assert.equal(gptPoolState.read('gpt-6-astra').pool.state, 'unknown', 'resetAt 到来で unknown へ戻る');
+    assert.match(lines.find(l => /outcome=forwarded/.test(l)), /gptPoolState=unknown/);
+  });
+
+  it('T7: releases an unusable without resetAt after gptPoolUnusableTtlMs (時刻注入)', async () => {
+    let clock = 1_000_000;
+    const gptPoolState = createGptPoolState({ now: () => clock, unusableTtlMs: 60000 });
+    const exhausted = contractHandler(529, {
+      'x-ombr-degrade-reason': 'codex_pool_exhausted',
+      'x-ombr-degrade-scope': 'pool',
+      'x-ombr-pool-state': 'exhausted',
+    });
+    const first = await callWithPoolState({
+      gptPoolState,
+      requestBody: '{"model":"gpt-6-astra"}',
+      settingsOverride: { degradeMapping: { enabled: true } },
+      bridgeHandler: exhausted,
+    });
+    assert.match(first.lines.find(l => /outcome=forwarded/.test(l)), /gptPoolState=unusable/);
+
+    clock += 59_999;
+    assert.equal(gptPoolState.read('gpt-6-astra').pool.state, 'unusable', 'TTL 到来前は保持する');
+
+    clock += 1;
+    const { lines } = await callWithPoolState({
+      gptPoolState,
+      requestBody: '{"model":"gpt-6-astra"}',
+      settingsOverride: { degradeMapping: { enabled: true } },
+      bridgeHandler: respondWithoutContract,
+    });
+    assert.equal(gptPoolState.read('gpt-6-astra').pool.state, 'unknown', 'TTL 到来で unknown へ戻る');
+    assert.match(lines.find(l => /outcome=forwarded/.test(l)), /gptPoolState=unknown gptModelState=unknown/);
+  });
+
+  it('learns nothing while degradeMapping is disabled, even when a pool state instance is passed', async () => {
+    // 設計書 §14.4: 未指定なら現行と完全に同一。生成も観測も行わないのが既定である。
+    const gptPoolState = createGptPoolState({ now: () => 1000 });
+    const { response, lines } = await callWithPoolState({
+      gptPoolState,
+      requestBody: '{"model":"gpt-6-astra"}',
+      // settingsOverride を渡さない＝degradeMapping 無効（OSS 利用者の構成）。
+      bridgeHandler: contractHandler(529, {
+        'x-ombr-degrade-reason': 'codex_pool_exhausted',
+        'x-ombr-degrade-scope': 'pool',
+        'x-ombr-pool-state': 'exhausted',
+      }),
+    });
+
+    assert.equal(response.status, 529);
+    assert.equal(gptPoolState.read('gpt-6-astra').pool.state, 'unknown', '無効時は観測しない');
+    assert.match(
+      lines.find(l => /openai-bridge/.test(l)),
+      /^\d{4}-\d{2}-\d{2}T[\d:.]+Z openai-bridge model=gpt-6-astra method=POST path=\/v1\/messages status=529 durationMs=\d+ outcome=forwarded$/,
+      '無効時のログ行は現行と文字列一致する',
+    );
+  });
+});
+
+describe('OSS 独立性 > gptPoolState を渡さない forwardToOpenAiBridge が現行と同一に振る舞う (§14.4)', () => {
+  it('appends no gptPoolState/gptModelState field when no instance is passed', async () => {
+    // degradeMapping を有効にし、bridge が契約ヘッダを full で返しても、状態を保持して
+    // いない呼び出しでは追記は R3-3 時点のフィールドだけになる（1フィールドも増えない）。
+    const { response, lines } = await callThroughRotator({
+      requestBody: '{"model":"gpt-6-astra"}',
+      settingsOverride: { degradeMapping: { enabled: true } },
+      bridgeHandler: (req, res) => {
+        res.writeHead(529, {
+          'Content-Type': 'application/json',
+          'x-ombr-contract': '1',
+          'x-ombr-degrade-reason': 'codex_pool_exhausted',
+          'x-ombr-pool-state': 'exhausted',
+          'x-ombr-degrade-scope': 'pool',
+          'x-ombr-upstream-status': '429',
+        }).end('{"type":"error"}');
+      },
+    });
+
+    assert.equal(response.status, 529);
+    assert.equal(
+      metaTail(lines.find(l => /outcome=forwarded/.test(l)), 'forwarded'),
+      ' bridgeContract=1 degradeReason=codex_pool_exhausted poolState=exhausted degradeScope=pool upstreamStatus=429',
+      'gptPoolState / gptModelState は保持しているときだけ載る（§9.3）',
+    );
+  });
+});

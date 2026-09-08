@@ -8956,3 +8956,161 @@ async function requestJson(url, options = {}) {
     body: response.bodyText ? JSON.parse(response.bodyText) : null,
   };
 }
+
+// ---------------------------------------------------------------------------
+// R3-4 の配線: GPT プール状態の生成・受け渡しと、/internal/reload での破棄
+// （設計書 §11.1 R3-4、指揮官判断 D-13）。
+//
+// 状態機械そのものの検査は test/degrade-state.test.js と test/openai-bridge.test.js に
+// あり、ここでは「本番の生成元・受け渡し・reload での破棄が実在すること」だけを固定する。
+// 既存ケースは1件も削除・書換しない（§14.4）。以下はすべて新規追加である。
+// ---------------------------------------------------------------------------
+describe('openai-bridge の GPT プール状態の配線 (R3-4 / 指揮官判断 D-13)', () => {
+  // 契約ヘッダ付きの 529（＝(pool) を unusable にする）と、契約ヘッダ無しの 200
+  // （＝学習しないので、そのとき保持している状態がログにそのまま出る）を切り替える偽 bridge。
+  async function startContractBridge() {
+    let withContract = true;
+    const bridge = await listen(http.createServer((req, res) => {
+      req.resume();
+      if (withContract) {
+        res.writeHead(529, {
+          'Content-Type': 'application/json',
+          'x-ombr-contract': '1',
+          'x-ombr-degrade-reason': 'codex_pool_exhausted',
+          'x-ombr-degrade-scope': 'pool',
+          'x-ombr-pool-state': 'exhausted',
+        });
+        res.end('{"type":"error"}');
+        return;
+      }
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end('{}');
+    }));
+    return { ...bridge, stopSendingContract: () => { withContract = false; } };
+  }
+
+  function startBridgeProxy({ openaiBridge, logLines, reloadOpenAiBridge = null }) {
+    return listen(createProxyServer({
+      accountManager: new AccountManager({
+        accounts: [{ id: 'acct_1', name: 'a@example.com', type: 'oauth' }],
+        now: () => 1000,
+      }),
+      secretStore: new MemorySecretStore(),
+      config: { upstream: 'http://127.0.0.1:1', usagePolling: { enabled: false }, openaiBridge },
+      reloadOpenAiBridge,
+      logger: line => logLines.push(line),
+    }));
+  }
+
+  async function askAstra(proxy) {
+    return requestJson(`${proxy.url}/v1/messages`, {
+      method: 'POST',
+      body: JSON.stringify({ model: 'gpt-6-astra' }),
+      headers: { authorization: `Bearer ${LOCAL_GATEWAY_AUTH_TOKEN}`, 'content-type': 'application/json' },
+    });
+  }
+
+  function lastBridgeLine(logLines) {
+    return logLines.filter(line => / openai-bridge model=/.test(line)).at(-1);
+  }
+
+  it('discards the learned pool state on POST /internal/reload so it returns to unknown', async () => {
+    const bridge = await startContractBridge();
+    cleanupAfterTest(async () => close(bridge.server));
+    const logLines = [];
+    const openaiBridge = {
+      enabled: true,
+      url: bridge.url,
+      modelPattern: '^gpt-',
+      connectTimeoutMs: 1000,
+      idleTimeoutMs: 1000,
+      connectRetries: 0,
+      degradeMapping: { enabled: true },
+    };
+    const proxy = await startBridgeProxy({ openaiBridge, logLines, reloadOpenAiBridge: async () => openaiBridge });
+    cleanupAfterTest(async () => close(proxy.server));
+
+    const learned = await askAstra(proxy);
+    assert.equal(learned.status, 529, '応答は素通し（書換は R4-1 の範囲）');
+    assert.match(lastBridgeLine(logLines), /gptPoolState=unusable/, '契約ヘッダから (pool)=unusable を学習する');
+
+    // 以後の応答は契約ヘッダを持たない＝学習しないので、ログの値は保持状態を映す。
+    bridge.stopSendingContract();
+    assert.equal((await askAstra(proxy)).status, 200);
+    assert.match(lastBridgeLine(logLines), /gptPoolState=unusable/, 'reload するまでは保持される');
+
+    assert.equal((await requestJson(`${proxy.url}/internal/reload`, { method: 'POST' })).status, 200);
+    assert.equal((await askAstra(proxy)).status, 200);
+    assert.match(
+      lastBridgeLine(logLines),
+      /gptPoolState=unknown gptModelState=unknown/,
+      'reload で学習前（unknown＝利用可能扱い）へ戻る',
+    );
+  });
+
+  it('creates no pool state at all while degradeMapping is disabled (§14.4)', async () => {
+    const bridge = await startContractBridge();
+    cleanupAfterTest(async () => close(bridge.server));
+    const logLines = [];
+    const openaiBridge = {
+      enabled: true,
+      url: bridge.url,
+      modelPattern: '^gpt-',
+      connectTimeoutMs: 1000,
+      idleTimeoutMs: 1000,
+      connectRetries: 0,
+    };
+    const proxy = await startBridgeProxy({ openaiBridge, logLines, reloadOpenAiBridge: async () => openaiBridge });
+    cleanupAfterTest(async () => close(proxy.server));
+
+    assert.equal((await askAstra(proxy)).status, 529);
+    assert.match(
+      lastBridgeLine(logLines),
+      /^\d{4}-\d{2}-\d{2}T[\d:.]+Z openai-bridge model=gpt-6-astra method=POST path=\/v1\/messages status=529 durationMs=\d+ outcome=forwarded$/,
+      '既定構成のログ行は現行と文字列一致する（gptPoolState も出ない）',
+    );
+
+    assert.equal((await requestJson(`${proxy.url}/internal/reload`, { method: 'POST' })).status, 200);
+    assert.equal((await askAstra(proxy)).status, 529);
+    assert.equal(
+      logLines.filter(line => line.includes('gptPoolState=')).length,
+      0,
+      'reload を挟んでも生成されない',
+    );
+  });
+
+  it('keeps the pool state per process while degradeMapping stays enabled across a reload that turns it off', async () => {
+    // 有効→無効の reload では破棄だけを行う（以後は観測もログ追記もしない）。
+    const bridge = await startContractBridge();
+    cleanupAfterTest(async () => close(bridge.server));
+    const logLines = [];
+    let nextOpenaiBridge = {
+      enabled: true,
+      url: bridge.url,
+      modelPattern: '^gpt-',
+      connectTimeoutMs: 1000,
+      idleTimeoutMs: 1000,
+      connectRetries: 0,
+      degradeMapping: { enabled: true },
+    };
+    const proxy = await startBridgeProxy({
+      openaiBridge: nextOpenaiBridge,
+      logLines,
+      reloadOpenAiBridge: async () => nextOpenaiBridge,
+    });
+    cleanupAfterTest(async () => close(proxy.server));
+
+    assert.equal((await askAstra(proxy)).status, 529);
+    assert.match(lastBridgeLine(logLines), /gptPoolState=unusable/);
+
+    nextOpenaiBridge = { ...nextOpenaiBridge, degradeMapping: { enabled: false } };
+    assert.equal((await requestJson(`${proxy.url}/internal/reload`, { method: 'POST' })).status, 200);
+    bridge.stopSendingContract();
+    assert.equal((await askAstra(proxy)).status, 200);
+    assert.match(
+      lastBridgeLine(logLines),
+      /^\d{4}-\d{2}-\d{2}T[\d:.]+Z openai-bridge model=gpt-6-astra method=POST path=\/v1\/messages status=200 durationMs=\d+ outcome=forwarded$/,
+      '無効化後は追記フィールドが1つも出ない',
+    );
+  });
+});

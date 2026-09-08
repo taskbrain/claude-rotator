@@ -288,7 +288,10 @@ function errorLogFields(error) {
 // 応答を受け取った後（res.headersSent === true）に再試行すると、二重処理のリスクが生まれる。
 const RETRYABLE_CONNECT_ERROR_CODES = new Set(['ECONNREFUSED', 'ECONNRESET', 'ENOTFOUND']);
 
-export function forwardToOpenAiBridge({ req, res, body, model, settings, logger, httpRequestImpl = http.request }) {
+// gptPoolState は任意引数である（設計書 §11.1 R3-4）。渡さない呼び出しは現行と完全に
+// 同一に振る舞い、ログへ1フィールドも足さない（§14.4）。渡すのは src/proxy-server.js が
+// degradeMapping.enabled を真と解決したときだけで、生成・破棄もそちらが受け持つ（D-13）。
+export function forwardToOpenAiBridge({ req, res, body, model, settings, logger, httpRequestImpl = http.request, gptPoolState = null }) {
   const startedAt = Date.now();
   const target = pinnedUpstreamTarget(req.url, settings.url);
   const headers = {};
@@ -329,6 +332,15 @@ export function forwardToOpenAiBridge({ req, res, body, model, settings, logger,
     // 既定（無効）の利用者のログは outcome 名の改名以外は1文字も変わらない。
     const metaEnabled = settings?.degradeMapping?.enabled === true;
 
+    // 設計書 §9.3 / §9.5(a): 学習した (pool) / (pool, model) の状態は、状態そのものを
+    // 保持しているときだけ載せる。gptPoolState を渡さない呼び出し（＝既定の経路）では
+    // 1フィールドも増えない。read() は期限切れ（T6・T7）を反映した現在値を返す。
+    const poolStateFields = () => {
+      if (!gptPoolState) return {};
+      const view = gptPoolState.read(model);
+      return { gptPoolState: view.pool.state, gptModelState: view.model.state };
+    };
+
     // 設計書 §9.3 のフィールドを「値があるときだけ」末尾へ足す形に組み立てる。
     const logMeta = (outcome, extra = {}) => {
       if (!metaEnabled) return null;
@@ -342,7 +354,7 @@ export function forwardToOpenAiBridge({ req, res, body, model, settings, logger,
           // bridge 自身が理由を名乗っていればそれを優先する（実データ）。名乗っていない
           // 障害（不達・タイムアウト・ストリーム障害）だけ rotator 側の値を入れる。
           reason: parsed?.reason ?? ROTATOR_DEGRADE_REASONS[outcome] ?? null,
-        }),
+        }, poolStateFields()),
         ...extra,
       };
     };
@@ -409,6 +421,15 @@ export function forwardToOpenAiBridge({ req, res, body, model, settings, logger,
           // 値域外・未知の値はすべて null へ倒れるので、ここから先のログは
           // 「bridge が名乗った正しい値」だけを載せる。
           contract = parseBridgeContract(upstreamRes.headers);
+          // 設計書 §11.1 R3-4・契約 §C10.3: 応答ヘッダの受領点で GPT プール状態を学習する。
+          // 学習はメモリ上の状態を更新するだけであり、**応答は1バイトも変えない**
+          // （529→403 の書換は R4-1 の範囲）。observe() 側で「契約ヘッダの無い応答は
+          // 学習しない（T9）」「200 と 4xx/5xx だけが入力になる」を判定する。
+          // res.destroyed のガードより前に置くのは、クライアントが切断していても
+          // 「bridge がこう答えた」という事実は変わらないためである（学習を捨てると
+          // 次の要求で同じ枯渇へもう1回投げることになる）。
+          // degradeMapping が無効な構成では metaEnabled が偽になり、生成も観測も行わない。
+          if (metaEnabled) gptPoolState?.observe(contract, upstreamRes.statusCode, model);
           if (res.destroyed) {
             upstream.destroy();
             return;

@@ -21,6 +21,7 @@ import {
 import { createNativeClaudeRefresher } from './native-claude-refresher.js';
 import { isFableScopeIdentity, parseRateLimitHeaders } from './quota.js';
 import { duplicateRefreshTokenAccountIds } from './secret-store.js';
+import { createGptPoolState } from './degrade-state.js';
 import {
   DEFAULT_OPENAI_BRIDGE,
   forwardToOpenAiBridge,
@@ -244,6 +245,18 @@ export function createProxyServer({
   // degradeMapping を書いていない構成では1行も出ない。
   logDegradeMappingConfigNotice(openaiBridgeSettings, logger);
 
+  // GPT プール状態（設計書 §11.1 R3-4・契約 §C10.2）。プロセス内メモリだけで持ち、
+  // degradeMapping が無効な構成では生成しない（null＝forwardToOpenAiBridge へも渡らず、
+  // 応答もログも現行と完全に同一になる＝§14.4）。
+  // 指揮官判断 D-13: POST /internal/reload では設定を読み直すだけでなく、学習済みの
+  // 状態も破棄して作り直す。ロールバック（無効化→reload→再有効化）で古い unusable が
+  // 残ると、実際には回復しているのに最大 gptPoolUnusableTtlMs の間 403 で止めてしまう。
+  // 未知（unknown）は「利用可能扱い」なので、破棄は常に安全側へ倒れる。
+  const createGptPoolStateFor = settings => (settings.degradeMapping?.enabled === true
+    ? createGptPoolState({ unusableTtlMs: settings.degradeMapping.gptPoolUnusableTtlMs })
+    : null);
+  let gptPoolState = createGptPoolStateFor(openaiBridgeSettings);
+
   const server = http.createServer(async (req, res) => {
     try {
       if (!isTrustedLocalHttpRequest(req)) {
@@ -338,6 +351,9 @@ export function createProxyServer({
             ? nextOpenaiBridge
             : { ...DEFAULT_OPENAI_BRIDGE };
           openaiBridgeSettings = resolveOpenAiBridgeSettings(config);
+          // D-13: 学習済みの GPT プール状態を破棄して作り直す（無効化されたときは
+          // 破棄だけを行う）。reload 後は必ず学習前＝unknown から始まる。
+          gptPoolState = createGptPoolStateFor(openaiBridgeSettings);
           logger?.(
             `${new Date().toISOString()} openai-bridge reload enabled=${openaiBridgeSettings.enabled} `
             + `url=${openaiBridgeSettings.url}${openaiBridgeSettings.warning ? ` warning="${openaiBridgeSettings.warning}"` : ''}`,
@@ -413,6 +429,8 @@ export function createProxyServer({
           model: openaiBridgeRouting.model,
           settings: openaiBridgeSettings,
           logger,
+          // degradeMapping.enabled が真のときだけ渡す（未指定＝現行と同一の経路）。
+          ...(gptPoolState ? { gptPoolState } : {}),
         });
         return;
       }
