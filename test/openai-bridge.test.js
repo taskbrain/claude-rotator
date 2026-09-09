@@ -2800,12 +2800,28 @@ function maskDateHeader(raw) {
   return raw.replace(/\r\nDate: [^\r\n]+\r\n/, '\r\nDate: <masked>\r\n');
 }
 
+/** 立てたサーバの接続を握っておく（close() は接続が残っている間は完了しないため）。 */
+function trackSockets(server, sockets) {
+  server.on('connection', socket => {
+    sockets.add(socket);
+    // 後始末で自分から destroy() するので、その後の ECONNRESET/EPIPE は想定内として捨てる。
+    socket.on('error', () => {});
+    socket.on('close', () => sockets.delete(socket));
+  });
+}
+
+function closeServer(server) {
+  return new Promise(resolve => server.close(() => resolve()));
+}
+
 /**
  * 偽 bridge を立て、forwardToOpenAiBridge を1回だけ通す（既存の callThroughRotator と
  * 同型だが、outcome と生バイト列を返す点だけが違う）。
  */
 async function callWith102Bridge({ bridge: bridgeSpec, idleTimeoutMs = PROCESSING_IDLE_MS, degradeMapping = null, raw = false }) {
   const { server: bridgeServer, port } = await startFakeBridge(bridgeSpec.handler);
+  const openSockets = new Set();
+  trackSockets(bridgeServer, openSockets);
   const settings = resolveOpenAiBridgeSettings({
     openaiBridge: {
       enabled: true,
@@ -2829,6 +2845,7 @@ async function callWith102Bridge({ bridge: bridgeSpec, idleTimeoutMs = PROCESSIN
       req, res, body, model: safeParseModel(body), settings, logger: line => lines.push(line),
     }));
   });
+  trackSockets(front, openSockets);
   await new Promise(resolve => front.listen(0, '127.0.0.1', resolve));
   const frontPort = front.address().port;
   const requestBody = '{"model":"gpt-6-astra"}';
@@ -2847,9 +2864,11 @@ async function callWith102Bridge({ bridge: bridgeSpec, idleTimeoutMs = PROCESSIN
     text = await response.text();
   }
   const result = await settled;
-  front.close();
-  bridgeServer.close();
+  // 偽 bridge の遅延タイマー → 接続 → サーバの順に畳み、閉じ切るまで待つ。
+  // close() を待たないと、後始末が次のサブテストの実行中へずれ込む。
   bridgeSpec.cleanup();
+  for (const socket of openSockets) socket.destroy();
+  await Promise.all([closeServer(front), closeServer(bridgeServer)]);
   return {
     response, text, raw: rawText, lines, result,
     bridgeLine: lines.find(line => / openai-bridge model=/.test(line)),
@@ -2995,12 +3014,17 @@ describe('forwardToOpenAiBridge > 非 SSE の生存通知 102 Processing (R6-2 /
     const lines = [];
 
     // forwardToOpenAiBridge が張ったタイマーのうち、まだ生きているものを数える。
+    // Node の HTTP クライアント（fetch/undici）は、先に閉じた接続の後始末としてこの窓の中で
+    // keep-alive タイマーを張り直すことがある。被験コードのタイマーではないので、生成元の
+    // スタックが openai-bridge.js のものだけを数える（数える対象を狭めるだけで、被験コードが
+    // 張ったタイマーは1つも取りこぼさない）。
     const live = new Set();
     const realSetTimeout = globalThis.setTimeout;
     const realClearTimeout = globalThis.clearTimeout;
+    const armedByBridge = () => (new Error().stack || '').includes('src/openai-bridge.js');
     globalThis.setTimeout = (fn, ms, ...args) => {
       const handle = realSetTimeout((...fired) => { live.delete(handle); fn(...fired); }, ms, ...args);
-      live.add(handle);
+      if (armedByBridge()) live.add(handle);
       return handle;
     };
     globalThis.clearTimeout = handle => { live.delete(handle); return realClearTimeout(handle); };
