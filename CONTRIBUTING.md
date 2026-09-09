@@ -7,7 +7,7 @@ requests are genuinely welcome.
 
 ## Development Setup
 
-- Node.js `>=18.10.0` (see `engines` in [package.json](./package.json)).
+- Node.js `>=18.18.0` (see `engines` in [package.json](./package.json)).
 - Clone the repo and you're ready to go:
 
   ```bash
@@ -28,7 +28,12 @@ npm run check
 ```
 
 which runs `npm run lint` (`node scripts/lint.js`) followed by `npm test`
-(`node --test`). You can also run either step on its own:
+(`node --import ./fixtures/service-command-guard.js --test`, which keeps the
+suite from reaching the machine's real `systemctl` / `launchctl`). If you run
+`node --test` directly, pass the same `--import`: a plain `node --test` does
+not intercept absolute-path calls such as `/bin/launchctl`. The shims in
+`fixtures/service-command-shims/` must keep their executable bit (755).
+You can also run either step on its own:
 
 ```bash
 npm test

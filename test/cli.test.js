@@ -24,6 +24,26 @@ import {
 } from '../src/cli.js';
 import { MACOS_LAUNCH_AGENT_LABEL, installSettings } from '../src/install.js';
 import { writeJsonFile } from '../src/json-file.js';
+import '../fixtures/service-command-guard.js';
+
+// uninstallCommand's non-darwin branch stops the unit before deleting it, so
+// every Linux test here must inject the command runner: left uninjected it
+// runs the machine's own `systemctl --user disable --now
+// claude-rotator.service` and takes down the developer's own rotator.
+const LINUX_UNINSTALL_SERVICE_CALLS = [
+  ['systemctl', ['--user', 'disable', '--now', 'claude-rotator.service']],
+];
+
+function createServiceCommandSpy() {
+  const calls = [];
+  return {
+    calls,
+    execFileImpl: async (command, args) => {
+      calls.push([command, [...args]]);
+      return { stdout: '', stderr: '' };
+    },
+  };
+}
 
 describe('ensureCredentialRevisions', () => {
   it('assigns a non-secret baseline only to accounts missing a revision', () => {
@@ -1226,6 +1246,7 @@ describe('uninstall --purge-secrets account id targeting', () => {
       // to no-op cleanly instead of throwing.
       await writeFile(join(xdgConfig, 'claude-rotator', 'install-state.json'), '{}', 'utf8');
       const { calls, secretStoreFactory } = createPurgeSpy();
+      const service = createServiceCommandSpy();
 
       // removeServiceFile() (called by uninstallCommand's non-darwin branch)
       // threads the `home` passed below straight into macosLaunchAgentPath()
@@ -1237,12 +1258,17 @@ describe('uninstall --purge-secrets account id targeting', () => {
         platform: 'linux',
         home,
         env: { XDG_CONFIG_HOME: xdgConfig, XDG_DATA_HOME: xdgData },
+        execFileImpl: service.execFileImpl,
         secretStoreFactory,
       });
 
       assert.equal(code, 0);
       assert.equal(calls.length, 1);
       assert.deepEqual(calls[0], ['acct_1', 'acct_2', 'current']);
+      // The injected runner must be the one that saw the stop, which is only
+      // true while uninstallCommand threads deps.execFileImpl into
+      // stopService() instead of letting it default to the real execFile.
+      assert.deepEqual(service.calls, LINUX_UNINSTALL_SERVICE_CALLS);
     } finally {
       await rm(sandbox, { recursive: true, force: true });
     }
@@ -1375,6 +1401,7 @@ describe('uninstall --purge-secrets config read failure warning', () => {
       // tests above for the same setup).
       await writeFile(join(xdgConfig, 'claude-rotator', 'install-state.json'), '{}', 'utf8');
       const { calls, secretStoreFactory } = createPurgeSpy();
+      const service = createServiceCommandSpy();
 
       const code = await runCli(['uninstall', '--purge-secrets'], {
         write: io.write,
@@ -1382,6 +1409,7 @@ describe('uninstall --purge-secrets config read failure warning', () => {
         platform: 'linux',
         home,
         env: { XDG_CONFIG_HOME: xdgConfig, XDG_DATA_HOME: xdgData },
+        execFileImpl: service.execFileImpl,
         secretStoreFactory,
       });
 
@@ -1394,6 +1422,7 @@ describe('uninstall --purge-secrets config read failure warning', () => {
       assert.equal(io.stderr(), '');
       assert.equal(calls.length, 1);
       assert.deepEqual(calls[0], ['current']);
+      assert.deepEqual(service.calls, LINUX_UNINSTALL_SERVICE_CALLS);
     } finally {
       await rm(sandbox, { recursive: true, force: true });
     }

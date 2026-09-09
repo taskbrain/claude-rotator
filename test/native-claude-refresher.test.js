@@ -1050,9 +1050,23 @@ describe('native Claude credential refresher', () => {
       const elapsed = Date.now() - startedAt;
       grandchildPid = Number(await readFile(grandchildPidPath, 'utf8'));
       assert.ok(elapsed >= 2_000, `elapsed ${elapsed}ms must include group termination grace`);
-      const processState = await readFile(`/proc/${grandchildPid}/stat`, 'utf8')
+      const readProcessState = () => readFile(`/proc/${grandchildPid}/stat`, 'utf8')
         .then(statLine => statLine.split(' ')[2])
         .catch(error => ['ENOENT', 'ESRCH'].includes(error.code) ? 'gone' : Promise.reject(error));
+      // The grandchild is not this process' child, so nothing can wait() on it:
+      // the command promise settles as soon as SIGKILL has been *posted* to the
+      // group, and the kernel still has to schedule the grandchild to take it.
+      // A single read here can therefore legitimately catch it as 'R' — the
+      // window is only milliseconds, but reading /proc costs microseconds, so
+      // Linux loses this race where a slower probe would not. Poll for the
+      // terminal state; the assertion itself is unchanged, and a grandchild
+      // that genuinely survives still fails once the bound is exhausted.
+      let processState = await readProcessState();
+      const terminalStateDeadline = Date.now() + 5_000;
+      while (!['Z', 'gone'].includes(processState) && Date.now() < terminalStateDeadline) {
+        await new Promise(resolve => setTimeout(resolve, 10));
+        processState = await readProcessState();
+      }
       assert.ok(['Z', 'gone'].includes(processState), `grandchild state was ${processState}`);
     } finally {
       if (Number.isInteger(grandchildPid)) {
