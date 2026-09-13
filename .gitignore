@@ -15,3 +15,6 @@ install-state.json
 *.credentials.json
 *.secret.json
 server.err
+
+# Internal session records (not part of the public repository)
+docs/sessions/
