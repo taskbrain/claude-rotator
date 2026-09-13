@@ -7,6 +7,7 @@ import {
   claudeAllUnusable,
   claudeEarliestResetAt,
   createGptPoolState,
+  decideAuthDegradeRewrite,
   decideBridgeResponse,
   formatLogMeta,
   mapClaudeExhaustion,
@@ -1185,6 +1186,140 @@ describe('契約 v1.6.3 > codex_aggregation_timeout は理由名として認識�
     assert.equal(
       formatLogMeta(meta),
       ' bridgeContract=1 degradeReason=codex_aggregation_timeout degradeScope=model upstreamStatus=none upstreamSent=yes',
+    );
+  });
+});
+
+// ---------------------------------------------------------------------------
+// R7-1: 認証失効（Codex 側）の 403 を 529 へ写像する（母艦裁定 D-72 / 坂根氏の判断③）
+//
+// 「ログインが切れた場合は自動でローテーションして claude-rotator status には認証が
+// 切れているというメッセージだけ出す。止まるのが困るので止まらないように」（判断③）。
+// 403 のままだと Claude Code はその場で停止する。529 にすると fallbackModel（Opus 等）
+// へ自動退避するので作業が止まらない。
+//
+// 対象は「契約ヘッダ付き」「403」「reason が codex_needs_login か
+// codex_credentials_unavailable」の3条件がすべて成り立つときだけである。
+// scope（pool / model）は問わない（学習の可否＝T3 とは別の判断であるため）。
+// ---------------------------------------------------------------------------
+describe('decideAuthDegradeRewrite > 認証失効の 403 を 529 へ写像する (D-72)', () => {
+  const authHeaders = (overrides = {}) => ({
+    'x-ombr-contract': '1',
+    'x-ombr-degrade-reason': 'codex_needs_login',
+    'x-ombr-degrade-scope': 'pool',
+    'x-ombr-pool-state': 'needs-login',
+    'x-ombr-upstream-status': 'none',
+    'x-ombr-upstream-sent': 'no',
+    ...overrides,
+  });
+
+  it('rewrites a needs-login 403 into a 529 overloaded_error', () => {
+    const decision = decideAuthDegradeRewrite(
+      parseBridgeContract(authHeaders()),
+      { enabled: true, upstreamStatus: 403 },
+    );
+
+    assert.equal(decision.rewrite, true);
+    assert.equal(decision.status, 529, 'Claude Code を fallbackModel へ退避させる（止めない）');
+    const body = JSON.parse(decision.body);
+    assert.equal(body.type, 'error');
+    assert.equal(body.error.type, 'overloaded_error', '529 の Anthropic 互換本文はこの型でなければならない');
+    assert.match(body.error.message, /codex login/, '何をすればよいかを本文に書く');
+    assert.deepEqual(decision.meta, {
+      mappedFrom: 403,
+      mappedFromType: 'permission_error',
+      mappedTo: 529,
+      mapReason: 'codex_auth_expired',
+    }, '既存の mappedFrom/mappedTo と同じ形で記録する（識別子は載せない）');
+  });
+
+  it('treats codex_credentials_unavailable exactly the same, with its own wording', () => {
+    const decision = decideAuthDegradeRewrite(
+      parseBridgeContract(authHeaders({
+        'x-ombr-degrade-reason': 'codex_credentials_unavailable',
+        'x-ombr-pool-state': 'credentials-unavailable',
+      })),
+      { enabled: true, upstreamStatus: 403 },
+    );
+
+    assert.equal(decision.rewrite, true);
+    assert.equal(decision.status, 529);
+    assert.equal(JSON.parse(decision.body).error.type, 'overloaded_error');
+    assert.match(
+      JSON.parse(decision.body).error.message,
+      /credential/i,
+      '「ログインし直せ」ではなく「資格情報を読めない」と書く（契約 §C3.4 が理由を分けた目的）',
+    );
+    assert.equal(decision.meta.mapReason, 'codex_auth_expired', '写像の理由は1つに揃える');
+  });
+
+  it('rewrites a model-scoped needs-login 403 as well (§D2 S7b-m)', () => {
+    const decision = decideAuthDegradeRewrite(
+      parseBridgeContract(authHeaders({ 'x-ombr-degrade-scope': 'model' })),
+      { enabled: true, upstreamStatus: 403 },
+    );
+
+    assert.equal(decision.rewrite, true, 'scope が model でも「止めない」方針は同じ（D-72 の1）');
+    assert.equal(decision.status, 529);
+  });
+
+  it('never rewrites a 403 that carries no contract headers', () => {
+    assert.deepEqual(
+      decideAuthDegradeRewrite(parseBridgeContract({}), { enabled: true, upstreamStatus: 403 }),
+      { rewrite: false, reason: 'no-contract-header' },
+      '契約前 bridge・bridge 不達の 403 は現行どおり素通しする（D-72 の2）',
+    );
+    assert.deepEqual(
+      decideAuthDegradeRewrite(null, { enabled: true, upstreamStatus: 403 }),
+      { rewrite: false, reason: 'no-contract-header' },
+    );
+  });
+
+  it('never rewrites a no-account-for-model 403', () => {
+    const parsed = parseBridgeContract({
+      'x-ombr-contract': '1',
+      'x-ombr-degrade-reason': 'codex_no_account_for_model',
+      'x-ombr-degrade-scope': 'model',
+      'x-ombr-pool-state': 'no-account-for-model',
+    });
+    assert.deepEqual(
+      decideAuthDegradeRewrite(parsed, { enabled: true, upstreamStatus: 403 }),
+      { rewrite: false, reason: 'reason-not-auth-expired' },
+      '設定の問題は時間でもローテーションでも解けないので止める（D-72 の2）',
+    );
+  });
+
+  it('never rewrites a status other than 403, and never runs while disabled', () => {
+    const parsed = parseBridgeContract(authHeaders());
+    assert.deepEqual(
+      decideAuthDegradeRewrite(parsed, { enabled: true, upstreamStatus: 529 }),
+      { rewrite: false, reason: 'status-not-403' },
+    );
+    assert.deepEqual(
+      decideAuthDegradeRewrite(parsed, { enabled: false, upstreamStatus: 403 }),
+      { rewrite: false, reason: 'disabled' },
+    );
+    assert.deepEqual(
+      decideAuthDegradeRewrite(parsed, { upstreamStatus: 403 }),
+      { rewrite: false, reason: 'disabled' },
+      'enabled を明示しない呼び出しでも写像しない（既定は無効）',
+    );
+  });
+
+  it('leaves the 529 → 403 decision untouched (両者の判定は排他である)', () => {
+    // 同じ応答が両方の書換に当たることはない。片方は 403 だけを、もう片方は 529 だけを見る。
+    const authParsed = parseBridgeContract(authHeaders());
+    assert.equal(
+      decideBridgeResponse(authParsed, {
+        enabled: true, upstreamStatus: 403, claudeAllUnusable: true,
+        gptPoolState: 'unusable', bothUnusableStatus: 403,
+      }).rewrite,
+      false,
+    );
+    const exhaustedParsed = parseBridgeContract(headers());
+    assert.equal(
+      decideAuthDegradeRewrite(exhaustedParsed, { enabled: true, upstreamStatus: 529 }).rewrite,
+      false,
     );
   });
 });

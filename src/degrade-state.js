@@ -400,6 +400,58 @@ export function mapClaudeExhaustion(candidate, ctx = {}) {
   };
 }
 
+// 母艦裁定 D-72（坂根氏の判断③）: Codex 側の「認証失効」だけは 403 を 529 へ写像する。
+// 「ログインが切れた場合は自動でローテーションして claude-rotator status には認証が
+// 切れているというメッセージだけ出す。止まるのが困るので止まらないように」。
+// 403 のままだと Claude Code はその場で停止する（M-5）。529 にすれば fallbackModel
+// （Opus 等）へ自動退避するので作業が止まらない。契約 §C3.4 が理由を2つに分けている
+// のは「ログインし直せ」と「資格情報そのものを読めない」を取り違えさせないためなので、
+// 本文の文言だけは分ける（判定・ステータス・写像の記録はまったく同じ）。
+const AUTH_EXPIRED_REASONS = new Map([
+  ['codex_needs_login', 'The Codex pool is signed out; run codex login to restore it.'],
+  ['codex_credentials_unavailable', 'The Codex pool credentials cannot be read; check the Codex credential storage.'],
+]);
+
+/**
+ * 認証失効で返す 529 の本文を作る（設計書 §8.8 / D-72）。
+ * @param {string} reason 契約 §C3.4 の理由名（AUTH_EXPIRED_REASONS の鍵）。
+ * @returns {string} JSON 文字列。
+ */
+export function buildAuthDegradeBody(reason) {
+  return JSON.stringify({
+    type: 'error',
+    error: { type: 'overloaded_error', message: AUTH_EXPIRED_REASONS.get(reason) },
+  });
+}
+
+/**
+ * gpt-* 経路で bridge の 403 を 529 へ書き換えるかを決める（母艦裁定 D-72）。
+ * 条件は3つだけで、すべて成り立つときに限る:
+ *   ①契約ヘッダ付きの応答であること（契約前 bridge・bridge 不達の 403 は素通し）
+ *   ②いま返そうとしている応答が 403 であること
+ *   ③理由が codex_needs_login または codex_credentials_unavailable であること
+ * **scope は問わない**——pool でも model でも「止めない」という方針は変わらないため
+ * （scope が効くのは (pool) を学習してよいかどうか＝§C10.3 T3 の側であり、そちらは変えない）。
+ * codex_no_account_for_model の 403 は対象外である（設定の問題は退避しても解けない）。
+ */
+export function decideAuthDegradeRewrite(parsed, ctx = {}) {
+  if (ctx.enabled !== true) return { rewrite: false, reason: 'disabled' };
+  if (!parsed || parsed.contract === null) return { rewrite: false, reason: 'no-contract-header' };
+  if (Number(ctx.upstreamStatus) !== 403) return { rewrite: false, reason: 'status-not-403' };
+  if (!AUTH_EXPIRED_REASONS.has(parsed.reason)) return { rewrite: false, reason: 'reason-not-auth-expired' };
+  return {
+    rewrite: true,
+    status: 529,
+    body: buildAuthDegradeBody(parsed.reason),
+    meta: {
+      mappedFrom: 403,
+      mappedFromType: 'permission_error',
+      mappedTo: 529,
+      mapReason: 'codex_auth_expired',
+    },
+  };
+}
+
 /**
  * gpt-* 経路で bridge の 529 を 403 へ書き換えるかを決める（設計書 §8.7 の4条件）。
  * 4条件は ①現在の応答が 529 かつ pool-state が exhausted/mixed ②Claude 全枯渇
