@@ -29,11 +29,11 @@
     "LICENSE"
   ],
   "scripts": {
-    "test": "node --test",
+    "test": "node --import ./fixtures/service-command-guard.js --test",
     "lint": "node scripts/lint.js",
     "check": "npm run lint && npm test"
   },
   "engines": {
-    "node": ">=18.10.0"
+    "node": ">=18.18.0"
   }
 }

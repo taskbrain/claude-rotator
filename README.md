@@ -2,7 +2,7 @@
 
 [![CI](https://github.com/taskbrain/claude-rotator/actions/workflows/ci.yml/badge.svg)](https://github.com/taskbrain/claude-rotator/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](./LICENSE)
-![Node.js >=18.10.0](https://img.shields.io/badge/node-%3E%3D18.10.0-brightgreen)
+![Node.js >=18.18.0](https://img.shields.io/badge/node-%3E%3D18.18.0-brightgreen)
 
 Claude Code の複数アカウントを、リクエストのモデルと利用枠に応じてローカルで自動的に使い分ける非公式プロキシツールです。macOS と Linux で動作します。
 
@@ -107,7 +107,7 @@ flowchart LR
 ## 動作環境
 
 - **複数の Claude アカウントが必要です。** このツールは「枠に達したアカウントから別のアカウントへ切り替える」ことが前提のため、契約しているアカウントが1つしか無い場合はローテーションできず、導入する意味がありません。
-- Node.js 18.10 以上
+- Node.js 18.18 以上
 - Claude Code 本体がインストール済みであること（`claude-rotator` は Claude Code の認証情報を読み取って中継するプロキシであり、Claude Code 自体の代替にはなりません）
 - macOS: LaunchAgent を使用
 - Ubuntu: systemd user service を使用
@@ -183,7 +183,7 @@ node --version
 npm install -g .
 ```
 
-`node --version` は `v18.10` 以上が必要です。
+`node --version` は `v18.18` 以上が必要です。
 
 まず Claude Code に普段どおりログインし、そのログインを `claude-rotator` へ登録します。
 
@@ -709,7 +709,15 @@ macOS では、実際の Keychain に書き込む一部のテストがデフォ�
 
 このリポジトリは公開されています。社内向けの作業記録・設計メモ・セッション記録（`docs/sessions/` 配下など）はコミットしないでください。
 
-ローカル Node は `v18.10` 以上で動作します。開発時は CI と同じ Node 20 / 22 の両方を Docker で確認してください。
+`npm test` と `npm run check` は、テストが開発機の実サービスマネージャ（`systemctl` / `launchctl`）へ到達しないようにするガード（[fixtures/service-command-guard.js](./fixtures/service-command-guard.js)）を読み込んだうえでテストを実行します。`node --test` を直接実行する場合は、代わりに次を使ってください。直接実行では絶対パス（`/bin/launchctl`）の遮断が効きません。
+
+```bash
+node --import ./fixtures/service-command-guard.js --test test/cli.test.js
+```
+
+`fixtures/service-command-shims/systemctl` と `fixtures/service-command-shims/launchctl` は実行ビット（755）が必要です。外れているとガードの PATH 側が黙って無効になります。
+
+ローカル Node は `v18.18` 以上で動作します。開発時は CI と同じ Node 20 / 22 の両方を Docker で確認してください。
 
 Docker での検証:
 
@@ -824,7 +832,7 @@ flowchart LR
 ### Requirements
 
 - **Multiple Claude accounts are required.** This tool exists to switch from an account that has hit its limit to another one; with only a single account under contract there is nothing to rotate to, so there is no point installing it.
-- Node.js 18.10 or later
+- Node.js 18.18 or later
 - Claude Code itself must already be installed (`claude-rotator` is a proxy that reads and relays Claude Code's own credentials; it is not a replacement for Claude Code)
 - macOS: uses a LaunchAgent
 - Ubuntu: uses a systemd user service
@@ -936,7 +944,7 @@ node --version
 npm install -g .
 ```
 
-`node --version` must be `v18.10` or later.
+`node --version` must be `v18.18` or later.
 
 First, log in to Claude Code as usual, then register that login with `claude-rotator`.
 
@@ -1461,7 +1469,15 @@ On macOS, some tests that write to the real Keychain are skipped by default. Add
 
 This repository is public. Do not commit internal working notes, design memos, or session records (for example anything under `docs/sessions/`).
 
-Local development works on Node `v18.10` and later. If you want to check macOS/Ubuntu-independent behavior in development, also run the Docker command below to verify against Node 22.
+`npm test` and `npm run check` load a guard ([fixtures/service-command-guard.js](./fixtures/service-command-guard.js)) that keeps the suite from reaching the development machine's real service manager (`systemctl` / `launchctl`). If you run `node --test` directly, use the form below instead: a plain `node --test` does not intercept absolute-path calls such as `/bin/launchctl`.
+
+```bash
+node --import ./fixtures/service-command-guard.js --test test/cli.test.js
+```
+
+`fixtures/service-command-shims/systemctl` and `fixtures/service-command-shims/launchctl` must keep their executable bit (755); without it the guard's PATH belt silently stops working.
+
+Local development works on Node `v18.18` and later. If you want to check macOS/Ubuntu-independent behavior in development, also run the Docker command below to verify against Node 22.
 
 Docker verification:
 

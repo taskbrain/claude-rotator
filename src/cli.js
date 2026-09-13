@@ -564,15 +564,21 @@ async function installCommand({ argv, write, deps = {} }) {
     write('Service start skipped because --no-start was set.\n');
     return;
   }
+  const uid = deps.uid ?? (typeof process.getuid === 'function' ? process.getuid() : null);
   try {
-    await startService();
+    // Every argument is threaded from `deps` on purpose: called bare,
+    // startService() falls back to the real process.platform and the real
+    // execFile, so a caller that injected platform/execFileImpl (a test) would
+    // still drive the host's own service manager.
+    await startService({
+      platform,
+      uid,
+      env,
+      execFileImpl: deps.execFileImpl || execFileAsync,
+    });
     write('Service started\n');
   } catch (caught) {
-    write(`${renderServiceStartFailureMessage({
-      platform: process.platform,
-      uid: typeof process.getuid === 'function' ? process.getuid() : null,
-      error: caught,
-    })}\n`);
+    write(`${renderServiceStartFailureMessage({ platform, uid, error: caught })}\n`);
   }
 }
 
@@ -641,7 +647,16 @@ async function uninstallCommand({ argv, write, error, deps = {} }) {
   }
   const result = await uninstallSettings({ settingsPath, installStatePath: statePath, force });
   if (result.conflict) throw new Error(result.reason);
-  await stopService().catch(() => {});
+  // Same reason as installCommand's startService() call: stopService() called
+  // bare re-reads the real process.platform and the real execFile, so an
+  // injected platform/execFileImpl would be ignored and the host's own
+  // `systemctl --user disable --now claude-rotator.service` would run for real.
+  await stopService({
+    platform,
+    uid: deps.uid ?? (typeof process.getuid === 'function' ? process.getuid() : null),
+    env,
+    execFileImpl: deps.execFileImpl || execFileAsync,
+  }).catch(() => {});
   await removeServiceFile({ configPath, env, home });
   await removeInstallState(statePath);
   if (purgeSecrets) {

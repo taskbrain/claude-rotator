@@ -1,0 +1,7 @@
+#!/bin/sh
+# Test-only stand-in for the real launchctl. Records the call and fails so a
+# test that reaches the host's service manager cannot silently succeed.
+log=${CLAUDE_ROTATOR_SERVICE_COMMAND_LOG:-${TMPDIR:-/tmp}/claude-rotator-service-command-guard.log}
+printf 'launchctl %s\n' "$*" >>"$log" 2>/dev/null
+printf 'refused: the test suite must not run the real launchctl\n' >&2
+exit 1

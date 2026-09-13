@@ -11,6 +11,7 @@ import {
   startMacosWatchdogService,
   stopMacosWatchdogService,
 } from '../src/macos-service.js';
+import '../fixtures/service-command-guard.js';
 
 const LOCKED_ENV = { CLAUDE_ROTATOR_MACOS_SERVICE_LOCKED: '1' };
 const MAIN_JOB = 'gui/501/io.github.claude-rotator';

@@ -12,6 +12,7 @@ import {
   shellQuote,
 } from '../src/macos-watchdog.js';
 import { fileSha256, writeJsonFile } from '../src/json-file.js';
+import '../fixtures/service-command-guard.js';
 
 const execFileAsync = promisify(execFile);
 
@@ -106,6 +107,12 @@ describe('macOS watchdog helper', () => {
       installStatePath: '/tmp/install-state.json',
       mainPlistPath: '/tmp/main.plist',
       domain: 'gui/501',
+      // This is the one helper test that executes the rendered script instead
+      // of only syntax-checking it. The script's preflight guards stop it long
+      // before the service calls, but the default /bin/launchctl would be the
+      // machine's real one, so point it at a path inside the sandbox: if the
+      // guards ever regress the run fails loudly instead of booting a job.
+      launchctlPath: join(dir, 'launchctl'),
     });
 
     const helperPath = join(dir, 'watchdog.sh');

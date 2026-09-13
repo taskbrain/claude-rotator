@@ -21,6 +21,7 @@ import {
 } from '../src/install.js';
 import { LOCAL_GATEWAY_AUTH_TOKEN } from '../src/config.js';
 import { fileSha256, readJsonFile, writeJsonFile } from '../src/json-file.js';
+import '../fixtures/service-command-guard.js';
 
 const execFileAsync = promisify(execFile);
 
