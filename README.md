@@ -482,8 +482,10 @@ claude-rotator status
 
 - 単一アカウントの一時的な 429 は退避させません。529 へ写像するのは、アカウント台帳上そのモデル系列で使えるアカウントが1つも無いときだけです（アカウント未登録のときも写像しません）。
 - **本機能が生成する** 403 は、Claude 側の全枯渇と GPT 側の利用不可が同時に成立したときだけです。応答本文には、両者のうち最も早い回復見込み時刻を添えます。なお、ブリッジへの接続拒否・接続タイムアウト・アイドルタイムアウトは本機能とは無関係に従来どおり 403 を返します（`outcome` の値で区別できます）。
+- **GPT 側の認証が切れたときは止めずに退避させます。** ブリッジが契約ヘッダ付きで 403 を返し、その理由が「ログイン切れ」（`codex_needs_login`）または「資格情報を読めない」（`codex_credentials_unavailable`）のときだけ、claude-rotator は **529 へ書き換えて**返し、Claude Code を `fallbackModel` の次の要素（Opus 等）へ退避させます。作業を止めないためです。両方とも使えないときの停止は従来どおり `bothUnusableStatus`（既定 `403`）が決めます。契約ヘッダの無い 403、およびモデル未割り当て（`codex_no_account_for_model`）の 403 は、従来どおりそのまま返します。
+- Claude 側のアカウントの認証が切れたときは、`status` の口座カードに `reason: login expired - run: claude-rotator login --id <id>` と表示し、Routing availability では `unknown` ではなく `needs login` と表示します。
 - 学習した GPT 側の状態はメモリ上にだけ保持し、`POST /internal/reload`（設定の再読み込み）で初期化されます。
-- ログの `outcome` は `forwarded` / `forwarded-mapped`（529 を 403 へ書き換えた）/ `bridge-unreachable` / `bridge-connect-timeout` / `bridge-idle-timeout` / `bridge-stream-error` に分かれ、`degradeReason` `upstreamStatus` `gptPoolState` `claudePoolState` `mappedFrom` / `mappedTo` などを、値があるときだけ行末へ追記します（値が1つも無ければ行は従来と同一です）。
+- ログの `outcome` は `forwarded` / `forwarded-mapped`（529 を 403 へ、または認証失効の 403 を 529 へ書き換えた）/ `bridge-unreachable` / `bridge-connect-timeout` / `bridge-idle-timeout` / `bridge-stream-error` に分かれ、`degradeReason` `upstreamStatus` `gptPoolState` `claudePoolState` `mappedFrom` / `mappedTo` などを、値があるときだけ行末へ追記します（値が1つも無ければ行は従来と同一です）。
 
 注意:
 
@@ -1240,8 +1242,10 @@ How it behaves:
 
 - A temporary 429 from a single account never triggers a fallback. The 529 mapping applies only when the account ledger has no usable account left for that model family (and never when no account is registered).
 - The 403 **produced by this feature** is returned only when the Claude side is fully exhausted *and* the GPT side is known to be unusable at the same time. The response body carries the earliest expected recovery time of the two. Independently of this feature, a refused connection, a connect timeout, or an idle timeout against the bridge still returns 403 exactly as before (the `outcome` value tells them apart).
+- **An expired GPT-side login degrades instead of stopping.** When the bridge answers 403 with contract headers and the reason is a signed-out pool (`codex_needs_login`) or unreadable credentials (`codex_credentials_unavailable`), claude-rotator **rewrites it to 529** so Claude Code falls back to the next entry of `fallbackModel` (for example `opus`) and the session keeps working. Stopping when neither side is usable is still governed by `bothUnusableStatus` (default `403`). A 403 without contract headers, and a `codex_no_account_for_model` 403, are forwarded unchanged as before.
+- When a Claude account's own login expires, the `status` account card prints `reason: login expired - run: claude-rotator login --id <id>` and Routing availability shows `needs login` instead of `unknown`.
 - The learned GPT-side state lives in memory only and is reset by `POST /internal/reload` (config reload).
-- Log `outcome` values split into `forwarded` / `forwarded-mapped` (a 529 rewritten to 403) / `bridge-unreachable` / `bridge-connect-timeout` / `bridge-idle-timeout` / `bridge-stream-error`, and fields such as `degradeReason`, `upstreamStatus`, `gptPoolState`, `claudePoolState`, `mappedFrom` / `mappedTo` are appended at the end of the line only when they have a value (with no values, the line is identical to the current one).
+- Log `outcome` values split into `forwarded` / `forwarded-mapped` (a 529 rewritten to 403, or an auth-expired 403 rewritten to 529) / `bridge-unreachable` / `bridge-connect-timeout` / `bridge-idle-timeout` / `bridge-stream-error`, and fields such as `degradeReason`, `upstreamStatus`, `gptPoolState`, `claudePoolState`, `mappedFrom` / `mappedTo` are appended at the end of the line only when they have a value (with no values, the line is identical to the current one).
 
 Caveats:
 
