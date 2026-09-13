@@ -1333,7 +1333,10 @@ describe('AccountManager', () => {
     ]);
   });
 
-  it('reports unknown after timed candidates when reset evidence or credentials are unusable', () => {
+  // 母艦裁定 D-72 で credential_error の期待だけを unknown → needs-login へ反転した
+  // （認証失効は時間では回復しないので「不明」と言わない）。並び順は変えていない——
+  // needs-login は unknown とまったく同じ順位で扱う。
+  it('reports unknown / needs-login after timed candidates when reset evidence or credentials are unusable', () => {
     const now = Date.parse('2026-08-29T05:00:00.000Z');
     const manager = new AccountManager({
       accounts: [
@@ -1373,10 +1376,76 @@ describe('AccountManager', () => {
       {
         account: 'credential_error',
         accountName: 'error@example.com',
-        state: 'unknown',
+        state: 'needs-login',
         availableAt: null,
       },
     ]);
+  });
+
+  // ---------------------------------------------------------------------------
+  // R7-3（母艦裁定 D-72 の 4(ii)）: 認証失効の口座だけを needs-login として報告する。
+  // 他の error は現行どおり unknown のままであり、並び順も1つも動かさない。
+  // ---------------------------------------------------------------------------
+  it('reports needs-login only for an expired credential, never for another account error', () => {
+    const now = Date.parse('2026-08-29T05:00:00.000Z');
+    const build = (type, message) => {
+      const manager = new AccountManager({
+        accounts: [
+          { id: 'acct_1', name: 'a@example.com', type: 'oauth' },
+          { id: 'acct_2', name: 'b@example.com', type: 'oauth' },
+        ],
+        switchThreshold: 1,
+        now: () => now,
+      });
+      for (const accountId of ['acct_1', 'acct_2']) {
+        manager.applyUsage(accountId, {
+          five_hour: { utilization: 0.2, resets_at: '2026-08-29T10:00:00.000Z' },
+          seven_day: { utilization: 0.2, resets_at: '2026-09-01T05:00:00.000Z' },
+        });
+      }
+      manager.markError('acct_1', type, message);
+      return manager;
+    };
+
+    for (const type of ['oauth_refresh_failed', 'authentication_error']) {
+      const status = build(type, 'OAuth token refresh failed').getStatus();
+      for (const family of ['fable', 'other']) {
+        const entry = status.routingAvailability[family].find(item => item.account === 'acct_1');
+        assert.equal(entry.state, 'needs-login', `${type} / ${family}`);
+        assert.equal(entry.availableAt, null, '回復見込み時刻は持たない（人が直すまで戻らない）');
+      }
+      assert.deepEqual(
+        status.accounts[0].unavailableReason,
+        { type, message: 'OAuth token refresh failed' },
+        '台帳側の理由は1ビットも変えない（表示だけの変更である）',
+      );
+    }
+
+    for (const type of ['account_error', 'upstream_error']) {
+      const status = build(type, 'something else').getStatus();
+      const entry = status.routingAvailability.other.find(item => item.account === 'acct_1');
+      assert.equal(entry.state, 'unknown', `${type} は現行どおり unknown`);
+    }
+  });
+
+  it('keeps the recovery order unchanged when an expired login sits next to an unknown one', () => {
+    const now = Date.parse('2026-08-29T05:00:00.000Z');
+    const manager = new AccountManager({
+      accounts: [
+        { id: 'first', name: 'first@example.com', type: 'oauth' },
+        { id: 'second', name: 'second@example.com', type: 'oauth' },
+      ],
+      switchThreshold: 1,
+      now: () => now,
+    });
+    manager.markError('first', 'account_error', 'plain error');
+    manager.markError('second', 'oauth_refresh_failed', 'refresh failed');
+
+    assert.deepEqual(
+      manager.getStatus().routingAvailability.other.map(entry => [entry.account, entry.state]),
+      [['first', 'unknown'], ['second', 'needs-login']],
+      'needs-login は unknown と同じ順位なので、並びは登録順のまま動かない',
+    );
   });
 
   it('rejects every model family when the common weekly/5h window is exhausted (not model-scoped)', () => {

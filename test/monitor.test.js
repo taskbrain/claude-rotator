@@ -401,3 +401,96 @@ function codexHealth() {
     },
   };
 }
+
+// ---------------------------------------------------------------------------
+// R7-3: 認証失効の表示（母艦裁定 D-72 の 4）
+//
+// 坂根氏の判断③「claude-rotator status には認証が切れているというメッセージだけ出す」。
+// 内部の型名（oauth_refresh_failed 等）を画面へ素出しせず、何をすればよいかを出す。
+// 認証失効が1件も無い構成では、出力は1文字も変わらない。
+// ---------------------------------------------------------------------------
+
+describe('認証失効の表示 (D-72)', () => {
+  const now = Date.parse('2026-06-04T09:00:00Z');
+
+  it('tells the operator how to recover instead of printing the internal reason type', () => {
+    for (const type of ['oauth_refresh_failed', 'authentication_error']) {
+      const output = renderStatus(authExpiredStatus(type), { now, columns: 120 });
+
+      assert.match(
+        output,
+        /reason: login expired - run: claude-rotator login --id acct_1/,
+        '何をすればよいかを1行で出す',
+      );
+      assert.doesNotMatch(output, new RegExp(type), '内部の型名を画面へ出さない');
+      assert.doesNotMatch(output, /OAuth token/, '内部のメッセージも出さない');
+    }
+  });
+
+  it('shows "needs login" in Routing availability instead of "unknown"', () => {
+    const output = renderStatus(authExpiredStatus('oauth_refresh_failed'), { now, columns: 160 });
+
+    assert.match(output, /2\. a@example\.com\s+needs login/, '回復順の一覧でも状態が読める');
+    assert.match(output, /routes Fable: needs login \| Other: needs login/, '口座カードの routes 行も同じ');
+    assert.doesNotMatch(output, /needs login.*\bunknown\b/, '「不明」で塗り潰さない');
+  });
+
+  it('keeps rendering a non-auth account error exactly as before', () => {
+    const output = renderStatus(authExpiredStatus('account_error'), { now, columns: 160 });
+
+    assert.match(output, /reason: account_error: OAuth token refresh failed/, '他の error は現行のまま');
+    assert.match(output, /2\. a@example\.com\s+unknown/, 'routing の状態も unknown のまま');
+    assert.doesNotMatch(output, /needs login|login expired/);
+  });
+
+  it('changes nothing at all for a status that carries no auth failure', () => {
+    for (const status of [sampleStatus(), modelAwareStatus()]) {
+      const output = renderStatus(status, { now, columns: 160 });
+      assert.doesNotMatch(output, /needs login/);
+      assert.doesNotMatch(output, /login expired/);
+    }
+  });
+
+  it('renders a signed-out codex pool from the health JSON (D-72 の 4(iii))', () => {
+    const health = codexHealth();
+    health.pool.state = 'needs-login';
+    health.pool.accountsAvailable = 0;
+    health.pool.accounts[0].state = 'needs-login';
+    health.pool.accounts[1].state = 'needs-login';
+
+    const output = renderStatus(sampleStatus(), { now, columns: 120, codex: { ok: true, health } });
+
+    assert.match(output, /Codex Rotator\s+pool: needs-login \(0\/2 available\)/);
+    assert.match(output, /pro-a\s+█████████░\s+97% 2nd\s+41% \(7d\)\s+needs-login/);
+    assert.match(output, /pro-b\s+███░░░░░░░\s+31%\s+needs-login/);
+  });
+});
+
+// 認証が失効した口座を1つ含む status。Claude 側の error reason は
+// src/account-manager.js の markError() が入れる形（type ＋ message）に揃える。
+function authExpiredStatus(type) {
+  const status = sampleStatus();
+  status.accounts[0].status = 'error';
+  status.accounts[0].unavailableReason = { type, message: 'OAuth token refresh failed' };
+  status.routingAvailability = {
+    fable: [
+      { account: 'acct_2', accountName: 'b@example.com', state: 'available', availableAt: null },
+      {
+        account: 'acct_1',
+        accountName: 'a@example.com',
+        state: type === 'account_error' ? 'unknown' : 'needs-login',
+        availableAt: null,
+      },
+    ],
+    other: [
+      { account: 'acct_2', accountName: 'b@example.com', state: 'available', availableAt: null },
+      {
+        account: 'acct_1',
+        accountName: 'a@example.com',
+        state: type === 'account_error' ? 'unknown' : 'needs-login',
+        availableAt: null,
+      },
+    ],
+  };
+  return status;
+}

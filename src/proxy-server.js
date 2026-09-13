@@ -2,7 +2,7 @@ import { createHash } from 'node:crypto';
 import http from 'node:http';
 import https from 'node:https';
 
-import { isCredentialRefreshCooldown, isUnifiedQuotaExhaustion } from './account-manager.js';
+import { isAuthExpiredReason, isCredentialRefreshCooldown, isUnifiedQuotaExhaustion } from './account-manager.js';
 import { readCurrentClaudeCredentials } from './claude-credentials.js';
 import {
   DEFAULT_USAGE_POLL_INTERVAL_MS,
@@ -2583,9 +2583,9 @@ function hasUsableAccessToken(secret, now = Date.now()) {
 }
 
 function isCredentialUnavailable(reason) {
-  return isCredentialRefreshCooldown(reason)
-    || reason?.type === 'oauth_refresh_failed'
-    || reason?.type === 'authentication_error';
+  // The expired-login half of this predicate is shared with the status screen
+  // (D-72), so the two lists cannot drift apart.
+  return isCredentialRefreshCooldown(reason) || isAuthExpiredReason(reason);
 }
 
 function formatCredentialExpiry(expiresAt) {

@@ -965,6 +965,27 @@ export function isCredentialRefreshCooldown(reason) {
 }
 
 /**
+ * Routing availability state used for an account whose login has expired
+ * (design ruling D-72). It ranks exactly like `unknown` - neither carries a
+ * recovery time - so the ordering of the recovery list is unchanged; only the
+ * word the screen prints differs, because "unknown" wrongly suggests the
+ * account might come back on its own.
+ */
+export const NEEDS_LOGIN_AVAILABILITY_STATE = 'needs-login';
+
+const AUTH_EXPIRED_REASON_TYPES = new Set(['oauth_refresh_failed', 'authentication_error']);
+
+/**
+ * True when the account is unusable because its credentials were rejected or
+ * could not be refreshed - the one case a human has to clear by running
+ * `claude-rotator login` again. Excludes the refresh cooldown reasons, which do
+ * recover on their own (see `isCredentialRefreshCooldown`).
+ */
+export function isAuthExpiredReason(reason) {
+  return AUTH_EXPIRED_REASON_TYPES.has(reason?.type);
+}
+
+/**
  * Decides whether an account's quota gates a request of the given model family.
  * This evaluates every window directly (never a single classified "the" reason)
  * so a model-scoped exhaustion can never mask a concurrent common-quota
@@ -1009,8 +1030,14 @@ function commonQuotaExhausted(quota, threshold) {
 }
 
 function futureAvailabilityForModelFamily(account, threshold, modelFamily, now) {
-  if (!account || account.status === 'error') {
-    return { state: 'unknown', availableAt: null };
+  if (!account) return { state: 'unknown', availableAt: null };
+  if (account.status === 'error') {
+    // D-72: an expired login is reported as such so the screen can tell the
+    // operator to run `claude-rotator login`. Every other error stays `unknown`.
+    return {
+      state: isAuthExpiredReason(account.errorReason) ? NEEDS_LOGIN_AVAILABILITY_STATE : 'unknown',
+      availableAt: null,
+    };
   }
 
   const blockers = [];
@@ -1054,7 +1081,7 @@ function availabilityResetTimestamp(value) {
 }
 
 function compareRoutingAvailabilityCandidates(left, right) {
-  const rank = { available: 0, waiting: 1, unknown: 2 };
+  const rank = { available: 0, waiting: 1, unknown: 2, [NEEDS_LOGIN_AVAILABILITY_STATE]: 2 };
   if (rank[left.state] !== rank[right.state]) return rank[left.state] - rank[right.state];
   if (left.state === 'available') {
     if (left.isCurrent !== right.isCurrent) return left.isCurrent ? -1 : 1;

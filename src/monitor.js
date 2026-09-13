@@ -1,3 +1,4 @@
+import { NEEDS_LOGIN_AVAILABILITY_STATE, isAuthExpiredReason } from './account-manager.js';
 import { sanitizeAccountLabel } from './degrade-state.js';
 
 export function progressBar(ratio, width = 10) {
@@ -96,6 +97,10 @@ function availabilitySummary(schedule, noAccounts) {
 function renderAvailability(entry, now, includeDate = false) {
   if (!entry) return 'no data';
   if (entry.state === 'available') return 'now';
+  // An expired login never recovers on its own, so "unknown" would be misleading
+  // (design ruling D-72): say what is actually wrong and leave the how-to-fix
+  // line to the account card, which knows the account id.
+  if (entry.state === NEEDS_LOGIN_AVAILABILITY_STATE) return 'needs login';
   if (entry.state !== 'waiting') return 'unknown';
   const availableAt = Date.parse(entry.availableAt || '');
   if (!Number.isFinite(availableAt) || availableAt <= now) return 'unknown';
@@ -108,7 +113,7 @@ function renderAccountCard(account, status, now) {
   const fable = findAccountAvailability(status.routingAvailability?.fable, account.id);
   const other = findAccountAvailability(status.routingAvailability?.other, account.id);
   lines.push(`routes Fable: ${renderAvailability(fable, now)} | Other: ${renderAvailability(other, now)}`);
-  const reason = renderUnavailableReason(account.unavailableReason);
+  const reason = renderUnavailableReason(account.unavailableReason, account.id);
   if (reason) lines.push(`reason: ${reason}`);
   lines.push(renderQuotaRow('5h', account.quota?.unified5h, account.quota?.unified5hReset, now));
   lines.push(renderQuotaRow('7d', account.quota?.unified7d, account.quota?.unified7dReset, now));
@@ -225,22 +230,29 @@ function renderEvent(event) {
     return `${at} request ${event.account || ''} ${event.method || ''} ${event.path || ''} -> ${status} ${event.durationMs ?? 0}ms outcome=${event.outcome || 'unknown'}${requestId}${errorType}`.trim();
   }
   if (event.type === 'upstream-error') {
-    const reason = renderUnavailableReason(event.reason);
+    const reason = renderUnavailableReason(event.reason, event.account);
     return `${at} upstream error ${event.account || ''}${reason ? ` (${reason})` : ''}`.trim();
   }
   if (event.type === 'quota-exhausted') {
-    const reason = renderUnavailableReason(event.reason);
+    const reason = renderUnavailableReason(event.reason, event.account);
     return `${at} quota exhausted ${event.account || ''}${reason ? ` (${reason})` : ''}`.trim();
   }
   if (event.type === 'account-error') {
-    const reason = renderUnavailableReason(event.reason);
+    const reason = renderUnavailableReason(event.reason, event.account);
     return `${at} account error ${event.account || ''}${reason ? ` (${reason})` : ''}`.trim();
   }
   return `${at} ${event.type || 'event'}`.trim();
 }
 
-function renderUnavailableReason(reason) {
+function renderUnavailableReason(reason, accountId = null) {
   if (!reason) return null;
+  // Design ruling D-72: an expired login is the one unavailable reason a human
+  // has to clear, so the screen says what to run instead of leaking the internal
+  // reason type (`oauth_refresh_failed` / `authentication_error`).
+  if (isAuthExpiredReason(reason)) {
+    const target = typeof accountId === 'string' && accountId.length > 0 ? ` --id ${accountId}` : '';
+    return `login expired - run: claude-rotator login${target}`;
+  }
   if (reason.type === 'quota_exhausted') {
     const reset = reason.resetAt ? `; reset -> ${formatDate(Date.parse(reason.resetAt))}` : '';
     return `${reason.window} quota exhausted${reset}`;
