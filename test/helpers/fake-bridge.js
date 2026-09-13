@@ -154,6 +154,42 @@ const MODE_TABLE = Object.freeze({
     withResetAt: false,
     summary: '403 permission_error / codex_needs_login / pool-state=needs-login',
   },
+  'credentials-unavailable': {
+    // §D2 S7c / 契約 v1.5: 資格情報そのものを読めない（auth.json が消えた・保存方式が非対応）。
+    // rotator の学習・素通しの扱いは needs-login と完全に同一だが、理由コードだけが違う。
+    kind: 'json',
+    status: 403,
+    errorType: 'permission_error',
+    message: 'codex credentials are unavailable; the saved authentication cannot be read (fake-bridge --mode credentials-unavailable).',
+    ombr: {
+      reason: 'codex_credentials_unavailable',
+      scope: 'pool',
+      poolState: 'credentials-unavailable',
+      upstreamStatus: 'none',
+      upstreamSent: 'no',
+    },
+    withAccount: false,
+    withResetAt: false,
+    summary: '403 permission_error / codex_credentials_unavailable / pool-state=credentials-unavailable',
+  },
+  'needs-login-model': {
+    // §D2 S7b-m（契約 v1.6.4）: そのモデル向けの口座だけが全失効。プールには他モデル用の
+    // 健全な口座が残っているため scope=model であり、(pool) は絶対に汚さない。
+    kind: 'json',
+    status: 403,
+    errorType: 'permission_error',
+    message: 'codex login required for the requested model; every account assigned to it is logged out (fake-bridge --mode needs-login-model).',
+    ombr: {
+      reason: 'codex_needs_login',
+      scope: 'model',
+      poolState: 'needs-login',
+      upstreamStatus: 'none',
+      upstreamSent: 'no',
+    },
+    withAccount: false,
+    withResetAt: false,
+    summary: '403 permission_error / codex_needs_login / scope=model（(pool) を汚さない）',
+  },
   'no-account': {
     // §D2 S9 / CR-P: そのモデルに割り当てられた口座がゼロ。scope=model なので
     // rotator は (pool) を汚さない（403 書換の根拠にもならない）。

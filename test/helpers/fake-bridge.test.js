@@ -354,8 +354,10 @@ describe('fake-bridge /healthz', () => {
 describe('fake-bridge pure helpers', () => {
   it('exposes every documented mode', () => {
     assert.deepEqual([...MODE_NAMES].sort(), [
-      'attempt-limit', 'exhausted', 'idle', 'legacy', 'mixed',
-      'needs-login', 'no-account', 'ok', 'stream-error', 'unreachable',
+      'attempt-limit', 'credentials-unavailable', 'exhausted', 'idle', 'legacy', 'mixed',
+      // R7-2（母艦裁定 D-72）で credentials-unavailable（§D2 S7c）と
+      // needs-login-model（§D2 S7b-m）を追加した。
+      'needs-login', 'needs-login-model', 'no-account', 'ok', 'stream-error', 'unreachable',
     ]);
   });
 

@@ -1,7 +1,8 @@
 import http from 'node:http';
 
 import {
-  buildBridgeLogMeta, decideBridgeResponse, formatLogMeta, parseBridgeContract,
+  buildBridgeLogMeta, decideAuthDegradeRewrite, decideBridgeResponse, formatLogMeta,
+  parseBridgeContract,
 } from './degrade-state.js';
 
 const LOOPBACK_HOSTS = new Set(['127.0.0.1', 'localhost', '::1']);
@@ -535,7 +536,7 @@ export function forwardToOpenAiBridge({
           // 学習済みの (pool)。gptPoolState を渡していない呼び出しでは 'unknown' 扱いになり、
           // 条件③が成り立たないので書換は起きない。
           const learnedPool = metaEnabled ? gptPoolState?.read(model).pool : null;
-          const decision = metaEnabled
+          let decision = metaEnabled
             ? decideBridgeResponse(contract, {
               enabled: true,
               upstreamStatus: upstreamRes.statusCode,
@@ -547,6 +548,17 @@ export function forwardToOpenAiBridge({
               bothUnusableStatus: settings.degradeMapping.bothUnusableStatus,
             })
             : { rewrite: false };
+          // ── R7-1（母艦裁定 D-72）: 認証失効の 403 だけは 529 へ書き換える ──
+          // 上の判定（529→403）とは入力が排他である（片方は 529 だけを、こちらは 403
+          // だけを見る）ので、先に決まっていなければ評価する、という順序で足りる。
+          // 応答の作り替え手順は下の decision.rewrite の分岐をそのまま使う。
+          if (metaEnabled && !decision.rewrite) {
+            const authDecision = decideAuthDegradeRewrite(contract, {
+              enabled: true,
+              upstreamStatus: upstreamRes.statusCode,
+            });
+            if (authDecision.rewrite) decision = authDecision;
+          }
           if (decision.rewrite) {
             const payload = Buffer.from(decision.body);
             // 手順2: 上流の本文由来ヘッダを落とす。とくに 529 の本文長を持つ Content-Length を

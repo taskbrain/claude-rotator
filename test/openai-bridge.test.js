@@ -2348,17 +2348,114 @@ describe('forwardToOpenAiBridge > 529 → 403 の書換 (R4-1 / 設計書 §8.7)
     assert.equal(/mapped(From|To)=/.test(bridgeLine), false);
   });
 
-  it('(f) forwards the needs-login 403 untouched (§8.8: CR は素通しするだけ)', async () => {
+  // 母艦裁定 D-72（坂根氏の判断③）で期待を反転した。旧版は
+  // 「(f) forwards the needs-login 403 untouched (§8.8)」として 403 の素通しを固定していたが、
+  // 「ログインが切れたら自動でローテーションして止まらないように」という方針へ変わった。
+  // 学習（T3）と (pool) の扱いは1ビットも変えていない。
+  it('(f) rewrites the needs-login 403 into a 529 so Claude Code falls back instead of stopping (D-72)', async () => {
     const { response, text, gptPoolState, bridgeLine } = await callWithLedger({
       mode: 'needs-login',
       claudeAllUnusable: allClaudeExhausted,
     });
 
-    assert.equal(response.status, 403);
-    assert.match(text, /codex login required/, '本文は bridge のまま（rotator は作り替えない）');
-    assert.equal(gptPoolState.snapshot().pool.state, 'unusable', '学習だけは起きる（T3）');
-    assert.match(bridgeLine, /outcome=forwarded /);
-    assert.equal(/mapped(From|To)=/.test(bridgeLine), false);
+    assert.equal(response.status, 529, '止めない：fallbackModel（Opus 等）へ退避させる');
+    const body = JSON.parse(text);
+    assert.equal(body.error.type, 'overloaded_error', '529 の Anthropic 互換本文');
+    assert.match(body.error.message, /codex login/, '何をすればよいかを本文に書く');
+    assert.equal(
+      response.headers.get('content-length'),
+      String(Buffer.byteLength(text)),
+      'Content-Length は上流 403 の本文長ではなく、自作した 529 本文の長さと一致する',
+    );
+    assert.equal(response.headers.get('content-type'), 'application/json');
+    assert.equal(response.headers.get('content-encoding'), null);
+    assert.equal(response.headers.get('x-ombr-pool-state'), 'needs-login', '契約ヘッダは診断のために残す');
+    assert.equal(gptPoolState.snapshot().pool.state, 'unusable', '学習（T3）は従来どおり起きる');
+    assert.match(bridgeLine, / status=529 /, '書き換えた後のステータスを status に出す');
+    assert.equal(
+      metaTail(bridgeLine, 'forwarded-mapped'),
+      ' bridgeContract=1 degradeReason=codex_needs_login poolState=needs-login degradeScope=pool'
+      + ' upstreamStatus=none upstreamSent=no'
+      + ' gptPoolState=unusable gptModelState=unknown claudePoolState=all-exhausted'
+      + ' mappedFrom=403 mappedFromType=permission_error mappedTo=529 mapReason=codex_auth_expired',
+      '既存の mappedFrom/mappedTo と同じ形式で記録し、識別子は載せない（D-72 の 7）',
+    );
+  });
+
+  it('(f2) rewrites the credentials-unavailable 403 the same way, with its own wording', async () => {
+    const { response, text, gptPoolState, bridgeLine } = await callWithLedger({
+      mode: 'credentials-unavailable',
+      claudeAllUnusable: allClaudeExhausted,
+    });
+
+    assert.equal(response.status, 529);
+    assert.equal(JSON.parse(text).error.type, 'overloaded_error');
+    assert.match(
+      JSON.parse(text).error.message,
+      /credential/i,
+      '「ログインし直せ」ではなく「資格情報を読めない」と書く（契約 §C3.4 が理由を分けた目的）',
+    );
+    assert.equal(gptPoolState.snapshot().pool.state, 'unusable', 'T3 の学習は needs-login と同じ');
+    assert.match(bridgeLine, /degradeReason=codex_credentials_unavailable poolState=credentials-unavailable/);
+    assert.match(bridgeLine, /mappedFrom=403 mappedFromType=permission_error mappedTo=529 mapReason=codex_auth_expired/);
+  });
+
+  it('(f3) rewrites a model-scoped needs-login 403 without touching (pool) (§D2 S7b-m)', async () => {
+    const { response, text, gptPoolState, bridgeLine } = await callWithLedger({
+      mode: 'needs-login-model',
+      claudeAllUnusable: allClaudeExhausted,
+    });
+
+    assert.equal(response.status, 529, 'scope が model でも「止めない」方針は同じ（D-72 の 1）');
+    assert.equal(JSON.parse(text).error.type, 'overloaded_error');
+    assert.equal(
+      gptPoolState.snapshot().pool.state,
+      'unknown',
+      'scope=model は (pool) を絶対に汚さない（契約 §C10.3 T3 は effectiveScope=pool の分岐）',
+    );
+    assert.equal(gptPoolState.read('gpt-6-astra').model.state, 'unknown', 'needs-login は T4 にも当たらない');
+    assert.match(bridgeLine, /degradeScope=model /);
+    assert.match(bridgeLine, /mappedFrom=403 mappedFromType=permission_error mappedTo=529 mapReason=codex_auth_expired/);
+  });
+
+  it('(f4) leaves a needs-login 403 alone while degradeMapping is disabled', async () => {
+    const { response, text, bridgeLine } = await callWithLedger({
+      mode: 'needs-login',
+      degradeMapping: null,
+      gptPoolState: null,
+      claudeAllUnusable: null,
+    });
+
+    assert.equal(response.status, 403, '既定（無効）の構成では現行とまったく同じ振る舞いをする');
+    assert.match(text, /codex login required/, '本文も bridge のまま');
+    assert.match(
+      bridgeLine,
+      /^\d{4}-\d{2}-\d{2}T[\d:.]+Z openai-bridge model=gpt-6-astra method=POST path=\/v1\/messages status=403 durationMs=\d+ outcome=forwarded$/,
+      'ログ行は現行とバイト単位で同一（追記フィールドが1つも出ない）',
+    );
+  });
+
+  it('(f5) forwards an auth-expired 403 that carries no contract headers untouched', async () => {
+    // 契約ヘッダを1つも付けない bridge の 403（契約前 bridge ・bridge 不達の形）。
+    const { response, text, lines } = await callThroughRotator({
+      requestBody: '{"model":"gpt-6-astra"}',
+      settingsOverride: { degradeMapping: { enabled: true } },
+      bridgeHandler: (req, res) => {
+        const payload = '{"type":"error","error":{"type":"permission_error","message":"codex login required"}}';
+        res.writeHead(403, {
+          'Content-Type': 'application/json',
+          'content-length': String(Buffer.byteLength(payload)),
+        }).end(payload);
+      },
+    });
+
+    assert.equal(response.status, 403, '契約ヘッダの無い 403 は対象外（D-72 の 2）');
+    assert.equal(JSON.parse(text).error.type, 'permission_error');
+    assert.equal(
+      /mapped(From|To)=/.test(lines.find(l => / openai-bridge model=/.test(l))),
+      false,
+      '写像していないので mapped* は出さない',
+    );
   });
 
   it('(g) forwards a legacy 429 without contract headers untouched (§C3.7-1)', async () => {
@@ -3194,5 +3291,82 @@ describe('forwardToOpenAiBridge > R6-4 契約ヘッダの送出と利用者ヘ�
       assert.equal(seen['x-ombr-idle-timeout-ms'], '30000');
       assert.deepEqual(contractHeaderNames(seen), ['x-ombr-idle-timeout-ms']);
     }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// R7-2: proxy 統合（母艦裁定 D-72）
+//
+// 純関数と forwardToOpenAiBridge の単体では「実際のクライアントが 529 を受け取る」
+// ことまでは固定できない。createProxyServer の gpt-* 分岐を実 TCP で1往復通して、
+// bridge の 403（認証失効）が 529 としてクライアントへ届くことを確かめる。
+// ---------------------------------------------------------------------------
+
+describe('proxy 統合 > 認証失効の 403 が 529 としてクライアントへ届く (D-72)', () => {
+  async function callProxy({ mode, degradeMapping = { enabled: true } }) {
+    const bridge = await startContractBridge({ port: 0, mode });
+    const secretStore = new MemorySecretStore();
+    await secretStore.set('acct_1', { accessToken: 'access-token-1' });
+    const accountManager = new AccountManager({
+      accounts: [{ id: 'acct_1', name: 'a@example.com', type: 'oauth' }],
+      now: () => 1000,
+    });
+    const logLines = [];
+    const proxy = await listen(createProxyServer({
+      accountManager,
+      secretStore,
+      config: {
+        upstream: 'http://127.0.0.1:1',
+        usagePolling: { enabled: false },
+        openaiBridge: {
+          enabled: true,
+          url: bridge.url,
+          modelPattern: '^gpt-',
+          connectTimeoutMs: 1000,
+          idleTimeoutMs: 1000,
+          connectRetries: 0,
+          ...(degradeMapping ? { degradeMapping } : {}),
+        },
+      },
+      currentCredentialReader: async () => null,
+      logger: line => logLines.push(line),
+    }));
+    try {
+      const response = await requestJson(`${proxy.url}/v1/messages`, {
+        method: 'POST',
+        body: JSON.stringify({ model: 'gpt-6-astra' }),
+        headers: {
+          authorization: `Bearer ${LOCAL_GATEWAY_AUTH_TOKEN}`,
+          'content-type': 'application/json',
+        },
+      });
+      return { response, logLines };
+    } finally {
+      await close(proxy.server);
+      await bridge.close();
+    }
+  }
+
+  it('delivers 529 overloaded_error to the client when the Codex pool is signed out', async () => {
+    const { response, logLines } = await callProxy({ mode: 'needs-login' });
+
+    assert.equal(response.status, 529, 'Claude Code はここで止まらず fallbackModel へ退避できる');
+    assert.equal(JSON.parse(response.bodyText).error.type, 'overloaded_error');
+    assert.equal(
+      response.headers['content-length'],
+      String(Buffer.byteLength(response.bodyText)),
+      '本文長が一致しないとクライアントが本文を待ち続ける',
+    );
+    assert.ok(
+      logLines.some(line => / openai-bridge /.test(line) && /mapReason=codex_auth_expired/.test(line)),
+      '写像の痕跡をログに残す',
+    );
+  });
+
+  it('still delivers the untouched 403 while degradeMapping is disabled', async () => {
+    const { response } = await callProxy({ mode: 'needs-login', degradeMapping: null });
+
+    assert.equal(response.status, 403, '既定（無効）の構成では現行と同一');
+    assert.equal(JSON.parse(response.bodyText).error.type, 'permission_error');
   });
 });
