@@ -7566,6 +7566,86 @@ describe('createProxyServer', () => {
     assert.equal(JSON.stringify(refresh.body).includes('refresh-token-'), false);
   });
 
+  it('利用量更新で再ログイン必須の認証を枠待ちではなく認証失敗として表示する', async () => {
+    const secretStore = new MemorySecretStore();
+    await secretStore.set('acct_1', {
+      accessToken: randomUUID(),
+      refreshToken: randomUUID(),
+      expiresAt: 1,
+    });
+    const accountManager = new AccountManager({
+      accounts: [{ id: 'acct_1', name: 'a@example.com', type: 'oauth' }],
+      now: () => 1000,
+    });
+    accountManager.updateQuota('acct_1', {
+      'anthropic-ratelimit-unified-5h-utilization': '1',
+      'anthropic-ratelimit-unified-5h-reset': '60',
+    });
+    assert.equal(accountManager.getStatus().accounts[0].unavailableReason.type, 'quota_exhausted');
+    let usageCalls = 0;
+    const proxy = await listen(createProxyServer({
+      accountManager,
+      secretStore,
+      allowLiveClaudeCodeCredentials: false,
+      config: { upstream: 'http://127.0.0.1:1', usagePolling: { enabled: false } },
+      tokenRefresher: async () => {
+        throw Object.assign(new Error('The stored OAuth refresh credential has expired and must be linked again'), {
+          code: 'NATIVE_REFRESH_REAUTH_REQUIRED',
+        });
+      },
+      usageFetcher: async () => { usageCalls += 1; },
+    }));
+    cleanupAfterTest(async () => close(proxy.server));
+
+    const refresh = await requestJson(`${proxy.url}/internal/refresh-usage`, { method: 'POST' });
+
+    assert.equal(refresh.status, 200);
+    assert.equal(refresh.body.accounts[0].ok, false);
+    assert.equal(usageCalls, 0);
+    assert.deepEqual(refresh.body.status.accounts[0].unavailableReason, {
+      type: 'oauth_refresh_failed',
+      message: 'OAuth token refresh failed',
+    });
+  });
+
+  for (const { code, message, retryAfterMs, expectedReason } of [
+    { code: 'SECRET_STORE_LOCK_TIMEOUT', message: 'Timed out waiting for credential lock', expectedReason: null },
+    { code: 'ETIMEDOUT', message: 'Native Claude refresh command timed out', expectedReason: null },
+    { code: 'NATIVE_REFRESH_COMMAND_FAILED', message: 'native refresh command failed', retryAfterMs: 60_000, expectedReason: 'oauth_refresh_retry' },
+  ]) {
+    it(`利用量更新で一時的な ${code} を再ログイン必須と誤分類しない`, async () => {
+      const secretStore = new MemorySecretStore();
+      await secretStore.set('acct_1', {
+        accessToken: randomUUID(),
+        refreshToken: randomUUID(),
+        expiresAt: 1,
+      });
+      const accountManager = new AccountManager({
+        accounts: [{ id: 'acct_1', name: 'a@example.com', type: 'oauth' }],
+        now: () => 1000,
+      });
+      let usageCalls = 0;
+      const proxy = await listen(createProxyServer({
+        accountManager,
+        secretStore,
+        allowLiveClaudeCodeCredentials: false,
+        config: { upstream: 'http://127.0.0.1:1', usagePolling: { enabled: false } },
+        tokenRefresher: async () => {
+          throw Object.assign(new Error(message), { code, retryAfterMs });
+        },
+        usageFetcher: async () => { usageCalls += 1; },
+      }));
+      cleanupAfterTest(async () => close(proxy.server));
+
+      const refresh = await requestJson(`${proxy.url}/internal/refresh-usage`, { method: 'POST' });
+
+      assert.equal(refresh.status, 200);
+      assert.equal(refresh.body.accounts[0].ok, false);
+      assert.equal(usageCalls, 0);
+      assert.equal(refresh.body.status.accounts[0].unavailableReason?.type ?? null, expectedReason);
+    });
+  }
+
   it('persists an unknown native refresh outcome from usage polling', async () => {
     const secretStore = new MemorySecretStore();
     await secretStore.set('acct_1', {

@@ -1870,6 +1870,7 @@ function rebalanceAfterUsageRefresh(accountManager) {
 
 function isOAuthCredentialError(message, error = null) {
   return error?.code === 'NATIVE_REFRESH_OUTCOME_UNKNOWN'
+    || error?.code === 'NATIVE_REFRESH_REAUTH_REQUIRED'
     || /OAuth access token is missing|Token refresh failed|Usage fetch failed \(401\)/.test(String(message || ''));
 }
 
