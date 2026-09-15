@@ -1128,6 +1128,53 @@ function commonQuotaExhausted(quota, threshold) {
   return false;
 }
 
+/**
+ * Public form of the module-private `commonQuotaExhausted` (design §5, D-56-3).
+ * True when a family-independent window of THIS account is at or over the
+ * threshold: unified 5h/7d, or the token/request rate limit. A model-scoped
+ * weekly window is never "common", so it never makes this true.
+ *
+ * Takes the account rather than the raw quota so callers outside this module
+ * never have to reach into `account.quota` themselves. A missing account is
+ * `false`: "no account" is not evidence of an exhausted common window.
+ */
+export function isCommonQuotaExhausted(account, threshold) {
+  if (!account) return false;
+  return commonQuotaExhausted(account.quota, threshold);
+}
+
+/**
+ * True only for the "sub-cap only" case of design §5.1 / D-56-3: a model-scoped
+ * weekly window blocks `modelFamily` while every common window is still below
+ * the threshold. This is the one case where the account stays perfectly usable
+ * for every other family, so the reactive 429 path must not move `currentIndex`.
+ *
+ * The three states that are NOT a quota exhaustion - an expired or rejected
+ * login (`status === 'error'`), a throttle (`status === 'throttled'`) and any
+ * live short-term back-off, which covers both the plain rate limit and the
+ * credential-refresh cooldown (`rateLimitedUntil` in the future) - are false
+ * here even when a scoped window happens to be over the threshold as well.
+ * Those belong to the existing retry path, which must keep its current
+ * behaviour (§4.3). `refreshQuotaState` can rewrite `status` to `'exhausted'`
+ * while a back-off is still running, which is why the back-off is read from
+ * `rateLimitedUntil` rather than from `status` alone.
+ *
+ * Reads the ledger without touching it: unlike `isAvailable` it never calls
+ * `refreshQuotaState`, so evaluating it cannot add a `quota-exhausted` event
+ * or move an account's status (invariant I-3).
+ *
+ * @param {number} [now] Clock used for the back-off comparison, in ms. Callers
+ *   holding an `AccountManager` pass `accountManager.now()` so a test clock is
+ *   honoured; the default keeps the predicate callable on its own.
+ */
+export function familyQuotaExhaustedOnly(account, threshold, modelFamily, now = Date.now()) {
+  if (!account) return false;
+  if (account.status === 'error' || account.status === 'throttled') return false;
+  if (account.rateLimitedUntil != null && now < account.rateLimitedUntil) return false;
+  if (commonQuotaExhausted(account.quota, threshold)) return false;
+  return quotaBlocksModelFamily(account.quota, threshold, modelFamily);
+}
+
 function futureAvailabilityForModelFamily(account, threshold, modelFamily, now) {
   if (!account) return { state: 'unknown', availableAt: null };
   if (account.status === 'error') {

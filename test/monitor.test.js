@@ -1,7 +1,7 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 
-import { AccountManager } from '../src/account-manager.js';
+import { AccountManager, familyQuotaExhaustedOnly } from '../src/account-manager.js';
 import { progressBar, renderStatus, formatDuration } from '../src/monitor.js';
 
 describe('monitor rendering', () => {
@@ -581,3 +581,79 @@ function authExpiredStatus(type) {
   };
   return status;
 }
+
+describe('サブキャップ 429 で稼働口座が動かないときの表示 (P-4 / 設計書 §7.3)', () => {
+  const NOW = Date.parse('2026-06-04T09:00:00.000Z');
+  const FIVE_HOUR_RESET = '2026-06-04T12:00:00.000Z';
+  const SEVEN_DAY_RESET = '2026-06-08T09:00:00.000Z';
+  const FABLE_RESET = '2026-06-06T09:00:00.000Z';
+
+  // R-S2b（設計書 §5.1）は、反応的 429 の switchToCandidate を
+  // familyQuotaExhaustedOnly で条件付きにする。ここではその条件式をそのまま置き、
+  // 系統枠だけが枯れた場合と共通枠が枯れた場合で画面がどう変わるかを固定する（P-4 の差分）。
+  function statusAfterReactive429({ commonExhausted }) {
+    const manager = new AccountManager({
+      accounts: [
+        { id: 'acct_1', name: 'a@example.com', type: 'oauth' },
+        { id: 'acct_2', name: 'b@example.com', type: 'oauth' },
+      ],
+      switchThreshold: 1,
+      now: () => NOW,
+    });
+    manager.applyUsage('acct_1', {
+      five_hour: { utilization: commonExhausted ? 1 : 0.2, resets_at: FIVE_HOUR_RESET },
+      seven_day: { utilization: 0.3, resets_at: SEVEN_DAY_RESET },
+      scoped_weekly: [{ key: 'fable', label: 'Fable', utilization: 1, resets_at: FABLE_RESET }],
+    });
+    manager.applyUsage('acct_2', {
+      five_hour: { utilization: 0.1, resets_at: FIVE_HOUR_RESET },
+      seven_day: { utilization: 0.1, resets_at: SEVEN_DAY_RESET },
+    });
+
+    const source = manager.find('acct_1');
+    if (!familyQuotaExhaustedOnly(source, manager.switchThreshold, 'fable', manager.now())) {
+      manager.switchToCandidate(
+        manager.bestAvailableSwitchCandidate({ excludeCurrent: false, modelFamily: 'fable' }),
+        'quota-threshold',
+        '429',
+      );
+    }
+    return manager.getStatus();
+  }
+
+  it('keeps the sub-cap-exhausted account as current and shows no account as active', () => {
+    const subCap = statusAfterReactive429({ commonExhausted: false });
+    const common = statusAfterReactive429({ commonExhausted: true });
+
+    assert.deepEqual({
+      currentAccount: subCap.currentAccount,
+      accounts: subCap.accounts.map(account => [account.id, account.status]),
+      autoSwitchEvents: subCap.events.filter(event => event.type === 'auto-switch').length,
+    }, {
+      currentAccount: 'acct_1',
+      accounts: [['acct_1', 'exhausted'], ['acct_2', 'ready']],
+      autoSwitchEvents: 0,
+    });
+    // 共通枠が枯れた 429 は従来どおり切り替わり、active の付け替えも従来どおり起きる。
+    assert.deepEqual({
+      currentAccount: common.currentAccount,
+      accounts: common.accounts.map(account => [account.id, account.status]),
+      autoSwitchEvents: common.events.filter(event => event.type === 'auto-switch').length,
+    }, {
+      currentAccount: 'acct_2',
+      accounts: [['acct_1', 'exhausted'], ['acct_2', 'active']],
+      autoSwitchEvents: 1,
+    });
+
+    const output = renderStatus(subCap, { now: NOW, columns: 100 });
+    assert.match(output, /current: a@example\.com/);
+    assert.match(output, /a@example\.com\s+exhausted/);
+    assert.match(output, /b@example\.com\s+ready/);
+    assert.ok(!/\bactive\b/.test(output), 'no account row may be labelled active');
+    assert.ok(!output.includes('switched acct_1 -> acct_2'), 'no auto-switch line is rendered');
+    // 消えるのは active の表示だけ。枯渇理由・回復時刻・経路は現行のまま（I-1 / I-2）。
+    assert.match(output, /reason: 7d Fable quota exhausted; reset -> 06\/06 18:00 JST/);
+    assert.match(output, /routes Fable: 2d \| Other: now/);
+    assert.match(renderStatus(common, { now: NOW, columns: 100 }), /b@example\.com\s+active/);
+  });
+});

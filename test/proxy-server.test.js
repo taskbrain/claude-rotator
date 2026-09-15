@@ -7,7 +7,7 @@ import { mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
-import { AccountManager } from '../src/account-manager.js';
+import { AccountManager, familyQuotaExhaustedOnly } from '../src/account-manager.js';
 import { LOCAL_GATEWAY_AUTH_TOKEN } from '../src/config.js';
 import { renderStatus } from '../src/monitor.js';
 import { OAuthTokenRefreshError, parseUsageResponse } from '../src/oauth.js';
@@ -2398,7 +2398,10 @@ describe('createProxyServer', () => {
       'Bearer access-token-1',
       'Bearer live-current-token',
     ]);
-    assert.equal(accountManager.getStatus().currentAccount, 'current');
+    // 反応的確認が確定したのは Fable の系統枠だけなので、R-S2b（設計書 §5.1）により
+    // この要求だけが `current` へ流れ、currentIndex は acct_1 に残る。
+    // 再生先の資格情報を実口座から読めることを押さえるのがこのテストの主旨で、そこは不変。
+    assert.equal(accountManager.getStatus().currentAccount, 'acct_1');
   });
 
   it('does not reuse a stored five-hour reset to replay a newer reset-less exhaustion header', async () => {
@@ -10607,10 +10610,10 @@ describe('account_switch trigger wiring', () => {
       accountManager,
       secretStore,
       config: { upstream: upstream.url, usagePolling: { enabled: false } },
+      // 反応的確認が確定させるのは共通枠（5h）の枯渇。系統枠だけの枯渇では
+      // R-S2b（設計書 §5.1）により currentIndex が動かず、切替行そのものが出ない。
       usageFetcher: async () => ({
-        scoped_weekly: [{
-          key: 'fable', label: 'Fable', utilization: 1, resets_at: futureReset(),
-        }],
+        five_hour: { utilization: 1, resets_at: futureReset() },
       }),
       logger,
     }));
@@ -10671,5 +10674,204 @@ describe('account_switch trigger wiring', () => {
       switchLines(logLines)[0],
       / account_switch from=acct_1 to=acct_2 reason=shortest-quota-reset trigger=request$/,
     );
+  });
+});
+
+describe('サブキャップ 429 の非対称の是正 (R-S2b / 設計書 §5.1)', () => {
+  function switchLines(logLines) {
+    return logLines.filter(line => line.includes(' account_switch '));
+  }
+
+  // 429 を返す口座（acct_1）だけが 429 を返し、ほかの資格情報は 200 を返す上流。
+  async function exhaustedOnFirstAccountUpstream(upstreamSeen) {
+    return listen(http.createServer((req, res) => {
+      upstreamSeen.push(req.headers.authorization);
+      if (req.headers.authorization === 'Bearer access-token-1') {
+        res.writeHead(429, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({
+          type: 'error', error: { type: 'rate_limit_error', message: 'Fable limit' },
+        }));
+        return;
+      }
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ ok: true }));
+    }));
+  }
+
+  it('does not move currentIndex for a reactive sub-cap 429', async () => {
+    const upstreamSeen = [];
+    const logLines = [];
+    const upstream = await exhaustedOnFirstAccountUpstream(upstreamSeen);
+    const secretStore = new MemorySecretStore();
+    await secretStore.set('acct_1', { accessToken: 'access-token-1' });
+    await secretStore.set('acct_2', { accessToken: 'access-token-2' });
+    const logger = line => logLines.push(line);
+    const accountManager = new AccountManager({
+      accounts: [
+        { id: 'acct_1', type: 'oauth' },
+        { id: 'acct_2', type: 'oauth' },
+      ],
+      logger,
+    });
+    accountManager.updateQuota('acct_1', {
+      'anthropic-ratelimit-unified-5h-utilization': '0.2',
+    });
+    accountManager.updateQuota('acct_2', {
+      'anthropic-ratelimit-unified-5h-utilization': '0.1',
+    });
+    const proxy = await listen(createProxyServer({
+      accountManager,
+      secretStore,
+      config: { upstream: upstream.url, usagePolling: { enabled: false } },
+      usageFetcher: async () => ({
+        scoped_weekly: [{
+          key: 'fable', label: 'Fable', utilization: 1, resets_at: futureReset(),
+        }],
+      }),
+      logger,
+    }));
+    cleanupAfterTest(async () => { await close(proxy.server); await close(upstream.server); });
+
+    const response = await requestJson(`${proxy.url}/v1/messages`, {
+      method: 'POST', body: JSON.stringify({ model: 'claude-fable-5' }),
+    });
+
+    assert.deepEqual({
+      status: response.status,
+      body: response.body,
+      upstreamSeen,
+      currentAccount: accountManager.getStatus().currentAccount,
+      switches: switchLines(logLines).length,
+    }, {
+      status: 200,
+      body: { ok: true },
+      // この要求だけが acct_2 へ流れる。先回り経路（getActiveAccount の ad-hoc 選択）と同じ扱い。
+      upstreamSeen: ['Bearer access-token-1', 'Bearer access-token-2'],
+      currentAccount: 'acct_1',
+      switches: 0,
+    });
+  });
+
+  it('still moves currentIndex for a reactive common-quota 429', async () => {
+    const upstreamSeen = [];
+    const logLines = [];
+    const upstream = await exhaustedOnFirstAccountUpstream(upstreamSeen);
+    const secretStore = new MemorySecretStore();
+    await secretStore.set('acct_1', { accessToken: 'access-token-1' });
+    await secretStore.set('acct_2', { accessToken: 'access-token-2' });
+    const logger = line => logLines.push(line);
+    const accountManager = new AccountManager({
+      accounts: [
+        { id: 'acct_1', type: 'oauth' },
+        { id: 'acct_2', type: 'oauth' },
+      ],
+      logger,
+    });
+    accountManager.updateQuota('acct_2', {
+      'anthropic-ratelimit-unified-5h-utilization': '0.1',
+    });
+    const proxy = await listen(createProxyServer({
+      accountManager,
+      secretStore,
+      config: { upstream: upstream.url, usagePolling: { enabled: false } },
+      // 反応的確認が返すのは共通枠（5h）の枯渇。系統枠ではない。
+      usageFetcher: async () => ({
+        five_hour: { utilization: 1, resets_at: futureReset() },
+      }),
+      logger,
+    }));
+    cleanupAfterTest(async () => { await close(proxy.server); await close(upstream.server); });
+
+    const response = await requestJson(`${proxy.url}/v1/messages`, {
+      method: 'POST', body: JSON.stringify({ model: 'claude-fable-5' }),
+    });
+
+    assert.deepEqual({
+      status: response.status,
+      body: response.body,
+      currentAccount: accountManager.getStatus().currentAccount,
+      switches: switchLines(logLines).length,
+    }, {
+      status: 200,
+      body: { ok: true },
+      currentAccount: 'acct_2',
+      switches: 1,
+    });
+    assert.match(
+      switchLines(logLines)[0],
+      / account_switch from=acct_1 to=acct_2 reason=quota-threshold trigger=429$/,
+    );
+  });
+
+  it('judges the sub-cap 429 by the quota of the account that returned it, not by the switch target', async () => {
+    const upstreamSeen = [];
+    const logLines = [];
+    const upstream = await exhaustedOnFirstAccountUpstream(upstreamSeen);
+    const secretStore = new MemorySecretStore();
+    await secretStore.set('acct_1', { accessToken: 'access-token-1' });
+    await secretStore.set('common_exhausted', { accessToken: 'access-token-common' });
+    await secretStore.set('target', { accessToken: 'access-token-target' });
+    const logger = line => logLines.push(line);
+    const accountManager = new AccountManager({
+      accounts: [
+        { id: 'acct_1', type: 'oauth' },
+        { id: 'common_exhausted', type: 'oauth' },
+        { id: 'target', type: 'oauth' },
+      ],
+      logger,
+    });
+    // 429 を返す口座: 共通枠は健全、系統枠（Fable）だけが枯れる（反応的確認で確定する）。
+    accountManager.updateQuota('acct_1', {
+      'anthropic-ratelimit-unified-5h-utilization': '0.2',
+    });
+    // 共通枠が枯れた口座。切替先にはなれないが、台帳に共通枠の状態が逆の口座を置く。
+    accountManager.updateQuota('common_exhausted', {
+      'anthropic-ratelimit-unified-5h-utilization': '1',
+      'anthropic-ratelimit-unified-5h-reset': String(Math.floor((Date.now() + 3_600_000) / 1000)),
+    });
+    // 実際の切替先候補。共通枠も系統枠も健全なので familyQuotaExhaustedOnly は偽になる。
+    accountManager.updateQuota('target', {
+      'anthropic-ratelimit-unified-5h-utilization': '0.1',
+    });
+    const proxy = await listen(createProxyServer({
+      accountManager,
+      secretStore,
+      config: { upstream: upstream.url, usagePolling: { enabled: false } },
+      usageFetcher: async () => ({
+        scoped_weekly: [{
+          key: 'fable', label: 'Fable', utilization: 1, resets_at: futureReset(),
+        }],
+      }),
+      logger,
+    }));
+    cleanupAfterTest(async () => { await close(proxy.server); await close(upstream.server); });
+
+    const response = await requestJson(`${proxy.url}/v1/messages`, {
+      method: 'POST', body: JSON.stringify({ model: 'claude-fable-5' }),
+    });
+
+    const now = accountManager.now();
+    const source = accountManager.find('acct_1');
+    const switchTarget = accountManager.find('target');
+    // 判定対象を取り違えると結論が逆になることを、述語そのもので固定する。
+    assert.deepEqual({
+      source: familyQuotaExhaustedOnly(source, accountManager.switchThreshold, 'fable', now),
+      switchTarget: familyQuotaExhaustedOnly(switchTarget, accountManager.switchThreshold, 'fable', now),
+    }, { source: true, switchTarget: false });
+
+    assert.deepEqual({
+      status: response.status,
+      body: response.body,
+      servedBy: upstreamSeen[upstreamSeen.length - 1],
+      currentAccount: accountManager.getStatus().currentAccount,
+      switches: switchLines(logLines).length,
+    }, {
+      status: 200,
+      body: { ok: true },
+      // 切替先は実際に選ばれている（reactiveSelection で判定していれば切替が起きるはず）。
+      servedBy: 'Bearer access-token-target',
+      currentAccount: 'acct_1',
+      switches: 0,
+    });
   });
 });

@@ -1,7 +1,7 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 
-import { AccountManager } from '../src/account-manager.js';
+import { AccountManager, familyQuotaExhaustedOnly, isCommonQuotaExhausted } from '../src/account-manager.js';
 import { parseRateLimitHeaders } from '../src/quota.js';
 
 describe('parseRateLimitHeaders', () => {
@@ -2414,5 +2414,117 @@ describe('account_switch log line', () => {
     assert.deepEqual(switchLines(logger), [
       '1970-01-01T00:00:01.000Z account_switch from=current to=available reason=quota-threshold trigger=unknown',
     ]);
+  });
+});
+
+describe('familyQuotaExhaustedOnly / isCommonQuotaExhausted (D-56-3 / 設計書 §5)', () => {
+  const NOW = Date.parse('2026-06-04T09:00:00.000Z');
+  const FABLE_RESET = '2026-06-06T09:00:00.000Z';
+  const LATER = '2026-06-08T09:00:00.000Z';
+
+  function makeManager(ids = ['acct_1']) {
+    return new AccountManager({
+      accounts: ids.map(id => ({ id, name: `${id}@example.com`, type: 'oauth' })),
+      switchThreshold: 1,
+      now: () => NOW,
+    });
+  }
+
+  function fableSubCapOnly(manager, id) {
+    manager.applyUsage(id, {
+      five_hour: { utilization: 0.2, resets_at: LATER },
+      seven_day: { utilization: 0.3, resets_at: LATER },
+      scoped_weekly: [{ key: 'fable', label: 'Fable', utilization: 1, resets_at: FABLE_RESET }],
+    });
+    return manager.find(id);
+  }
+
+  it('is true only for a model-scoped exhaustion', () => {
+    const manager = makeManager(['acct_1', 'healthy']);
+    const scoped = fableSubCapOnly(manager, 'acct_1');
+    manager.applyUsage('healthy', {
+      five_hour: { utilization: 0.2, resets_at: LATER },
+      seven_day: { utilization: 0.3, resets_at: LATER },
+    });
+
+    assert.equal(
+      familyQuotaExhaustedOnly(scoped, manager.switchThreshold, 'fable', NOW),
+      true,
+      'the Fable sub-cap is the only exhausted window, so the Fable family is blocked',
+    );
+    assert.equal(
+      familyQuotaExhaustedOnly(scoped, manager.switchThreshold, null, NOW),
+      false,
+      'a Fable-scoped window never blocks a non-Fable request',
+    );
+    assert.equal(
+      familyQuotaExhaustedOnly(manager.find('healthy'), manager.switchThreshold, 'fable', NOW),
+      false,
+      'an account with no exhausted window at all is not "family-exhausted only"',
+    );
+    assert.equal(familyQuotaExhaustedOnly(null, manager.switchThreshold, 'fable', NOW), false);
+  });
+
+  it('is false when the common quota is exhausted', () => {
+    const manager = makeManager(['both', 'commonOnly']);
+    manager.applyUsage('both', {
+      five_hour: { utilization: 1, resets_at: LATER },
+      seven_day: { utilization: 0.3, resets_at: LATER },
+      scoped_weekly: [{ key: 'fable', label: 'Fable', utilization: 1, resets_at: FABLE_RESET }],
+    });
+    manager.applyUsage('commonOnly', {
+      five_hour: { utilization: 0.2, resets_at: LATER },
+      seven_day: { utilization: 1, resets_at: LATER },
+    });
+
+    assert.equal(
+      familyQuotaExhaustedOnly(manager.find('both'), manager.switchThreshold, 'fable', NOW),
+      false,
+      'a common window that is also exhausted makes this a global exhaustion, not a sub-cap one',
+    );
+    assert.equal(
+      familyQuotaExhaustedOnly(manager.find('commonOnly'), manager.switchThreshold, 'fable', NOW),
+      false,
+    );
+  });
+
+  it('is false for a credential cooldown, a throttled account and an errored account', () => {
+    const manager = makeManager(['cooldown', 'throttled', 'errored']);
+    for (const id of ['cooldown', 'throttled', 'errored']) fableSubCapOnly(manager, id);
+    manager.markCredentialRefreshRateLimited('cooldown', 300);
+    manager.markRateLimited('throttled', 300);
+    manager.markError('errored', 'authentication_error', 'OAuth token rejected');
+
+    for (const id of ['cooldown', 'throttled', 'errored']) {
+      assert.equal(
+        familyQuotaExhaustedOnly(manager.find(id), manager.switchThreshold, 'fable', NOW),
+        false,
+        `${id}: the binding must not be treated as a sub-cap exhaustion (D-56-3)`,
+      );
+      assert.equal(
+        isCommonQuotaExhausted(manager.find(id), manager.switchThreshold),
+        false,
+        `${id}: neither predicate may claim a quota exhaustion for this account`,
+      );
+    }
+  });
+
+  it('delegates isCommonQuotaExhausted to the family-independent windows only', () => {
+    const manager = makeManager(['fiveHour', 'sevenDay', 'tokenRate', 'scoped']);
+    manager.applyUsage('fiveHour', { five_hour: { utilization: 1, resets_at: LATER } });
+    manager.applyUsage('sevenDay', { seven_day: { utilization: 1, resets_at: LATER } });
+    manager.updateQuota('tokenRate', {
+      'anthropic-ratelimit-tokens-limit': '100',
+      'anthropic-ratelimit-tokens-remaining': '0',
+    });
+    fableSubCapOnly(manager, 'scoped');
+
+    assert.deepEqual([
+      isCommonQuotaExhausted(manager.find('fiveHour'), manager.switchThreshold),
+      isCommonQuotaExhausted(manager.find('sevenDay'), manager.switchThreshold),
+      isCommonQuotaExhausted(manager.find('tokenRate'), manager.switchThreshold),
+      isCommonQuotaExhausted(manager.find('scoped'), manager.switchThreshold),
+      isCommonQuotaExhausted(null, manager.switchThreshold),
+    ], [true, true, true, false, false]);
   });
 });

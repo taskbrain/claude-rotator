@@ -2,7 +2,12 @@ import { createHash } from 'node:crypto';
 import http from 'node:http';
 import https from 'node:https';
 
-import { isAuthExpiredReason, isCredentialRefreshCooldown, isUnifiedQuotaExhaustion } from './account-manager.js';
+import {
+  familyQuotaExhaustedOnly,
+  isAuthExpiredReason,
+  isCredentialRefreshCooldown,
+  isUnifiedQuotaExhaustion,
+} from './account-manager.js';
 import { readCurrentClaudeCredentials } from './claude-credentials.js';
 import {
   DEFAULT_USAGE_POLL_INTERVAL_MS,
@@ -2179,7 +2184,22 @@ async function forwardWithRotation({
       return;
     }
     attemptedAccountIds.add(account.id);
-    if (reactiveQuotaRetryUsed) {
+    // 設計書 §5.1（D-54-12）: 系統枠だけが枯れた 429 では currentIndex を動かさない。
+    // その口座は他の系統では現役のままなので、先回り経路（getActiveAccount の
+    // `leave currentIndex untouched`）と同じく、この要求の送信先としてだけ候補を使う。
+    // 判定するのは **429 を返した口座**（reactiveQuotaSource）であって切替先の候補ではない。
+    // 切替先で判定すると、枯れていない新候補を見て「共通枠は無事」と読み、
+    // 系統枠由来でもグローバル切替を実行してしまう（是正が逆に効く）。
+    // reactiveQuotaSource が無いときは述語が偽になり、従来どおり切り替える。
+    if (
+      reactiveQuotaRetryUsed
+      && !familyQuotaExhaustedOnly(
+        reactiveQuotaSource,
+        accountManager.switchThreshold,
+        modelFamily,
+        accountManager.now(),
+      )
+    ) {
       accountManager.switchToCandidate(reactiveSelection, 'quota-threshold', '429');
     }
 
