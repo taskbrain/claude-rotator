@@ -7,6 +7,21 @@ import {
 
 export const DEFAULT_WEEKLY_RESET_PRIORITY_WINDOW_MS = 36 * 60 * 60 * 1000;
 const MAX_DATE_TIMESTAMP_MS = 8_640_000_000_000_000;
+
+/**
+ * Affinity-only selector constants (design 4.2, D-56-1).
+ * `DEFAULT_ASSIGN_STOP_UTILIZATION` stops NEW assignments at 90% - it is not an
+ * eviction line: a session already bound to a 90% account stays there until the
+ * account actually runs out (R2). `ASSIGN_BAND_WIDTH` is the 5-point band below
+ * the best headroom inside which the weekly-reset priority is allowed to decide;
+ * the width itself is an authoring judgement that has not been measured (U15).
+ * `ASSIGN_BAND_EPSILON` only absorbs binary floating point error, so a candidate
+ * exactly `ASSIGN_BAND_WIDTH` below the best (e.g. 0.85 against 0.90 - 0.05,
+ * which evaluates to 0.8500000000000001) still counts as inside the band.
+ */
+const DEFAULT_ASSIGN_STOP_UTILIZATION = 0.9;
+const ASSIGN_BAND_WIDTH = 0.05;
+const ASSIGN_BAND_EPSILON = 1e-9;
 const ACCOUNT_SWITCH_TRIGGERS = new Set([
   'usage-refresh',
   '429',
@@ -862,6 +877,112 @@ export class AccountManager {
     return 'ready';
   }
 
+  /**
+   * Picks the account a NEW session should be bound to (design 4.2, D-56-1).
+   *
+   * This is the affinity-only selector. It deliberately does NOT reuse
+   * `switchTargetScore` / `compareSwitchTargetScores`: that comparator ranks
+   * `weeklyResetPriority` first, reads only the unified 5h/7d windows into
+   * `maxUtilization` and always settles ties on ledger order, so it does not
+   * pick the account with the most headroom (design 4.2 (a)-(c)). Requests
+   * without a session key keep going through the existing comparator.
+   *
+   * Ranking, after the assign-stop gate and the missing-window split:
+   *   K1 weekly reset priority (only inside the band)
+   *   K2 earliest weekly reset (only between two priority accounts)
+   *   K3 fewest sessions already bound (R4 - this key is reachable here,
+   *      unlike in the existing comparator)
+   *   K4 largest headroom, then account priority, then ledger order
+   *
+   * Side effect: the availability filter calls `isAvailable`, which refreshes
+   * the quota state of every account it looks at. That is wanted - an expired
+   * reset is applied, so a recovered account comes back as a candidate - and it
+   * does not inflate the event log, because `recordQuotaExhausted` dedupes on
+   * the exhaustion reason (invariant I-3).
+   *
+   * @param {string|null} modelFamily 'fable' for a Fable request, null otherwise.
+   *   Only a Fable request counts the Fable weekly sub-cap as one of its windows.
+   * @param {Set<string>|Iterable<string>|string|null} excludeAccountIds Account
+   *   ids that must not be picked - the caller passes `attemptedAccountIds`
+   *   and, for a sub-binding, the account that just failed.
+   * @param {number} assignStopUtilization Utilization at which an account stops
+   *   accepting NEW sessions. The gate is dropped entirely when it would leave
+   *   no candidate at all (R1).
+   * @param {Map<string,number>|Record<string,number>|null} sessionCounts Sessions
+   *   already bound per account id (`SessionAffinity.summary().sessionsByAccount`).
+   * @returns {object|null} The chosen account, or null when nothing is usable -
+   *   the caller then falls through to the existing exhausted-response path (R1).
+   */
+  selectForNewAssignment({
+    modelFamily = null,
+    excludeAccountIds = null,
+    assignStopUtilization = DEFAULT_ASSIGN_STOP_UTILIZATION,
+    sessionCounts = null,
+  } = {}) {
+    const excluded = normalizeExcludedAccountIds(excludeAccountIds);
+    const gate = normalizeAssignStopUtilization(assignStopUtilization);
+    const now = this.now();
+
+    const pool = this.accounts
+      .map((account, index) => ({ account, index }))
+      .filter(({ account }) => !excluded.has(account.id) && this.isAvailable(account, modelFamily))
+      .map(({ account, index }) => this.newAssignmentCandidate(account, index, modelFamily, now, sessionCounts));
+    if (pool.length === 0) return null;
+
+    const admitted = pool.filter(candidate => (
+      candidate.headroom.min != null && candidate.headroom.min > 1 - gate
+    ));
+    const candidates = admitted.length > 0 ? admitted : pool;
+
+    // D-60-4: split the candidates with a missing window out BEFORE the band is
+    // computed. A window that could not be read must not look like headroom and
+    // push a fully known candidate out of the band.
+    const known = candidates.filter(candidate => candidate.headroom.complete);
+    const missing = candidates.filter(candidate => !candidate.headroom.complete);
+    const ranked = known.length > 0 ? known : missing;
+
+    const best = Math.max(...ranked.map(candidate => candidate.headroom.min ?? -1));
+    const band = ranked.filter(candidate => (
+      (candidate.headroom.min ?? -1) >= best - ASSIGN_BAND_WIDTH - ASSIGN_BAND_EPSILON
+    ));
+
+    band.sort(compareNewAssignmentCandidates);
+    return band[0].account;
+  }
+
+  /** One ranking row for `selectForNewAssignment`. Reads the ledger, never writes it. */
+  newAssignmentCandidate(account, index, modelFamily, now, sessionCounts) {
+    const quota = account.quota || {};
+    const weeklyUtilization = finiteNumberOrNull(quota.unified7d);
+    const weeklyResetAt = finiteNumberOrNull(quota.unified7dReset);
+    const weeklyResetPriority = this.rotationPolicy.mode === 'use-expiring-weekly'
+      && weeklyUtilization != null
+      && weeklyResetAt != null
+      && weeklyResetAt > now
+      && weeklyResetAt - now <= this.rotationPolicy.weeklyResetPriorityWindowMs;
+    return {
+      account,
+      index,
+      headroom: assignmentHeadroom(quota, modelFamily),
+      weeklyResetPriority,
+      // K2 only separates two priority accounts, so everything else shares the
+      // same sentinel and falls through to K3.
+      weeklyResetAt: weeklyResetPriority ? weeklyResetAt : Number.MAX_SAFE_INTEGER,
+      sessions: sessionCountFor(sessionCounts, account.id),
+      priority: account.priority ?? Number.MAX_SAFE_INTEGER,
+    };
+  }
+
+  /**
+   * Same lookup as `find`, but returns null instead of throwing when the id is
+   * unknown. A session binding can outlive its account (a reload that drops an
+   * account), and that case has to be detectable rather than fatal (design 4.3).
+   */
+  findOrNull(accountId) {
+    if (typeof accountId !== 'string' || accountId === '') return null;
+    return this.accounts.find(item => item.id === accountId || item.name === accountId) || null;
+  }
+
   find(accountId) {
     const account = this.accounts.find(item => item.id === accountId || item.name === accountId);
     if (!account) throw new Error(`Unknown account: ${accountId}`);
@@ -1238,6 +1359,77 @@ function compareRoutingAvailabilityCandidates(left, right) {
   }
   if (left.priority !== right.priority) return left.priority - right.priority;
   return left.index - right.index;
+}
+
+/**
+ * Headroom of an account for `selectForNewAssignment` (design 4.2).
+ *
+ * `min` is the residual (1 - utilization) of the tightest window that could be
+ * read, so the account is ranked by the window that will run out first. A Fable
+ * request also counts the Fable weekly sub-cap, which is what keeps a 95%
+ * sub-cap account from becoming the home of a new Fable session.
+ *
+ * A window that could not be read is NOT treated as 100% free: it is left out of
+ * `min` and reported through `complete: false`, so the caller can rank those
+ * candidates behind the fully known ones instead of trusting a flattering value.
+ */
+function assignmentHeadroom(quota, modelFamily) {
+  const utilizations = [finiteNumberOrNull(quota?.unified5h), finiteNumberOrNull(quota?.unified7d)];
+  if (modelFamily === 'fable' && Array.isArray(quota?.weeklyScoped)) {
+    for (const limit of quota.weeklyScoped) {
+      if (!scopeMatchesModelFamily(limit, modelFamily)) continue;
+      utilizations.push(finiteNumberOrNull(limit.utilization));
+    }
+  }
+  const residuals = utilizations
+    .filter(utilization => utilization != null)
+    .map(utilization => 1 - utilization);
+  return {
+    min: residuals.length > 0 ? Math.min(...residuals) : null,
+    complete: residuals.length === utilizations.length,
+  };
+}
+
+function compareNewAssignmentCandidates(left, right) {
+  if (left.weeklyResetPriority !== right.weeklyResetPriority) {
+    return left.weeklyResetPriority ? -1 : 1;
+  }
+  if (left.weeklyResetAt !== right.weeklyResetAt) {
+    return left.weeklyResetAt - right.weeklyResetAt;
+  }
+  if (left.sessions !== right.sessions) {
+    return left.sessions - right.sessions;
+  }
+  const leftHeadroom = left.headroom.min ?? -1;
+  const rightHeadroom = right.headroom.min ?? -1;
+  if (leftHeadroom !== rightHeadroom) {
+    return rightHeadroom - leftHeadroom;
+  }
+  if (left.priority !== right.priority) {
+    return left.priority - right.priority;
+  }
+  return left.index - right.index;
+}
+
+function normalizeExcludedAccountIds(value) {
+  if (!value) return new Set();
+  if (value instanceof Set) return value;
+  if (typeof value === 'string') return new Set([value]);
+  if (typeof value[Symbol.iterator] === 'function') return new Set(value);
+  return new Set();
+}
+
+function normalizeAssignStopUtilization(value) {
+  const utilization = Number(value);
+  if (!Number.isFinite(utilization)) return DEFAULT_ASSIGN_STOP_UTILIZATION;
+  return Math.min(1, Math.max(0, utilization));
+}
+
+function sessionCountFor(sessionCounts, accountId) {
+  if (!sessionCounts) return 0;
+  const raw = typeof sessionCounts.get === 'function' ? sessionCounts.get(accountId) : sessionCounts[accountId];
+  const count = Number(raw);
+  return Number.isFinite(count) && count > 0 ? count : 0;
 }
 
 function compareSwitchTargetScores(left, right) {

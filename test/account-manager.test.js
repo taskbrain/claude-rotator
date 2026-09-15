@@ -2528,3 +2528,261 @@ describe('familyQuotaExhaustedOnly / isCommonQuotaExhausted (D-56-3 / 設計書 
     ], [true, true, true, false, false]);
   });
 });
+
+describe('findOrNull (設計書 §5)', () => {
+  function makeManager() {
+    return new AccountManager({
+      accounts: [{ id: 'acct_1', name: 'a@example.com', type: 'oauth' }],
+      switchThreshold: 1,
+      now: () => 1000,
+    });
+  }
+
+  it('returns the account for a known id or name', () => {
+    const manager = makeManager();
+
+    assert.equal(manager.findOrNull('acct_1').id, 'acct_1');
+    assert.equal(manager.findOrNull('a@example.com').id, 'acct_1');
+  });
+
+  it('returns null where find() throws, so a removed binding can be detected', () => {
+    const manager = makeManager();
+
+    assert.throws(() => manager.find('gone'), /Unknown account: gone/);
+    assert.equal(manager.findOrNull('gone'), null);
+    assert.equal(manager.findOrNull(null), null);
+    assert.equal(manager.findOrNull(''), null);
+    assert.equal(manager.findOrNull(undefined), null);
+  });
+});
+
+describe('selectForNewAssignment (D-56-1 / D-60-4 / 設計書 §4.2)', () => {
+  const NOW = Date.parse('2026-06-04T09:00:00.000Z');
+  // 36h の週次リセット優先窓（DEFAULT_WEEKLY_RESET_PRIORITY_WINDOW_MS）の内と外。
+  const SOON_WEEKLY = '2026-06-04T15:00:00.000Z'; // NOW + 6h  -> weeklyResetPriority = true
+  const LATE_WEEKLY = '2026-06-08T09:00:00.000Z'; // NOW + 4d  -> weeklyResetPriority = false
+  const FIVE_HOUR_RESET = '2026-06-04T12:00:00.000Z';
+
+  function makeManager(ids) {
+    return new AccountManager({
+      accounts: ids.map(id => ({ id, name: `${id}@example.com`, type: 'oauth' })),
+      switchThreshold: 1,
+      now: () => NOW,
+    });
+  }
+
+  /** `residual` は「残率」。utilization = 1 - residual で使用量へ直して台帳へ入れる。 */
+  function setWindows(manager, id, { fiveHour = null, weekly = null, weeklyResetAt = LATE_WEEKLY, fableSubCap = null }) {
+    const payload = {};
+    if (fiveHour != null) payload.five_hour = { utilization: 1 - fiveHour, resets_at: FIVE_HOUR_RESET };
+    if (weekly != null) payload.seven_day = { utilization: 1 - weekly, resets_at: weeklyResetAt };
+    if (fableSubCap != null) {
+      payload.scoped_weekly = [
+        { key: 'fable', label: 'Fable', utilization: 1 - fableSubCap, resets_at: LATE_WEEKLY },
+      ];
+    }
+    manager.applyUsage(id, payload);
+  }
+
+  function existingComparatorPick(manager, modelFamily = null) {
+    return manager.bestAvailableSwitchCandidate({ excludeCurrent: false, modelFamily })?.account.id ?? null;
+  }
+
+  it('§4.2 例①: prefers 90% headroom over an 11% account whose weekly window resets sooner', () => {
+    const manager = makeManager(['cand1', 'cand2']);
+    setWindows(manager, 'cand1', { fiveHour: 0.11, weekly: 0.80, weeklyResetAt: SOON_WEEKLY });
+    setWindows(manager, 'cand2', { fiveHour: 0.90, weekly: 0.95, weeklyResetAt: LATE_WEEKLY });
+
+    assert.equal(
+      existingComparatorPick(manager),
+      'cand1',
+      '既存比較器は weeklyResetPriority が第0キーなので残 11% を無条件に先着させる（§4.2 (a)）',
+    );
+    assert.equal(
+      manager.selectForNewAssignment({ assignStopUtilization: 0.9 })?.id,
+      'cand2',
+      'cand1 は best(0.90) の 5 ポイント帯域から外れるので週次リセット優先まで到達しない',
+    );
+  });
+
+  it('§4.2 例②: never hands a new Fable session to an account whose Fable sub-cap is at 95%', () => {
+    const manager = makeManager(['cand1', 'cand2']);
+    setWindows(manager, 'cand1', { fiveHour: 0.80, weekly: 0.70, fableSubCap: 0.05 });
+    setWindows(manager, 'cand2', { fiveHour: 0.60, weekly: 0.50, fableSubCap: 0.90 });
+
+    assert.equal(
+      existingComparatorPick(manager, 'fable'),
+      'cand1',
+      '既存の maxUtilization は 5h/7d しか見ないので F7d 残 5% の口座を選ぶ（§4.2 (b)）',
+    );
+    assert.equal(
+      manager.selectForNewAssignment({ modelFamily: 'fable', assignStopUtilization: 0.9 })?.id,
+      'cand2',
+      'headroom が F7d を同列に入れるので cand1 の min は 0.05 になり割当停止ゲートで落ちる',
+    );
+    assert.equal(
+      manager.selectForNewAssignment({ modelFamily: null, assignStopUtilization: 0.9 })?.id,
+      'cand1',
+      '非 Fable の要求では F7d を見ないので cand1 が残る（scopeMatchesModelFamily）',
+    );
+  });
+
+  it('§4.2 例③: breaks an exact tie by the number of sessions already bound', () => {
+    const manager = makeManager(['cand1', 'cand2']);
+    setWindows(manager, 'cand1', { fiveHour: 0.80, weekly: 0.70 });
+    setWindows(manager, 'cand2', { fiveHour: 0.80, weekly: 0.70 });
+
+    assert.equal(
+      existingComparatorPick(manager),
+      'cand1',
+      '既存比較器の最終キーは台帳順なので常に同じ口座へ寄る（§4.2 (c)）',
+    );
+    assert.equal(
+      manager.selectForNewAssignment({
+        assignStopUtilization: 0.9,
+        sessionCounts: new Map([['cand1', 12], ['cand2', 1]]),
+      })?.id,
+      'cand2',
+      'K3（バインド済みセッション数）が台帳順より前にあるので必ず効く',
+    );
+    assert.equal(
+      manager.selectForNewAssignment({
+        assignStopUtilization: 0.9,
+        sessionCounts: { cand1: 12, cand2: 1 },
+      })?.id,
+      'cand2',
+      'summary().sessionsByAccount のような素のオブジェクトでも同じ結果になる',
+    );
+  });
+
+  it('§4.2 例④: one missing window must not push a known candidate out of the band', () => {
+    const manager = makeManager(['cand1', 'cand2']);
+    setWindows(manager, 'cand1', { fiveHour: 0.40, weekly: 0.60 });
+    setWindows(manager, 'cand2', { fiveHour: 0.95 }); // 7d の利用率が取得できない
+
+    assert.equal(
+      existingComparatorPick(manager),
+      'cand2',
+      '既存の maxUtilization は取得できた窓だけから作られるので欠測の口座が勝つ',
+    );
+    assert.equal(
+      manager.selectForNewAssignment({ assignStopUtilization: 0.9 })?.id,
+      'cand1',
+      '欠測候補は帯域を決める前に分離されるので、帯域は既知の cand1 だけで決まる（D-60-4）',
+    );
+  });
+
+  it('disables the assign-stop gate when no account clears it (R1)', () => {
+    const manager = makeManager(['low', 'lower']);
+    setWindows(manager, 'low', { fiveHour: 0.08, weekly: 0.90 });
+    setWindows(manager, 'lower', { fiveHour: 0.02, weekly: 0.90 });
+
+    const selected = manager.selectForNewAssignment({ assignStopUtilization: 0.9 });
+
+    assert.equal(selected?.id, 'low', 'ゲートを無効化したうえで残枠の大きい方を選ぶ');
+  });
+
+  it('honours the exclusion set and returns null once every account is excluded', () => {
+    const manager = makeManager(['cand1', 'cand2']);
+    setWindows(manager, 'cand1', { fiveHour: 0.90, weekly: 0.90 });
+    setWindows(manager, 'cand2', { fiveHour: 0.40, weekly: 0.40 });
+
+    assert.equal(manager.selectForNewAssignment({})?.id, 'cand1');
+    assert.equal(
+      manager.selectForNewAssignment({ excludeAccountIds: new Set(['cand1']) })?.id,
+      'cand2',
+      'attemptedAccountIds をそのまま渡せる（Set）',
+    );
+    assert.equal(
+      manager.selectForNewAssignment({ excludeAccountIds: ['cand1'] })?.id,
+      'cand2',
+      '配列でも同じ',
+    );
+    assert.equal(manager.selectForNewAssignment({ excludeAccountIds: ['cand1', 'cand2'] }), null);
+  });
+
+  it('lets the weekly-reset priority decide only inside the band', () => {
+    const manager = makeManager(['soon', 'late']);
+    setWindows(manager, 'soon', { fiveHour: 0.80, weekly: 0.90, weeklyResetAt: SOON_WEEKLY });
+    setWindows(manager, 'late', { fiveHour: 0.82, weekly: 0.90, weeklyResetAt: LATE_WEEKLY });
+
+    assert.equal(
+      manager.selectForNewAssignment({ assignStopUtilization: 0.9 })?.id,
+      'soon',
+      'best=0.82 の帯域（0.77 以上）に両方入るので K1 の週次リセット優先が効く',
+    );
+  });
+
+  it('keeps a candidate exactly five points below the best inside the band', () => {
+    const manager = makeManager(['best', 'edge']);
+    setWindows(manager, 'best', { fiveHour: 0.90, weekly: 0.90, weeklyResetAt: LATE_WEEKLY });
+    setWindows(manager, 'edge', { fiveHour: 0.85, weekly: 0.90, weeklyResetAt: SOON_WEEKLY });
+
+    assert.equal(
+      manager.selectForNewAssignment({ assignStopUtilization: 0.9 })?.id,
+      'edge',
+      '帯域はちょうど 5 ポイントまでを含む（0.90 - 0.05 の二進小数誤差で落とさない）',
+    );
+  });
+
+  it('uses candidates with a missing window only when no complete candidate is left (D-60-4)', () => {
+    const manager = makeManager(['knownSmall', 'missingLarge']);
+    setWindows(manager, 'knownSmall', { fiveHour: 0.30, weekly: 0.40 });
+    setWindows(manager, 'missingLarge', { fiveHour: 0.70 });
+
+    assert.equal(
+      manager.selectForNewAssignment({ assignStopUtilization: 0.9 })?.id,
+      'knownSmall',
+      '既知候補が1つでもあれば欠測候補は使わない',
+    );
+    assert.equal(
+      manager.selectForNewAssignment({
+        assignStopUtilization: 0.9,
+        excludeAccountIds: ['knownSmall'],
+      })?.id,
+      'missingLarge',
+      '既知候補が0になって初めて欠測候補が順位付けの対象になる',
+    );
+  });
+
+  it('keeps an account whose windows are all missing as a candidate (R1)', () => {
+    const manager = makeManager(['unknown', 'known']);
+
+    assert.equal(
+      manager.selectForNewAssignment({ assignStopUtilization: 0.9 })?.id,
+      'unknown',
+      '全窓欠測でも候補から外さない（使用量が未取得の口座で要求を止めない）',
+    );
+
+    setWindows(manager, 'known', { fiveHour: 0.30, weekly: 0.30 });
+
+    assert.equal(
+      manager.selectForNewAssignment({ assignStopUtilization: 0.9 })?.id,
+      'known',
+      '既知候補があるときは全窓欠測の口座を選ばない',
+    );
+  });
+
+  it('returns null when every account is unavailable so the caller keeps the current exhausted path (R1)', () => {
+    const manager = makeManager(['cand1', 'cand2']);
+    setWindows(manager, 'cand1', { fiveHour: 0, weekly: 0.90 });
+    setWindows(manager, 'cand2', { fiveHour: 0, weekly: 0.90 });
+
+    assert.equal(manager.selectForNewAssignment({}), null);
+  });
+
+  it('does not multiply quota-exhausted events when the selector evaluates the same account repeatedly', () => {
+    const manager = makeManager(['exhausted', 'healthy']);
+    setWindows(manager, 'exhausted', { fiveHour: 0, weekly: 0.90 });
+    setWindows(manager, 'healthy', { fiveHour: 0.80, weekly: 0.80 });
+
+    const before = manager.events.filter(event => event.type === 'quota-exhausted').length;
+    for (let i = 0; i < 50; i += 1) {
+      assert.equal(manager.selectForNewAssignment({ assignStopUtilization: 0.9 })?.id, 'healthy');
+    }
+    const after = manager.events.filter(event => event.type === 'quota-exhausted').length;
+
+    assert.equal(before, 1, '枯渇は台帳へ取り込んだ時点で1件だけ積まれている');
+    assert.equal(after, 1, 'セレクタが同じ口座を何度評価しても quota-exhausted は増えない（I-3）');
+  });
+});
