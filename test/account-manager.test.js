@@ -546,6 +546,7 @@ describe('AccountManager', () => {
     assert.deepEqual(account.unavailableReason, {
       type: 'oauth_refresh_failed',
       message: 'OAuth token refresh failed',
+      at: '1970-01-01T00:00:01.000Z',
     });
     assert.equal(manager.selectBestExhaustedFallback(), null);
   });
@@ -1061,6 +1062,7 @@ describe('AccountManager', () => {
     assert.deepEqual(status.accounts[2].unavailableReason, {
       type: 'authentication_error',
       message: 'OAuth token rejected',
+      at: '1970-01-01T00:00:01.000Z',
     });
   });
 
@@ -1416,8 +1418,8 @@ describe('AccountManager', () => {
       }
       assert.deepEqual(
         status.accounts[0].unavailableReason,
-        { type, message: 'OAuth token refresh failed' },
-        '台帳側の理由は1ビットも変えない（表示だけの変更である）',
+        { type, message: 'OAuth token refresh failed', at: '2026-08-29T05:00:00.000Z' },
+        '台帳側の理由は、検出時刻が足された以外はそのまま（表示だけの変更である）',
       );
     }
 
@@ -1865,5 +1867,183 @@ describe('AccountManager', () => {
     assert.equal(account.status, 'active');
     assert.equal(account.rateLimitedUntil, null);
     assert.equal(account.unavailableReason, null);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// (c) 認証失敗の原因コードと検出時刻の保持（母艦裁定 C-20260915-3F-03）
+//
+// 「認証が切れている」だけでは、いつ・何が原因で落ちたのかが分からず、
+// 再ログインすべきかどうかを人が判断できない。markError に details を足して
+// 原因コード（cause）と検出時刻（at）を台帳へ残し、再起動を挟んでも失わない。
+// ---------------------------------------------------------------------------
+describe('認証失敗の原因コードと検出時刻 (c)', () => {
+  const buildManager = (now) => new AccountManager({
+    accounts: [{ id: 'acct_1', name: 'a@example.com', type: 'oauth' }],
+    now,
+  });
+
+  it('keeps an explicitly detected time instead of overwriting it with the store time', () => {
+    const detectedAt = '2026-09-15T01:00:00.000Z';
+    const manager = buildManager(() => Date.parse('2026-09-15T01:05:00.000Z'));
+
+    manager.markError('acct_1', 'oauth_refresh_failed', 'OAuth token refresh failed', {
+      cause: 'NATIVE_REFRESH_REAUTH_REQUIRED',
+      at: detectedAt,
+    });
+
+    assert.deepEqual(manager.getStatus().accounts[0].unavailableReason, {
+      type: 'oauth_refresh_failed',
+      message: 'OAuth token refresh failed',
+      cause: 'NATIVE_REFRESH_REAUTH_REQUIRED',
+      at: detectedAt,
+    }, '保存が5分遅れても、記録されるのは検出した時刻のほう');
+  });
+
+  it('accepts the detected time as epoch milliseconds too', () => {
+    const manager = buildManager(() => Date.parse('2026-09-15T01:05:00.000Z'));
+
+    manager.markError('acct_1', 'oauth_refresh_failed', 'OAuth token refresh failed', {
+      cause: 'http-401',
+      at: Date.parse('2026-09-15T01:00:00.000Z'),
+    });
+
+    assert.equal(
+      manager.getStatus().accounts[0].unavailableReason.at,
+      '2026-09-15T01:00:00.000Z',
+    );
+  });
+
+  it('still records the store time when no detected time is given', () => {
+    const manager = buildManager(() => Date.parse('2026-09-15T01:05:00.000Z'));
+
+    manager.markError('acct_1', 'oauth_refresh_failed', 'OAuth token refresh failed', {
+      cause: 'NATIVE_REFRESH_OUTCOME_UNKNOWN',
+    });
+
+    assert.equal(
+      manager.getStatus().accounts[0].unavailableReason.at,
+      '2026-09-15T01:05:00.000Z',
+    );
+  });
+
+  it('leaves an unparsable detected time to the clock rather than persisting it', () => {
+    const manager = buildManager(() => Date.parse('2026-09-15T01:05:00.000Z'));
+
+    manager.markError('acct_1', 'oauth_refresh_failed', 'OAuth token refresh failed', {
+      cause: 'http-401',
+      at: 'not a timestamp',
+    });
+
+    assert.equal(
+      manager.getStatus().accounts[0].unavailableReason.at,
+      '2026-09-15T01:05:00.000Z',
+    );
+  });
+
+  it('keeps the three-argument call working exactly as before', () => {
+    const manager = buildManager(() => 1000);
+
+    manager.markError('acct_1', 'oauth_refresh_failed', 'OAuth token refresh failed');
+
+    const reason = manager.getStatus().accounts[0].unavailableReason;
+    assert.equal(manager.getStatus().accounts[0].status, 'error');
+    assert.equal(reason.type, 'oauth_refresh_failed');
+    assert.equal(reason.message, 'OAuth token refresh failed');
+    assert.equal('cause' in reason, false, '原因が分からないときに cause を捏造しない');
+    assert.equal(reason.at, '1970-01-01T00:00:01.000Z');
+  });
+
+  it('carries the cause and detected time through save and reload', () => {
+    const detectedAt = '2026-09-15T01:00:00.000Z';
+    const saved = buildManager(() => Date.parse('2026-09-15T01:00:00.000Z'));
+    saved.markError('acct_1', 'oauth_refresh_failed', 'OAuth token refresh failed', {
+      cause: 'NATIVE_REFRESH_REAUTH_REQUIRED',
+      at: detectedAt,
+    });
+
+    const restored = buildManager(() => Date.parse('2026-09-15T09:00:00.000Z'));
+    restored.restoreState(saved.exportState());
+
+    const reason = restored.getStatus().accounts[0].unavailableReason;
+    assert.equal(restored.getStatus().accounts[0].status, 'error');
+    assert.equal(reason.cause, 'NATIVE_REFRESH_REAUTH_REQUIRED');
+    assert.equal(reason.at, detectedAt, '再起動しても検出時刻は起動時刻に置き換わらない');
+  });
+
+  it('restores a state file written before the cause and detected time existed', () => {
+    const manager = buildManager(() => Date.parse('2026-09-15T09:00:00.000Z'));
+
+    manager.restoreState({
+      version: 1,
+      currentAccount: 'acct_1',
+      accounts: [{
+        id: 'acct_1',
+        status: 'error',
+        quota: {},
+        usage: {},
+        rateLimitedUntil: null,
+        temporaryUnavailableReason: null,
+        errorReason: { type: 'oauth_refresh_failed', message: 'OAuth token refresh failed' },
+      }],
+    });
+
+    const account = manager.getStatus().accounts[0];
+    assert.equal(account.status, 'error');
+    assert.deepEqual(account.unavailableReason, {
+      type: 'oauth_refresh_failed',
+      message: 'OAuth token refresh failed',
+    }, '旧形式は欠けたまま読めればよい。無い検出時刻を後から作らない');
+  });
+
+  it('drops the cause and detected time when the credential identity changes', () => {
+    const manager = new AccountManager({
+      accounts: [{
+        id: 'acct_1',
+        name: 'a@example.com',
+        type: 'oauth',
+        credentialRevision: 'revision-2',
+      }],
+      now: () => Date.parse('2026-09-15T09:00:00.000Z'),
+    });
+
+    manager.restoreState({
+      version: 1,
+      currentAccount: 'acct_1',
+      accounts: [{
+        id: 'acct_1',
+        credentialRevision: 'revision-1',
+        status: 'error',
+        quota: {},
+        usage: {},
+        rateLimitedUntil: null,
+        temporaryUnavailableReason: null,
+        errorReason: {
+          type: 'oauth_refresh_failed',
+          message: 'OAuth token refresh failed',
+          cause: 'NATIVE_REFRESH_REAUTH_REQUIRED',
+          at: '2026-09-15T01:00:00.000Z',
+        },
+      }],
+    });
+
+    assert.equal(manager.accounts[0].errorReason, null, '別の資格情報の失敗理由を持ち越さない');
+    assert.equal(manager.getStatus().accounts[0].unavailableReason, null);
+  });
+
+  it('drops the cause and detected time once the account authenticates again', () => {
+    const manager = buildManager(() => Date.parse('2026-09-15T01:00:00.000Z'));
+    manager.markError('acct_1', 'oauth_refresh_failed', 'OAuth token refresh failed', {
+      cause: 'NATIVE_REFRESH_REAUTH_REQUIRED',
+      at: '2026-09-15T01:00:00.000Z',
+    });
+
+    manager.applyUsage('acct_1', {
+      five_hour: { utilization: 0.1, resets_at: null },
+      seven_day: { utilization: 0.2, resets_at: null },
+    });
+
+    assert.equal(manager.accounts[0].errorReason, null);
+    assert.equal(manager.getStatus().accounts[0].unavailableReason, null);
   });
 });

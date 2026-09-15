@@ -251,7 +251,7 @@ function renderUnavailableReason(reason, accountId = null) {
   // reason type (`oauth_refresh_failed` / `authentication_error`).
   if (isAuthExpiredReason(reason)) {
     const target = typeof accountId === 'string' && accountId.length > 0 ? ` --id ${accountId}` : '';
-    return `login expired - run: claude-rotator login${target}`;
+    return `login expired${renderAuthFailureDetail(reason)} - run: claude-rotator login${target}`;
   }
   if (reason.type === 'quota_exhausted') {
     const reset = reason.resetAt ? `; reset -> ${formatDate(Date.parse(reason.resetAt))}` : '';
@@ -268,6 +268,30 @@ function renderUnavailableReason(reason, accountId = null) {
   }
   if (reason.message) return `${reason.type}: ${reason.message}`;
   return reason.type;
+}
+
+/**
+ * The ` (cause=...; detected MM/DD HH:MM JST)` fragment appended to the expired
+ * login line.
+ *
+ * It says "detected" deliberately: this is when the rotator saw the credential
+ * fail, NOT when the credential itself expired. The two differ whenever the
+ * failure surfaces late - a parked account is only rechecked on the next usage
+ * poll - so wording such as "expired at" would be read as an actual expiry time
+ * the rotator does not know.
+ *
+ * Both fields are optional. A reason restored from a state file written before
+ * they existed carries neither, and then this returns an empty string so the
+ * line is byte-identical to what it printed before.
+ */
+function renderAuthFailureDetail(reason) {
+  const detail = [];
+  if (typeof reason.cause === 'string' && reason.cause.length > 0) {
+    detail.push(`cause=${reason.cause}`);
+  }
+  const detectedAt = Date.parse(reason.at || '');
+  if (Number.isFinite(detectedAt)) detail.push(`detected ${formatDate(detectedAt)}`);
+  return detail.length > 0 ? ` (${detail.join('; ')})` : '';
 }
 
 function formatDate(ts) {

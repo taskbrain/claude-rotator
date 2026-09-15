@@ -351,6 +351,8 @@ Events
 - `Routing availability` は Fable と Other（Sonnet / Opus / Haiku）の候補を別々に表示します。`now` は現在利用可能、`in ... -> ... JST` は復帰までの時間と時刻、`unknown` は安全に時刻を計算できない状態です。
 - 候補は「現在利用可能」「復帰時刻が早い」「復帰時刻不明」の順です。この一覧は表示時点の共有ルーターの候補順であり、特定のターミナルや会話へアカウントを予約するものではありません。
 - アカウントごとに1カード表示され、`routes Fable: ... | Other: ...` でモデル系列別の利用可否を確認できます。カードの `active` / `ready` / `exhausted` / `throttled` / `error` と `reason:` はアカウント全体の代表状態です。
+- 認証失敗の主文は `login expired` / `needs login` と表示し、括弧内の `cause` は診断・突合用に `server.log` の `errorType=` と同一の内部コードを原値のまま表示します。
+- `detected` は原則として直近の検出時刻（JST）です。ただし、その口座が同じ認証失効として既に記録済みのときは、起動時の資格情報点検と重複リフレッシュ資格情報の隔離が記録を上書きしないため、初回の検出時刻が残ります。どちらの場合も検出した時刻であり、最初に失敗した瞬間や資格情報の実際の満了時刻ではありません。
 - `5h` / `7d` 行は進捗バー（`█` / `░` を10文字）、使用率、reset までの残り時間と reset 時刻を表示します。使用率のデータが無い場合は ` --%`、reset 情報が無い場合は `no data yet` になります。
 - Usage API がモデル別週次枠（`limits[]`）を返す場合は、`7d Fable` のような追加行がさらに表示されます。
 - `requests:` はそのアカウントで proxy が転送した累計リクエスト数です。
@@ -1112,6 +1114,8 @@ What each line means:
 - `Routing availability` has separate candidate lists for Fable and Other (Sonnet / Opus / Haiku). `now` means available immediately, `in ... -> ... JST` gives the recovery delay and time, and `unknown` means a safe recovery time cannot be calculated.
 - Candidates are ordered by currently available, earliest known recovery, then unknown recovery. This is a snapshot of the shared router's candidate order; it does not reserve an account for a terminal or conversation.
 - Each account gets a card. `routes Fable: ... | Other: ...` is the model-family-specific availability. The card's `active` / `ready` / `exhausted` / `throttled` / `error` and `reason:` remain its overall representative state.
+- The main authentication-failure text remains `login expired` / `needs login`; the parenthesized `cause` preserves the same internal code as `errorType=` in `server.log` for diagnosis and correlation.
+- `detected` is normally the most recent detection time (JST). When the account is already recorded under the same expired login, however, the startup credential check and the duplicate-refresh-credential parking leave the existing record untouched, so the first detection time stays. Either way the value is a detection time, not the moment the credential first failed and not its actual expiry time.
 - The `5h` / `7d` rows show a progress bar (`█` / `░`, 10 characters), the usage ratio, and time remaining to reset plus the reset time itself. Usage shows as ` --%` when no data is available yet, and the reset field shows `no data yet` when there's no reset information.
 - If the Usage API returns model-scoped weekly limits (`limits[]`), an extra row appears, such as `7d Fable`.
 - `requests:` is the cumulative number of requests the proxy has forwarded for that account.

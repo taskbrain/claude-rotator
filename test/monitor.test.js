@@ -1,6 +1,7 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 
+import { AccountManager } from '../src/account-manager.js';
 import { progressBar, renderStatus, formatDuration } from '../src/monitor.js';
 
 describe('monitor rendering', () => {
@@ -463,6 +464,92 @@ describe('認証失効の表示 (D-72)', () => {
     assert.match(output, /Codex Rotator\s+pool: needs-login \(0\/2 available\)/);
     assert.match(output, /pro-a\s+█████████░\s+97% 2nd\s+41% \(7d\)\s+needs-login/);
     assert.match(output, /pro-b\s+███░░░░░░░\s+31%\s+needs-login/);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// (c) 認証失敗の原因コードと検出時刻の表示（母艦裁定 C-20260915-3F-03）
+//
+// 「認証が切れている」だけでは、いつ・何が原因で落ちたのかが読めない。
+// 再ログインの案内（D-72）はそのまま残したうえで、原因コードと「検出した時刻」を
+// 添える。表示は必ず detected と書く——資格情報が実際に満了した時刻は当方では
+// 分からず、expired at と書けば別の時刻として読まれてしまうため。
+// ---------------------------------------------------------------------------
+describe('認証失敗の原因コードと検出時刻の表示 (c)', () => {
+  const now = Date.parse('2026-06-04T09:00:00Z');
+
+  it('adds the cause and the detected time without dropping the login guidance', () => {
+    const status = authExpiredStatus('oauth_refresh_failed');
+    Object.assign(status.accounts[0].unavailableReason, {
+      cause: 'NATIVE_REFRESH_REAUTH_REQUIRED',
+      at: '2026-06-04T08:00:00.000Z',
+    });
+
+    const output = renderStatus(status, { now, columns: 200 });
+
+    assert.match(
+      output,
+      /reason: login expired \(cause=NATIVE_REFRESH_REAUTH_REQUIRED; detected 06\/04 17:00 JST\) - run: claude-rotator login --id acct_1/,
+      '原因と検出時刻を足しても、何をすればよいかの案内は消えない',
+    );
+    assert.doesNotMatch(output, /expired at|expires at/, '検出時刻を「満了時刻」と読める書き方にしない');
+  });
+
+  it('prints whichever of the two it has, and nothing when it has neither', () => {
+    const onlyCause = authExpiredStatus('oauth_refresh_failed');
+    onlyCause.accounts[0].unavailableReason.cause = 'http-401';
+    assert.match(
+      renderStatus(onlyCause, { now, columns: 200 }),
+      /reason: login expired \(cause=http-401\) - run: claude-rotator login --id acct_1/,
+    );
+
+    const onlyDetectedAt = authExpiredStatus('oauth_refresh_failed');
+    onlyDetectedAt.accounts[0].unavailableReason.at = '2026-06-04T08:00:00.000Z';
+    assert.match(
+      renderStatus(onlyDetectedAt, { now, columns: 200 }),
+      /reason: login expired \(detected 06\/04 17:00 JST\) - run: claude-rotator login --id acct_1/,
+    );
+
+    assert.match(
+      renderStatus(authExpiredStatus('oauth_refresh_failed'), { now, columns: 200 }),
+      /reason: login expired - run: claude-rotator login --id acct_1/,
+      '旧い state から復元した理由には何も足さない（1文字も変わらない）',
+    );
+  });
+
+  it('ignores an unparsable detected time instead of printing a broken date', () => {
+    const status = authExpiredStatus('oauth_refresh_failed');
+    status.accounts[0].unavailableReason.at = 'not a timestamp';
+
+    assert.match(
+      renderStatus(status, { now, columns: 200 }),
+      /reason: login expired - run: claude-rotator login --id acct_1/,
+    );
+  });
+
+  it('survives the whole save/reload path from markError to the screen', () => {
+    const detectedAt = '2026-06-04T08:00:00.000Z';
+    const accounts = [
+      { id: 'acct_1', name: 'a@example.com', type: 'oauth' },
+      { id: 'acct_2', name: 'b@example.com', type: 'oauth' },
+    ];
+    const before = new AccountManager({ accounts, now: () => Date.parse(detectedAt) });
+    before.markError('acct_1', 'oauth_refresh_failed', 'OAuth token refresh failed', {
+      cause: 'NATIVE_REFRESH_REAUTH_REQUIRED',
+      at: detectedAt,
+    });
+
+    const afterRestart = new AccountManager({ accounts, now: () => now });
+    afterRestart.restoreState(before.exportState());
+
+    const output = renderStatus(afterRestart.getStatus(), { now, columns: 200 });
+
+    assert.match(
+      output,
+      /reason: login expired \(cause=NATIVE_REFRESH_REAUTH_REQUIRED; detected 06\/04 17:00 JST\) - run: claude-rotator login --id acct_1/,
+      '再起動を挟んでも、原因と「1時間前に検出した」ことが画面から読める',
+    );
+    assert.match(output, /needs login/, 'D-72 の routing 表示も従来どおり');
   });
 });
 

@@ -9,6 +9,7 @@ import { join } from 'node:path';
 
 import { AccountManager } from '../src/account-manager.js';
 import { LOCAL_GATEWAY_AUTH_TOKEN } from '../src/config.js';
+import { renderStatus } from '../src/monitor.js';
 import { OAuthTokenRefreshError, parseUsageResponse } from '../src/oauth.js';
 import { LinuxFileSecretStore, MemorySecretStore } from '../src/secret-store.js';
 import { createProxyServer, defaultTokenRefresher } from '../src/proxy-server.js';
@@ -4203,6 +4204,123 @@ describe('createProxyServer', () => {
     assert.equal(finalAccount.unavailableReason?.type, 'oauth_refresh_failed');
   });
 
+  // (c) 分類できない失敗では cause を捏造せず、検出時刻だけを残す。
+  it('records only the detected time when the failure has no machine code to name', async () => {
+    const secretStore = new MemorySecretStore();
+    await secretStore.set('acct_1', { refreshToken: 'refresh-only-fixture' });
+    const accountManager = new AccountManager({
+      accounts: [{ id: 'acct_1', name: 'a@example.com', type: 'oauth' }],
+      now: () => 1000,
+    });
+    const proxy = await listen(createProxyServer({
+      accountManager,
+      secretStore,
+      allowLiveClaudeCodeCredentials: false,
+      config: { upstream: 'http://127.0.0.1:1', usagePolling: { enabled: false } },
+      usageFetcher: async () => assert.fail('usage must not be fetched without an access token'),
+    }));
+    cleanupAfterTest(async () => close(proxy.server));
+
+    const refresh = await requestJson(`${proxy.url}/internal/refresh-usage`, { method: 'POST' });
+
+    assert.equal(refresh.status, 200);
+    assert.deepEqual(refresh.body.status.accounts[0].unavailableReason, {
+      type: 'oauth_refresh_failed',
+      message: 'OAuth token refresh failed',
+      at: '1970-01-01T00:00:01.000Z',
+    }, 'cause=Error のような中身のない原因を画面へ出さない');
+  });
+
+  // (c) 母艦裁定 C-20260915-3F-03。上のテストと同じ「古い失敗を後から適用する」経路で、
+  // 記録される検出時刻が「適用した時刻」ではなく「実際に失敗を見た時刻」であることを見る。
+  // 適用は newer な観測が片付くまで待たされるので、適用時に時計を読むと、口座が落ちた
+  // 時刻が実際より後ろにずれて記録されてしまう。
+  it('stamps a deferred Usage 401 with when it was seen, not when it was finally applied', async () => {
+    const upstream = await listen(http.createServer((req, res) => {
+      res.writeHead(429, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({
+        type: 'error', error: { type: 'rate_limit_error', message: 'temporary Fable throttle' },
+      }));
+    }));
+    const secretStore = new MemorySecretStore();
+    await secretStore.set('acct_1', { accessToken: 'access-token-1' });
+    let clockMs = Date.now();
+    const accountManager = new AccountManager({
+      accounts: [{ id: 'acct_1', type: 'oauth' }],
+      now: () => clockMs,
+    });
+    let usageCalls = 0;
+    let scheduledStarted = false;
+    let rejectScheduled;
+    let releaseScheduledSafely;
+    const scheduledPending = new Promise((resolve, reject) => {
+      rejectScheduled = reject;
+      releaseScheduledSafely = () => resolve({});
+    });
+    let reactiveStarted = false;
+    let rejectReactive;
+    let releaseReactiveSafely;
+    const reactivePending = new Promise((resolve, reject) => {
+      rejectReactive = reject;
+      releaseReactiveSafely = () => resolve({});
+    });
+    const proxy = await listen(createProxyServer({
+      accountManager,
+      secretStore,
+      config: {
+        upstream: upstream.url,
+        usagePolling: { enabled: false, concurrency: 2, requestSpacingMs: 0 },
+      },
+      reactiveQuotaConfirmTimeoutMs: 500,
+      usageFetcher: async () => {
+        usageCalls += 1;
+        if (usageCalls === 1) {
+          scheduledStarted = true;
+          return scheduledPending;
+        }
+        reactiveStarted = true;
+        return reactivePending;
+      },
+    }));
+    cleanupAfterTest(async () => {
+      releaseScheduledSafely?.();
+      releaseReactiveSafely?.();
+      await close(proxy.server);
+      await close(upstream.server);
+    });
+
+    const scheduledRefresh = requestJson(`${proxy.url}/internal/refresh-usage`, { method: 'POST' });
+    assert.equal(await waitForStatus(() => scheduledStarted, Boolean), true);
+    const responsePending = requestJson(`${proxy.url}/v1/messages`, {
+      method: 'POST', body: JSON.stringify({ model: 'claude-fable-5' }),
+    });
+    assert.equal(await waitForStatus(() => reactiveStarted, Boolean), true);
+
+    const detectedAtMs = clockMs;
+    rejectScheduled(new Error('Usage fetch failed (401)'));
+    await scheduledRefresh;
+    assert.notEqual(
+      accountManager.getStatus().accounts[0].status,
+      'error',
+      '新しい観測が飛んでいる間は、まだ失敗を適用しない（前提の確認）',
+    );
+
+    clockMs += 5 * 60 * 1000;
+    assert.equal(clockMs - detectedAtMs, 5 * 60 * 1000, '適用までに時計を5分進めた');
+
+    rejectReactive(new Error('reactive Usage fetch failed'));
+    await responsePending;
+
+    const reason = accountManager.getStatus().accounts[0].unavailableReason;
+    assert.equal(reason.type, 'oauth_refresh_failed');
+    assert.equal(reason.cause, 'http-401', '原因コードは server.log の errorType= と同じ値');
+    assert.equal(
+      reason.at,
+      new Date(detectedAtMs).toISOString(),
+      '5分後に適用されても、記録は失敗を見た時刻のまま',
+    );
+  });
+
   it('serializes stateWriter snapshots so an older slow write cannot roll back newer quota', async () => {
     const secretStore = new MemorySecretStore();
     await secretStore.set('acct_1', { accessToken: 'access-token-1' });
@@ -6503,6 +6621,8 @@ describe('createProxyServer', () => {
     assert.deepEqual(accountManager.getStatus().accounts[0].unavailableReason, {
       type: 'oauth_refresh_failed',
       message: 'OAuth token refresh failed',
+      cause: 'NATIVE_REFRESH_OUTCOME_UNKNOWN',
+      at: '1970-01-01T00:00:01.000Z',
     });
   });
 
@@ -7605,7 +7725,52 @@ describe('createProxyServer', () => {
     assert.deepEqual(refresh.body.status.accounts[0].unavailableReason, {
       type: 'oauth_refresh_failed',
       message: 'OAuth token refresh failed',
+      cause: 'NATIVE_REFRESH_REAUTH_REQUIRED',
+      at: '1970-01-01T00:00:01.000Z',
     });
+  });
+
+  it('keeps the displayed diagnostic cause identical to the logged classifier code while humanizing the main reason', async () => {
+    const secretStore = new MemorySecretStore();
+    await secretStore.set('acct_1', {
+      accessToken: randomUUID(),
+      refreshToken: randomUUID(),
+      expiresAt: 1,
+    });
+    const accountManager = new AccountManager({
+      accounts: [{ id: 'acct_1', name: 'a@example.com', type: 'oauth' }],
+      now: () => 1000,
+    });
+    const logs = [];
+    const proxy = await listen(createProxyServer({
+      accountManager,
+      secretStore,
+      allowLiveClaudeCodeCredentials: false,
+      config: { upstream: 'http://127.0.0.1:1', usagePolling: { enabled: false } },
+      tokenRefresher: async () => {
+        throw Object.assign(new Error('The stored OAuth refresh credential has expired and must be linked again'), {
+          code: 'NATIVE_REFRESH_REAUTH_REQUIRED',
+        });
+      },
+      usageFetcher: async () => assert.fail('usage fetch must not run after the refresh fails'),
+      logger: line => logs.push(line),
+    }));
+    cleanupAfterTest(async () => close(proxy.server));
+
+    const refresh = await requestJson(`${proxy.url}/internal/refresh-usage`, { method: 'POST' });
+    assert.equal(refresh.status, 200);
+    assert.equal(refresh.body.accounts[0].ok, false);
+    const failureLog = logs.find(line => line.includes('usage-refresh account=acct_1 result=failed'));
+    const loggedCause = failureLog?.match(/\berrorType=(\S+)/)?.[1];
+    assert.equal(loggedCause, 'NATIVE_REFRESH_REAUTH_REQUIRED');
+
+    const output = renderStatus(refresh.body.status, { now: 1000, columns: 200 });
+    const reasonLine = output.split('\n').find(line => line.startsWith('reason: '));
+    assert.match(reasonLine, /^reason: login expired \(cause=NATIVE_REFRESH_REAUTH_REQUIRED; detected /);
+    assert.match(reasonLine, / - run: claude-rotator login --id acct_1$/);
+    assert.equal(reasonLine.match(/\(cause=([^;]+)/)?.[1], loggedCause);
+    assert.match(output, /routes Fable: needs login \| Other: needs login/);
+    assert.doesNotMatch(output, /oauth_refresh_failed|OAuth token refresh failed/);
   });
 
   for (const { code, message, retryAfterMs, expectedReason } of [
@@ -7679,6 +7844,8 @@ describe('createProxyServer', () => {
     assert.deepEqual(accountManager.getStatus().accounts[0].unavailableReason, {
       type: 'oauth_refresh_failed',
       message: 'OAuth token refresh failed',
+      cause: 'NATIVE_REFRESH_OUTCOME_UNKNOWN',
+      at: '1970-01-01T00:00:01.000Z',
     });
   });
 

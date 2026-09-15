@@ -580,7 +580,12 @@ async function reconcilePersistedRefreshIntents({ accountManager, secretStore, l
         continue;
       }
       if (account.errorReason?.type !== 'oauth_refresh_failed') {
-        accountManager.markError(account.id, 'oauth_refresh_failed', 'OAuth token refresh failed');
+        accountManager.markError(
+          account.id,
+          'oauth_refresh_failed',
+          'OAuth token refresh failed',
+          authErrorDetails(credentialRefreshErrorType(error), accountManager.now()),
+        );
         changed = true;
       }
     }
@@ -612,7 +617,14 @@ function parkDuplicateRefreshTokenAccounts({
     if (!duplicateRefreshAccountIds.has(account.id)) continue;
     if (ownedDuplicateIds.has(account.id)) duplicateRefreshAccounts.add(account);
     if (account.errorReason?.type === 'oauth_refresh_failed') continue;
-    accountManager.markError(account.id, 'oauth_refresh_failed', 'OAuth token refresh failed');
+    // No error object here: the account is parked because it shares a refresh
+    // credential with another account, which is detected rather than thrown.
+    accountManager.markError(
+      account.id,
+      'oauth_refresh_failed',
+      'OAuth token refresh failed',
+      authErrorDetails('DUPLICATE_REFRESH_TOKEN', accountManager.now()),
+    );
     duplicateRefreshAccounts.add(account);
     changed = true;
   }
@@ -1846,11 +1858,21 @@ async function refreshAccountUsage({
     if (!accountManager.accounts.includes(account)) {
       return { account: account.id, ok: false, stale: true, error: message };
     }
+    // Captured here, not inside `applyFailure`: the failure below can be held
+    // back until every newer in-flight observation settles, so reading the clock
+    // at apply time would stamp the account with the settle time instead of the
+    // moment the credential was actually seen to fail.
+    const detectedAt = accountManager.now();
     const applyFailure = () => {
       if (!accountManager.accounts.includes(account)) return;
       const refreshUnavailable = markOAuthRefreshUnavailable(accountManager, account.id, caught);
       if (!refreshUnavailable && isOAuthCredentialError(message, caught)) {
-        accountManager.markError(account.id, 'oauth_refresh_failed', 'OAuth token refresh failed');
+        accountManager.markError(
+          account.id,
+          'oauth_refresh_failed',
+          'OAuth token refresh failed',
+          authErrorDetails(usageRefreshErrorType(caught), detectedAt),
+        );
       }
     };
     const deferred = usageObservationTracker.deferFailure(observation, applyFailure);
@@ -2045,7 +2067,12 @@ async function forwardWithRotation({
       }
       if (error?.code === 'NATIVE_REFRESH_OUTCOME_UNKNOWN') {
         if (!markOAuthRefreshUnavailable(accountManager, account.id, error)) {
-          accountManager.markError(account.id, 'oauth_refresh_failed', 'OAuth token refresh failed');
+          accountManager.markError(
+            account.id,
+            'oauth_refresh_failed',
+            'OAuth token refresh failed',
+            authErrorDetails(credentialRefreshErrorType(error), accountManager.now()),
+          );
         }
         continue;
       }
@@ -2092,7 +2119,12 @@ async function forwardWithRotation({
       } catch (caught) {
         if (!accountManager.accounts.includes(account)) continue;
         if (!markOAuthRefreshUnavailable(accountManager, account.id, caught)) {
-          accountManager.markError(account.id, 'oauth_refresh_failed', 'OAuth token refresh failed');
+          accountManager.markError(
+            account.id,
+            'oauth_refresh_failed',
+            'OAuth token refresh failed',
+            authErrorDetails(credentialRefreshErrorType(caught), accountManager.now()),
+          );
         }
         continue;
       }
@@ -2169,7 +2201,12 @@ async function forwardWithRotation({
       } catch (caught) {
         if (!accountManager.accounts.includes(account)) continue;
         if (!markOAuthRefreshUnavailable(accountManager, account.id, caught)) {
-          accountManager.markError(account.id, 'oauth_refresh_failed', 'OAuth token refresh failed');
+          accountManager.markError(
+            account.id,
+            'oauth_refresh_failed',
+            'OAuth token refresh failed',
+            authErrorDetails(credentialRefreshErrorType(caught), accountManager.now()),
+          );
         }
         continue;
       }
@@ -2322,7 +2359,12 @@ async function forwardCurrentUnavailableAccount({
   } catch (caught) {
     if (caught?.code !== 'NATIVE_REFRESH_OUTCOME_UNKNOWN') throw caught;
     if (!markOAuthRefreshUnavailable(accountManager, account.id, caught)) {
-      accountManager.markError(account.id, 'oauth_refresh_failed', 'OAuth token refresh failed');
+      accountManager.markError(
+        account.id,
+        'oauth_refresh_failed',
+        'OAuth token refresh failed',
+        authErrorDetails(credentialRefreshErrorType(caught), accountManager.now()),
+      );
     }
     return false;
   }
@@ -2435,6 +2477,33 @@ function credentialRefreshErrorType(error) {
 function usageRefreshErrorType(error) {
   const status = String(error?.message || '').match(/Usage fetch failed \((\d+)\)/)?.[1];
   return status ? `http-${status}` : credentialRefreshErrorType(error);
+}
+
+/**
+ * The `{ cause, at }` detail stored with an auth error, so `claude-rotator
+ * status` can say why an account fell out and when that was seen instead of
+ * only that it fell out.
+ *
+ * `cause` is the same short classification the server.log `errorType=` field
+ * already carries, which keeps the screen and the log talking about one value.
+ * It is deliberately never the raw message: messages can quote credential
+ * material, and this value is both persisted and printed.
+ *
+ * A classification that names nothing is stored as no cause at all, so the
+ * screen stays silent instead of printing `cause=unknown` or `cause=Error`
+ * (the latter is what a plain `new Error(...)` degrades to, e.g. the stored
+ * credential having no access token at all).
+ *
+ * `detectedAtMs` is read from the account manager's clock by the caller, at the
+ * point the failure is seen - never inside a deferred apply callback.
+ */
+const UNINFORMATIVE_ERROR_TYPES = new Set(['unknown', 'Error']);
+
+function authErrorDetails(errorType, detectedAtMs) {
+  return {
+    cause: errorType && !UNINFORMATIVE_ERROR_TYPES.has(errorType) ? errorType : null,
+    at: detectedAtMs,
+  };
 }
 
 function canRefreshSecret(account, secret) {

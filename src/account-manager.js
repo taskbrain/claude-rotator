@@ -194,11 +194,31 @@ export class AccountManager {
     });
   }
 
-  markError(accountId, type = 'account_error', message = null) {
+  /**
+   * @param {{cause?: string|null, at?: string|number|null}|null} [details] Why
+   *   the account failed and when that was detected.
+   *
+   *   `cause` is the short machine classification of the failure (e.g.
+   *   `NATIVE_REFRESH_REAUTH_REQUIRED`, `http-401`) - never a raw error message,
+   *   which can quote credential material.
+   *
+   *   `at` is kept exactly as given, so a failure that is applied late still
+   *   records when it was actually seen rather than when it was finally stored.
+   *   The usage-refresh path defers a failure until every newer in-flight
+   *   observation has settled (see `deferFailure` in proxy-server.js), which can
+   *   be minutes after the catch. Omitted `at` falls back to the store time.
+   *
+   *   Both are optional: a three-argument call keeps working unchanged.
+   */
+  markError(accountId, type = 'account_error', message = null, details = null) {
     const account = this.find(accountId);
     account.status = 'error';
     account.errorReason = { type };
     if (message) account.errorReason.message = message;
+    const cause = normalizeErrorCause(details?.cause);
+    if (cause) account.errorReason.cause = cause;
+    account.errorReason.at = normalizeDetectedAt(details?.at)
+      || new Date(this.now()).toISOString();
     this.events.unshift({
       at: new Date(this.now()).toISOString(),
       type: 'account-error',
@@ -843,6 +863,33 @@ function restoredCredentialCooldownLimitMs(retryAfterSource) {
   if (retryAfterSource === 'provider') return DEFAULT_MAX_PROVIDER_RETRY_AFTER_MS;
   if (retryAfterSource === 'fixed') return DEFAULT_SUSTAINED_TOKEN_REFRESH_RETRY_MS;
   return DEFAULT_MAX_TOKEN_REFRESH_BACKOFF_MS;
+}
+
+function normalizeErrorCause(value) {
+  if (typeof value !== 'string') return null;
+  const cause = value.trim();
+  return cause.length > 0 ? cause : null;
+}
+
+/**
+ * Accepts either an epoch millisecond value or a parsable date string and
+ * returns it as an ISO string, so the stored shape is the same one
+ * `exportState` writes and `restoreState` reads back. Anything unparsable
+ * returns null, which makes `markError` fall back to its own clock rather than
+ * persisting a timestamp nothing can render.
+ */
+function normalizeDetectedAt(value) {
+  if (typeof value === 'number') return isoTimestampOrNull(value);
+  if (typeof value !== 'string' || value.length === 0) return null;
+  return isoTimestampOrNull(Date.parse(value));
+}
+
+function isoTimestampOrNull(timestamp) {
+  if (!Number.isFinite(timestamp)) return null;
+  // `new Date(...).toISOString()` throws outside this range instead of
+  // returning an invalid date, so it is checked rather than caught.
+  if (Math.abs(timestamp) > MAX_DATE_TIMESTAMP_MS) return null;
+  return new Date(timestamp).toISOString();
 }
 
 function normalizeCredentialRevision(value) {
