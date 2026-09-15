@@ -373,6 +373,7 @@ OAuth Usage API は 429 を返しやすいため、usage 取得はデフォル�
 - `oauth_refresh_retry`: token を渡す前の一時的なローカル失敗です。5分後に再試行し、他アカウントの処理は続けます。
 - `oauth_refresh_rate_limit`: provider が更新をレート制限しています。`Retry-After` の範囲で再試行します。
 - `oauth_refresh_failed`: token を渡した後の結果を安全に確定できなかったため、そのアカウントを停止しています。次を実行して再登録してください。
+  - この `oauth_refresh_failed` には、**保存済みのリフレッシュ資格情報自体が期限切れになり、再ログインが必要な場合**も含みます。利用量の更新でこれを検出したときは、そのアカウントに付いていた直前の理由（たとえば枠切れの回復待ち）のままにせず、再ログインが必要な状態として分類します。`status` の口座カードには `reason: login expired - run: claude-rotator login --id <id>`、Routing availability には `needs login` と表示します。枠の回復を待っても直らないため、上のコマンドで再ログインしてください。資格情報ロックの待ち時間切れや更新コマンドのタイムアウトなど、再試行で回復する一時的な失敗は、従来どおりこの分類には入りません。
 
 ```bash
 claude auth login --claudeai
@@ -1133,6 +1134,7 @@ Normally, no new login is required. Use the reason shown by `status` to distingu
 - `oauth_refresh_retry`: a temporary local failure before token handoff. It retries after five minutes while other accounts keep working.
 - `oauth_refresh_rate_limit`: the provider rate-limited the refresh. It retries according to `Retry-After`.
 - `oauth_refresh_failed`: the post-handoff result could not be established safely, so that account is parked. Re-register it with:
+  - This `oauth_refresh_failed` also covers the case where **the stored refresh credential itself has expired and the account has to be linked again**. When a usage refresh detects that, the account is no longer left under whatever reason it happened to carry before (a quota wait, for example): it is classified as an expired login. The `status` account card then prints `reason: login expired - run: claude-rotator login --id <id>`, and Routing availability shows `needs login`. Waiting for the quota to recover will not clear it, so run the commands above to log in again. Temporary failures that recover on a retry - a credential lock timeout or a refresh command timeout, for example - are still not put in this category.
 
 ```bash
 claude auth login --claudeai
