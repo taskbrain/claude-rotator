@@ -25,6 +25,7 @@ import {
   buildBridgeLogMeta,
   claudeAllUnusable,
   claudeEarliestResetAt,
+  claudeQuotaState,
   createGptPoolState,
   formatLogMeta,
   mapClaudeExhaustion,
@@ -260,7 +261,13 @@ export function createProxyServer({
   // 残ると、実際には回復しているのに最大 gptPoolUnusableTtlMs の間 403 で止めてしまう。
   // 未知（unknown）は「利用可能扱い」なので、破棄は常に安全側へ倒れる。
   const createGptPoolStateFor = settings => (settings.degradeMapping?.enabled === true
-    ? createGptPoolState({ unusableTtlMs: settings.degradeMapping.gptPoolUnusableTtlMs })
+    ? createGptPoolState({
+      unusableTtlMs: settings.degradeMapping.gptPoolUnusableTtlMs,
+      // 層1（T2b・T6b・キャッシュ非学習）は recoveryWaitEnabled の配下に置く
+      // （統合設計 v2.1 §2.1 案A）。層1 は 403 書換の条件③を通じて応答バイトを変えうる
+      // ので、「フラグ off ＝現行とバイト互換」を保つには同じフラグで切る必要がある。
+      recoveryWaitEnabled: settings.degradeMapping.recoveryWaitEnabled === true,
+    })
     : null);
   let gptPoolState = createGptPoolStateFor(openaiBridgeSettings);
 
@@ -294,12 +301,21 @@ export function createProxyServer({
     const commonAllUnusable = allUnusable
       ? (modelFamily ? claudeAllUnusable(accountManager, null) : true)
       : false;
+    // 層2（recoveryWaitEnabled のときだけ）: 共通枠の空きを三値で問い直す。判定不能
+    // （判定関数が無い・口座0件・判定中の例外）を「空きあり」へ丸めず、待機側へ倒す
+    // （統合設計 v2.1 §3.5）。二値の commonAllUnusable は off 経路のためそのまま残す。
+    const recoveryWaitEnabled = mapping.recoveryWaitEnabled === true;
+    const commonQuota = recoveryWaitEnabled
+      ? (allUnusable ? claudeQuotaState(accountManager, null) : 'available')
+      : undefined;
     const mapped = mapClaudeExhaustion(candidate, {
       enabled: true,
       mapPath,
       headersSent,
       claudeAllUnusable: allUnusable,
       commonFamilyAllUnusable: commonAllUnusable,
+      recoveryWaitEnabled,
+      commonFamilyQuotaState: commonQuota,
       gptPoolState: gptState,
       bothUnusableStatus: mapping.bothUnusableStatus,
       gptResetAt: pool?.resetAt || null,
@@ -307,7 +323,7 @@ export function createProxyServer({
       // ので、403 になりうる組み合わせのときだけ台帳を引く。403 の根拠は**共通枠**の
       // 枯渇なので、回復時刻も共通枠（modelFamily 無し）で問う。要求系列で引くと、
       // Fable 週次サブキャップのように共通枠より遠いリセットを表示してしまう。
-      claudeResetAt: commonAllUnusable && gptState === 'unusable'
+      claudeResetAt: (commonAllUnusable || commonQuota === 'indeterminate') && gptState === 'unusable'
         ? claudeEarliestResetAt(accountManager, null)
         : null,
     });
@@ -499,6 +515,10 @@ export function createProxyServer({
             // （§4.2）。Fable 週次サブキャップだけの枯渇では「Claude は使える」と判定され、
             // 403 で止めずに 529 のまま Opus へ退避させる。
             claudeAllUnusable: () => claudeAllUnusable(accountManager, null),
+            // 三値版（統合設計 v2.1 §3.5）。二値版を残したまま隣に足す。引数は共通枠
+            // （modelFamily = null）で揃える——契約の条件2 が参照するのと同じ引数であり、
+            // 系列付きにすると契約と実装がずれる。
+            claudeQuotaState: () => claudeQuotaState(accountManager, null),
             // 403 の本文へ載せる「最早回復時刻」の Claude 側の候補（§8.7）。
             // 全枯渇と判定したときだけ呼ばれる。判定そのものには使わない。
             claudeResetAt: () => claudeEarliestResetAt(accountManager, null),

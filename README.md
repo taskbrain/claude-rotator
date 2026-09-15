@@ -474,8 +474,9 @@ claude-rotator status
 | キー | 既定値 | 意味 |
 |---|---|---|
 | `degradeMapping.enabled` | `false` | 写像・学習・403 書き換えの総合スイッチ。`false` なら現行と完全に同一の挙動 |
-| `degradeMapping.bothUnusableStatus` | `403` | Claude も GPT も使えないときのステータス。`403` = 明示停止、`529` = 退避を試み続ける。それ以外の値は `403` として扱います |
-| `degradeMapping.gptPoolUnusableTtlMs` | `60000`（60秒） | 回復見込み時刻を伴わない「GPT 側は使えない」という学習を、状態不明へ戻すまでの時間 |
+| `degradeMapping.bothUnusableStatus` | `403` | Claude も GPT も使えないときのステータス。`403` = 明示停止、`529` = 退避を試み続ける。それ以外の値は `403` として扱います。**`recoveryWaitEnabled` が `true` のときは、このキーより下記の待機（429）が優先します** |
+| `degradeMapping.recoveryWaitEnabled` | `false` | **上流が全滅・一時障害のときに Claude Code を止めず、待たせて自動継続させるスイッチ。** `true` のとき、403 の代わりに **429 `rate_limit_error` ＋ `Retry-After: 30`** を返します。真偽値の `true` だけを受け付け、それ以外（`"true"` や `1` を含む）はすべて `false` です。**`false`（既定）なら応答もログも現行と1バイト変わりません** |
+| `degradeMapping.gptPoolUnusableTtlMs` | `60000`（60秒） | 「GPT 側は使えない」という学習を、状態不明へ戻すまでの時間。`recoveryWaitEnabled` が `false` のときは**回復見込み時刻を伴わない学習にだけ**効き、`true` のときは回復見込み時刻を伴う学習にも `min(回復見込み時刻, 学習時刻 + この値)` として効きます |
 | `degradeMapping.codexStatusUrl` | `null` | `status` にブリッジ側の枠状況を表示するための取得先（loopback のみ）。`null` なら表示しません |
 | `degradeMapping.codexStatusTimeoutMs` | `1500` | 上記取得のタイムアウト（必ず有限値） |
 
@@ -488,6 +489,25 @@ claude-rotator status
 - **GPT 側の認証が切れたときは止めずに退避させます。** ブリッジが契約ヘッダ付きで 403 を返し、その理由が「ログイン切れ」（`codex_needs_login`）または「資格情報を読めない」（`codex_credentials_unavailable`）のときだけ、claude-rotator は **529 へ書き換えて**返し、Claude Code を `fallbackModel` の次の要素（Opus 等）へ退避させます。作業を止めないためです。両方とも使えないときの停止は従来どおり `bothUnusableStatus`（既定 `403`）が決めます。契約ヘッダの無い 403、およびモデル未割り当て（`codex_no_account_for_model`）の 403 は、従来どおりそのまま返します。
 - Claude 側のアカウントの認証が切れたときは、`status` の口座カードに `reason: login expired - run: claude-rotator login --id <id>` と表示し、Routing availability では `unknown` ではなく `needs login` と表示します。
 - 学習した GPT 側の状態はメモリ上にだけ保持し、`POST /internal/reload`（設定の再読み込み）で初期化されます。
+- **`recoveryWaitEnabled: true` のときだけ変わること**（`false` の既定では何も変わりません）:
+  - **両方とも使えないとき**、403（明示停止）ではなく **429 `rate_limit_error` ＋ `Retry-After: 30`** を返します。Claude Code は 403 を再試行も退避もしないためその場で停止しますが、429 なら同じモデルのまま自動で再試行を続けます。**画面にエラーは出ますが、セッションは終了しません。**
+  - **ブリッジの一時障害**（接続拒否・接続タイムアウト・アイドルタイムアウト、およびブリッジが返す `codex_upstream_timeout` / `codex_upstream_unreachable` の 403）も、Claude 側に空きが無い／判定できないときは 429 で待たせ、Claude 側に空きがあるときは 529 にして `fallbackModel` の次の要素へ退避させます。
+  - **Claude 側の空きを「あり／なし／判定できない」の3値で見ます。** 判定できないとき（台帳の判定が例外を投げた・アカウントが1件も無い等）は、「空きあり」ではなく**待機側**へ倒します。
+  - 合成した 429 からは、上流の `Retry-After` と `anthropic-ratelimit-*`（`anthropic-ratelimit-unified-reset` を含む）を**すべて除去**し、`Retry-After: 30` を1つだけ付けます。除去しないと、Claude Code がそのリセット時刻まで（最大6時間）無言で待つことがあります。
+  - **回復後に人手の再起動・リロードを必要としません。** ブリッジが「上流へ送って 200 が返った」ことを示す成功応答を1件返した時点で、学習した「GPT 側は使えない」を状態不明へ戻します（利用可能へは格上げしません）。あわせて、ブリッジのキャッシュ由来の否定応答（`x-ombr-cached: yes`）では学習も延命もしません。
+  - **GPT 側の認証切れ（`codex_needs_login` / `codex_credentials_unavailable`）は待機の対象外**で、従来どおり 529 にして退避させます。人が `codex login` するまで自力では回復しないため、待たせても意味がないからです。
+  - ログ行に `cached=`（ブリッジのキャッシュ由来かどうか。ヘッダが無ければ `none`）と `retryAfter=` が加わります。
+  - 設定例（`config.json`）:
+
+    ```json
+    {
+      "openaiBridge": {
+        "enabled": true,
+        "url": "http://127.0.0.1:18765",
+        "degradeMapping": { "enabled": true, "recoveryWaitEnabled": true }
+      }
+    }
+    ```
 - ログの `outcome` は `forwarded` / `forwarded-mapped`（529 を 403 へ、または認証失効の 403 を 529 へ書き換えた）/ `bridge-unreachable` / `bridge-connect-timeout` / `bridge-idle-timeout` / `bridge-stream-error` に分かれ、`degradeReason` `upstreamStatus` `gptPoolState` `claudePoolState` `mappedFrom` / `mappedTo` などを、値があるときだけ行末へ追記します（値が1つも無ければ行は従来と同一です）。
 
 注意:
@@ -1237,8 +1257,9 @@ Configuration keys (the whole section may be omitted):
 | Key | Default | Meaning |
 |---|---|---|
 | `degradeMapping.enabled` | `false` | Master switch for the mapping, the learning, and the 403 rewrite. With `false` the behavior is identical to the current one |
-| `degradeMapping.bothUnusableStatus` | `403` | Status returned when neither Claude nor GPT is usable. `403` = stop explicitly, `529` = keep attempting to degrade. Any other value is treated as `403` |
-| `degradeMapping.gptPoolUnusableTtlMs` | `60000` (60 sec) | How long a "GPT side is unusable" observation without a recovery time is kept before it reverts to unknown |
+| `degradeMapping.bothUnusableStatus` | `403` | Status returned when neither Claude nor GPT is usable. `403` = stop explicitly, `529` = keep attempting to degrade. Any other value is treated as `403`. **When `recoveryWaitEnabled` is `true`, the wait below takes precedence over this key** |
+| `degradeMapping.recoveryWaitEnabled` | `false` | **Keeps Claude Code alive while every upstream is exhausted or temporarily broken.** When `true`, the proxy answers **429 `rate_limit_error` with `Retry-After: 30`** instead of 403. Only the boolean `true` is accepted (`"true"` and `1` are not). **With `false` (the default) both the responses and the log lines are byte-for-byte identical to the current behavior** |
+| `degradeMapping.gptPoolUnusableTtlMs` | `60000` (60 sec) | How long a "GPT side is unusable" observation is kept before it reverts to unknown. With `recoveryWaitEnabled: false` it only applies to observations **without** a recovery time; with `true` it also caps observations that carry one, as `min(recovery time, learned at + this value)` |
 | `degradeMapping.codexStatusUrl` | `null` | Endpoint used to show the bridge's quota state in `status` (loopback only). `null` shows nothing |
 | `degradeMapping.codexStatusTimeoutMs` | `1500` | Timeout for that fetch (always finite) |
 
@@ -1251,6 +1272,14 @@ How it behaves:
 - **An expired GPT-side login degrades instead of stopping.** When the bridge answers 403 with contract headers and the reason is a signed-out pool (`codex_needs_login`) or unreadable credentials (`codex_credentials_unavailable`), claude-rotator **rewrites it to 529** so Claude Code falls back to the next entry of `fallbackModel` (for example `opus`) and the session keeps working. Stopping when neither side is usable is still governed by `bothUnusableStatus` (default `403`). A 403 without contract headers, and a `codex_no_account_for_model` 403, are forwarded unchanged as before.
 - When a Claude account's own login expires, the `status` account card prints `reason: login expired - run: claude-rotator login --id <id>` and Routing availability shows `needs login` instead of `unknown`.
 - The learned GPT-side state lives in memory only and is reset by `POST /internal/reload` (config reload).
+- **What changes only when `recoveryWaitEnabled: true`** (nothing changes with the default `false`):
+  - When neither side is usable, the proxy answers **429 `rate_limit_error` with `Retry-After: 30`** instead of stopping with 403. Claude Code neither retries nor falls back on a 403, so it stops right there; on a 429 it keeps retrying on the same model. **An error is still shown, but the session is not terminated.**
+  - **Temporary bridge failures** (connection refused, connect timeout, idle timeout, and the bridge's own `codex_upstream_timeout` / `codex_upstream_unreachable` 403) also wait with 429 when no Claude account is available or availability cannot be determined, and degrade with 529 when Claude still has room.
+  - **Claude availability is read as three values** — available / none / indeterminate. Indeterminate (the ledger predicate threw, no accounts are registered, and so on) falls to the **waiting** side, never to "available".
+  - The synthesized 429 **drops every** upstream `Retry-After` and `anthropic-ratelimit-*` header (including `anthropic-ratelimit-unified-reset`) and carries exactly one `Retry-After: 30`. Without that, Claude Code can sleep silently until the advertised reset (up to six hours).
+  - **Recovery needs no restart or reload.** A single successful response proving the bridge reached its upstream returns the learned "GPT side is unusable" to unknown (never straight to available). Cached denials (`x-ombr-cached: yes`) neither create nor extend that state.
+  - **Expired GPT credentials (`codex_needs_login` / `codex_credentials_unavailable`) are excluded from waiting** and keep degrading with 529, because they never recover until a human runs `codex login`.
+  - Log lines gain `cached=` (whether the bridge answered from its cache; `none` when the header is absent) and `retryAfter=`.
 - Log `outcome` values split into `forwarded` / `forwarded-mapped` (a 529 rewritten to 403, or an auth-expired 403 rewritten to 529) / `bridge-unreachable` / `bridge-connect-timeout` / `bridge-idle-timeout` / `bridge-stream-error`, and fields such as `degradeReason`, `upstreamStatus`, `gptPoolState`, `claudePoolState`, `mappedFrom` / `mappedTo` are appended at the end of the line only when they have a value (with no values, the line is identical to the current one).
 
 Caveats:

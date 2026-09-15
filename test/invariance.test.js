@@ -33,6 +33,7 @@ import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 import { AccountManager } from '../src/account-manager.js';
+import { createGptPoolState, parseBridgeContract } from '../src/degrade-state.js';
 import { runCli } from '../src/cli.js';
 import { LOCAL_GATEWAY_AUTH_TOKEN } from '../src/config.js';
 import { createProxyServer } from '../src/proxy-server.js';
@@ -371,6 +372,75 @@ describe('unset-config-is-byte-identical (設計書 §14.1・§7.3-3)', () => {
       unset.observations.every(observation => observation.headers.length > 0 && observation.bodyText !== ''),
       '各観測にヘッダと本文があること（比較が空振りしていないこと）',
     );
+  });
+
+  it('recoveryWait off keeps T2b/T6b/cache-exclusion inactive (層1 もフラグ配下)', async () => {
+    // 統合設計 v2.1 §2.1 案A: 層1（T2b・T6b・キャッシュ非学習）は 403 書換の条件③
+    // （gptPoolState !== 'unusable'）を通じて応答バイトを変えうるので、層2 と同じ
+    // フラグの配下に置く。ここでは「off なら1バイトも変わらない」を2段で固定する。
+    const bridge = await startFakeBridge({ port: 0, mode: 'exhausted' });
+    cleanupAfterTest(async () => bridge.close());
+    const upstream = await startAnthropicUpstream();
+    cleanupAfterTest(async () => upstream.close());
+
+    // (a) 応答とログ行: 未指定・false・非真偽値（'true'）の3構成が完全に一致する。
+    const enabledOnly = await exerciseProxy({ bridge, upstream, degradeMapping: { enabled: true } });
+    const explicitFalse = await exerciseProxy({
+      bridge, upstream, degradeMapping: { enabled: true, recoveryWaitEnabled: false },
+    });
+    const notABoolean = await exerciseProxy({
+      bridge, upstream, degradeMapping: { enabled: true, recoveryWaitEnabled: 'true' },
+    });
+    assert.deepEqual(enabledOnly.observations, explicitFalse.observations);
+    assert.deepEqual(enabledOnly.logLines, explicitFalse.logLines);
+    assert.deepEqual(enabledOnly.observations, notABoolean.observations, '真偽値でない値は false へ倒れる');
+    assert.deepEqual(enabledOnly.logLines, notABoolean.logLines);
+    assert.equal(
+      enabledOnly.logLines.filter(line => /retryAfter=| cached=|Retry-After/.test(line)).length,
+      0,
+      'off では待機・キャッシュ由来の追記フィールドが1つも出ない',
+    );
+    // 空振り防止: gpt-* 要求が実際に 529（枯渇の素通し。Claude 側に空きがあるので
+    // 403 へは昇格しない）で返り、その過程で (pool)=unusable の学習が走っていること。
+    assert.deepEqual(
+      enabledOnly.observations.map(observation => `${observation.name}:${observation.status}`),
+      ['health:200', 'status:200', 'gpt:529', 'claude:200'],
+    );
+    assert.ok(
+      enabledOnly.logLines.some(line => /gptPoolState=unusable/.test(line)),
+      '層1 の学習が実際に走っている（比較が空振りしていない）',
+    );
+
+    // (b) 層1 の3点が off で発火しないこと（純関数の側で直接固定する）。
+    const learned = Date.parse('2026-09-14T00:00:00Z');
+    let nowMs = learned;
+    const off = createGptPoolState({ now: () => nowMs, recoveryWaitEnabled: false });
+    const denial = {
+      'x-ombr-contract': '1',
+      'x-ombr-degrade-reason': 'codex_pool_exhausted',
+      'x-ombr-degrade-scope': 'pool',
+      'x-ombr-pool-state': 'exhausted',
+      'x-ombr-upstream-status': '429',
+      'x-ombr-reset-at': '2099-01-01T00:00:00Z',
+      'x-ombr-cached': 'yes',
+    };
+    assert.equal(
+      off.observe(parseBridgeContract(denial), 529, 'gpt-6-astra').transition,
+      'T3',
+      'キャッシュ非学習は off では効かない（現行どおり学習する）',
+    );
+    nowMs = learned + 24 * 3_600_000;
+    assert.equal(off.read().pool.state, 'unusable', 'T6b は off では効かない（resetAt まで固着する）');
+    assert.equal(
+      off.observe(parseBridgeContract({
+        'x-ombr-contract': '1',
+        'x-ombr-upstream-status': '200',
+        'x-ombr-upstream-sent': 'yes',
+      }), 200, 'gpt-6-astra').transition,
+      null,
+      'T2b は off では発火しない',
+    );
+    assert.equal(off.read().pool.state, 'unusable');
   });
 
   async function exerciseProxy({ bridge, upstream, degradeMapping }) {

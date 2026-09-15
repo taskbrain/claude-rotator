@@ -1076,6 +1076,7 @@ describe('normalizeDegradeMapping (R3-2 / 設計書 §7.3)', () => {
       {
         enabled: true,
         bothUnusableStatus: 529,
+        recoveryWaitEnabled: false,
         gptPoolUnusableTtlMs: 30000,
         codexStatusUrl: 'http://127.0.0.1:18765/healthz',
         codexStatusTimeoutMs: 800,
@@ -1090,6 +1091,7 @@ describe('normalizeDegradeMapping (R3-2 / 設計書 §7.3)', () => {
     assert.deepEqual(normalizeDegradeMapping({ enabled: true }), {
       enabled: true,
       bothUnusableStatus: 403,
+      recoveryWaitEnabled: false,
       gptPoolUnusableTtlMs: 60000,
       codexStatusUrl: null,
       codexStatusTimeoutMs: 1500,
@@ -1107,6 +1109,17 @@ describe('normalizeDegradeMapping (R3-2 / 設計書 §7.3)', () => {
       assert.equal(normalizeDegradeMapping({ enabled: true, bothUnusableStatus: value }).bothUnusableStatus, 403);
     }
     assert.equal(normalizeDegradeMapping({ enabled: true, bothUnusableStatus: 529 }).bothUnusableStatus, 529);
+    // recoveryWaitEnabled も真偽値の true だけを受け付ける（統合設計 v2.1 §3.1）。
+    // 429 は設定値ではなく新経路がコードで返すので、bothUnusableStatus の値域（403/529）
+    // と既定 403 は上の行のとおり1つも変えていない。
+    for (const value of ['true', 1, 'yes', {}, [], null, undefined, 0, false]) {
+      assert.equal(
+        normalizeDegradeMapping({ enabled: true, recoveryWaitEnabled: value }).recoveryWaitEnabled,
+        false,
+        `recoveryWaitEnabled:${JSON.stringify(value)}`,
+      );
+    }
+    assert.equal(normalizeDegradeMapping({ enabled: true, recoveryWaitEnabled: true }).recoveryWaitEnabled, true);
     // ミリ秒は有限の正数のみ。0・負・NaN・Infinity・文字列はすべて既定へ戻す。
     for (const value of [0, -1, Number.NaN, Number.POSITIVE_INFINITY, '60000', null, {}]) {
       assert.equal(normalizeDegradeMapping({ gptPoolUnusableTtlMs: value }).gptPoolUnusableTtlMs, 60000);
@@ -1199,6 +1212,7 @@ describe('resolveOpenAiBridgeSettings degradeMapping (R3-2 / 設計書 §7.3-2)'
     assert.deepEqual(settings.degradeMapping, {
       enabled: true,
       bothUnusableStatus: 529,
+      recoveryWaitEnabled: false,
       gptPoolUnusableTtlMs: 60000,
       codexStatusUrl: null,
       codexStatusTimeoutMs: 1500,
@@ -3814,5 +3828,285 @@ describe('openai-bridge connect retry hardening', () => {
       assert.equal(syntheticMessage(res), 'openai-bridge unreachable: connection refused');
       assertNoAttemptAfterDeadline(factory, startedAt);
     });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// 段階①: 上流全滅・一時障害で Claude Code を止めない（統合設計 v2.1 §3）
+// recoveryWaitEnabled が真のときだけ 429 ＋ Retry-After: 30 を返し、偽なら現行と同一。
+// ---------------------------------------------------------------------------
+
+const RECOVERY_WAIT_ON = { enabled: true, recoveryWaitEnabled: true };
+
+/** 上流応答を手で駆動し、recoveryWait 有効の合成応答を観測する。 */
+function driveRecoveryWait({
+  upstreamStatus = 529,
+  upstreamHeaders = {},
+  claudeQuotaState = () => 'none',
+  degradeMapping = RECOVERY_WAIT_ON,
+  gptPoolState = createGptPoolState({ recoveryWaitEnabled: true }),
+} = {}) {
+  const manual = createManualUpstream();
+  const res = fakeServerResponse();
+  const lines = [];
+  const done = forwardToOpenAiBridge({
+    req: fakeIncomingRequest(),
+    res,
+    body: Buffer.from('{"model":"gpt-6-astra"}'),
+    model: 'gpt-6-astra',
+    settings: bridgeSettings({ degradeMapping }),
+    logger: line => lines.push(line),
+    httpRequestImpl: manual.requestImpl,
+    gptPoolState,
+    claudeAllUnusable: () => true,
+    claudeQuotaState,
+    claudeResetAt: () => '2098-01-01T00:00:00Z',
+  });
+  const upstreamRes = fakeUpstreamResponse(upstreamStatus, {
+    'content-type': 'application/json',
+    'Content-Length': '999',
+    'x-ombr-contract': '1',
+    'x-ombr-degrade-reason': 'codex_pool_exhausted',
+    'x-ombr-degrade-scope': 'pool',
+    'x-ombr-pool-state': 'exhausted',
+    'x-ombr-upstream-status': '429',
+    'x-ombr-upstream-sent': 'yes',
+    'x-ombr-reset-at': FAR_FUTURE_RESET_AT,
+    ...upstreamHeaders,
+  });
+  return { manual, res, lines, done, upstreamRes };
+}
+
+async function runRecoveryWait(options) {
+  const driven = driveRecoveryWait(options);
+  await new Promise(resolve => setImmediate(resolve));
+  driven.manual.getCallback()(driven.upstreamRes);
+  await driven.done;
+  return { ...driven, bridgeLine: driven.lines.find(l => / openai-bridge model=/.test(l)) };
+}
+
+describe('forwardToOpenAiBridge > recoveryWait の 429 待機 (統合設計 v2.1 §3.2)', () => {
+  it('answers 429 rate_limit_error with Retry-After 30 instead of stopping with 403', async () => {
+    const { res, bridgeLine } = await runRecoveryWait();
+    assert.equal(res.statusCode, 429, '403 では Claude Code がその場で停止する（M-5）');
+    assert.equal(res.headers['Retry-After'], '30');
+    const body = JSON.parse(res.endPayload.toString('utf8'));
+    assert.equal(body.error.type, 'rate_limit_error');
+    assert.equal(res.headers['Content-Length'], String(Buffer.byteLength(res.endPayload)));
+    assert.match(bridgeLine, / status=429 /);
+    assert.match(bridgeLine, /mappedFrom=529 .*mappedTo=429/);
+    assert.match(bridgeLine, /retryAfter=30/);
+  });
+
+  it('V1: strips retry-after and anthropic-ratelimit-* so the client never sleeps on a 5-day reset', async () => {
+    const { res } = await runRecoveryWait({
+      upstreamHeaders: {
+        'retry-after': '3600',
+        'Anthropic-RateLimit-Unified-Reset': '1789000000',
+        'anthropic-ratelimit-requests-remaining': '0',
+      },
+    });
+    const leaked = Object.keys(res.headers).filter(key => /ratelimit/i.test(key));
+    assert.deepEqual(leaked, [], '除去漏れは監視 ON で最大 6 時間の無音になる');
+    assert.equal(res.headers['Retry-After'], '30', '待機指示は合成した1本だけ');
+  });
+
+  it('a thrown ledger predicate yields indeterminate, not available', async () => {
+    const { res } = await runRecoveryWait({
+      claudeQuotaState: () => { throw new Error('ledger unavailable'); },
+    });
+    assert.equal(res.statusCode, 429, '判定不能を「空きあり」へ丸めない');
+    assert.match(
+      res.endPayload.toString('utf8'),
+      /rate_limit_error/,
+    );
+  });
+
+  it('logs claudePoolState=indeterminate so the waiting reason stays readable', async () => {
+    const { bridgeLine } = await runRecoveryWait({ claudeQuotaState: () => 'indeterminate' });
+    assert.match(bridgeLine, /claudePoolState=indeterminate/);
+  });
+
+  it('falls back with 529 (not 429) while the Claude common quota still has room', async () => {
+    const { res, bridgeLine } = await runRecoveryWait({ claudeQuotaState: () => 'available' });
+    assert.equal(res.statusCode, 529, '退避先があるなら退避させる');
+    assert.equal(res.headers['Retry-After'], undefined);
+    assert.equal(/mappedTo=/.test(bridgeLine), false, '書換なしなので痕跡も出ない');
+  });
+
+  it('keeps the auth-expired 403 on the R7 path (429 へ再変換しない)', async () => {
+    const { res, bridgeLine } = await runRecoveryWait({
+      upstreamStatus: 403,
+      upstreamHeaders: {
+        'x-ombr-degrade-reason': 'codex_needs_login',
+        'x-ombr-pool-state': 'needs-login',
+        'x-ombr-upstream-status': 'none',
+        'x-ombr-upstream-sent': 'no',
+      },
+    });
+    assert.equal(res.statusCode, 529, 'D-72 / R7 の 403→529 を維持する');
+    assert.equal(res.headers['Retry-After'], undefined);
+    assert.match(bridgeLine, /mapReason=codex_auth_expired/);
+  });
+
+  it('maps a transient 403 (upstream timeout) to 429 while waiting', async () => {
+    const { res, bridgeLine } = await runRecoveryWait({
+      upstreamStatus: 403,
+      upstreamHeaders: {
+        'x-ombr-degrade-reason': 'codex_upstream_timeout',
+        'x-ombr-pool-state': undefined,
+        'x-ombr-upstream-status': 'none',
+        'x-ombr-upstream-sent': 'no',
+      },
+    });
+    assert.equal(res.statusCode, 429);
+    assert.equal(res.headers['Retry-After'], '30');
+    assert.match(bridgeLine, /mapReason=codex_upstream_transient/);
+  });
+
+  it('answers 403 exactly as today while recoveryWait is off', async () => {
+    const { res, bridgeLine } = await runRecoveryWait({ degradeMapping: { enabled: true } });
+    assert.equal(res.statusCode, 403);
+    assert.equal(res.headers['Retry-After'], undefined);
+    assert.equal(JSON.parse(res.endPayload.toString('utf8')).error.type, 'permission_error');
+    assert.match(bridgeLine, /mappedTo=403/);
+    assert.equal(/retryAfter=/.test(bridgeLine), false);
+    assert.equal(/ cached=/.test(bridgeLine), false, 'フラグ off ではログ行も1フィールド増えない');
+  });
+
+  it('emits cached= on every contract response so T2b の第3条件を本番で監査できる', async () => {
+    const withoutHeader = await runRecoveryWait();
+    assert.match(withoutHeader.bridgeLine, / cached=none /, 'ヘッダが無いことを none として残す');
+    const withHeader = await runRecoveryWait({ upstreamHeaders: { 'x-ombr-cached': 'yes' } });
+    assert.match(withHeader.bridgeLine, / cached=yes /);
+  });
+});
+
+/** 不達（ECONNREFUSED）を再現して合成応答を観測する。 */
+async function driveUnreachable({ claudeQuotaState = () => 'none', degradeMapping = RECOVERY_WAIT_ON } = {}) {
+  const res = fakeServerResponse();
+  const lines = [];
+  const requestImpl = () => {
+    const upstream = new EventEmitter();
+    upstream.destroyed = false;
+    upstream.destroy = () => { upstream.destroyed = true; };
+    upstream.end = () => {
+      process.nextTick(() => upstream.emit('error', Object.assign(new Error('refused'), { code: 'ECONNREFUSED' })));
+    };
+    return upstream;
+  };
+  await forwardToOpenAiBridge({
+    req: fakeIncomingRequest(),
+    res,
+    body: Buffer.from('{"model":"gpt-6-astra"}'),
+    model: 'gpt-6-astra',
+    settings: bridgeSettings({ degradeMapping }),
+    logger: line => lines.push(line),
+    httpRequestImpl: requestImpl,
+    gptPoolState: createGptPoolState({ recoveryWaitEnabled: true }),
+    claudeAllUnusable: () => true,
+    claudeQuotaState,
+  });
+  return { res, bridgeLine: lines.find(l => / openai-bridge model=/.test(l)) };
+}
+
+describe('forwardToOpenAiBridge > bridge 不達の帰結 (統合設計 v2.1 §3.2 の8行目)', () => {
+  it('waits with 429 + Retry-After when no Claude account is available', async () => {
+    const { res, bridgeLine } = await driveUnreachable();
+    assert.equal(res.statusCode, 429, '不達は恒久拒否ではないので 403 で止めない');
+    assert.equal(res.headers['Retry-After'], '30');
+    assert.equal(JSON.parse(res.endPayload).error.type, 'rate_limit_error');
+    assert.match(bridgeLine, /outcome=bridge-unreachable/);
+    assert.match(bridgeLine, /mapReason=codex_upstream_transient/);
+  });
+
+  it('falls back with 529 when the Claude common quota still has room', async () => {
+    const { res } = await driveUnreachable({ claudeQuotaState: () => 'available' });
+    assert.equal(res.statusCode, 529);
+    assert.equal(res.headers['Retry-After'], undefined);
+    assert.equal(JSON.parse(res.endPayload).error.type, 'overloaded_error');
+  });
+
+  it('keeps the 403 permission_error answer byte-for-byte while recoveryWait is off', async () => {
+    const { res, bridgeLine } = await driveUnreachable({ degradeMapping: { enabled: true } });
+    assert.equal(res.statusCode, 403);
+    assert.equal(
+      res.endPayload,
+      '{"type":"error","error":{"type":"permission_error","message":"openai-bridge unreachable: connection refused"}}',
+    );
+    assert.equal(/mapReason=codex_upstream_transient/.test(bridgeLine), false);
+  });
+});
+
+describe('forwardToOpenAiBridge > V12: 上流回復後に T2b へ到達する (統合設計 v2.1 §6)', () => {
+  it('returns gptPoolState to unknown on the request that follows a successful 200', async () => {
+    const gptPoolState = createGptPoolState({ recoveryWaitEnabled: true });
+    const settingsOverride = { degradeMapping: RECOVERY_WAIT_ON };
+
+    // 1) 週次 resetAt 付きの全滅を学習する（本番で 21 時間固着した形）。
+    await callWithPoolState({
+      gptPoolState,
+      requestBody: '{"model":"gpt-6-astra"}',
+      settingsOverride,
+      bridgeHandler: contractHandler(529, {
+        'x-ombr-degrade-reason': 'codex_pool_exhausted',
+        'x-ombr-degrade-scope': 'pool',
+        'x-ombr-pool-state': 'exhausted',
+        'x-ombr-upstream-status': '429',
+        'x-ombr-upstream-sent': 'yes',
+        'x-ombr-reset-at': '2099-01-01T00:00:00Z',
+      }),
+    });
+    assert.equal(gptPoolState.read('gpt-6-astra').pool.state, 'unusable');
+
+    // 2) bridge が回復し、上流証拠つきの 200 を1件だけ通す。
+    await callWithPoolState({
+      gptPoolState,
+      requestBody: '{"model":"gpt-6-astra"}',
+      settingsOverride,
+      bridgeHandler: contractHandler(
+        200,
+        { 'x-ombr-upstream-status': '200', 'x-ombr-upstream-sent': 'yes' },
+        '{"ok":true}',
+      ),
+    });
+
+    // 3) 次の要求のログ行で unknown に戻っている（人手の再起動・reload なし）。
+    const { lines } = await callWithPoolState({
+      gptPoolState,
+      requestBody: '{"model":"gpt-6-astra"}',
+      settingsOverride,
+      bridgeHandler: respondWithoutContract,
+    });
+    assert.match(lines.find(l => / openai-bridge model=/.test(l)), /gptPoolState=unknown/);
+    assert.equal(gptPoolState.read('gpt-6-astra').pool.state, 'unknown');
+  });
+
+  it('stays unusable across the same sequence while recoveryWait is off (回帰の再現)', async () => {
+    const gptPoolState = createGptPoolState({ recoveryWaitEnabled: false });
+    const settingsOverride = { degradeMapping: { enabled: true } };
+    await callWithPoolState({
+      gptPoolState,
+      requestBody: '{"model":"gpt-6-astra"}',
+      settingsOverride,
+      bridgeHandler: contractHandler(529, {
+        'x-ombr-degrade-reason': 'codex_pool_exhausted',
+        'x-ombr-degrade-scope': 'pool',
+        'x-ombr-pool-state': 'exhausted',
+        'x-ombr-upstream-status': '429',
+        'x-ombr-reset-at': '2099-01-01T00:00:00Z',
+      }),
+    });
+    await callWithPoolState({
+      gptPoolState,
+      requestBody: '{"model":"gpt-6-astra"}',
+      settingsOverride,
+      bridgeHandler: contractHandler(
+        200,
+        { 'x-ombr-upstream-status': '200', 'x-ombr-upstream-sent': 'yes' },
+        '{"ok":true}',
+      ),
+    });
+    assert.equal(gptPoolState.read('gpt-6-astra').pool.state, 'unusable', '現行では回復しない');
   });
 });

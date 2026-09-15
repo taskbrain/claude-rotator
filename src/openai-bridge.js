@@ -1,8 +1,9 @@
 import http from 'node:http';
 
 import {
-  buildBridgeLogMeta, decideAuthDegradeRewrite, decideBridgeResponse, formatLogMeta,
-  parseBridgeContract,
+  applyRecoveryWaitHeaders, buildBridgeLogMeta, decideAuthDegradeRewrite, decideBridgeResponse,
+  decideRecoveryWaitResponse, formatLogMeta, parseBridgeContract, quotaWaits,
+  RECOVERY_WAIT_RETRY_AFTER_SECONDS, withoutRateLimitHeaders,
 } from './degrade-state.js';
 
 const LOOPBACK_HOSTS = new Set(['127.0.0.1', 'localhost', '::1']);
@@ -52,6 +53,12 @@ export const DEFAULT_OPENAI_BRIDGE = {
 export const DISABLED_DEGRADE_MAPPING = Object.freeze({
   enabled: false,
   bothUnusableStatus: 403,
+  // 統合設計 v2.1 §3.1: 上流全滅・一時障害で 403 の代わりに 429 ＋ Retry-After: 30 を返し、
+  // Claude Code のセッションを止めない。**未指定・false は現行とバイト互換**であり、
+  // 層1（T2b・T6b・キャッシュ非学習）も含めてこのキー1つで切り戻せる。
+  // 平坦キーにしてあるのは、既存4キーがすべて平坦であること、Object.freeze が浅いこと、
+  // ネストの型検査を1段増やさないことによる（同 §3.1）。
+  recoveryWaitEnabled: false,
   gptPoolUnusableTtlMs: 60000,
   codexStatusUrl: null,
   codexStatusTimeoutMs: 1500,
@@ -76,6 +83,13 @@ const DEGRADE_MAPPING_WITHOUT_BRIDGE_NOTICE =
 // 同じ言い回しに揃える（'openaiBridge.url must be loopback; branch disabled'）。
 // 設定値そのものは載せない: この行は運用ログへ出るため、利用者が書いた URL を
 // そのまま転記しない。
+// 03 §4.1: recoveryWait が有効な構成では、両プール全滅の帰結を決めるのは
+// bothUnusableStatus ではなく本機能の応答表（429 ＋ Retry-After）である。設定を読んだ人が
+// 取り違えないよう、起動と reload のときだけ1行残す（要求ごとには出さない）。
+const RECOVERY_WAIT_PRECEDENCE_NOTICE =
+  'degradeMapping.recoveryWaitEnabled takes precedence over bothUnusableStatus; '
+  + 'both-pool exhaustion answers 429 with Retry-After';
+
 const CODEX_STATUS_URL_NOT_LOOPBACK_NOTICE =
   'degradeMapping.codexStatusUrl must be loopback; codex status section disabled';
 const CODEX_STATUS_URL_INVALID_NOTICE =
@@ -149,6 +163,8 @@ export function normalizeDegradeMapping(raw) {
     bothUnusableStatus: BOTH_UNUSABLE_STATUSES.has(raw.bothUnusableStatus)
       ? raw.bothUnusableStatus
       : DISABLED_DEGRADE_MAPPING.bothUnusableStatus,
+    // 真偽値の true だけを受け付ける（'true' や 1 は無効＝判定式を1つに保つ）。
+    recoveryWaitEnabled: raw.recoveryWaitEnabled === true,
     gptPoolUnusableTtlMs: positiveNumber(raw.gptPoolUnusableTtlMs, DISABLED_DEGRADE_MAPPING.gptPoolUnusableTtlMs),
     codexStatusUrl: codexStatusUrl.value,
     codexStatusTimeoutMs: positiveNumber(raw.codexStatusTimeoutMs, DISABLED_DEGRADE_MAPPING.codexStatusTimeoutMs),
@@ -173,7 +189,11 @@ export function logDegradeMappingConfigNotice(settings, logger) {
   if (!settings.enabled && degradeMapping.enabled === true) {
     reasons.push(DEGRADE_MAPPING_WITHOUT_BRIDGE_NOTICE);
   }
-  // (2) 正規化で捨てた設定（非ループバック等の codexStatusUrl。設計書 §7.2）。
+  // (2) recoveryWait が bothUnusableStatus より優先することの明示（03 §4.1）。
+  if (settings.enabled && degradeMapping.enabled === true && degradeMapping.recoveryWaitEnabled === true) {
+    reasons.push(RECOVERY_WAIT_PRECEDENCE_NOTICE);
+  }
+  // (3) 正規化で捨てた設定（非ループバック等の codexStatusUrl。設計書 §7.2）。
   // fail-safe 3経路では degradeMapping ごと DISABLED_DEGRADE_MAPPING に倒れており
   // notices は空なので、ここでも1行も出ない。
   // notices が欠けた settings（正規化を通っていない手組みの値）でも投げない。
@@ -263,20 +283,28 @@ export function shouldRouteToOpenAiBridge(body, settings) {
   return { route: true, model, reason: 'match' };
 }
 
-function errorBody(reason) {
+// status が 403（既定）のときは現行と1バイトも変わらない。recoveryWait が 429／529 へ
+// 倒したときだけ、ステータスに合う error.type にする（型とステータスを矛盾させない）。
+function errorBody(reason, status = BRIDGE_UNREACHABLE_STATUS) {
+  const type = status === 429
+    ? 'rate_limit_error'
+    : status === 529 ? 'overloaded_error' : 'permission_error';
   return JSON.stringify({
     type: 'error',
-    error: { type: 'permission_error', message: `openai-bridge unreachable: ${reason}` },
+    error: { type, message: `openai-bridge unreachable: ${reason}` },
   });
 }
 
-function sendSynthetic(res, reason) {
+function sendSynthetic(res, reason, { status = BRIDGE_UNREACHABLE_STATUS, retryAfterSeconds = null } = {}) {
   if (res.headersSent || res.writableEnded) return;
-  const payload = errorBody(reason);
-  res.writeHead(BRIDGE_UNREACHABLE_STATUS, {
+  const payload = errorBody(reason, status);
+  const headers = {
     'Content-Type': 'application/json',
     'Content-Length': Buffer.byteLength(payload),
-  });
+  };
+  // 10 進整数秒。合成応答なので落とすべき上流ヘッダはそもそも無い。
+  if (retryAfterSeconds !== null) headers['Retry-After'] = String(Math.trunc(retryAfterSeconds));
+  res.writeHead(status, headers);
   res.end(payload);
 }
 
@@ -382,7 +410,7 @@ export function planConnectRetry({ attempt, retries, elapsedMs }) {
 export function forwardToOpenAiBridge({
   req, res, body, model, settings, logger,
   httpRequestImpl = http.request, gptPoolState = null,
-  claudeAllUnusable = null, claudeResetAt = null,
+  claudeAllUnusable = null, claudeResetAt = null, claudeQuotaState = null,
 }) {
   const startedAt = Date.now();
   const target = pinnedUpstreamTarget(req.url, settings.url);
@@ -453,6 +481,9 @@ export function forwardToOpenAiBridge({
     // （追記フィールドが1つも出ないこと）」。追記は写像機能を有効にした構成だけの挙動であり、
     // 既定（無効）の利用者のログは outcome 名の改名以外は1文字も変わらない。
     const metaEnabled = settings?.degradeMapping?.enabled === true;
+    // 層2（統合設計 v2.1 §3）。親（degradeMapping.enabled）が真のときだけ効く。
+    // 偽なら応答もログも現行と1バイト変わらない。
+    const recoveryWaitEnabled = metaEnabled && settings.degradeMapping.recoveryWaitEnabled === true;
 
     // 設計書 §9.3 / §9.5(a): 学習した (pool) / (pool, model) の状態は、状態そのものを
     // 保持しているときだけ載せる。gptPoolState を渡さない呼び出し（＝既定の経路）では
@@ -492,9 +523,57 @@ export function forwardToOpenAiBridge({
       }
     };
 
-    const claudePoolStateFields = () => (claudeExhausted === null
-      ? {}
-      : { claudePoolState: claudeExhausted ? 'all-exhausted' : 'available' });
+    // Claude 側の空きを**三値**で読む（統合設計 v2.1 §3.5）。判定不能（未結線・例外・
+    // 口座0件）を available へ丸めない——丸めると、実際には死んでいる Claude へ退避して
+    // 最終退避先の無音バックオフに落ちる。二値版 evaluateClaudeLedger() は off 経路の
+    // ためにそのまま残し、null（例外）はここで indeterminate として保持する。
+    let claudeQuota = null;
+    const evaluateClaudeQuota = () => {
+      if (typeof claudeQuotaState !== 'function') {
+        if (claudeExhausted === null) return 'indeterminate';
+        return claudeExhausted === true ? 'none' : 'available';
+      }
+      try {
+        const value = claudeQuotaState();
+        return value === 'available' || value === 'none' ? value : 'indeterminate';
+      } catch {
+        return 'indeterminate';
+      }
+    };
+
+    const claudePoolStateFields = () => {
+      // recoveryWait 有効時は三値をそのまま載せる（'indeterminate' を 'available' と
+      // 書いてしまうと、後からログだけでは待機の理由を説明できない）。
+      if (recoveryWaitEnabled && claudeQuota !== null) {
+        return { claudePoolState: claudeQuota === 'none' ? 'all-exhausted' : claudeQuota };
+      }
+      return claudeExhausted === null
+        ? {}
+        : { claudePoolState: claudeExhausted ? 'all-exhausted' : 'available' };
+    };
+
+    // rotator 自身が検出した不達・接続期限・無通信期限（応答ヘッダ未送出）の帰結。
+    // recoveryWait 有効時は Claude 共通枠が none／indeterminate なら 429 で待たせ、空きが
+    // あるなら 529 にして fallbackModel へ退避させる（統合設計 v2.1 §3.2 の 8 行目）。
+    // 不達は恒久拒否ではないので、現行の 403（即停止）はこの局面で欠陥になる。
+    // 無効時は現行どおり 403 を返し、ログにも1フィールドも足さない。
+    const unreachableOutcome = () => {
+      if (!recoveryWaitEnabled) return { status: BRIDGE_UNREACHABLE_STATUS, retryAfterSeconds: null, meta: null };
+      claudeQuota = evaluateClaudeQuota();
+      const status = quotaWaits(claudeQuota) ? 429 : 529;
+      const retryAfterSeconds = status === 429 ? RECOVERY_WAIT_RETRY_AFTER_SECONDS : null;
+      return {
+        status,
+        retryAfterSeconds,
+        meta: {
+          mappedFrom: BRIDGE_UNREACHABLE_STATUS,
+          mappedFromType: 'permission_error',
+          mappedTo: status,
+          retryAfter: retryAfterSeconds ?? undefined,
+          mapReason: 'codex_upstream_transient',
+        },
+      };
+    };
 
     // 設計書 §9.3 のフィールドを「値があるときだけ」末尾へ足す形に組み立てる。
     // 第3引数（写像の痕跡）は §9.3 の表の順序で並べたいので buildBridgeLogMeta 側へ渡す。
@@ -510,7 +589,16 @@ export function forwardToOpenAiBridge({
           // bridge 自身が理由を名乗っていればそれを優先する（実データ）。名乗っていない
           // 障害（不達・タイムアウト・ストリーム障害）だけ rotator 側の値を入れる。
           reason: parsed?.reason ?? ROTATOR_DEGRADE_REASONS[outcome] ?? null,
-        }, { ...poolStateFields(), ...claudePoolStateFields(), ...(mapped || {}) }),
+        }, {
+          // T2b の第3条件（cached ≠ yes）とキャッシュ非学習を本番ログで監査するため、
+          // recoveryWait 有効時はヘッダが無い場合も 'none' として必ず出す（既存の
+          // bridgeCached はヘッダがあるときしか出ないので、無い場合と機能無効の場合を
+          // 区別できない）。
+          ...(recoveryWaitEnabled ? { cached: parsed?.cached || 'none' } : {}),
+          ...poolStateFields(),
+          ...claudePoolStateFields(),
+          ...(mapped || {}),
+        }),
         ...extra,
       };
     };
@@ -542,9 +630,14 @@ export function forwardToOpenAiBridge({
       idleTimer = setTimeout(() => {
         currentUpstream?.destroy();
         const willSend = !res.headersSent;
-        if (willSend) sendSynthetic(res, 'idle timeout');
+        const outcome = willSend ? unreachableOutcome() : null;
+        if (willSend) sendSynthetic(res, 'idle timeout', outcome);
         else res.destroy();
-        finish('bridge-idle-timeout', willSend ? BRIDGE_UNREACHABLE_STATUS : null, logMeta('bridge-idle-timeout'));
+        finish(
+          'bridge-idle-timeout',
+          outcome ? outcome.status : null,
+          logMeta('bridge-idle-timeout', {}, outcome?.meta),
+        );
       }, settings.idleTimeoutMs);
     };
 
@@ -615,11 +708,32 @@ export function forwardToOpenAiBridge({
           // 判定は degrade-state.js の decideBridgeResponse に閉じてある（4条件のすべてが
           // 成り立つときだけ真を返す）。ここでは「決まった手順で応答を作り替える」だけを行う。
           if (metaEnabled) claudeExhausted = evaluateClaudeLedger();
+          if (recoveryWaitEnabled) claudeQuota = evaluateClaudeQuota();
           // 学習済みの (pool)。gptPoolState を渡していない呼び出しでは 'unknown' 扱いになり、
           // 条件③が成り立たないので書換は起きない。
           const learnedPool = metaEnabled ? gptPoolState?.read(model).pool : null;
-          let decision = metaEnabled
-            ? decideBridgeResponse(contract, {
+          // 写像の評価順（1要求につき1回だけ・排他）:
+          //   ① recoveryWait の待機判定（529→429／一時障害 403→429|529）。有効時のみ。
+          //   ② 529→403（既存。recoveryWait が①で決めなかったときだけ走る）
+          //   ③ 403→529（R7・認証失効）
+          // ①は AUTH_EXPIRED_REASONS を明示的に除外するので、③と取り合いにならない
+          // （順序ではなく上流の実ステータスと reason で判定している）。
+          let decision = { rewrite: false };
+          if (recoveryWaitEnabled) {
+            decision = decideRecoveryWaitResponse(contract, {
+              enabled: true,
+              upstreamStatus: upstreamRes.statusCode,
+              claudeQuotaState: claudeQuota,
+              gptPoolState: learnedPool?.state,
+              gptResetAt: learnedPool?.resetAt,
+              claudeResetAt: quotaWaits(claudeQuota) ? evaluateClaudeResetAt() : null,
+            });
+          }
+          // recoveryWait が有効な構成では 529→403 の書換そのものを行わない。本機能の目的は
+          // 「両プール全滅でも 403 で止めないこと」であり、①で待機にならなかった応答
+          // （＝Claude 側に空きがある）を 403 へ落とすと、その目的と真逆になる。
+          if (metaEnabled && !recoveryWaitEnabled && !decision.rewrite) {
+            decision = decideBridgeResponse(contract, {
               enabled: true,
               upstreamStatus: upstreamRes.statusCode,
               claudeAllUnusable: claudeExhausted === true,
@@ -628,8 +742,8 @@ export function forwardToOpenAiBridge({
               // 本文の「最早回復時刻」は GPT 側と Claude 側の早いほうを採る（§8.7）。
               claudeResetAt: claudeExhausted === true ? evaluateClaudeResetAt() : null,
               bothUnusableStatus: settings.degradeMapping.bothUnusableStatus,
-            })
-            : { rewrite: false };
+            });
+          }
           // ── R7-1（母艦裁定 D-72）: 認証失効の 403 だけは 529 へ書き換える ──
           // 上の判定（529→403）とは入力が排他である（片方は 529 だけを、こちらは 403
           // だけを見る）ので、先に決まっていなければ評価する、という順序で足りる。
@@ -651,11 +765,21 @@ export function forwardToOpenAiBridge({
                 delete responseHeaders[key];
               }
             }
+            // 手順2b（recoveryWait の合成応答だけ）: 元の Retry-After と
+            // anthropic-ratelimit-*（unified-* を含む）を大小文字問わず全部落とす。残すと
+            // 再試行監視が有効な Claude Code はそれを最優先し、5 日先の reset で最大 6 時間
+            // 無音で眠る（統合設計 v2.1 §3.3・S-8）。429 では 10 進整数秒の Retry-After を
+            // 1つだけ付け直す。既存の 529→403・403→529 の経路はここを通らない。
+            const outboundHeaders = decision.stripRateLimitHeaders === true
+              ? (decision.retryAfterSeconds
+                ? applyRecoveryWaitHeaders(responseHeaders, decision.retryAfterSeconds)
+                : withoutRateLimitHeaders(responseHeaders))
+              : responseHeaders;
             // 手順3: 自作した本文に一致するヘッダを入れ直す。
-            responseHeaders['Content-Type'] = 'application/json';
-            responseHeaders['Content-Length'] = String(payload.length);
+            outboundHeaders['Content-Type'] = 'application/json';
+            outboundHeaders['Content-Length'] = String(payload.length);
             // 手順4。
-            res.writeHead(decision.status, responseHeaders);
+            res.writeHead(decision.status, outboundHeaders);
             res.end(payload);
             // 手順5: finish() を destroy() より先に呼ぶ（settled=true にして、破棄由来の
             // upstream 'error' で応答を二重に書かないようにする）。
@@ -740,8 +864,9 @@ export function forwardToOpenAiBridge({
         : Math.max(0, Math.min(settings.connectTimeoutMs, remainingBudgetMs));
       connectTimer = setTimeout(() => {
         upstream.destroy();
-        sendSynthetic(res, 'connect timeout');
-        finish('bridge-connect-timeout', BRIDGE_UNREACHABLE_STATUS, logMeta('bridge-connect-timeout'));
+        const outcome = unreachableOutcome();
+        sendSynthetic(res, 'connect timeout', outcome);
+        finish('bridge-connect-timeout', outcome.status, logMeta('bridge-connect-timeout', {}, outcome.meta));
       }, connectTimeoutMs);
 
       upstream.once('socket', socket => {
@@ -808,8 +933,13 @@ export function forwardToOpenAiBridge({
             // 残予算が尽きていたら開かずに、1回目の失敗と同じ形で打ち切る。
             const leftMs = remainingConnectBudgetMs();
             if (leftMs !== null && leftMs <= 0) {
-              sendSynthetic(res, 'connection refused');
-              finish('bridge-unreachable', BRIDGE_UNREACHABLE_STATUS, logMeta('bridge-unreachable', errorLogFields(error)));
+              const outcome = unreachableOutcome();
+              sendSynthetic(res, 'connection refused', outcome);
+              finish(
+                'bridge-unreachable',
+                outcome.status,
+                logMeta('bridge-unreachable', errorLogFields(error), outcome.meta),
+              );
               return;
             }
             attemptConnect(attempt + 1);
@@ -817,8 +947,13 @@ export function forwardToOpenAiBridge({
           return;
         }
         // 応答本文は現行のまま（丸めたまま）にし、種別はログの errorCode で判別する（§8.9・§9）。
-        sendSynthetic(res, 'connection refused');
-        finish('bridge-unreachable', BRIDGE_UNREACHABLE_STATUS, logMeta('bridge-unreachable', errorLogFields(error)));
+        const outcome = unreachableOutcome();
+        sendSynthetic(res, 'connection refused', outcome);
+        finish(
+          'bridge-unreachable',
+          outcome.status,
+          logMeta('bridge-unreachable', errorLogFields(error), outcome.meta),
+        );
       });
 
       upstream.end(body);
