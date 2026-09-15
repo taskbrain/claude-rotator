@@ -1550,6 +1550,18 @@ describe('キャッシュ由来の否定応答は学習の入力にしない (�
     assert.equal(state.read().pool.state, 'unknown', 'キャッシュ由来の否定で TTL が作り直されない');
   });
 
+  it('learns from a 529 that carries no x-ombr-cached header at all (除外は cached: yes のときだけ)', () => {
+    // a8 の回答 R-20260916-a8-26: 本番で最も頻度が高い 529 は「使用率 95% 超の除外分岐
+    // （observationOnly）」由来で x-ombr-cached を付けない。つまり**学習対象**である。
+    // キャッシュ非学習が効くのは cached: yes のときだけ、という前提をここで固定する。
+    const state = createGptPoolState({ now: () => 1000, recoveryWaitEnabled: true });
+    const parsed = parseBridgeContract(headers());
+    assert.equal(parsed.cached, null, 'ヘッダが無いことを前提にしている');
+    assert.equal(state.observe(parsed, 529, 'gpt-6-astra').transition, 'T3');
+    assert.equal(state.read().pool.state, 'unusable');
+    assert.equal(state.read().pool.reason, 'codex_pool_exhausted');
+  });
+
   it('still learns from a cached denial while recoveryWait is off (現行どおり)', () => {
     const state = createGptPoolState({ now: () => 1000, recoveryWaitEnabled: false });
     const result = state.observe(
