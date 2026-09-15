@@ -9,7 +9,10 @@ import { LOCAL_GATEWAY_AUTH_TOKEN, createDefaultConfig } from '../src/config.js'
 import { MemorySecretStore } from '../src/secret-store.js';
 import { createProxyServer } from '../src/proxy-server.js';
 import {
+  CONNECT_RETRY_BUDGET_MS,
   forwardToOpenAiBridge,
+  normalizeConnectRetries,
+  planConnectRetry,
   resolveOpenAiBridgeSettings,
   safeParseModel,
   shouldRouteToOpenAiBridge,
@@ -199,7 +202,13 @@ function fakeServerResponse() {
     return true;
   };
   res.forceNextWriteToReportBackpressure = () => { forceNextWriteFalse = true; };
-  res.end = () => { res.writableEnded = true; };
+  // 合成応答（sendSynthetic）は res.end(payload) で本文を渡す。本文の文言まで
+  // 検証できるように、渡された payload だけ控える（既存の呼び出しは引数なしなので
+  // endPayload は undefined のまま＝既存テストの挙動は変わらない）。
+  res.end = payload => {
+    if (payload !== undefined) res.endPayload = payload;
+    res.writableEnded = true;
+  };
   res.destroy = () => {
     // 実際の http.ServerResponse#destroy() は 'close' を非同期に発火する
     // （基底ソケットのクローズ経由）。同期発火にすると、この destroy() 自体を
@@ -3368,5 +3377,442 @@ describe('proxy 統合 > 認証失効の 403 が 529 としてクライアント
 
     assert.equal(response.status, 403, '既定（無効）の構成では現行と同一');
     assert.equal(JSON.parse(response.bodyText).error.type, 'permission_error');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// 接続前リトライの硬化（2026-09-14）
+//
+// 12:07 の ECONNREFUSED ×4／12:32 の ECONNRESET ×3（いずれも bridge の再起動と対応）
+// の調査で、接続前リトライ経路に次の穴が見つかった。
+//   (a) 再試行の可否を 'finish'（requestFullySent）だけで判定しており、TCP 接続が
+//       確立していても 'finish' 前なら再送してしまう（二重送信の危険）。
+//   (b) ECONNRESET / ENOTFOUND まで再試行対象に入れていた。再送してよいのは
+//       「一度も接続できなかった」ECONNREFUSED だけである。
+//   (c) connectRetries が有限整数か検証されず、Infinity や巨大値がそのまま上限になる。
+//   (d) 再試行が即時で、待機も総予算も無い。
+//   (e) ECONNRESET は拒否（ECONNREFUSED）と原因が違うが、**応答本文は変えない**
+//       （§8.9「HTTP 応答は不変」）。区別はログの errorCode だけが担う。
+// ---------------------------------------------------------------------------
+
+// 試行ごとの upstream を全部records として保持するフェイク。createManualUpstream は
+// 最後の1本しか返さないので、再試行の有無（＝接続を何本開いたか）を数えられない。
+function createAttemptRecordingUpstream() {
+  const attempts = [];
+  const requestImpl = (options, cb) => {
+    const upstream = new EventEmitter();
+    upstream.destroyed = false;
+    upstream.destroy = () => { upstream.destroyed = true; };
+    // openedAt は「この接続試行が始まった実時刻」。接続前の締切を過ぎてから新しい
+    // 接続が開いていないことを、試行ごとに確かめるために持つ。
+    const record = { upstream, callback: cb, ended: false, socket: null, openedAt: Date.now() };
+    upstream.end = () => { record.ended = true; };
+    attempts.push(record);
+    return upstream;
+  };
+  return { requestImpl, attempts };
+}
+
+// 実機の http.ClientRequest は「ソケットは割り当てたが接続はまだ」の状態で 'socket' を
+// 発火する（socket.connecting === true）。接続拒否は必ずこの状態から起きる。
+function emitConnectingSocket(record) {
+  const socket = new EventEmitter();
+  socket.connecting = true;
+  record.socket = socket;
+  record.upstream.emit('socket', socket);
+  return socket;
+}
+
+// TCP 接続が確立した状態。keep-alive の使い回し（最初から connecting=false）も同じ扱い。
+function emitConnectedSocket(record) {
+  const socket = emitConnectingSocket(record);
+  socket.connecting = false;
+  socket.emit('connect');
+  return socket;
+}
+
+async function waitFor(predicate, { timeoutMs = 3000, label = 'condition' } = {}) {
+  const deadline = Date.now() + timeoutMs;
+  for (;;) {
+    if (predicate()) return;
+    if (Date.now() >= deadline) throw new Error(`timed out waiting for ${label}`);
+    await new Promise(resolve => setTimeout(resolve, 10));
+  }
+}
+
+// 指定時刻までイベントループを同期的に止める（タイマーを発火させない）。CPU を回さずに
+// 止めたいので Atomics.wait を使う（Node のメインスレッドでは許可されている）。
+function blockEventLoopUntil(untilMs) {
+  const lock = new Int32Array(new SharedArrayBuffer(4));
+  for (let remaining = untilMs - Date.now(); remaining > 0; remaining = untilMs - Date.now()) {
+    Atomics.wait(lock, 0, 0, remaining);
+  }
+}
+
+const refusedError = () => Object.assign(new Error('connect ECONNREFUSED 127.0.0.1:18765'), { code: 'ECONNREFUSED' });
+const resetError = () => Object.assign(new Error('read ECONNRESET'), { code: 'ECONNRESET' });
+
+function retrySettings(overrides = {}) {
+  return resolveOpenAiBridgeSettings({
+    openaiBridge: {
+      enabled: true,
+      url: 'http://127.0.0.1:1',
+      modelPattern: '^gpt-',
+      connectTimeoutMs: 2000,
+      idleTimeoutMs: 2000,
+      connectRetries: 0,
+      ...overrides,
+    },
+  });
+}
+
+function startForward({ settings, factory, logger = () => {} }) {
+  const req = fakeIncomingRequest();
+  const res = fakeServerResponse();
+  const done = forwardToOpenAiBridge({
+    req, res, body: Buffer.from('{"model":"gpt-6-astra"}'), model: 'gpt-6-astra', settings,
+    logger, httpRequestImpl: factory.requestImpl,
+  });
+  return { req, res, done };
+}
+
+const syntheticMessage = res => JSON.parse(String(res.endPayload)).error.message;
+
+describe('openai-bridge connect retry hardening', () => {
+  describe('normalizeConnectRetries', () => {
+    it('accepts a finite integer in 0..12 and falls back to 0 for anything else', () => {
+      for (const value of [0, 1, 5, 12]) {
+        assert.equal(normalizeConnectRetries(value), value, `${value} は正当な設定値`);
+      }
+      for (const value of [13, 1e9, -1, 2.5, NaN, Infinity, -Infinity, '3', null, undefined, true, {}]) {
+        assert.equal(
+          normalizeConnectRetries(value), 0,
+          `${String(value)} は解釈できない。既定（再試行しない）へ倒す fail-safe`,
+        );
+      }
+    });
+  });
+
+  describe('planConnectRetry', () => {
+    it('allows exactly connectRetries re-attempts, so attempt N+1 never schedules another', () => {
+      // off-by-one の定義: connectRetries=N ＝ 再試行 N 回 ＝ 接続試行は最大 N+1 回。
+      assert.equal(planConnectRetry({ attempt: 1, retries: 0, elapsedMs: 0 }).retry, false, '既定の 0 は現行どおり一度も再試行しない');
+      assert.equal(planConnectRetry({ attempt: 1, retries: 1, elapsedMs: 0 }).retry, true);
+      assert.equal(planConnectRetry({ attempt: 2, retries: 1, elapsedMs: 0 }).retry, false, '再試行1回＝接続2回で打ち切る');
+      assert.equal(planConnectRetry({ attempt: 12, retries: 12, elapsedMs: 0 }).retry, true);
+      assert.equal(planConnectRetry({ attempt: 13, retries: 12, elapsedMs: 0 }).retry, false, '上限は再試行12回＝接続13回');
+    });
+
+    it('waits a fixed 500ms and refuses a wait that would end after the 6000ms connect budget', () => {
+      assert.equal(planConnectRetry({ attempt: 1, retries: 12, elapsedMs: 0 }).delayMs, 500, '再試行は即時ではない');
+      assert.equal(
+        planConnectRetry({ attempt: 1, retries: 12, elapsedMs: 5500 }).retry, true,
+        '待機の完了がちょうど予算（5500+500=6000ms）なら許す',
+      );
+      assert.equal(
+        planConnectRetry({ attempt: 1, retries: 12, elapsedMs: 5501 }).retry, false,
+        '待機の完了が予算を超えるなら再試行しない（予算には待機時間も含める）',
+      );
+    });
+  });
+
+  describe('forwardToOpenAiBridge', () => {
+    it('re-attempts a refused connection after the fixed delay and forwards the recovered response', async () => {
+      const factory = createAttemptRecordingUpstream();
+      const startedAt = Date.now();
+      const { res, done } = startForward({ settings: retrySettings({ connectRetries: 1 }), factory });
+
+      await waitFor(() => factory.attempts.length === 1, { label: 'first attempt' });
+      emitConnectingSocket(factory.attempts[0]);
+      factory.attempts[0].upstream.emit('error', refusedError());
+
+      await waitFor(() => factory.attempts.length === 2, { label: 'second attempt' });
+      assert.ok(Date.now() - startedAt >= 500, '再試行の前に 500ms 待つ（即時再試行は bridge 再起動中の連打になる）');
+
+      emitConnectedSocket(factory.attempts[1]);
+      const upstreamRes = fakeUpstreamResponse(200, { 'content-type': 'application/json' });
+      factory.attempts[1].callback(upstreamRes);
+      upstreamRes.emit('end');
+
+      const result = await done;
+      assert.equal(result.outcome, 'forwarded');
+      assert.equal(result.status, 200);
+      assert.equal(res.statusCode, 200);
+      assert.equal(factory.attempts.length, 2, '再試行は1回だけ');
+    });
+
+    it('does not re-attempt once the socket has connected, even when the error code is ECONNREFUSED', async () => {
+      // 'finish' 前でも、TCP 接続が確立した後の失敗は再送しない（(a)）。requestFullySent
+      // だけを見る旧実装はここで2本目の接続を開いてしまう。
+      const factory = createAttemptRecordingUpstream();
+      const { res, done } = startForward({ settings: retrySettings({ connectRetries: 2 }), factory });
+
+      await waitFor(() => factory.attempts.length === 1, { label: 'first attempt' });
+      emitConnectedSocket(factory.attempts[0]);
+      factory.attempts[0].upstream.emit('error', refusedError());
+
+      const result = await done;
+      assert.equal(result.outcome, 'bridge-unreachable');
+      assert.equal(res.statusCode, 403, '最終ステータスは 403 のまま（502/504 へ変えない）');
+      assert.equal(factory.attempts.length, 1, '接続確立後は再送しない（二重送信の危険）');
+      assert.equal(syntheticMessage(res), 'openai-bridge unreachable: connection refused');
+    });
+
+    it('never re-attempts a reset before finish and keeps the response body rounded', async () => {
+      // (b)(e): ECONNRESET は「一度は接続できた」証拠なので再試行対象から外す。
+      // ただし **応答本文は拒否と同じ固定文言のまま**にし（§8.9「HTTP 応答は不変」）、
+      // 拒否との区別はログの errorCode だけで行う。
+      const factory = createAttemptRecordingUpstream();
+      const lines = [];
+      const { res, done } = startForward({
+        // errorCode の追記は degradeMapping を有効にした構成だけの挙動なので（§14.4）、
+        // ログ側の区別まで見るこのケースだけ有効にする。
+        settings: retrySettings({ connectRetries: 2, degradeMapping: { enabled: true } }),
+        factory,
+        logger: l => lines.push(l),
+      });
+
+      await waitFor(() => factory.attempts.length === 1, { label: 'first attempt' });
+      emitConnectedSocket(factory.attempts[0]);
+      assert.equal(res.headersSent, false, 'precondition: bridge の応答はまだ何も届いていない');
+      factory.attempts[0].upstream.emit('error', resetError());
+
+      const result = await done;
+      assert.equal(result.outcome, 'bridge-unreachable');
+      assert.equal(res.statusCode, 403);
+      assert.equal(factory.attempts.length, 1, 'リセットは再試行しない');
+      assert.equal(syntheticMessage(res), 'openai-bridge unreachable: connection refused', '応答本文の文言は変えない（§8.9）');
+      assert.match(lines.find(l => /outcome=bridge-unreachable/.test(l)), /errorCode=ECONNRESET/);
+    });
+
+    it('keeps the 403 body byte-identical to 385dace for a reset after accept under the default config', async () => {
+      // 回帰固定: 既定構成（connectRetries を設定しない）で、bridge が accept 後・
+      // ヘッダ送出前に RST を返したときの 403 本文が 385dace と一字一句同じであることを
+      // 固定する。種別（refused / reset）の区別はログの errorCode だけが担う（§8.9）。
+      const settings = resolveOpenAiBridgeSettings({
+        openaiBridge: {
+          enabled: true,
+          url: 'http://127.0.0.1:1',
+          modelPattern: '^gpt-',
+          connectTimeoutMs: 2000,
+          idleTimeoutMs: 2000,
+          // connectRetries は書かない（＝既定構成。DEFAULT_OPENAI_BRIDGE の 0 が採用される）。
+          // errorCode の追記は degradeMapping を有効にした構成だけの振る舞いなので（§14.4）、
+          // ログ側の区別まで見るためにここだけ有効化する。
+          degradeMapping: { enabled: true },
+        },
+      });
+      assert.equal(settings.connectRetries, 0, 'precondition: 既定構成の connectRetries は 0');
+      const factory = createAttemptRecordingUpstream();
+      const lines = [];
+      const { res, done } = startForward({ settings, factory, logger: l => lines.push(l) });
+
+      await waitFor(() => factory.attempts.length === 1, { label: 'first attempt' });
+      emitConnectedSocket(factory.attempts[0]); // accept 済み（TCP 接続確立）
+      assert.equal(res.headersSent, false, 'precondition: bridge の応答はまだ何も届いていない');
+      factory.attempts[0].upstream.emit('error', resetError());
+
+      const result = await done;
+      assert.equal(result.outcome, 'bridge-unreachable');
+      assert.equal(res.statusCode, 403, '385dace と同じ 403');
+      assert.equal(
+        String(res.endPayload),
+        '{"type":"error","error":{"type":"permission_error","message":"openai-bridge unreachable: connection refused"}}',
+        '403 本文（type・error.type・message）は 385dace と同一の固定文言',
+      );
+      assert.equal(factory.attempts.length, 1, '既定構成では再試行しない');
+      assert.match(
+        lines.find(l => /outcome=bridge-unreachable/.test(l)),
+        /errorCode=ECONNRESET/,
+        '種別の区別はログ側で維持する',
+      );
+    });
+
+    it('does not re-attempt a name resolution failure (ENOTFOUND is not a refused connection)', async () => {
+      const factory = createAttemptRecordingUpstream();
+      const { res, done } = startForward({ settings: retrySettings({ connectRetries: 2 }), factory });
+
+      await waitFor(() => factory.attempts.length === 1, { label: 'first attempt' });
+      emitConnectingSocket(factory.attempts[0]);
+      factory.attempts[0].upstream.emit('error', Object.assign(new Error('getaddrinfo ENOTFOUND nowhere.invalid'), { code: 'ENOTFOUND' }));
+
+      const result = await done;
+      assert.equal(result.outcome, 'bridge-unreachable');
+      assert.equal(factory.attempts.length, 1);
+      assert.equal(syntheticMessage(res), 'openai-bridge unreachable: connection refused', '本文の丸めは ENOTFOUND では変えない');
+    });
+
+    it('treats a socket whose connecting state is unknown as already connected', async () => {
+      // 状態を確かめられないソケットは「接続済み」として保守的に扱い、再送しない。
+      const factory = createAttemptRecordingUpstream();
+      const { done } = startForward({ settings: retrySettings({ connectRetries: 2 }), factory });
+
+      await waitFor(() => factory.attempts.length === 1, { label: 'first attempt' });
+      factory.attempts[0].upstream.emit('socket', {}); // connecting プロパティを持たない
+      factory.attempts[0].upstream.emit('error', refusedError());
+
+      const result = await done;
+      assert.equal(result.outcome, 'bridge-unreachable');
+      assert.equal(factory.attempts.length, 1, '状態不明なソケットは再送の根拠にしない');
+    });
+
+    it('does not re-attempt at all when connectRetries is not a finite integer in range', async () => {
+      // (c): Infinity をそのまま上限にすると、bridge が落ちている間ずっと再接続を撃ち続ける。
+      const factory = createAttemptRecordingUpstream();
+      const { res, done } = startForward({ settings: retrySettings({ connectRetries: Infinity }), factory });
+
+      await waitFor(() => factory.attempts.length === 1, { label: 'first attempt' });
+      emitConnectingSocket(factory.attempts[0]);
+      factory.attempts[0].upstream.emit('error', refusedError());
+
+      const result = await done;
+      assert.equal(result.outcome, 'bridge-unreachable');
+      assert.equal(res.statusCode, 403);
+      assert.equal(factory.attempts.length, 1, '解釈できない設定は既定（再試行しない）へ倒す');
+    });
+
+    it('stops the pending re-attempt when the client disconnects during the retry wait', async () => {
+      // (d) の待機中にクライアントが切れたら、待機タイマーごと畳んで2本目を開かない。
+      const factory = createAttemptRecordingUpstream();
+      const { res, done } = startForward({ settings: retrySettings({ connectRetries: 2 }), factory });
+
+      await waitFor(() => factory.attempts.length === 1, { label: 'first attempt' });
+      emitConnectingSocket(factory.attempts[0]);
+      factory.attempts[0].upstream.emit('error', refusedError());
+
+      res.destroy(); // res.on('close') 経由で onClientGone → finish('client-abort')
+      const result = await done;
+      assert.equal(result.outcome, 'client-abort');
+
+      await new Promise(resolve => setTimeout(resolve, 700)); // 500ms の待機を追い越して確認する
+      assert.equal(factory.attempts.length, 1, 'クライアント不在のまま再接続を開かない');
+    });
+
+    it('ignores a late error from an abandoned attempt instead of opening another connection', async () => {
+      // 破棄した試行から遅れて届く 'error' が、もう1本の接続を生やしてはいけない。
+      const factory = createAttemptRecordingUpstream();
+      const { res, done } = startForward({ settings: retrySettings({ connectRetries: 1 }), factory });
+
+      await waitFor(() => factory.attempts.length === 1, { label: 'first attempt' });
+      emitConnectingSocket(factory.attempts[0]);
+      factory.attempts[0].upstream.emit('error', refusedError());
+      factory.attempts[0].upstream.emit('error', refusedError()); // 遅れて届いた重複
+
+      await waitFor(() => factory.attempts.length === 2, { label: 'second attempt' });
+      await new Promise(resolve => setTimeout(resolve, 700));
+      assert.equal(factory.attempts.length, 2, '重複した error から3本目を開かない');
+
+      emitConnectingSocket(factory.attempts[1]);
+      factory.attempts[1].upstream.emit('error', refusedError());
+      const result = await done;
+      assert.equal(result.outcome, 'bridge-unreachable');
+      assert.equal(res.statusCode, 403);
+      assert.equal(factory.attempts.length, 2);
+    });
+
+    // -----------------------------------------------------------------------
+    // (f) 予算を「待機の予約時」にしか見ておらず、予約された次の試行に
+    //     connectTimeoutMs が丸ごと付き直していた（Astra 実測の BLOCKING）。
+    //     connectRetries=12 / connectTimeoutMs=5000 で、最初の未接続が 4800ms 目に
+    //     ECONNREFUSED → 2回目の接続開始が 5306ms 目 → 最終 403 が 10307ms 目。
+    //     接続前の総予算 6000ms に対して 1.7 倍である。
+    //
+    //     ここで検証するのは「6秒ちょうどで応答する」ことではない（イベントループの
+    //     遅延は保証できない）。検証するのは次の2点だけである。
+    //       (1) 締切を過ぎてから新しい接続試行を開かない
+    //       (2) 残予算を超える connect タイムアウトを張らない
+    // -----------------------------------------------------------------------
+
+    // 締切を過ぎて開かれた接続が1本も無いこと（record.openedAt は試行の開始実時刻）。
+    const assertNoAttemptAfterDeadline = (factory, startedAt) => {
+      for (const [index, record] of factory.attempts.entries()) {
+        assert.ok(
+          record.openedAt - startedAt < CONNECT_RETRY_BUDGET_MS,
+          `接続試行 ${index + 1} は締切（${CONNECT_RETRY_BUDGET_MS}ms）より後に開かれている`
+          + `（開始 ${record.openedAt - startedAt}ms 目）`,
+        );
+      }
+    };
+
+    it('clamps each re-attempt connect timeout to the remaining connect budget', async () => {
+      // connectTimeoutMs（12000）は予算（6000）より大きい。再試行のたびにこの値を
+      // そのまま張り直すと、2本目の試行だけで予算の2倍を費やす。
+      const factory = createAttemptRecordingUpstream();
+      const startedAt = Date.now();
+      const { res, done } = startForward({
+        settings: retrySettings({ connectRetries: 12, connectTimeoutMs: 12000 }),
+        factory,
+      });
+
+      await waitFor(() => factory.attempts.length === 1, { label: 'first attempt' });
+      emitConnectingSocket(factory.attempts[0]);
+      factory.attempts[0].upstream.emit('error', refusedError());
+
+      // 2本目は「接続もしないし、エラーも返さない」= 落ちた bridge にそのまま吸われる状態。
+      // 打ち切るのは connect タイムアウトだけであり、その値が残予算以内かがここの争点。
+      await waitFor(() => factory.attempts.length === 2, { label: 'second attempt' });
+      emitConnectingSocket(factory.attempts[1]);
+
+      const settled = await Promise.race([
+        done,
+        new Promise(resolve => setTimeout(() => resolve(null), CONNECT_RETRY_BUDGET_MS + 1500)),
+      ]);
+      // 未解決のまま抜けると 12000ms のタイマーが残るので、確定させてから assert する。
+      if (settled === null) {
+        res.destroy();
+        await done;
+      }
+
+      assert.notEqual(
+        settled, null,
+        `接続前の総予算（${CONNECT_RETRY_BUDGET_MS}ms）を過ぎても応答が確定しない`
+        + '（再試行へ connectTimeoutMs を丸ごと付け直している）',
+      );
+      assert.equal(settled.outcome, 'bridge-connect-timeout');
+      assert.equal(res.statusCode, 403, '最終ステータスは 403 のまま');
+      assert.equal(factory.attempts.length, 2);
+      assertNoAttemptAfterDeadline(factory, startedAt);
+    });
+
+    it('does not start a re-attempt when the retry wait callback runs after the deadline', async () => {
+      // planConnectRetry は予約時点（4800+500=5300 <= 6000）では許す。しかし待機中に
+      // イベントループが詰まると callback は締切より後に走る。そこで開き直すと、その
+      // 試行にまた connect タイムアウトが付いて予算を超える。
+      const factory = createAttemptRecordingUpstream();
+      const startedAt = Date.now();
+      const { res, done } = startForward({
+        settings: retrySettings({ connectRetries: 12, connectTimeoutMs: 12000 }),
+        factory,
+      });
+
+      await waitFor(() => factory.attempts.length === 1, { label: 'first attempt' });
+      emitConnectingSocket(factory.attempts[0]);
+      await new Promise(resolve => setTimeout(resolve, 4800));
+      factory.attempts[0].upstream.emit('error', refusedError());
+
+      // イベントループの詰まりを再現する（待機 callback を締切の後ろへ押し出す）。
+      // ビジーループではなく Atomics.wait で止める: イベントループを塞ぐ効果は同じまま、
+      // CPU コアを占有しないので、並列実行されている他のテストファイル（実時間に依存する
+      // install / native-claude-refresher など）のタイマーを巻き添えにしない。
+      blockEventLoopUntil(startedAt + CONNECT_RETRY_BUDGET_MS + 150);
+
+      const settled = await Promise.race([
+        done,
+        new Promise(resolve => setTimeout(() => resolve(null), 600)),
+      ]);
+      if (settled === null) {
+        res.destroy();
+        await done;
+      }
+
+      assert.equal(
+        factory.attempts.length, 1,
+        '締切を過ぎた待機 callback から新しい接続を開かない',
+      );
+      assert.equal(settled?.outcome, 'bridge-unreachable', '1回目の失敗と同じ形で打ち切る');
+      assert.equal(res.statusCode, 403);
+      assert.equal(syntheticMessage(res), 'openai-bridge unreachable: connection refused');
+      assertNoAttemptAfterDeadline(factory, startedAt);
+    });
   });
 });

@@ -321,9 +321,53 @@ function errorLogFields(error) {
   return fields;
 }
 
-// 本文送信前（＝bridge からの応答を一切受け取っていない）の接続確立失敗に限り再試行する。
-// 応答を受け取った後（res.headersSent === true）に再試行すると、二重処理のリスクが生まれる。
-const RETRYABLE_CONNECT_ERROR_CODES = new Set(['ECONNREFUSED', 'ECONNRESET', 'ENOTFOUND']);
+// 再試行してよいのは「TCP 接続が一度も確立しなかった」失敗だけである。ECONNREFUSED は
+// 定義上そこにしか現れない（相手がポートを開いていない＝本文は1バイトも渡っていない）。
+// 旧実装は ECONNRESET / ENOTFOUND も対象にしていたが、
+//   - ECONNRESET は「一度は接続できた」証拠であり、再送は二重送信（Pro 枠の二重消費）になり得る。
+//   - ENOTFOUND は名前解決の失敗で、即時に繰り返しても結果は変わらない。
+// ので外した。実際の判定はコード名だけでなく「接続が確立していないこと」との論理積で行う
+// （下の connectionEstablished）。
+const RETRYABLE_CONNECT_ERROR_CODES = new Set(['ECONNREFUSED']);
+
+// 接続前リトライの境界値。いずれも実測に基づく確定値ではなく、bridge の再起動
+// （設定適用）が数秒で終わることを前提にした保守的な暫定値である。
+//   - MAX_CONNECT_RETRIES: connectRetries の上限。**再試行の回数**であり、接続試行の
+//     総数は connectRetries + 1（off-by-one の定義）。上限 12 ＝ 接続試行 13 回。
+//   - CONNECT_RETRY_DELAY_MS: 各再試行の前に必ず待つ時間。即時再試行は、落ちている
+//     bridge へ連打するだけで復帰を助けない。
+//   - CONNECT_RETRY_BUDGET_MS: 接続が確立するまでに費やしてよい総時間（待機と接続試行の
+//     両方を含む）。待機の完了がこの予算を超える再試行は予約しない。
+//     6000ms ÷ 500ms ＝ 12 なので、予算側の上限も再試行 12 回で MAX_CONNECT_RETRIES と一致する。
+export const MAX_CONNECT_RETRIES = 12;
+export const CONNECT_RETRY_DELAY_MS = 500;
+export const CONNECT_RETRY_BUDGET_MS = 6000;
+
+// connectRetries の正規化。0..12 の有限整数だけを受け付け、それ以外（NaN・Infinity・
+// 負数・小数・範囲外の巨大値・文字列・null など）は「設定を解釈できなかった」として
+// 既定の 0（再試行しない）へ倒す。resolveOpenAiBridgeSettings() の fail-safe 3経路
+// （modelPattern / url / 非ループバック）と同じ考え方で、解釈できない設定で勝手に
+// 再接続を撃たない。
+export function normalizeConnectRetries(value) {
+  if (typeof value !== 'number' || !Number.isInteger(value)) return 0;
+  if (value < 0 || value > MAX_CONNECT_RETRIES) return 0;
+  return value;
+}
+
+// 再試行を予約してよいかの判定（純関数）。attempt は今まさに失敗した試行の番号（1 始まり）。
+// retries は正規化前の設定値でよい（ここで正規化する）。elapsedMs は要求の開始からの経過。
+export function planConnectRetry({ attempt, retries, elapsedMs }) {
+  const delayMs = CONNECT_RETRY_DELAY_MS;
+  const allowed = normalizeConnectRetries(retries);
+  if (!Number.isInteger(attempt) || attempt < 1) return { retry: false, delayMs };
+  // attempt 回目の失敗後に許される再試行は attempt <= allowed のときだけ
+  // （allowed=1 なら 1 回目の失敗だけが再試行でき、2 回目の失敗では打ち切る）。
+  if (attempt > allowed) return { retry: false, delayMs };
+  const elapsed = Number.isFinite(elapsedMs) ? Math.max(0, elapsedMs) : Number.POSITIVE_INFINITY;
+  // 「待機が明けた時点」が予算内であることを求める（＝待機時間も予算に含める）。
+  if (elapsed + delayMs > CONNECT_RETRY_BUDGET_MS) return { retry: false, delayMs };
+  return { retry: true, delayMs };
+}
 
 // gptPoolState は任意引数である（設計書 §11.1 R3-4）。渡さない呼び出しは現行と完全に
 // 同一に振る舞い、ログへ1フィールドも足さない（§14.4）。渡すのは src/proxy-server.js が
@@ -354,12 +398,34 @@ export function forwardToOpenAiBridge({
   const idleTimeoutHeader = idleTimeoutRequestHeaderValue(settings);
   if (idleTimeoutHeader !== null) headers[IDLE_TIMEOUT_REQUEST_HEADER] = idleTimeoutHeader;
 
-  const maxConnectAttempts = 1 + Math.max(0, Number(settings.connectRetries) || 0);
+  // 解釈できない設定（NaN・Infinity・負数・小数・範囲外・文字列）は 0 へ倒す。
+  // 旧実装は `Math.max(0, Number(...) || 0)` だけだったため、Infinity がそのまま
+  // 上限になり、bridge が落ちている間ずっと再接続を撃ち続ける経路が開いていた。
+  const connectRetries = normalizeConnectRetries(settings.connectRetries);
+
+  // 接続前リトライを使う構成だけが持つ「接続前の締切」（絶対時刻）。
+  // 予算（CONNECT_RETRY_BUDGET_MS）を待機の予約時にしか見ていなかったため、予約された
+  // 次の試行には connectTimeoutMs が丸ごと付き直し、総時間が予算を大きく超え得た
+  // （実測: connectRetries=12 / connectTimeoutMs=5000 で、最初の未接続が 4800ms 目に
+  // ECONNREFUSED → 2回目の接続開始が 5306ms 目 → 最終 403 が 10307ms 目）。
+  // 締切を1本だけ持ち、
+  //   (1) 各試行の connect タイムアウトを残予算以内へ切り詰める
+  //   (2) 待機 callback が締切より後に走ったら、新しい接続を開かない
+  // の2点で閉じる。
+  // **この締切は接続が確立するまでにしか効かない。** 接続後は connectTimer を解除して
+  // idleTimer へ引き継ぐ設計（下の onConnected）なので、接続済み・送信中の正常な要求を
+  // 途中で切ることはない（長考の応答待ちは従来どおり idleTimeoutMs の責務）。
+  // connectRetries=0（既定）では締切を持たず、connectTimeoutMs は現行のまま素通しする。
+  const connectDeadlineAt = connectRetries > 0 ? startedAt + CONNECT_RETRY_BUDGET_MS : null;
+  const remainingConnectBudgetMs = () => (
+    connectDeadlineAt === null ? null : connectDeadlineAt - Date.now()
+  );
 
   return new Promise(resolve => {
     let settled = false;
     let connectTimer = null;
     let idleTimer = null;
+    let retryTimer = null;
     let currentUpstream = null;
     // upstream（ClientRequest）の 'finish' が一度でも発火したら true。'finish' は
     // リクエスト全体（ヘッダ＋本文）がOSへ渡され切った時点で発火するため、これが
@@ -375,6 +441,9 @@ export function forwardToOpenAiBridge({
     const clearTimers = () => {
       clearTimeout(connectTimer);
       clearTimeout(idleTimer);
+      // 再試行の待機タイマーも同じ場所で畳む。クライアント切断・タイムアウトで
+      // finish() が確定した後に待機が明けて、宛先のいない接続を開かないようにする。
+      clearTimeout(retryTimer);
     };
 
     // bridge が返した契約ヘッダ（x-ombr-*）の解析結果。応答ヘッダを受け取るまでは null。
@@ -450,6 +519,10 @@ export function forwardToOpenAiBridge({
       if (settled) return;
       settled = true;
       clearTimers();
+      // 要求ごとに張ったリスナーを解放する（req/res はこの後も生き得る）。
+      // 二重発火は settled が防ぐので挙動は変わらない。解放そのものが目的。
+      req.off?.('aborted', onClientGone);
+      res.off?.('close', onResponseClose);
       logger?.(
         `${new Date().toISOString()} openai-bridge model=${model || '-'} method=${req.method} `
         + `path=${target.pathname} status=${status ?? '-'} durationMs=${Date.now() - startedAt} outcome=${outcome}`
@@ -484,12 +557,21 @@ export function forwardToOpenAiBridge({
       finish('client-abort', null, logMeta('client-abort'));
     };
     // 'aborted' は readBody() 前に切断された場合の保険として残す（副作用なし・二重発火は finish が防ぐ）。
-    req.on('aborted', onClientGone);
-    res.on('close', () => {
+    const onResponseClose = () => {
       if (!res.writableEnded) onClientGone();
-    });
+    };
+    req.on('aborted', onClientGone);
+    res.on('close', onResponseClose);
 
     const attemptConnect = attempt => {
+      // この試行を捨てたら true。捨てた後に遅れて届くイベント（error・socket・
+      // information・finish）から、次の試行を生やしたりタイマーを張り直したりしない。
+      let attemptAbandoned = false;
+      // この試行で TCP 接続が確立したか。再試行してよいのは「一度も接続できなかった」
+      // ときだけなので、'finish'（requestFullySent）とは別にここを明示して追う。
+      // requestFullySent だけを見る旧実装では、接続が確立した後・'finish' の前に
+      // 起きた失敗を「未送信」と誤認して再送し得た。
+      let connectionEstablished = false;
       const upstream = httpRequestImpl(
         {
           hostname: target.hostname,
@@ -616,7 +698,10 @@ export function forwardToOpenAiBridge({
         },
       );
       currentUpstream = upstream;
-      upstream.once('finish', () => { requestFullySent = true; });
+      upstream.once('finish', () => {
+        if (attemptAbandoned) return; // 捨てた試行の遅れた 'finish' で次の試行を縛らない
+        requestFullySent = true;
+      });
 
       // 非 SSE 要求の生存通知（契約 §C4.6）。非ストリーミング応答には SSE の開始マーカーに
       // 相当する「流すもの」が無いため、bridge が上流の応答ヘッダを待っている間は rotator へ
@@ -636,7 +721,8 @@ export function forwardToOpenAiBridge({
         if (!Number.isInteger(informationalStatus)) return;
         if (informationalStatus < 100 || informationalStatus > 199 || informationalStatus === 101) return;
         // settled 後に武装すると、誰も止めないタイマーが後から destroy() を撃つ。
-        if (settled || res.destroyed) return;
+        // 捨てた試行から遅れて届いた 102 も同じ（現行の試行のタイマーを乱さない）。
+        if (settled || attemptAbandoned || res.destroyed) return;
         armIdleTimer();
       });
 
@@ -645,20 +731,35 @@ export function forwardToOpenAiBridge({
       // 受け付けられていない状態を指す（設計書 §9.4）。
       // TCP の接続確立（socket の 'connect'）が起きるまでだけを計測する。確立後は
       // ヘッダ待ち・チャンク間の無応答を問わずすべて idleTimer の責務にする。
+      // 再試行が有効なときは、この待ちも「接続前の締切」の内側に収める。試行ごとに
+      // connectTimeoutMs を丸ごと付け直すと、再試行のたびに予算が伸びてしまうため。
+      // 再試行が無効（既定）なら remaining は null で、現行と同じ値をそのまま使う。
+      const remainingBudgetMs = remainingConnectBudgetMs();
+      const connectTimeoutMs = remainingBudgetMs === null
+        ? settings.connectTimeoutMs
+        : Math.max(0, Math.min(settings.connectTimeoutMs, remainingBudgetMs));
       connectTimer = setTimeout(() => {
         upstream.destroy();
         sendSynthetic(res, 'connect timeout');
         finish('bridge-connect-timeout', BRIDGE_UNREACHABLE_STATUS, logMeta('bridge-connect-timeout'));
-      }, settings.connectTimeoutMs);
+      }, connectTimeoutMs);
 
       upstream.once('socket', socket => {
         const onConnected = () => {
+          if (attemptAbandoned || settled) return;
+          connectionEstablished = true;
           clearTimeout(connectTimer);
           // 接続確立後はヘッダ待ちもアイドル判定に含める。
           armIdleTimer();
         };
-        // 既に接続済みのソケット（keep-alive の使い回し）であれば即座に扱う。
-        if (socket.connecting) socket.once('connect', onConnected);
+        // 「まだ接続の途中である」と積極的に判定できるときだけ 'connect' を待つ。
+        // それ以外は接続済みとして扱い、再送の根拠にしない（保守側へ倒す）:
+        //   - keep-alive の使い回し（最初から connecting=false）
+        //   - 状態を確かめられないソケット（connecting が真偽値でない・socket が無い）
+        //   - TLS（https）のソケット。TCP の 'connect' は TLS ハンドシェイクより先に
+        //     発火するので、そこで「接続済み」とみなすのが保守的な扱いになる。
+        //     （settings.url はループバック http に限定されるため実運用の経路には現れない）
+        if (socket?.connecting === true) socket.once('connect', onConnected);
         else onConnected();
       });
 
@@ -667,6 +768,9 @@ export function forwardToOpenAiBridge({
         // 発火した 'error'（例: destroy() 由来の ECONNRESET/socket hang up）は
         // 無視する。res 相手が既にいない状態で再試行・応答書込みを行わない。
         if (settled) return;
+        // 捨てた試行から遅れて届いた 'error'（destroy() 由来の重複など）。現行の試行は
+        // 別にあるので、ここから再試行も応答書込みもしない。
+        if (attemptAbandoned) return;
         // ヘッダ送出後は新しいステータスを返せない（仕様書 4.2.3 節）。応答は既に
         // 始まっていて上流側で壊れたのだから、不達ではなくストリーム障害である（§9.4）。
         if (res.headersSent) {
@@ -674,18 +778,42 @@ export function forwardToOpenAiBridge({
           finish('bridge-stream-error', null, logMeta('bridge-stream-error', errorLogFields(error)));
           return;
         }
-        // まだ bridge からの応答を何も受け取っておらず、かつリクエスト全体（本文含む）
-        // の送信が完了していない場合に限り settings.connectRetries まで再試行する。
-        // requestFullySent===true の場合、本文は
-        // 既に bridge へ渡り切っている（受信済みの可能性がある）ため、再試行すると
-        // 二重送信（Pro 枠の二重消費）になり得るため再試行しない。
-        if (!requestFullySent && attempt < maxConnectAttempts && RETRYABLE_CONNECT_ERROR_CODES.has(error?.code)) {
+        // 再試行してよいのは、次の3つがすべて成り立つときだけである。
+        //   ① TCP 接続が一度も確立していない（connectionEstablished===false）
+        //   ② リクエスト全体の送信が完了していない（requestFullySent===false）
+        //   ③ エラーが ECONNREFUSED（＝相手がポートを開いていない＝本文は渡っていない）
+        // ①②のどちらかでも崩れると、本文が bridge に届いている可能性があり、再送は
+        // 二重送信（Pro 枠の二重消費）になり得る。①は②より早く真になるため、
+        // 'finish' 前でも接続後は再送しない（旧実装はここを塞げていなかった）。
+        const canRetry = !connectionEstablished
+          && !requestFullySent
+          && RETRYABLE_CONNECT_ERROR_CODES.has(error?.code);
+        const plan = canRetry
+          ? planConnectRetry({ attempt, retries: connectRetries, elapsedMs: Date.now() - startedAt })
+          : { retry: false, delayMs: CONNECT_RETRY_DELAY_MS };
+        if (plan.retry) {
+          attemptAbandoned = true;
           clearTimers();
           logger?.(
             `${new Date().toISOString()} openai-bridge model=${model || '-'} method=${req.method} `
             + `path=${target.pathname} outcome=connect-retry attempt=${attempt + 1} code=${error?.code || '-'}`,
           );
-          attemptConnect(attempt + 1);
+          // 即時ではなく一定時間待ってから開き直す。待機中にクライアントが切れたら
+          // clearTimers()（finish 経由）がこのタイマーごと畳む。
+          retryTimer = setTimeout(() => {
+            if (settled) return;
+            // 待機 callback は、イベントループが詰まれば要求した時刻より後に走る。
+            // 予約時点（planConnectRetry）の判断だけを信じて開くと、締切を過ぎてから
+            // 新しい接続を開き、その試行にまた connect タイムアウトが付いて予算を超える。
+            // 残予算が尽きていたら開かずに、1回目の失敗と同じ形で打ち切る。
+            const leftMs = remainingConnectBudgetMs();
+            if (leftMs !== null && leftMs <= 0) {
+              sendSynthetic(res, 'connection refused');
+              finish('bridge-unreachable', BRIDGE_UNREACHABLE_STATUS, logMeta('bridge-unreachable', errorLogFields(error)));
+              return;
+            }
+            attemptConnect(attempt + 1);
+          }, plan.delayMs);
           return;
         }
         // 応答本文は現行のまま（丸めたまま）にし、種別はログの errorCode で判別する（§8.9・§9）。
