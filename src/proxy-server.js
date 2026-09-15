@@ -2005,7 +2005,7 @@ async function forwardWithRotation({
       : null;
     const account = reactiveQuotaRetryUsed
       ? reactiveSelection?.account
-      : accountManager.getActiveAccount(modelFamily);
+      : accountManager.getActiveAccount(modelFamily, { trigger: 'request' });
     if (!account) {
       if (reactiveQuotaRetryUsed && lastRetryableResponse) {
         sendLastRetryable();
@@ -2180,7 +2180,7 @@ async function forwardWithRotation({
     }
     attemptedAccountIds.add(account.id);
     if (reactiveQuotaRetryUsed) {
-      accountManager.switchToCandidate(reactiveSelection, 'quota-threshold');
+      accountManager.switchToCandidate(reactiveSelection, 'quota-threshold', '429');
     }
 
     const result = await forwardOnce({
@@ -3414,7 +3414,7 @@ function sendCurrentQuotaUnavailableResponse({
   let reason = accountManager.unavailableReasonForModelFamily(account, modelFamily);
   if (!isUnifiedQuotaExhaustion(reason)) return false;
 
-  const shortestResetAccount = accountManager.selectBestExhaustedFallback();
+  const shortestResetAccount = accountManager.selectBestExhaustedFallback({ trigger: 'request' });
   if (shortestResetAccount) {
     account = shortestResetAccount;
     reason = accountManager.unavailableReasonForModelFamily(account, modelFamily);

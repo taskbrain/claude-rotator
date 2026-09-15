@@ -355,12 +355,21 @@ async function runServer({ write }) {
   const loginOverride = await localClaudeLoginOverrideSource();
   const credentialOwnership = credentialOwnershipConfiguration(config.accounts, loginOverride);
   if (ensureCredentialRevisions(config)) await saveConfig(config);
+  // Built before the AccountManager so that every account switch — including
+  // one that happens while the server is still coming up — reaches the log.
+  const logPath = join(dirname(getConfigPath()), 'server.log');
+  const logWriter = process.stdout.isTTY ? null : createServerLogWriter({ logPath });
+  const logger = line => {
+    if (logWriter) logWriter.write(line);
+    else write(`${line}\n`);
+  };
   const secretStore = createSecretStore();
   const accountManager = new AccountManager({
     accounts: config.accounts,
     switchThreshold: config.switchThreshold,
     currentAccountId: config.activeAccount,
     rotationPolicy: config.rotationPolicy,
+    logger,
   });
   const statePath = runtimeStatePath();
   const savedState = await readJsonFile(statePath, null).catch(error => {
@@ -368,8 +377,6 @@ async function runServer({ write }) {
     return null;
   });
   if (savedState) accountManager.restoreState(savedState);
-  const logPath = join(dirname(getConfigPath()), 'server.log');
-  const logWriter = process.stdout.isTTY ? null : createServerLogWriter({ logPath });
   const server = createProxyServer({
     accountManager,
     secretStore,
@@ -384,10 +391,7 @@ async function runServer({ write }) {
       });
     },
     reloadOpenAiBridge: () => loadConfig().then(nextConfig => nextConfig?.openaiBridge),
-    logger: line => {
-      if (logWriter) logWriter.write(line);
-      else write(`${line}\n`);
-    },
+    logger,
     stateWriter: state => writeJsonFile(statePath, state),
     serviceGeneration: process.env.CLAUDE_ROTATOR_SERVICE_GENERATION || null,
   });

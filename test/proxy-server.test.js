@@ -10526,3 +10526,150 @@ describe('写像フィールドを既存の proxy ログ行へ併記する (R4-5
     assert.deepEqual(logLines.filter(line => line.includes('claude-exhaustion-map')), []);
   });
 });
+
+describe('account_switch trigger wiring', () => {
+  function switchLines(logLines) {
+    return logLines.filter(line => line.includes(' account_switch '));
+  }
+
+  it('passes trigger=request when a request leaves an unusable account', async () => {
+    const logLines = [];
+    const upstream = await listen(http.createServer((_req, res) => {
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ ok: true }));
+    }));
+    const secretStore = new MemorySecretStore();
+    await secretStore.set('acct_1', { accessToken: 'access-token-1' });
+    await secretStore.set('acct_2', { accessToken: 'access-token-2' });
+    const logger = line => logLines.push(line);
+    const accountManager = new AccountManager({
+      accounts: [
+        { id: 'acct_1', type: 'oauth' },
+        { id: 'acct_2', type: 'oauth' },
+      ],
+      logger,
+    });
+    accountManager.updateQuota('acct_1', {
+      'anthropic-ratelimit-unified-5h-utilization': '1',
+      'anthropic-ratelimit-unified-5h-reset': String(Math.floor(futureReset() / 1000)),
+    });
+    accountManager.updateQuota('acct_2', {
+      'anthropic-ratelimit-unified-5h-utilization': '0.1',
+    });
+    const proxy = await listen(createProxyServer({
+      accountManager,
+      secretStore,
+      config: { upstream: upstream.url, usagePolling: { enabled: false } },
+      logger,
+    }));
+    cleanupAfterTest(async () => { await close(proxy.server); await close(upstream.server); });
+
+    const response = await requestJson(`${proxy.url}/v1/messages`, {
+      method: 'POST', body: JSON.stringify({ model: 'sonnet' }),
+    });
+
+    assert.equal(response.status, 200);
+    assert.equal(switchLines(logLines).length, 1);
+    assert.match(
+      switchLines(logLines)[0],
+      / account_switch from=acct_1 to=acct_2 reason=quota-threshold trigger=request$/,
+    );
+  });
+
+  it('passes trigger=429 when a reactive Fable 429 moves the active account', async () => {
+    const logLines = [];
+    const upstream = await listen(http.createServer((req, res) => {
+      if (req.headers.authorization === 'Bearer access-token-1') {
+        res.writeHead(429, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({
+          type: 'error', error: { type: 'rate_limit_error', message: 'Fable limit' },
+        }));
+        return;
+      }
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ ok: true }));
+    }));
+    const secretStore = new MemorySecretStore();
+    await secretStore.set('acct_1', { accessToken: 'access-token-1' });
+    await secretStore.set('acct_2', { accessToken: 'access-token-2' });
+    const logger = line => logLines.push(line);
+    const accountManager = new AccountManager({
+      accounts: [
+        { id: 'acct_1', type: 'oauth' },
+        { id: 'acct_2', type: 'oauth' },
+      ],
+      logger,
+    });
+    accountManager.updateQuota('acct_2', {
+      'anthropic-ratelimit-unified-5h-utilization': '0.1',
+    });
+    const proxy = await listen(createProxyServer({
+      accountManager,
+      secretStore,
+      config: { upstream: upstream.url, usagePolling: { enabled: false } },
+      usageFetcher: async () => ({
+        scoped_weekly: [{
+          key: 'fable', label: 'Fable', utilization: 1, resets_at: futureReset(),
+        }],
+      }),
+      logger,
+    }));
+    cleanupAfterTest(async () => { await close(proxy.server); await close(upstream.server); });
+
+    const response = await requestJson(`${proxy.url}/v1/messages`, {
+      method: 'POST', body: JSON.stringify({ model: 'claude-fable-5' }),
+    });
+
+    assert.equal(response.status, 200);
+    assert.equal(switchLines(logLines).length, 1);
+    assert.match(
+      switchLines(logLines)[0],
+      / account_switch from=acct_1 to=acct_2 reason=quota-threshold trigger=429$/,
+    );
+  });
+
+  it('passes trigger=request when the exhausted response picks the shortest reset', async () => {
+    const logLines = [];
+    const upstream = await listen(http.createServer((_req, res) => {
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ ok: true }));
+    }));
+    const secretStore = new MemorySecretStore();
+    await secretStore.set('acct_1', { accessToken: 'access-token-1' });
+    await secretStore.set('acct_2', { accessToken: 'access-token-2' });
+    const logger = line => logLines.push(line);
+    const accountManager = new AccountManager({
+      accounts: [
+        { id: 'acct_1', type: 'oauth' },
+        { id: 'acct_2', type: 'oauth' },
+      ],
+      logger,
+    });
+    accountManager.updateQuota('acct_1', {
+      'anthropic-ratelimit-unified-7d-utilization': '1',
+      'anthropic-ratelimit-unified-7d-reset': String(Math.floor(futureReset() / 1000) + 3600),
+    });
+    accountManager.updateQuota('acct_2', {
+      'anthropic-ratelimit-unified-5h-utilization': '1',
+      'anthropic-ratelimit-unified-5h-reset': String(Math.floor(futureReset() / 1000)),
+    });
+    const proxy = await listen(createProxyServer({
+      accountManager,
+      secretStore,
+      config: { upstream: upstream.url, usagePolling: { enabled: false } },
+      logger,
+    }));
+    cleanupAfterTest(async () => { await close(proxy.server); await close(upstream.server); });
+
+    const response = await requestJson(`${proxy.url}/v1/messages`, {
+      method: 'POST', body: JSON.stringify({ model: 'sonnet' }),
+    });
+
+    assert.equal(response.status, 429);
+    assert.equal(switchLines(logLines).length, 1);
+    assert.match(
+      switchLines(logLines)[0],
+      / account_switch from=acct_1 to=acct_2 reason=shortest-quota-reset trigger=request$/,
+    );
+  });
+});

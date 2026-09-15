@@ -7,6 +7,14 @@ import {
 
 export const DEFAULT_WEEKLY_RESET_PRIORITY_WINDOW_MS = 36 * 60 * 60 * 1000;
 const MAX_DATE_TIMESTAMP_MS = 8_640_000_000_000_000;
+const ACCOUNT_SWITCH_TRIGGERS = new Set([
+  'usage-refresh',
+  '429',
+  'reload',
+  'manual',
+  'request',
+  'prepare-resume',
+]);
 
 export class AccountManager {
   constructor({
@@ -15,8 +23,10 @@ export class AccountManager {
     currentAccountId = null,
     now = () => Date.now(),
     rotationPolicy = null,
+    logger = null,
   } = {}) {
     this.now = now;
+    this.logger = typeof logger === 'function' ? logger : null;
     this.switchThreshold = normalizeSwitchThreshold(switchThreshold);
     this.rotationPolicy = normalizeRotationPolicy(rotationPolicy);
     this.events = [];
@@ -32,7 +42,7 @@ export class AccountManager {
    *   other (or unidentified) request. A Fable-only sub-cap exhaustion never
    *   blocks a non-Fable request; a common 5h/7d exhaustion blocks every family.
    */
-  getActiveAccount(modelFamily = null) {
+  getActiveAccount(modelFamily = null, { trigger = 'unknown' } = {}) {
     const current = this.accounts[this.currentIndex];
     if (this.isAvailable(current, modelFamily)) {
       current.status = 'active';
@@ -41,7 +51,7 @@ export class AccountManager {
 
     const reason = this.unavailableReason(current);
     if (current?.status === 'error' || this.hasCredentialRefreshCooldown(current)) {
-      const next = this.selectBestAvailableSwitchTarget(modelFamily);
+      const next = this.selectBestAvailableSwitchTarget(modelFamily, { trigger });
       if (next) {
         next.status = 'active';
         return next;
@@ -58,7 +68,7 @@ export class AccountManager {
       return adHoc ? adHoc.account : null;
     }
 
-    const next = this.selectBestAvailableSwitchTarget(modelFamily);
+    const next = this.selectBestAvailableSwitchTarget(modelFamily, { trigger });
     if (next) {
       next.status = 'active';
       return next;
@@ -97,6 +107,12 @@ export class AccountManager {
       at: new Date(this.now()).toISOString(),
       type: 'manual-switch',
       account: this.accounts[index].id,
+    });
+    this.logAccountSwitch({
+      from: previous?.id || null,
+      to: this.accounts[index].id,
+      reason: 'manual',
+      trigger: 'manual',
     });
   }
 
@@ -256,6 +272,7 @@ export class AccountManager {
   }
 
   replaceAccounts(accounts) {
+    const previousActiveId = this.accounts[this.currentIndex]?.id ?? null;
     const existingById = new Map(this.accounts.map(account => [account.id, account]));
     this.accounts = accounts.map((account, index) => {
       const existing = existingById.get(account.id);
@@ -293,6 +310,12 @@ export class AccountManager {
       at: new Date(this.now()).toISOString(),
       type: 'reload',
       accounts: this.accounts.length,
+    });
+    this.logAccountSwitch({
+      from: previousActiveId,
+      to: this.accounts[this.currentIndex]?.id ?? null,
+      reason: 'accounts-replaced',
+      trigger: 'reload',
     });
   }
 
@@ -446,13 +469,13 @@ export class AccountManager {
     if (account.status === 'throttled') account.status = 'ready';
   }
 
-  selectBestAvailableSwitchTarget(modelFamily = null) {
+  selectBestAvailableSwitchTarget(modelFamily = null, { trigger = 'unknown' } = {}) {
     const selected = this.bestAvailableSwitchCandidate({ excludeCurrent: true, modelFamily });
     if (!selected) return null;
 
     const previous = this.accounts[this.currentIndex];
     const reason = this.autoSwitchReason(previous);
-    return this.switchToCandidate(selected, reason);
+    return this.switchToCandidate(selected, reason, trigger);
   }
 
   prepareResumeTarget() {
@@ -461,7 +484,7 @@ export class AccountManager {
     if (available) {
       const account = available.index === this.currentIndex
         ? available.account
-        : this.switchToCandidate(available, 'resume-ready');
+        : this.switchToCandidate(available, 'resume-ready', 'prepare-resume');
       return this.resumeTarget({
         account,
         action: 'ready',
@@ -476,7 +499,7 @@ export class AccountManager {
       return this.emptyResumeTarget('no-resume-target');
     }
 
-    const account = this.switchToExhaustedFallbackCandidate(selected);
+    const account = this.switchToExhaustedFallbackCandidate(selected, 'prepare-resume');
     const resetAt = finiteResetAt(selected.score.resetAt);
     if (resetAt == null) {
       return this.resumeTarget({
@@ -504,7 +527,7 @@ export class AccountManager {
     if (!current) return null;
 
     if (!this.isAvailable(current)) {
-      if (!this.getActiveAccount()) return this.getFallbackAccount();
+      if (!this.getActiveAccount(null, { trigger: 'usage-refresh' })) return this.getFallbackAccount();
       return this.getCurrentAccount();
     }
 
@@ -521,7 +544,7 @@ export class AccountManager {
       return current;
     }
 
-    return this.switchToCandidate(selected, 'weekly-reset-priority');
+    return this.switchToCandidate(selected, 'weekly-reset-priority', 'usage-refresh');
   }
 
   bestAvailableSwitchCandidate({ excludeCurrent, allowedAccounts = null, modelFamily = null } = {}) {
@@ -537,7 +560,7 @@ export class AccountManager {
     return candidates[0] || null;
   }
 
-  switchToCandidate(selected, reason) {
+  switchToCandidate(selected, reason, trigger = 'unknown') {
     const previous = this.accounts[this.currentIndex];
     if (previous) {
       this.refreshQuotaState(previous);
@@ -553,13 +576,19 @@ export class AccountManager {
       reason,
       targetScore: selected.score,
     });
+    this.logAccountSwitch({
+      from: previous?.id || null,
+      to: selected.account.id,
+      reason,
+      trigger,
+    });
     return selected.account;
   }
 
-  selectBestExhaustedFallback() {
+  selectBestExhaustedFallback({ trigger = 'unknown' } = {}) {
     const selected = this.bestExhaustedFallbackCandidate();
     if (!selected) return null;
-    return this.switchToExhaustedFallbackCandidate(selected);
+    return this.switchToExhaustedFallbackCandidate(selected, trigger);
   }
 
   bestExhaustedFallbackCandidate() {
@@ -571,7 +600,7 @@ export class AccountManager {
     return candidates[0] || null;
   }
 
-  switchToExhaustedFallbackCandidate(selected) {
+  switchToExhaustedFallbackCandidate(selected, trigger = 'unknown') {
     if (selected.index !== this.currentIndex) {
       const previous = this.accounts[this.currentIndex];
       if (previous) previous.status = this.displayStatus(previous);
@@ -584,8 +613,31 @@ export class AccountManager {
         reason: 'shortest-quota-reset',
         targetScore: selected.score,
       });
+      this.logAccountSwitch({
+        from: previous?.id || null,
+        to: selected.account.id,
+        reason: 'shortest-quota-reset',
+        trigger,
+      });
     }
     return selected.account;
+  }
+
+  /**
+   * The single counting source for a move of the globally active account
+   * (D-54-13(a) / D-54-14). Callers that forget to pass a trigger produce
+   * `trigger=unknown` rather than an exception, so a missed hand-off shows up
+   * in the log instead of failing a live request.
+   */
+  logAccountSwitch({ from, to, reason, trigger }) {
+    if (!this.logger) return;
+    // The switch helpers still run their status/event bookkeeping when the
+    // chosen candidate is the account already in use; that is not a move of
+    // the active account, so it must not reach the counting source (D-54-14).
+    if (from === to) return;
+    const at = new Date(this.now()).toISOString();
+    const normalizedTrigger = ACCOUNT_SWITCH_TRIGGERS.has(trigger) ? trigger : 'unknown';
+    this.logger(`${at} account_switch from=${from ?? 'none'} to=${to ?? 'none'} reason=${reason} trigger=${normalizedTrigger}`);
   }
 
   resumeTarget({

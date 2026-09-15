@@ -2047,3 +2047,372 @@ describe('認証失敗の原因コードと検出時刻 (c)', () => {
     assert.equal(manager.getStatus().accounts[0].unavailableReason, null);
   });
 });
+
+describe('account_switch log line', () => {
+  function collectingLogger() {
+    const logger = line => logger.lines.push(line);
+    logger.lines = [];
+    return logger;
+  }
+
+  function switchLines(logger) {
+    return logger.lines.filter(line => line.includes(' account_switch '));
+  }
+
+  it('writes one account_switch line for a proactive weekly-reset switch', () => {
+    const logger = collectingLogger();
+    const manager = new AccountManager({
+      accounts: [
+        { id: 'current', name: 'current@example.com', type: 'oauth' },
+        { id: 'soon-weekly', name: 'soon@example.com', type: 'oauth' },
+      ],
+      currentAccountId: 'current',
+      switchThreshold: 1,
+      now: () => 1000,
+      logger,
+    });
+    manager.updateQuota('current', {
+      'anthropic-ratelimit-unified-5h-utilization': '0.12',
+      'anthropic-ratelimit-unified-7d-utilization': '0.30',
+      'anthropic-ratelimit-unified-7d-reset': '500000',
+    });
+    manager.updateQuota('soon-weekly', {
+      'anthropic-ratelimit-unified-5h-utilization': '0.33',
+      'anthropic-ratelimit-unified-7d-utilization': '0.07',
+      'anthropic-ratelimit-unified-7d-reset': '100',
+    });
+
+    manager.rebalanceActiveAccount();
+
+    assert.deepEqual(switchLines(logger), [
+      '1970-01-01T00:00:01.000Z account_switch from=current to=soon-weekly reason=weekly-reset-priority trigger=usage-refresh',
+    ]);
+  });
+
+  it('writes one account_switch line when the usage refresh finds the current account unusable', () => {
+    const logger = collectingLogger();
+    const manager = new AccountManager({
+      accounts: [
+        { id: 'current', name: 'current@example.com', type: 'oauth' },
+        { id: 'available', name: 'available@example.com', type: 'oauth' },
+      ],
+      currentAccountId: 'current',
+      switchThreshold: 1,
+      now: () => 1000,
+      logger,
+    });
+    manager.updateQuota('current', {
+      'anthropic-ratelimit-unified-5h-utilization': '1',
+      'anthropic-ratelimit-unified-5h-reset': '20',
+    });
+    manager.updateQuota('available', {
+      'anthropic-ratelimit-unified-5h-utilization': '0.1',
+      'anthropic-ratelimit-unified-7d-utilization': '0.2',
+    });
+
+    manager.rebalanceActiveAccount();
+
+    assert.deepEqual(switchLines(logger), [
+      '1970-01-01T00:00:01.000Z account_switch from=current to=available reason=quota-threshold trigger=usage-refresh',
+    ]);
+  });
+
+  it('writes one account_switch line for a reactive 429', () => {
+    const logger = collectingLogger();
+    const manager = new AccountManager({
+      accounts: [
+        { id: 'current', name: 'current@example.com', type: 'oauth' },
+        { id: 'lower-usage', name: 'lower@example.com', type: 'oauth' },
+      ],
+      currentAccountId: 'current',
+      switchThreshold: 1,
+      now: () => 1000,
+      logger,
+    });
+    manager.updateQuota('current', {
+      'anthropic-ratelimit-unified-5h-utilization': '0.40',
+      'anthropic-ratelimit-unified-7d-utilization': '0.45',
+    });
+    manager.updateQuota('lower-usage', {
+      'anthropic-ratelimit-unified-5h-utilization': '0.05',
+      'anthropic-ratelimit-unified-7d-utilization': '0.02',
+    });
+    const reactiveSelection = manager.bestAvailableSwitchCandidate({ excludeCurrent: false });
+
+    manager.switchToCandidate(reactiveSelection, 'quota-threshold', '429');
+
+    assert.deepEqual(switchLines(logger), [
+      '1970-01-01T00:00:01.000Z account_switch from=current to=lower-usage reason=quota-threshold trigger=429',
+    ]);
+  });
+
+  it('writes one account_switch line when a request finds the current account unusable', () => {
+    const logger = collectingLogger();
+    const manager = new AccountManager({
+      accounts: [
+        { id: 'current', name: 'current@example.com', type: 'oauth' },
+        { id: 'available', name: 'available@example.com', type: 'oauth' },
+      ],
+      currentAccountId: 'current',
+      switchThreshold: 1,
+      now: () => 1000,
+      logger,
+    });
+    manager.updateQuota('current', {
+      'anthropic-ratelimit-unified-5h-utilization': '1',
+      'anthropic-ratelimit-unified-5h-reset': '20',
+    });
+    manager.updateQuota('available', {
+      'anthropic-ratelimit-unified-5h-utilization': '0.1',
+      'anthropic-ratelimit-unified-7d-utilization': '0.2',
+    });
+
+    manager.getActiveAccount(null, { trigger: 'request' });
+
+    assert.deepEqual(switchLines(logger), [
+      '1970-01-01T00:00:01.000Z account_switch from=current to=available reason=quota-threshold trigger=request',
+    ]);
+  });
+
+  it('writes one account_switch line when the exhausted response picks the shortest reset', () => {
+    const logger = collectingLogger();
+    const manager = new AccountManager({
+      accounts: [
+        { id: 'weekly-a', name: 'weekly-a@example.com', type: 'oauth' },
+        { id: 'dev', name: 'dev@example.com', type: 'oauth' },
+        { id: 'weekly-b', name: 'weekly-b@example.com', type: 'oauth' },
+      ],
+      switchThreshold: 1,
+      now: () => 1000,
+      logger,
+    });
+    manager.updateQuota('weekly-a', {
+      'anthropic-ratelimit-unified-7d-utilization': '1',
+      'anthropic-ratelimit-unified-7d-reset': '100',
+    });
+    manager.updateQuota('dev', {
+      'anthropic-ratelimit-unified-5h-utilization': '1',
+      'anthropic-ratelimit-unified-5h-reset': '10',
+    });
+    manager.updateQuota('weekly-b', {
+      'anthropic-ratelimit-unified-7d-utilization': '1',
+      'anthropic-ratelimit-unified-7d-reset': '50',
+    });
+
+    manager.selectBestExhaustedFallback({ trigger: 'request' });
+
+    assert.deepEqual(switchLines(logger), [
+      '1970-01-01T00:00:01.000Z account_switch from=weekly-a to=dev reason=shortest-quota-reset trigger=request',
+    ]);
+  });
+
+  it('writes one account_switch line for a manual switch', () => {
+    const logger = collectingLogger();
+    const manager = new AccountManager({
+      accounts: [
+        { id: 'acct_1', name: 'a@example.com', type: 'oauth' },
+        { id: 'acct_2', name: 'b@example.com', type: 'oauth' },
+      ],
+      switchThreshold: 1,
+      now: () => 1000,
+      logger,
+    });
+
+    manager.switchTo('acct_2');
+
+    assert.deepEqual(switchLines(logger), [
+      '1970-01-01T00:00:01.000Z account_switch from=acct_1 to=acct_2 reason=manual trigger=manual',
+    ]);
+  });
+
+  it('writes one account_switch line for prepare-resume', () => {
+    const logger = collectingLogger();
+    const manager = new AccountManager({
+      accounts: [
+        { id: 'current', name: 'current@example.com', type: 'oauth' },
+        { id: 'available', name: 'available@example.com', type: 'oauth' },
+      ],
+      switchThreshold: 1,
+      now: () => 1000,
+      logger,
+    });
+    manager.updateQuota('current', {
+      'anthropic-ratelimit-unified-5h-utilization': '1',
+      'anthropic-ratelimit-unified-5h-reset': '20',
+    });
+    manager.updateQuota('available', {
+      'anthropic-ratelimit-unified-5h-utilization': '0.1',
+      'anthropic-ratelimit-unified-7d-utilization': '0.2',
+    });
+
+    manager.prepareResumeTarget();
+
+    assert.deepEqual(switchLines(logger), [
+      '1970-01-01T00:00:01.000Z account_switch from=current to=available reason=resume-ready trigger=prepare-resume',
+    ]);
+  });
+
+  it('writes one account_switch line for prepare-resume when every account is exhausted', () => {
+    const logger = collectingLogger();
+    const manager = new AccountManager({
+      accounts: [
+        { id: 'weekly-a', name: 'weekly-a@example.com', type: 'oauth' },
+        { id: 'dev', name: 'dev@example.com', type: 'oauth' },
+        { id: 'weekly-b', name: 'weekly-b@example.com', type: 'oauth' },
+      ],
+      switchThreshold: 1,
+      now: () => 1000,
+      logger,
+    });
+    manager.updateQuota('weekly-a', {
+      'anthropic-ratelimit-unified-7d-utilization': '1',
+      'anthropic-ratelimit-unified-7d-reset': '100',
+    });
+    manager.updateQuota('dev', {
+      'anthropic-ratelimit-unified-5h-utilization': '1',
+      'anthropic-ratelimit-unified-5h-reset': '10',
+    });
+    manager.updateQuota('weekly-b', {
+      'anthropic-ratelimit-unified-7d-utilization': '1',
+      'anthropic-ratelimit-unified-7d-reset': '50',
+    });
+
+    manager.prepareResumeTarget();
+
+    assert.deepEqual(switchLines(logger), [
+      '1970-01-01T00:00:01.000Z account_switch from=weekly-a to=dev reason=shortest-quota-reset trigger=prepare-resume',
+    ]);
+  });
+
+  it('writes one account_switch line when a reload swaps the account at the unchanged index', () => {
+    const logger = collectingLogger();
+    const manager = new AccountManager({
+      accounts: [
+        { id: 'acct_a', name: 'a@example.com', type: 'oauth' },
+        { id: 'acct_b', name: 'b@example.com', type: 'oauth' },
+        { id: 'acct_c', name: 'c@example.com', type: 'oauth' },
+      ],
+      currentAccountId: 'acct_b',
+      switchThreshold: 1,
+      now: () => 1000,
+      logger,
+    });
+
+    manager.replaceAccounts([
+      { id: 'acct_a', name: 'a@example.com', type: 'oauth' },
+      { id: 'acct_c', name: 'c@example.com', type: 'oauth' },
+    ]);
+
+    assert.equal(manager.currentIndex, 1);
+    assert.deepEqual(switchLines(logger), [
+      '1970-01-01T00:00:01.000Z account_switch from=acct_b to=acct_c reason=accounts-replaced trigger=reload',
+    ]);
+  });
+
+  it('writes nothing when the reactive selection is the current account', () => {
+    const logger = collectingLogger();
+    const manager = new AccountManager({
+      accounts: [
+        { id: 'current', name: 'current@example.com', type: 'oauth' },
+        { id: 'higher-usage', name: 'higher@example.com', type: 'oauth' },
+      ],
+      currentAccountId: 'current',
+      switchThreshold: 1,
+      now: () => 1000,
+      logger,
+    });
+    manager.updateQuota('current', {
+      'anthropic-ratelimit-unified-5h-utilization': '0.05',
+      'anthropic-ratelimit-unified-7d-utilization': '0.02',
+    });
+    manager.updateQuota('higher-usage', {
+      'anthropic-ratelimit-unified-5h-utilization': '0.40',
+      'anthropic-ratelimit-unified-7d-utilization': '0.45',
+    });
+    const reactiveSelection = manager.bestAvailableSwitchCandidate({ excludeCurrent: false });
+    assert.equal(reactiveSelection.account.id, 'current');
+
+    manager.switchToCandidate(reactiveSelection, 'quota-threshold', '429');
+
+    assert.deepEqual(switchLines(logger), []);
+    assert.equal(manager.getStatus().events[0].type, 'auto-switch');
+  });
+
+  it('writes nothing when a reload keeps the current account', () => {
+    const logger = collectingLogger();
+    const manager = new AccountManager({
+      accounts: [
+        { id: 'acct_a', name: 'a@example.com', type: 'oauth' },
+        { id: 'acct_b', name: 'b@example.com', type: 'oauth' },
+      ],
+      currentAccountId: 'acct_b',
+      switchThreshold: 1,
+      now: () => 1000,
+      logger,
+    });
+
+    manager.replaceAccounts([
+      { id: 'acct_a', name: 'a@example.com', type: 'oauth' },
+      { id: 'acct_b', name: 'b@example.com', type: 'oauth' },
+    ]);
+
+    assert.deepEqual(switchLines(logger), []);
+    assert.equal(manager.getStatus().events[0].type, 'reload');
+  });
+
+  it('defaults trigger to unknown when a caller does not pass one', () => {
+    const logger = collectingLogger();
+    const manager = new AccountManager({
+      accounts: [
+        { id: 'current', name: 'current@example.com', type: 'oauth' },
+        { id: 'available', name: 'available@example.com', type: 'oauth' },
+      ],
+      currentAccountId: 'current',
+      switchThreshold: 1,
+      now: () => 1000,
+      logger,
+    });
+    manager.updateQuota('current', {
+      'anthropic-ratelimit-unified-5h-utilization': '1',
+      'anthropic-ratelimit-unified-5h-reset': '20',
+    });
+    manager.updateQuota('available', {
+      'anthropic-ratelimit-unified-5h-utilization': '0.1',
+      'anthropic-ratelimit-unified-7d-utilization': '0.2',
+    });
+
+    manager.getActiveAccount();
+
+    assert.deepEqual(switchLines(logger), [
+      '1970-01-01T00:00:01.000Z account_switch from=current to=available reason=quota-threshold trigger=unknown',
+    ]);
+  });
+
+  it('normalizes an unrecognised trigger to unknown instead of throwing', () => {
+    const logger = collectingLogger();
+    const manager = new AccountManager({
+      accounts: [
+        { id: 'current', name: 'current@example.com', type: 'oauth' },
+        { id: 'available', name: 'available@example.com', type: 'oauth' },
+      ],
+      currentAccountId: 'current',
+      switchThreshold: 1,
+      now: () => 1000,
+      logger,
+    });
+    manager.updateQuota('current', {
+      'anthropic-ratelimit-unified-5h-utilization': '1',
+      'anthropic-ratelimit-unified-5h-reset': '20',
+    });
+    manager.updateQuota('available', {
+      'anthropic-ratelimit-unified-5h-utilization': '0.1',
+      'anthropic-ratelimit-unified-7d-utilization': '0.2',
+    });
+
+    assert.doesNotThrow(() => manager.getActiveAccount(null, { trigger: 'bogus' }));
+
+    assert.deepEqual(switchLines(logger), [
+      '1970-01-01T00:00:01.000Z account_switch from=current to=available reason=quota-threshold trigger=unknown',
+    ]);
+  });
+});
