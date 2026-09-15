@@ -2713,15 +2713,21 @@ describe('selectForNewAssignment (D-56-1 / D-60-4 / 設計書 §4.2)', () => {
     );
   });
 
+  // FU-58: 旧値（残 0.90 / 0.85）は ASSIGN_BAND_EPSILON を 0 にしても緑になり、
+  // この回帰は epsilon を一度も踏んでいなかった。残枠を 0.06〜1.00 まで 1 ポイント
+  // 刻みで振ると、95 組のうち 29 組で「ちょうど 5 ポイント下」の候補が帯域の外へ
+  // 落ちる（1 - (1 - x) の往復で生じる二進小数の誤差。0.30 / 0.25 はその 1 つで、
+  // 0.25 の残枠は 0.24999999999999997 になり 0.30 - 0.05 = 0.25 をわずかに下回る）。
+  // 値を落ちる組へ差し替えて、epsilon が無いと 'best' が選ばれることを固定する。
   it('keeps a candidate exactly five points below the best inside the band', () => {
     const manager = makeManager(['best', 'edge']);
-    setWindows(manager, 'best', { fiveHour: 0.90, weekly: 0.90, weeklyResetAt: LATE_WEEKLY });
-    setWindows(manager, 'edge', { fiveHour: 0.85, weekly: 0.90, weeklyResetAt: SOON_WEEKLY });
+    setWindows(manager, 'best', { fiveHour: 0.30, weekly: 0.90, weeklyResetAt: LATE_WEEKLY });
+    setWindows(manager, 'edge', { fiveHour: 0.25, weekly: 0.90, weeklyResetAt: SOON_WEEKLY });
 
     assert.equal(
       manager.selectForNewAssignment({ assignStopUtilization: 0.9 })?.id,
       'edge',
-      '帯域はちょうど 5 ポイントまでを含む（0.90 - 0.05 の二進小数誤差で落とさない）',
+      '帯域はちょうど 5 ポイントまでを含む（0.30 - 0.05 の二進小数誤差で落とさない）',
     );
   });
 
@@ -2784,5 +2790,122 @@ describe('selectForNewAssignment (D-56-1 / D-60-4 / 設計書 §4.2)', () => {
 
     assert.equal(before, 1, '枯渇は台帳へ取り込んだ時点で1件だけ積まれている');
     assert.equal(after, 1, 'セレクタが同じ口座を何度評価しても quota-exhausted は増えない（I-3）');
+  });
+});
+
+describe('credential identity の戻り値 (D-60-3 / 設計書 §8.1)', () => {
+  // sticky affinity は「口座 id は同じだが資格情報が別物になった」ことを自分では
+  // 判定できない（台帳には同じ id の行が残る）。判定しているのは replaceAccounts と
+  // restoreState の内部だけなので、その結果を戻り値として外へ出す（D-60-3）。
+  // 受け取った側は該当口座の基本バインドと副バインドを両方破棄する（F3）。
+  function makeManager(accounts) {
+    return new AccountManager({
+      accounts,
+      switchThreshold: 1,
+      now: () => 1000,
+    });
+  }
+
+  const LEDGER = [
+    { id: 'acct_1', name: 'a@example.com', type: 'oauth', accountUuid: 'uuid-1', credentialRevision: 'revision-1' },
+    { id: 'acct_2', name: 'b@example.com', type: 'oauth', accountUuid: 'uuid-2', credentialRevision: 'revision-1' },
+    { id: 'acct_3', name: 'c@example.com', type: 'oauth', accountUuid: 'uuid-3', credentialRevision: 'revision-1' },
+  ];
+
+  function savedEntry(id, { accountUuid, credentialRevision }) {
+    return {
+      id,
+      accountUuid,
+      credentialRevision,
+      status: 'ready',
+      quota: {},
+      usage: {},
+      rateLimitedUntil: null,
+      temporaryUnavailableReason: null,
+      errorReason: null,
+    };
+  }
+
+  it('replaceAccounts returns the ids whose credential identity changed', () => {
+    const manager = makeManager(LEDGER);
+
+    const changed = manager.replaceAccounts([
+      // 資格情報の版が上がった＝別の資格情報になった。
+      { id: 'acct_1', name: 'a@example.com', type: 'oauth', accountUuid: 'uuid-1', credentialRevision: 'revision-2' },
+      // 同じ id のまま別組織のアカウントへ繋ぎ直された。
+      { id: 'acct_2', name: 'b@example.com', type: 'oauth', accountUuid: 'uuid-2b', credentialRevision: 'revision-1' },
+      // 何も変わっていない。
+      { id: 'acct_3', name: 'c@example.com', type: 'oauth', accountUuid: 'uuid-3', credentialRevision: 'revision-1' },
+      // 新しく足された口座。バインドが存在しえないので「変わった」には入らない。
+      { id: 'acct_4', name: 'd@example.com', type: 'oauth', accountUuid: 'uuid-4', credentialRevision: 'revision-1' },
+    ]);
+
+    assert.deepEqual(changed, ['acct_1', 'acct_2']);
+  });
+
+  it('replaceAccounts returns an empty array when no credential identity changed', () => {
+    const manager = makeManager(LEDGER);
+
+    // 口座が台帳から消えるのは credential_changed ではなく account_removed の事象で、
+    // affinity 側は prune が受け持つ（§8.1 の表）。ここには載せない。
+    const changed = manager.replaceAccounts([
+      { id: 'acct_1', name: 'a@example.com', type: 'oauth', accountUuid: 'uuid-1', credentialRevision: 'revision-1' },
+      { id: 'acct_3', name: 'c@example.com', type: 'oauth', accountUuid: 'uuid-3', credentialRevision: 'revision-1' },
+    ]);
+
+    assert.ok(Array.isArray(changed));
+    assert.deepEqual(changed, []);
+  });
+
+  it('restoreState returns the ids whose credential identity changed', () => {
+    const manager = makeManager(LEDGER);
+
+    const changed = manager.restoreState({
+      version: 1,
+      currentAccount: 'acct_1',
+      accounts: [
+        // 保存時より資格情報の版が上がっている。
+        savedEntry('acct_1', { accountUuid: 'uuid-1', credentialRevision: 'revision-0' }),
+        // 保存時と別のアカウントが同じ id に載っている。
+        savedEntry('acct_2', { accountUuid: 'uuid-old', credentialRevision: 'revision-1' }),
+        // 変化なし。
+        savedEntry('acct_3', { accountUuid: 'uuid-3', credentialRevision: 'revision-1' }),
+        // 台帳から消えた口座の保存分。台帳に無いので何も返さない。
+        savedEntry('acct_gone', { accountUuid: 'uuid-9', credentialRevision: 'revision-1' }),
+      ],
+    });
+
+    assert.deepEqual(changed, ['acct_1', 'acct_2']);
+  });
+
+  it('restoreState returns an empty array when no credential identity changed', () => {
+    const manager = makeManager(LEDGER);
+
+    const changed = manager.restoreState({
+      version: 1,
+      currentAccount: 'acct_1',
+      accounts: [
+        savedEntry('acct_1', { accountUuid: 'uuid-1', credentialRevision: 'revision-1' }),
+        savedEntry('acct_2', { accountUuid: 'uuid-2', credentialRevision: 'revision-1' }),
+      ],
+    });
+
+    assert.ok(Array.isArray(changed));
+    assert.deepEqual(changed, []);
+  });
+
+  it('returns an empty array for a non-object saved state', () => {
+    // U19 の唯一の注意点。早期 return が裸の `return;` のままだと、保存データが
+    // 壊れている F1 のときにだけ affinity が undefined を受け取る（正常系では
+    // 露見しない）。全 return 経路が配列であることを固定する。
+    const manager = makeManager(LEDGER);
+
+    for (const savedState of [null, undefined, 'not-an-object', 42, false]) {
+      const changed = manager.restoreState(savedState);
+      assert.ok(Array.isArray(changed), `${String(savedState)} でも配列を返す`);
+      assert.deepEqual(changed, []);
+    }
+
+    assert.deepEqual(manager.accounts.map(account => account.id), ['acct_1', 'acct_2', 'acct_3']);
   });
 });

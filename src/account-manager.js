@@ -15,9 +15,14 @@ const MAX_DATE_TIMESTAMP_MS = 8_640_000_000_000_000;
  * account actually runs out (R2). `ASSIGN_BAND_WIDTH` is the 5-point band below
  * the best headroom inside which the weekly-reset priority is allowed to decide;
  * the width itself is an authoring judgement that has not been measured (U15).
- * `ASSIGN_BAND_EPSILON` only absorbs binary floating point error, so a candidate
- * exactly `ASSIGN_BAND_WIDTH` below the best (e.g. 0.85 against 0.90 - 0.05,
- * which evaluates to 0.8500000000000001) still counts as inside the band.
+ * `ASSIGN_BAND_EPSILON` only absorbs binary floating point error. It is NOT the
+ * subtraction of the width that needs it - `0.9 - 0.05` is exactly `0.85`. The
+ * error is in the residuals themselves, which are read back as `1 - utilization`
+ * after the utilization was stored as `1 - residual`. Sweeping the best residual
+ * from 0.06 to 1.00 in one-point steps, 29 of those 95 pairs push the candidate
+ * that sits exactly `ASSIGN_BAND_WIDTH` below the best out of the band: with a
+ * best of 0.13 the candidate at 0.08 reads back as 0.07999999999999996 while the
+ * band starts at 0.08. The epsilon keeps those candidates inside.
  */
 const DEFAULT_ASSIGN_STOP_UTILIZATION = 0.9;
 const ASSIGN_BAND_WIDTH = 0.05;
@@ -286,9 +291,21 @@ export class AccountManager {
     return event;
   }
 
+  /**
+   * Rebuild the ledger from a reloaded configuration.
+   *
+   * @returns {string[]} the ids of the accounts that stayed in the ledger but
+   *   whose credential identity changed (D-60-3, design 8.1). The row keeps its
+   *   id, so nothing downstream can tell on its own that the upstream cache
+   *   behind it is gone; session affinity uses this list to drop the home and
+   *   family bindings of those accounts. Accounts that were added, and accounts
+   *   that disappeared, are NOT reported here - those are the account_removed
+   *   case that affinity handles through prune.
+   */
   replaceAccounts(accounts) {
     const previousActiveId = this.accounts[this.currentIndex]?.id ?? null;
     const existingById = new Map(this.accounts.map(account => [account.id, account]));
+    const credentialChangedIds = [];
     this.accounts = accounts.map((account, index) => {
       const existing = existingById.get(account.id);
       if (!existing) return this.createAccount(account, index);
@@ -299,6 +316,7 @@ export class AccountManager {
       const incomingAccountUuid = account.accountUuid || null;
       const credentialIdentityChanged = credentialRevisionChanged
         || incomingAccountUuid !== existing.accountUuid;
+      if (credentialIdentityChanged) credentialChangedIds.push(existing.id);
       return {
         ...existing,
         name: account.name || account.email || account.id,
@@ -332,6 +350,7 @@ export class AccountManager {
       reason: 'accounts-replaced',
       trigger: 'reload',
     });
+    return credentialChangedIds;
   }
 
   getStatus() {
@@ -429,12 +448,22 @@ export class AccountManager {
     };
   }
 
+  /**
+   * Restore the ledger from the saved runtime state.
+   *
+   * @returns {string[]} the same credential-identity report as
+   *   `replaceAccounts` (D-60-3, design 8.1). EVERY return path returns an
+   *   array, the early return for a broken saved state included: a bare
+   *   `return` would hand `undefined` to session affinity exactly in the F1
+   *   case (unreadable saved state), where it is least likely to be noticed.
+   */
   restoreState(state) {
-    if (!state || typeof state !== 'object') return;
+    if (!state || typeof state !== 'object') return [];
     const savedById = new Map((Array.isArray(state.accounts) ? state.accounts : [])
       .filter(account => account && typeof account.id === 'string')
       .map(account => [account.id, account]));
 
+    const credentialChangedIds = [];
     for (const account of this.accounts) {
       const saved = savedById.get(account.id);
       if (!saved) continue;
@@ -447,6 +476,7 @@ export class AccountManager {
         ? (saved.accountUuid || null) !== account.accountUuid
         : account.accountUuid != null;
       const credentialIdentityChanged = credentialRevisionChanged || accountUuidChanged;
+      if (credentialIdentityChanged) credentialChangedIds.push(account.id);
       account.status = credentialIdentityChanged ? 'ready' : restoreStatus(saved.status);
       account.quota = credentialIdentityChanged ? emptyQuota() : restoreQuota(saved.quota);
       account.usage = credentialIdentityChanged ? emptyAccountUsage() : restoreUsage(saved.usage);
@@ -468,6 +498,8 @@ export class AccountManager {
       const index = this.accounts.findIndex(account => account.id === state.currentAccount);
       if (index >= 0) this.currentIndex = index;
     }
+
+    return credentialChangedIds;
   }
 
   normalizeRestoredCredentialCooldown(account) {
