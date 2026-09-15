@@ -21,6 +21,34 @@ export const DEFAULT_MAX_SESSIONS = 10_000;
 /** 鍵の最大長（§2.2）。これを超える値は鍵にしない。 */
 export const MAX_SESSION_KEY_LENGTH = 128;
 
+/**
+ * 設定セクション `sessionAffinity` の既定（設計書 §6・D-54-6）。
+ * `createDefaultConfig()` にはこのキーを足さない——足すと ①浅いマージで、利用者が一部だけ
+ * 書いた瞬間に残りが `undefined` になる ②本機能を使わない利用者の生成 `config.json` が
+ * 変わる。既定は内部の凍結定数として持ち、キーごとに個別へ正規化する
+ * （`normalizeDegradeMapping`(`openai-bridge.js`) と同型）。
+ */
+export const DEFAULT_SESSION_AFFINITY = Object.freeze({
+  mode: 'off',
+  idleTtlMs: DEFAULT_IDLE_TTL_MS,
+  maxSessions: DEFAULT_MAX_SESSIONS,
+  assignStopUtilization: 0.9,
+  rebindGraceMs: 60_000,
+  persist: true,
+});
+
+// `off`＝コード経路にも入らず現行と同一 ／ `observe`＝鍵の抽出とログだけ ／ `on`＝固定。
+// 未知の値（大文字・真偽値・数値を含む）はすべて `off` へ倒す（§6）。
+const SESSION_AFFINITY_MODES = new Set(['off', 'observe', 'on']);
+// 4つの数値キーの値域（§6 の表）。`min` 側も既定へ戻さずクランプする——`rebindGraceMs:0` は
+// 「待機の無効化」、`assignStopUtilization:0` は「ゲートの最も厳しい側」であって未指定ではない。
+const SESSION_AFFINITY_RANGES = Object.freeze({
+  idleTtlMs: { min: 60_000, max: 604_800_000 },
+  maxSessions: { min: 1, max: DEFAULT_MAX_SESSIONS, integer: true },
+  assignStopUtilization: { min: 0, max: 1 },
+  rebindGraceMs: { min: 0, max: 600_000 },
+});
+
 const SESSION_ID_HEADER = 'x-claude-code-session-id';
 // 制御文字・改行・空白・カンマ結合された重複ヘッダを鍵にしない（§2.2）。
 const SESSION_KEY_PATTERN = /^[A-Za-z0-9._:-]+$/;
@@ -121,6 +149,65 @@ function parseJson(text) {
   } catch {
     return null;
   }
+}
+
+/**
+ * 設定セクション `sessionAffinity` を正規化する（設計書 §6）。
+ * セクションが無い・型が違う・キーが欠けている、のいずれでも既定へ倒れるので、
+ * 戻り値のキーが `undefined` になることはない。
+ *
+ * @param {unknown} raw `config.sessionAffinity`。
+ * @returns {Readonly<typeof DEFAULT_SESSION_AFFINITY>} 凍結した設定。
+ */
+export function normalizeSessionAffinity(raw) {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return DEFAULT_SESSION_AFFINITY;
+  return Object.freeze({
+    mode: normalizeMode(raw.mode),
+    idleTtlMs: clampSetting(raw.idleTtlMs, 'idleTtlMs'),
+    maxSessions: clampSetting(raw.maxSessions, 'maxSessions'),
+    assignStopUtilization: clampSetting(raw.assignStopUtilization, 'assignStopUtilization'),
+    rebindGraceMs: clampSetting(raw.rebindGraceMs, 'rebindGraceMs'),
+    // 既定が真のキーなので、真偽値の `false` だけを「切った」と読む（型違いは既定へ）。
+    persist: raw.persist !== false,
+  });
+}
+
+/**
+ * 起動時に1行だけ残す記録（U17・§5.2 末尾）。
+ *
+ * `switchThreshold` は sticky の前提ではない（v1.0 の「`mode:"on"` かつ 1 未満なら affinity を
+ * off へ倒す」は D-56-7 で撤回した）が、1 未満だと既存の可用性判定と全滅判定がその分だけ
+ * 手前で止まるため、後から読めるように値を残す。**`mode:"off"` では1行も出さない**——
+ * 未記載構成でログ・status・CLI 出力・`runtime-state.json` を現行と同一に保つため。
+ *
+ * @param {object|null} settings `normalizeSessionAffinity()` の戻り値。
+ * @param {{switchThreshold?:number|null, logger?:Function|null, now?:number}} [options]
+ * @returns {string[]} 実際に出した行（`mode:"off"` では空配列）。
+ */
+export function logSessionAffinityStartupNotice(settings, {
+  switchThreshold = null,
+  logger = null,
+  now = Date.now(),
+} = {}) {
+  const mode = normalizeMode(settings?.mode);
+  if (mode === 'off') return [];
+  const threshold = Number.isFinite(switchThreshold) ? switchThreshold : 'unknown';
+  const lines = [
+    `${new Date(now).toISOString()} affinity config mode=${mode} switchThreshold=${threshold}`,
+  ];
+  for (const line of lines) logger?.(line);
+  return lines;
+}
+
+function normalizeMode(value) {
+  return SESSION_AFFINITY_MODES.has(value) ? value : DEFAULT_SESSION_AFFINITY.mode;
+}
+
+function clampSetting(value, key) {
+  const { min, max, integer } = SESSION_AFFINITY_RANGES[key];
+  if (typeof value !== 'number' || !Number.isFinite(value)) return DEFAULT_SESSION_AFFINITY[key];
+  const clamped = Math.min(max, Math.max(min, value));
+  return integer ? Math.floor(clamped) : clamped;
 }
 
 /**
@@ -270,6 +357,36 @@ export class SessionAffinity {
     if (idleTtlMs !== undefined) this.idleTtlMs = positiveInteger(idleTtlMs, this.idleTtlMs);
     if (maxSessions !== undefined) this.maxSessions = positiveInteger(maxSessions, this.maxSessions);
     return this.prune({ now });
+  }
+
+  /**
+   * 正規化し直した設定を表へ反映する（§6 の reload）。
+   * `off` へ落ちるときは表を破棄して `affinity_disabled sessions=<n>` を1行だけ残す
+   * （設定値そのものはログへ出さない）。`off` から有効化するときは空表から開始する。
+   * それ以外は上限を入れ直すだけで、結び付け先は保つ。
+   *
+   * @param {object} settings 生の `config.sessionAffinity` でも正規化済みでもよい。
+   * @param {{previousMode?:string, now?:number}} [options] 直前のモード（既定は `off`）。
+   * @returns {{mode:string, previousMode:string, cleared:number, evicted:Array}}
+   */
+  applySettings(settings, { previousMode = 'off', now = this.now() } = {}) {
+    const next = normalizeSessionAffinity(settings);
+    const previous = normalizeMode(previousMode);
+
+    if (next.mode === 'off') {
+      const cleared = this.entries.size;
+      this.entries.clear();
+      if (previous !== 'off') this.write(now, `affinity_disabled sessions=${cleared}`);
+      return { mode: next.mode, previousMode: previous, cleared, evicted: [] };
+    }
+
+    const cleared = previous === 'off' ? this.entries.size : 0;
+    if (previous === 'off') this.entries.clear();
+    const evicted = this.configure(
+      { idleTtlMs: next.idleTtlMs, maxSessions: next.maxSessions },
+      { now },
+    );
+    return { mode: next.mode, previousMode: previous, cleared, evicted };
   }
 
   /**

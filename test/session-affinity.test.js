@@ -735,3 +735,275 @@ describe('SessionAffinity export and restore', () => {
     assert.equal(affinity.get('kept').home, 'acct-a');
   });
 });
+
+// ---------------------------------------------------------------------------
+// 設定の正規化と reload（設計書 §6 / R-S6）
+//
+// 既存の import 文（ファイル冒頭）は1行も書き換えない。ESM の import 宣言は位置に
+// 関係なく巻き上げられるため、R-S6 で足りない分だけを別の import 文にする。
+// ---------------------------------------------------------------------------
+
+import { createDefaultConfig } from '../src/config.js';
+import {
+  DEFAULT_SESSION_AFFINITY,
+  logSessionAffinityStartupNotice,
+  normalizeSessionAffinity,
+} from '../src/session-affinity.js';
+
+const FULL_SECTION = {
+  mode: 'on',
+  idleTtlMs: 3_600_000,
+  maxSessions: 500,
+  assignStopUtilization: 0.75,
+  rebindGraceMs: 30_000,
+  persist: false,
+};
+
+describe('normalizeSessionAffinity (R-S6 / 設計書 §6)', () => {
+  it('falls back to the shared defaults when the section is absent or is not an object', () => {
+    // セクションが無い／型が違う、のいずれでも既定（mode:"off"）へ倒れる。
+    for (const raw of [undefined, null, false, 0, '', 'on', 42, [], [{ mode: 'on' }]]) {
+      assert.equal(
+        normalizeSessionAffinity(raw),
+        DEFAULT_SESSION_AFFINITY,
+        `${JSON.stringify(raw) ?? String(raw)} must resolve to the shared default constant`,
+      );
+    }
+    assert.deepEqual(DEFAULT_SESSION_AFFINITY, {
+      mode: 'off',
+      idleTtlMs: 21_600_000,
+      maxSessions: 10_000,
+      assignStopUtilization: 0.9,
+      rebindGraceMs: 60_000,
+      persist: true,
+    });
+    assert.deepEqual(normalizeSessionAffinity({}), DEFAULT_SESSION_AFFINITY);
+  });
+
+  it('normalizes every key when the section is fully specified', () => {
+    assert.deepEqual(normalizeSessionAffinity(FULL_SECTION), FULL_SECTION);
+  });
+
+  it('keeps the remaining defaults when only one key is written (浅いマージの罠)', () => {
+    // createDefaultConfig() 側に既定を置いていたら、この部分指定で他のキーが
+    // すべて undefined になる。専用の正規化関数を通すことでそれを避ける（§6 理由①）。
+    for (const partial of [{ mode: 'on' }, { maxSessions: 5 }, { persist: false }]) {
+      const normalized = normalizeSessionAffinity(partial);
+      for (const key of Object.keys(DEFAULT_SESSION_AFFINITY)) {
+        assert.notEqual(normalized[key], undefined, `${JSON.stringify(partial)} -> ${key}`);
+      }
+      assert.deepEqual(
+        normalized,
+        { ...DEFAULT_SESSION_AFFINITY, ...partial },
+        JSON.stringify(partial),
+      );
+    }
+  });
+
+  it('keeps the three known modes and folds every other value into off', () => {
+    for (const mode of ['off', 'observe', 'on']) {
+      assert.equal(normalizeSessionAffinity({ mode }).mode, mode, mode);
+    }
+    // 未知の値は "off" へ倒す（§6）。大文字・真偽値・数値も未知として扱う。
+    for (const mode of ['ON', 'On', 'enabled', '', 'true', true, 1, null, undefined, {}, []]) {
+      assert.equal(
+        normalizeSessionAffinity({ mode }).mode,
+        'off',
+        `mode:${JSON.stringify(mode) ?? String(mode)}`,
+      );
+    }
+  });
+
+  it('clamps the four numeric keys into their documented range', () => {
+    const clamps = [
+      ['idleTtlMs', [[0, 60_000], [1, 60_000], [60_000, 60_000], [120_000, 120_000],
+        [604_800_000, 604_800_000], [604_800_001, 604_800_000]]],
+      ['maxSessions', [[0, 1], [-5, 1], [1, 1], [500, 500], [10_000, 10_000], [10_001, 10_000]]],
+      ['assignStopUtilization', [[-1, 0], [0, 0], [0.75, 0.75], [1, 1], [1.5, 1]]],
+      ['rebindGraceMs', [[-1, 0], [0, 0], [30_000, 30_000], [600_000, 600_000], [600_001, 600_000]]],
+    ];
+    for (const [key, cases] of clamps) {
+      for (const [written, expected] of cases) {
+        assert.equal(
+          normalizeSessionAffinity({ [key]: written })[key],
+          expected,
+          `${key}:${written}`,
+        );
+      }
+    }
+    // 明示された 0 は既定へ戻さない: rebindGraceMs:0 は待機の無効化（§6・v1.1 の挙動へ）、
+    // assignStopUtilization:0 はゲートの最も厳しい側であって「未指定」ではない。
+    assert.equal(normalizeSessionAffinity({ rebindGraceMs: 0 }).rebindGraceMs, 0);
+    assert.equal(normalizeSessionAffinity({ assignStopUtilization: 0 }).assignStopUtilization, 0);
+    // 端数のあるセッション数は切り捨てる（表の上限は整数）。
+    assert.equal(normalizeSessionAffinity({ maxSessions: 7.9 }).maxSessions, 7);
+  });
+
+  it('falls back to the default for wrong types and non-finite numbers', () => {
+    const wrong = [Number.NaN, Number.POSITIVE_INFINITY, Number.NEGATIVE_INFINITY,
+      '60000', null, {}, [], true, false];
+    for (const key of ['idleTtlMs', 'maxSessions', 'assignStopUtilization', 'rebindGraceMs']) {
+      for (const value of wrong) {
+        assert.equal(
+          normalizeSessionAffinity({ [key]: value })[key],
+          DEFAULT_SESSION_AFFINITY[key],
+          `${key}:${JSON.stringify(value) ?? String(value)}`,
+        );
+      }
+    }
+  });
+
+  it('accepts only the boolean false to turn persist off', () => {
+    assert.equal(normalizeSessionAffinity({ persist: false }).persist, false);
+    for (const value of [true, 'false', 0, 1, null, undefined, {}, []]) {
+      assert.equal(
+        normalizeSessionAffinity({ persist: value }).persist,
+        true,
+        `persist:${JSON.stringify(value) ?? String(value)}`,
+      );
+    }
+  });
+
+  it('returns a frozen section so a consumer cannot flip the mode at runtime', () => {
+    const normalized = normalizeSessionAffinity({ mode: 'on' });
+    assert.equal(Object.isFrozen(normalized), true);
+    assert.equal(Object.isFrozen(DEFAULT_SESSION_AFFINITY), true);
+    assert.throws(() => { 'use strict'; normalized.mode = 'off'; }, TypeError);
+    assert.equal(normalized.mode, 'on');
+  });
+});
+
+describe('OSS 独立性 > sessionAffinity 未記載 (R-S6)', () => {
+  it('leaves createDefaultConfig() unchanged and resolves to off', () => {
+    // 新規インストールの config.json（createDefaultConfig）にはセクションが無い。
+    // 生成物を1バイトも変えないため、既定側にキーを足していないことを固定する（§6 理由②）。
+    const config = createDefaultConfig();
+    assert.equal(config.sessionAffinity, undefined);
+    assert.equal(Object.prototype.hasOwnProperty.call(config, 'sessionAffinity'), false);
+    assert.deepEqual(Object.keys(config), [
+      'proxy', 'upstream', 'switchThreshold', 'rotationPolicy', 'usagePolling',
+      'openaiBridge', 'accounts',
+    ]);
+    assert.equal(normalizeSessionAffinity(config.sessionAffinity), DEFAULT_SESSION_AFFINITY);
+    assert.equal(normalizeSessionAffinity(config.sessionAffinity).mode, 'off');
+  });
+});
+
+describe('SessionAffinity applySettings (R-S6 / 設計書 §6 の reload)', () => {
+  it('starts from an empty table when the mode goes from off to on', () => {
+    const { affinity, logger } = createAffinity();
+    reserve(affinity, 'session-a', 'acct-a');
+    reserve(affinity, 'session-b', 'acct-b');
+
+    const result = affinity.applySettings({ mode: 'on' }, { previousMode: 'off' });
+
+    assert.equal(affinity.size, 0, 'off→on は空表から開始する');
+    assert.equal(result.mode, 'on');
+    assert.equal(result.previousMode, 'off');
+    assert.equal(result.cleared, 2);
+    assert.deepEqual(linesOf(logger, 'affinity_disabled'), [], '有効化では1行も出さない');
+  });
+
+  it('discards the table and logs one affinity_disabled line when the mode goes to off', () => {
+    const { affinity, clock, logger } = createAffinity();
+    reserve(affinity, 'session-a', 'acct-a');
+    reserve(affinity, 'session-b', 'acct-b');
+
+    const result = affinity.applySettings({ mode: 'off' }, { previousMode: 'on' });
+
+    assert.equal(affinity.size, 0);
+    assert.equal(result.mode, 'off');
+    assert.equal(result.cleared, 2);
+    assert.deepEqual(linesOf(logger, 'affinity_disabled'), [
+      `${isoAt(clock.ms)} affinity_disabled sessions=2`,
+    ]);
+    // 値そのものは出さない（§6）。設定由来の数値・ハッシュ・口座名を載せない。
+    const [line] = linesOf(logger, 'affinity_disabled');
+    for (const forbidden of ['21600000', '10000', 'idleTtlMs', 'maxSessions', 'acct-a', sidHash('session-a')]) {
+      assert.equal(line.includes(forbidden), false, forbidden);
+    }
+  });
+
+  it('logs nothing when the mode was already off', () => {
+    const { affinity, logger } = createAffinity();
+
+    const result = affinity.applySettings({ mode: 'off' }, { previousMode: 'off' });
+
+    assert.equal(result.cleared, 0);
+    assert.deepEqual(logger.lines, []);
+  });
+
+  it('re-applies the clamped limits and trims the table immediately', () => {
+    const { affinity, logger } = createAffinity({ maxSessions: 10 });
+    reserve(affinity, 'session-a', 'acct-a');
+    reserve(affinity, 'session-b', 'acct-b');
+    reserve(affinity, 'session-c', 'acct-c');
+
+    // 0 は 1 へクランプされるので、最も新しい1件だけが残る（§3 の LRU）。
+    const result = affinity.applySettings({ mode: 'on', maxSessions: 0 }, { previousMode: 'on' });
+
+    assert.equal(affinity.maxSessions, 1);
+    assert.equal(affinity.size, 1);
+    assert.equal(affinity.get('session-c').home, 'acct-c');
+    assert.equal(result.evicted.length, 2);
+    assert.deepEqual([...new Set(result.evicted.map(entry => entry.reason))], ['capacity']);
+    assert.deepEqual(linesOf(logger, 'affinity_disabled'), []);
+  });
+
+  it('keeps the bindings when the mode stays enabled', () => {
+    const { affinity } = createAffinity();
+    reserve(affinity, 'session-a', 'acct-a');
+
+    const result = affinity.applySettings({ mode: 'observe' }, { previousMode: 'on' });
+
+    assert.equal(affinity.size, 1);
+    assert.equal(affinity.get('session-a').home, 'acct-a');
+    assert.equal(result.mode, 'observe');
+    assert.equal(result.cleared, 0);
+  });
+
+  it('accepts an already normalized section unchanged', () => {
+    const { affinity } = createAffinity();
+    const settings = normalizeSessionAffinity({ mode: 'on', idleTtlMs: 60_000 });
+
+    const result = affinity.applySettings(settings, { previousMode: 'on' });
+
+    assert.equal(result.mode, 'on');
+    assert.equal(affinity.idleTtlMs, 60_000);
+  });
+});
+
+describe('logSessionAffinityStartupNotice (R-S6 / U17)', () => {
+  it('records the switch threshold on exactly one line while affinity runs', () => {
+    for (const mode of ['on', 'observe']) {
+      const lines = [];
+      const returned = logSessionAffinityStartupNotice(
+        normalizeSessionAffinity({ mode }),
+        { switchThreshold: 0.8, logger: line => lines.push(line), now: START_MS },
+      );
+      assert.deepEqual(returned, lines, '返り値は実際に出した行の配列');
+      assert.deepEqual(lines, [`${isoAt(START_MS)} affinity config mode=${mode} switchThreshold=0.8`]);
+    }
+  });
+
+  it('stays silent when the section is absent or the mode is off', () => {
+    for (const raw of [undefined, null, {}, { mode: 'off' }, { mode: 'ON' }]) {
+      const lines = [];
+      const returned = logSessionAffinityStartupNotice(
+        normalizeSessionAffinity(raw),
+        { switchThreshold: 1, logger: line => lines.push(line), now: START_MS },
+      );
+      assert.deepEqual(lines, [], JSON.stringify(raw) ?? String(raw));
+      assert.deepEqual(returned, []);
+    }
+  });
+
+  it('does not print undefined when the threshold is not a finite number', () => {
+    const lines = [];
+    logSessionAffinityStartupNotice(
+      normalizeSessionAffinity({ mode: 'on' }),
+      { switchThreshold: undefined, logger: line => lines.push(line), now: START_MS },
+    );
+    assert.deepEqual(lines, [`${isoAt(START_MS)} affinity config mode=on switchThreshold=unknown`]);
+  });
+});

@@ -20,9 +20,14 @@ const MAX_DATE_TIMESTAMP_MS = 8_640_000_000_000_000;
  * error is in the residuals themselves, which are read back as `1 - utilization`
  * after the utilization was stored as `1 - residual`. Sweeping the best residual
  * from 0.06 to 1.00 in one-point steps, 29 of those 95 pairs push the candidate
- * that sits exactly `ASSIGN_BAND_WIDTH` below the best out of the band: with a
- * best of 0.13 the candidate at 0.08 reads back as 0.07999999999999996 while the
- * band starts at 0.08. The epsilon keeps those candidates inside.
+ * that sits exactly `ASSIGN_BAND_WIDTH` below the best out of the band, and the
+ * error is on the BEST side, not the candidate side: with a best of 0.30 and a
+ * candidate of 0.25, the candidate reads back as exactly 0.25 while the best
+ * reads back as 0.30000000000000004, so the band starts at 0.25000000000000006
+ * - just above the candidate. The epsilon keeps those candidates inside. (The
+ * 0.13 / 0.08 pair is also one of the 29, but it cannot be used as the example
+ * here: the default `assignStopUtilization` of 0.9 only admits candidates whose
+ * headroom is above 0.1, so 0.08 is dropped before the band is computed.)
  */
 const DEFAULT_ASSIGN_STOP_UTILIZATION = 0.9;
 const ASSIGN_BAND_WIDTH = 0.05;
