@@ -730,8 +730,11 @@ describe('does-not-touch-gpt-path (設計書 §10・§1・R9)', () => {
     const upstream = await startAnthropicUpstream();
     cleanupAfterTest(async () => upstream.close());
 
-    // 同じ偽 bridge・同じ偽 Anthropic 上流に対し、同じ順序で同じ要求を通す。
-    const off = await exerciseGptPath({ bridge, upstream, sessionAffinity: undefined });
+    // 同じ偽 bridge・同じ偽 Anthropic 上流に対し、同じ順序で同じ要求を通す。off 側は
+    // 明示の `{ mode:'off' }` である（FU-108）——設計書 §10 が固定するのは「`mode:"on"`
+    // にしても `mode:"off"` と不変であること」であり、未記載構成との同値は不変性①が
+    // 別に固定しているので、ここは条文どおり明示の off と比べる。
+    const off = await exerciseGptPath({ bridge, upstream, sessionAffinity: { mode: 'off' } });
     const on = await exerciseGptPath({ bridge, upstream, sessionAffinity: { mode: 'on' } });
 
     assert.deepEqual(on.bridgeRequests, off.bridgeRequests, '① bridge が受け取るヘッダ・パス・本文が不変');
@@ -748,6 +751,14 @@ describe('does-not-touch-gpt-path (設計書 §10・§1・R9)', () => {
       'claude-* の proxy 行にだけ sid=/aff=/fam= が付く＝mode:"on" が効いている',
     );
     assert.equal(off.affinityProxyLines.length, 0, 'mode:"off" では1行も付かない');
+    // FU-108: 上の assert メッセージが実際の構成と食い違わないこと。off 側は
+    // 未記載（`sessionAffinity: undefined`）ではなく明示の `{ mode:'off' }` で走らせる
+    // （未記載 ⇔ 明示 off の同値は不変性①が別に固定している）。
+    assert.deepEqual(
+      off.sessionAffinity,
+      { mode: 'off' },
+      'off 側は明示の mode:"off" 構成で走っている（FU-108）',
+    );
     assert.deepEqual(
       on.bridgeRequests.map(request => request.headers['x-claude-code-session-id']),
       [STICKY_SESSION_ID, STICKY_SESSION_ID],
@@ -804,6 +815,18 @@ describe('does-not-touch-gpt-path (設計書 §10・§1・R9)', () => {
 
 describe('no-raw-session-id-in-logs (設計書 §10・§9.1・R7・FU-98)', () => {
   it('uses a scanner that actually catches a leaked raw value (positive control)', () => {
+    // FU-109: 走査集合が**全口座ぶん**を覆っていること。1口座ぶんしか入っていないと、
+    // もう片方の口座の token / refresh / メールアドレスだけが漏れる欠陥を検出できない
+    // （口座は STICKY_ACCOUNT_IDS の2つに分散して使われている）。
+    for (const id of STICKY_ACCOUNT_IDS) {
+      for (const value of [`token-${id}`, `refresh-${id}`, `${id}@example.com`]) {
+        assert.ok(
+          STICKY_RAW_VALUES.some(([, raw]) => raw === value),
+          `走査集合に入っていない口座の生値がある: ${value}（FU-109）`,
+        );
+      }
+    }
+
     // このテストが無いと、走査の対象や比較を壊しても「一致0件」で緑になってしまう。
     for (const [label, value] of STICKY_RAW_VALUES) {
       assert.notDeepEqual(
@@ -1132,9 +1155,13 @@ const STICKY_RAW_VALUES = Object.freeze([
   ['受信した x-api-key', STICKY_CLIENT_API_KEY],
   ['受信した authorization', STICKY_CLIENT_AUTHORIZATION],
   ['受信した authorization のトークン部', STICKY_CLIENT_BEARER],
-  ['口座のアクセストークン', `token-${STICKY_ACCOUNT_IDS[0]}`],
-  ['口座のリフレッシュトークン', `refresh-${STICKY_ACCOUNT_IDS[0]}`],
-  ['口座のメールアドレス', `${STICKY_ACCOUNT_IDS[0]}@example.com`],
+  // 口座の資格情報は**全口座ぶん**を並べる（FU-109）。1口座ぶんだけだと、バインドが
+  // 2口座に分散しているぶん、もう片方の口座の値だけが漏れる欠陥を検出できない。
+  ...STICKY_ACCOUNT_IDS.flatMap(id => [
+    [`口座 ${id} のアクセストークン`, `token-${id}`],
+    [`口座 ${id} のリフレッシュトークン`, `refresh-${id}`],
+    [`口座 ${id} のメールアドレス`, `${id}@example.com`],
+  ]),
 ]);
 
 // (a)〜(d) を作るための固定の要求列。鍵つき2件（同一セッション・別系統）＋別セッション
@@ -1400,6 +1427,8 @@ async function exerciseGptPath({ bridge, upstream, sessionAffinity }) {
 
   const normalized = normalizeLogLines(logLines);
   return {
+    // どの構成で走らせたか（FU-108: assert メッセージと構成の食い違いを防ぐ）。
+    sessionAffinity,
     bridgeRequests: bridge.take(),
     bridgeLogLines: normalized.filter(line => / openai-bridge /.test(line)),
     gptObservations,

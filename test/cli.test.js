@@ -8,6 +8,7 @@ import http from 'node:http';
 import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { Readable } from 'node:stream';
+import { fileURLToPath } from 'node:url';
 
 import {
   assertAnthropicGatewayProviderCompatible,
@@ -24,9 +25,11 @@ import {
   runMacosCliActionWithLock,
   startService,
 } from '../src/cli.js';
+import { AccountManager } from '../src/account-manager.js';
 import { MACOS_LAUNCH_AGENT_LABEL, installSettings } from '../src/install.js';
+import { SessionAffinity } from '../src/session-affinity.js';
 import { writeJsonFile } from '../src/json-file.js';
-import '../fixtures/service-command-guard.js';
+import { SERVICE_COMMAND_LOG_ENV } from '../fixtures/service-command-guard.js';
 
 // uninstallCommand's non-darwin branch stops the unit before deleting it, so
 // every Linux test here must inject the command runner: left uninjected it
@@ -2292,5 +2295,317 @@ describe('runtime state wiring (R-S11)', () => {
     assert.deepEqual(skipped, ['permission denied']);
     assert.equal(result.savedState, null);
     assert.deepEqual(result.credentialChangedAccountIds, []);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// FU-99: `runServer` 自身の結線（設計書 v1.5 §8・§8.1・§5.2(b) ／ D-56-5・D-60-3・D-182）
+//
+// 切り出した `createRuntimeStateWriter` ／ `restoreRuntimeState` と `createProxyServer`
+// 側は上の R-S11 で個別に押さえてあるが、**それらを runServer が実際に繋いでいるか**は
+// 自動テストの外にあった（FU-99）。`runServer` は export されていないので、
+// `bin/claude-rotator.js server` を子プロセスとして起動し、外から見える形で3点を押さえる。
+//
+//   ① `stateWriter: createRuntimeStateWriter(statePath)`（＝`writeJsonFileDurable`）:
+//      `runtime-state.json` が `runtimeStatePath()` の位置へ書かれ、**そのとき新規に
+//      作られた親ディレクトリが 0700**・ファイルが 0600 であること。`writeJsonFile` へ
+//      戻す回帰（D-56-5 の逆行）は `mkdir` に mode を渡さないので親ディレクトリに
+//      0700 が付かない（既定の 0777 & ~umask のまま）。
+//   ② `restoreRuntimeState` の戻り値2つが `createProxyServer` へ渡ること:
+//      保存された2件のうち、資格情報が別物になった口座（`credentialRevision` が config と
+//      食い違う `acct_a`）のバインドだけが落ち、もう1件が残る。`savedState` が渡らなければ
+//      0件、`credentialChangedAccountIds` が渡らなければ2件になるので、**片方だけの結線では
+//      この 1件 にならない**。
+//   ③ `eventHistory` が mode に連動すること（`src/cli.js` の AccountManager 構築時・D-182）:
+//      `createProxyServer` 側の `setEventHistoryEnabled` は復元より**後**に走るため、構築時に
+//      渡し忘れると `mode:"on"` でも `events` が1件も復元されない。`mode` 未記載（off）では
+//      逆に復元されないことも確かめる（負の対照）。
+//
+// 隔離: 実サービスへ到達する経路は `server` コマンドには無い（`install` ／ `uninstall`
+// だけ）。それでも guard のシムを載せた PATH のまま起動し、guard ログが増えないことを
+// 確かめる。`HOME` ／ `XDG_*` ／ `CLAUDE_CONFIG_DIR` ／ `CLAUDE_ROTATOR_CONFIG` はすべて
+// 一時ディレクトリへ向け、実 Keychain（口座は `type:'apikey'` なので読み出し経路へ入らない）・
+// `~/.config/claude-rotator/`・本番 rotator（37891）には触れない。口座は合成ラベルと
+// `*@example.com`、セッション鍵は合成の12桁ハッシュだけを使う。
+// ---------------------------------------------------------------------------
+
+const FU99_CONFIG_ACCOUNTS = Object.freeze([
+  // `type:'apikey'` にして資格情報の読み出し（macOS では Keychain）経路へ入れない。
+  { id: 'acct_a', name: 'acct_a@example.com', type: 'apikey', credentialRevision: 'rev-a-2' },
+  { id: 'acct_b', name: 'acct_b@example.com', type: 'apikey', credentialRevision: 'rev-b-1' },
+]);
+// 保存側の `acct_a` だけ版を古くする＝資格情報が別物になった口座（§8 の破棄条件⑥・F3）。
+const FU99_SAVED_REVISIONS = Object.freeze({ acct_a: 'rev-a-1', acct_b: 'rev-b-1' });
+const FU99_SEEDED_EVENT_TYPE = 'seeded-switch';
+const FU99_CHANGED_SID = 'a1a1a1a1a1a1';
+const FU99_KEPT_SID = 'b2b2b2b2b2b2';
+const PRODUCTION_ROTATOR_PORT = 37891;
+
+function fu99SavedState(nowMs) {
+  const savedAt = new Date(nowMs - 60_000).toISOString();
+  return {
+    version: 1,
+    savedAt,
+    currentAccount: 'acct_a',
+    // ③ の観測対象。`eventHistory` が真のときだけ復元される（D-56-6・D-182）。
+    events: [{ at: savedAt, type: FU99_SEEDED_EVENT_TYPE, account: 'acct_b' }],
+    accounts: FU99_CONFIG_ACCOUNTS.map(account => ({
+      id: account.id,
+      accountUuid: null,
+      credentialRevision: FU99_SAVED_REVISIONS[account.id],
+      status: 'ready',
+      quota: {},
+      usage: {},
+      rateLimitedUntil: null,
+      temporaryUnavailableReason: null,
+      errorReason: null,
+    })),
+    sessionAffinity: {
+      version: 1,
+      savedAt,
+      entries: [
+        { k: FU99_CHANGED_SID, a: 'acct_a', t: nowMs - 60_000, s: 0 },
+        { k: FU99_KEPT_SID, a: 'acct_b', t: nowMs - 60_000, s: 1 },
+      ],
+    },
+  };
+}
+
+async function fu99StartServer({ home, sessionAffinity, guardLogPath }) {
+  const configPath = join(home, 'config', 'config.json');
+  const port = await unusedCodexLoopbackPort();
+  assert.ok(port > 0, '空きポートが取れていること');
+  assert.notEqual(port, PRODUCTION_ROTATOR_PORT, '本番 rotator のポートは使わない');
+  await mkdir(dirname(configPath), { recursive: true });
+  await writeJsonFile(configPath, {
+    // port を 0 にすると `config.proxy?.port || DEFAULT_PORT` が本番ポートへ落ちるので、
+    // 必ず実ポートを書く。
+    proxy: { host: '127.0.0.1', port },
+    // 上流へは1件も送らない（叩くのは /internal/* だけである）。
+    upstream: 'http://127.0.0.1:1',
+    switchThreshold: 1,
+    usagePolling: { enabled: false },
+    accounts: FU99_CONFIG_ACCOUNTS.map(account => ({ ...account })),
+    ...(sessionAffinity === undefined ? {} : { sessionAffinity }),
+  });
+
+  const env = {
+    ...process.env,
+    HOME: home,
+    XDG_CONFIG_HOME: join(home, 'xdg'),
+    XDG_DATA_HOME: join(home, 'share'),
+    CLAUDE_CONFIG_DIR: join(home, 'claude'),
+    CLAUDE_ROTATOR_CONFIG: configPath,
+    // guard のログは**この子プロセス専用**のパスへ向ける（他のテストファイルと
+    // 並行実行されても、他人の1行で判定が揺れない）。PATH に載ったシムがここへ書く。
+    [SERVICE_COMMAND_LOG_ENV]: guardLogPath,
+  };
+  // ログイン上書きの判定を実行環境に依存させない（開発機の環境変数を持ち込まない）。
+  for (const name of [
+    'ANTHROPIC_AUTH_TOKEN', 'ANTHROPIC_API_KEY', 'CLAUDE_CODE_OAUTH_TOKEN',
+    'CLAUDE_CODE_USE_BEDROCK', 'CLAUDE_CODE_USE_VERTEX', 'CLAUDE_CODE_USE_FOUNDRY',
+    'CLAUDE_CODE_USE_ANTHROPIC_AWS', 'CLAUDE_CODE_USE_ANTHROPIC_GOOGLE_CLOUD',
+    'CLAUDE_CODE_USE_MANTLE',
+  ]) delete env[name];
+
+  const cliPath = fileURLToPath(new URL('../bin/claude-rotator.js', import.meta.url));
+  const child = spawn(process.execPath, [cliPath, 'server'], {
+    env,
+    stdio: ['ignore', 'pipe', 'pipe'],
+  });
+  const stop = async () => {
+    if (child.exitCode !== null) return;
+    child.kill('SIGTERM');
+    await new Promise(done => child.once('exit', done));
+  };
+  try {
+    await fu99WaitForOutput(child, /listening on/);
+  } catch (error) {
+    await stop();
+    throw error;
+  }
+  return { child, port, url: `http://127.0.0.1:${port}`, stop };
+}
+
+function fu99WaitForOutput(child, pattern, timeoutMs = 15_000) {
+  return new Promise((resolve, reject) => {
+    let buffer = '';
+    const timer = setTimeout(
+      () => reject(new Error(`Timed out waiting for the server; output=${buffer}`)),
+      timeoutMs,
+    );
+    const onData = chunk => {
+      buffer += chunk.toString('utf8');
+      if (!pattern.test(buffer)) return;
+      clearTimeout(timer);
+      resolve(buffer);
+    };
+    child.stdout.on('data', onData);
+    child.stderr.on('data', onData);
+    child.once('exit', code => {
+      clearTimeout(timer);
+      reject(new Error(`Server exited before listening: ${code}; output=${buffer}`));
+    });
+  });
+}
+
+describe('runServer wiring (FU-99)', () => {
+  it('hands the durable writer, both restore results and the event-history flag to the proxy', async () => {
+    const sandbox = await mkdtemp(join(tmpdir(), 'claude-rotator-runserver-'));
+    // 起動した子プロセスが実サービスへ届いていないことの証拠（PATH のシムが書く）。
+    const guardLogPath = join(sandbox, 'service-command-guard.log');
+    const nowMs = Date.now();
+    const servers = [];
+    try {
+      // --- ① 耐久書き込みの結線: 何も無いところへ runtime-state.json を書かせる ---
+      const freshHome = join(sandbox, 'fresh');
+      const freshStateDir = join(freshHome, 'xdg', 'claude-rotator');
+      const freshStatePath = join(freshStateDir, 'runtime-state.json');
+      await assert.rejects(
+        stat(freshStateDir),
+        error => error.code === 'ENOENT',
+        '起動前は runtime-state.json の親ディレクトリが存在しないこと（0700 の判定が意味を持つ前提）',
+      );
+
+      const fresh = await fu99StartServer({ home: freshHome, sessionAffinity: { mode: 'on' }, guardLogPath });
+      servers.push(fresh);
+      // 末尾で必ず persistState() を await する経路（/internal/prepare-resume）で1回書かせる。
+      await requestJson(`${fresh.url}/internal/prepare-resume`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: '{}',
+      });
+
+      const savedFresh = JSON.parse(await readFile(freshStatePath, 'utf8'));
+      assert.equal(savedFresh.version, 1, 'runtime-state.json が runtimeStatePath() の位置へ書かれていること');
+      assert.ok(savedFresh.sessionAffinity, 'mode:"on" ＋ persist 既定 true なので表の節が載ること');
+      assert.equal(
+        (await stat(freshStatePath)).mode & 0o777,
+        0o600,
+        '① 保存ファイルは 0600（writeJsonFileDurable）',
+      );
+      assert.equal(
+        (await stat(freshStateDir)).mode & 0o777,
+        0o700,
+        '① 新規に作られた親ディレクトリは 0700。writeJsonFile へ戻す回帰では 0700 が付かない（D-56-5）',
+      );
+
+      // --- ②③ 復元の結線: 保存ファイルを置いた状態で起動する ---
+      const restoreHome = join(sandbox, 'restore');
+      const restoreStatePath = join(restoreHome, 'xdg', 'claude-rotator', 'runtime-state.json');
+      await writeJsonFile(restoreStatePath, fu99SavedState(nowMs));
+
+      const restored = await fu99StartServer({ home: restoreHome, sessionAffinity: { mode: 'on' }, guardLogPath });
+      servers.push(restored);
+      const onStatus = await requestJson(`${restored.url}/internal/status`, { method: 'GET' });
+
+      assert.ok(onStatus.sessionAffinity, 'mode:"on" では status に sessionAffinity 節が出る');
+      assert.equal(
+        onStatus.sessionAffinity.sessions,
+        1,
+        '② savedState と credentialChangedAccountIds の両方が渡って初めて「2件中1件」になる'
+        + '（savedState 未渡し＝0件 / 資格情報の変更が未渡し＝2件）',
+      );
+      assert.deepEqual(
+        onStatus.sessionAffinity.sessionsByAccount,
+        { acct_b: 1 },
+        '② 残るのは資格情報が変わっていない acct_b のバインドだけ（§8 の破棄条件⑥・F3）',
+      );
+      assert.deepEqual(
+        onStatus.events.filter(event => event.type === FU99_SEEDED_EVENT_TYPE),
+        [fu99SavedState(nowMs).events[0]],
+        '③ mode:"on" では eventHistory が真で構築され、保存された events が復元される（D-182）',
+      );
+
+      // --- ③ の負の対照: 同じ保存ファイルを mode 未記載（＝off）で読み戻す ---
+      const offHome = join(sandbox, 'off');
+      const offStatePath = join(offHome, 'xdg', 'claude-rotator', 'runtime-state.json');
+      await writeJsonFile(offStatePath, fu99SavedState(nowMs));
+
+      const off = await fu99StartServer({ home: offHome, sessionAffinity: undefined, guardLogPath });
+      servers.push(off);
+      const offStatus = await requestJson(`${off.url}/internal/status`, { method: 'GET' });
+
+      assert.equal(
+        'sessionAffinity' in offStatus,
+        false,
+        '未記載構成では status に sessionAffinity キー自体が出ない（R7・D-56-6）',
+      );
+      assert.deepEqual(
+        offStatus.events.filter(event => event.type === FU99_SEEDED_EVENT_TYPE),
+        [],
+        '③ 未記載構成では eventHistory が偽で構築され、保存された events を復元しない',
+      );
+
+      // 3本とも実サービス（launchctl / systemctl）へ1回も届いていないこと。
+      assert.equal(
+        await readFile(guardLogPath, 'utf8').catch(() => null),
+        null,
+        `起動した server が実サービスへ到達している: ${guardLogPath}`,
+      );
+    } finally {
+      for (const server of servers.reverse()) await server.stop();
+      await rm(sandbox, { recursive: true, force: true });
+    }
+  });
+
+  it('uses observations that actually change when a wiring point is missing (positive control)', async () => {
+    // この対照が無いと、上のテストは「結線を1本外しても緑のまま」になりうる。
+    // `runServer` は src なので壊せない。代わりに**同じ入力を同じ層へ直接与えて**、
+    // 3点それぞれの観測が本当に差を出すことを示す。
+    const nowMs = Date.now();
+    const saved = fu99SavedState(nowMs);
+    const accountsForLedger = () => FU99_CONFIG_ACCOUNTS.map(account => ({ ...account }));
+
+    // ① 耐久書き込み: writeJsonFile は mkdir に mode を渡さないので 0700 にならない。
+    const sandbox = await mkdtemp(join(tmpdir(), 'claude-rotator-runserver-control-'));
+    try {
+      const plainDir = join(sandbox, 'plain');
+      await writeJsonFile(join(plainDir, 'runtime-state.json'), { version: 1 });
+      // umask 022 の環境では 0755 になり、0700 との差で writer の取り違えを検出できる
+      // （umask 077 の環境ではこの1点だけでは差が出ない——だから②③も併せて見る）。
+      assert.equal(
+        (await stat(plainDir)).mode & 0o777,
+        0o777 & ~process.umask(),
+        '① writeJsonFile が作る親ディレクトリは umask のまま（durable 側だけが 0700 を付ける）',
+      );
+    } finally {
+      await rm(sandbox, { recursive: true, force: true });
+    }
+
+    // ② 復元の戻り値2つ: 片方でも渡さなければ「2件中1件」にならない。
+    const restoreWith = credentialChangedAccountIds => {
+      const accountManager = new AccountManager({ accounts: accountsForLedger() });
+      accountManager.restoreState(saved);
+      const table = new SessionAffinity({ mode: 'on', now: () => nowMs });
+      table.restore(saved.sessionAffinity, { accountManager, credentialChangedAccountIds });
+      return table.size;
+    };
+    const ledger = new AccountManager({ accounts: accountsForLedger() });
+    assert.deepEqual(
+      ledger.restoreState(saved),
+      ['acct_a'],
+      '② 台帳の復元は acct_a を「資格情報が別物になった口座」として返す',
+    );
+    assert.equal(restoreWith(['acct_a']), 1, '② 両方渡したときだけ1件になる');
+    assert.equal(restoreWith(undefined), 2, '② credentialChangedAccountIds を渡さないと2件残る');
+    const emptyTable = new SessionAffinity({ mode: 'on', now: () => nowMs });
+    assert.equal(emptyTable.size, 0, '② savedState を渡さなければ表は0件（復元そのものが起きない）');
+
+    // ③ eventHistory: 構築時に偽だと、mode:"on" でも events は1件も復元されない。
+    const withHistory = new AccountManager({ accounts: accountsForLedger(), eventHistory: true });
+    withHistory.restoreState(saved);
+    assert.equal(
+      withHistory.getStatus().events.filter(event => event.type === FU99_SEEDED_EVENT_TYPE).length,
+      1,
+      '③ eventHistory:true で構築すると復元される',
+    );
+    const withoutHistory = new AccountManager({ accounts: accountsForLedger(), eventHistory: false });
+    withoutHistory.restoreState(saved);
+    assert.deepEqual(
+      withoutHistory.getStatus().events,
+      [],
+      '③ eventHistory:false で構築すると復元されない（setEventHistoryEnabled は復元より後に走る）',
+    );
   });
 });
