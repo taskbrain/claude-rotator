@@ -12,6 +12,7 @@ import { LOCAL_GATEWAY_AUTH_TOKEN } from '../src/config.js';
 import { renderStatus } from '../src/monitor.js';
 import { OAuthTokenRefreshError, parseUsageResponse } from '../src/oauth.js';
 import { LinuxFileSecretStore, MemorySecretStore } from '../src/secret-store.js';
+import { sidHash } from '../src/session-affinity.js';
 import { createProxyServer, defaultTokenRefresher } from '../src/proxy-server.js';
 
 const cleanupCallbacks = [];
@@ -10873,5 +10874,410 @@ describe('サブキャップ 429 の非対称の是正 (R-S2b / 設計書 §5.1)
       currentAccount: 'acct_1',
       switches: 0,
     });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// sticky affinity 本体の結線（R-S7 / 設計書 v1.5 §4.1・§4.4・§7.1・§7.2・§9 F9）
+//
+// 統合①②③④⑥⑦⑫⑬⑯㉑ ＋ `fam=` 1件 ＋ F9 1件。
+// 既存ケースは1件も削除・書換しない。`mode:"off"`（既定・未記載）では proxy 行が
+// 追加前とバイト同一であること（`fam` 用の1件で固定する）。
+// ---------------------------------------------------------------------------
+describe('session affinity wiring (R-S7)', () => {
+  // 末尾追記あり（§7.1）。sid は鍵を持つ要求だけに出る。
+  const AFFINITY_PROXY_LINE = /^\d{4}-\d{2}-\d{2}T[\d:.]+Z proxy account=\S+ method=\S+ path=\S+ status=\S+ durationMs=\d+ outcome=[a-z-]+(?: requestId=\S+)?(?: errorType=\S+)?(?: sid=[0-9a-f]{12})? aff=(?:new|bound|switch|none) fam=(?:fable|other)$/;
+  // 追記が1つも無い現行の形（`mode:"off"` で守る）。
+  const LEGACY_PROXY_LINE_RS7 = /^\d{4}-\d{2}-\d{2}T[\d:.]+Z proxy account=\S+ method=\S+ path=\S+ status=\S+ durationMs=\d+ outcome=[a-z-]+(?: requestId=\S+)?(?: errorType=\S+)?$/;
+
+  function eventLines(logLines, kind) {
+    return logLines.filter(line => line.includes(` ${kind} `));
+  }
+
+  function proxyLines(logLines) {
+    return logLines.filter(line => line.includes(' proxy account='));
+  }
+
+  function futureResetSeconds(offsetMs = 3_600_000) {
+    return String(Math.floor((Date.now() + offsetMs) / 1000));
+  }
+
+  async function waitFor(predicate, timeoutMs = 2000) {
+    const startedAt = Date.now();
+    while (!predicate() && Date.now() - startedAt < timeoutMs) await sleep(5);
+    return predicate();
+  }
+
+  // 資格情報の解決（`resolveSecretForAccount` の await）を任意の口座で止められる保管庫。
+  // 統合⑫（予約が無い実装なら2本目が別口座へ割れる）と⑯（遅着した確定）で使う。
+  class GatedSecretStore extends MemorySecretStore {
+    constructor() {
+      super();
+      this.gate = null;
+      this.entered = [];
+    }
+
+    async getOperational(accountId) {
+      if (this.gate && this.gate.accountId === accountId) {
+        this.entered.push(accountId);
+        await this.gate.promise;
+      }
+      return super.getOperational(accountId);
+    }
+
+    openGate(accountId) {
+      let release = null;
+      const promise = new Promise(resolve => { release = resolve; });
+      this.gate = { accountId, promise, release };
+      return () => { this.gate = null; release(); };
+    }
+  }
+
+  async function startAffinity({
+    accounts = ['acct_a', 'acct_b'],
+    sessionAffinity = { mode: 'on' },
+    upstream: upstreamHandler = null,
+    secretStore: providedStore = null,
+    tokenRefresher = null,
+    clock = null,
+  } = {}) {
+    const logLines = [];
+    const seen = [];
+    const upstream = await listen(http.createServer((req, res) => {
+      seen.push(req.headers.authorization);
+      if (upstreamHandler && upstreamHandler({ req, res, seen }) === true) return;
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ ok: true }));
+    }));
+    const secretStore = providedStore || new MemorySecretStore();
+    for (const id of accounts) {
+      await secretStore.set(id, {
+        accessToken: `token-${id}`,
+        refreshToken: `refresh-${id}`,
+        expiresAt: Date.now() + 3_600_000,
+      });
+    }
+    const logger = line => logLines.push(line);
+    const accountManager = new AccountManager({
+      accounts: accounts.map(id => ({ id, type: 'oauth' })),
+      logger,
+      ...(clock ? { now: () => clock.ms } : {}),
+    });
+    const proxy = await listen(createProxyServer({
+      accountManager,
+      secretStore,
+      logger,
+      ...(tokenRefresher ? { tokenRefresher } : {}),
+      config: {
+        upstream: upstream.url,
+        usagePolling: { enabled: false },
+        ...(sessionAffinity ? { sessionAffinity } : {}),
+      },
+    }));
+    cleanupAfterTest(async () => { await close(proxy.server); await close(upstream.server); });
+
+    const ask = ({ sid = null, model = 'sonnet', headers = {} } = {}) => requestJson(
+      `${proxy.url}/v1/messages`,
+      {
+        method: 'POST',
+        body: JSON.stringify({ model }),
+        headers: { ...(sid ? { 'x-claude-code-session-id': sid } : {}), ...headers },
+      },
+    );
+    return { proxy, upstream, seen, secretStore, accountManager, logLines, logger, ask };
+  }
+
+  it('①: two sessions land on two different accounts', async () => {
+    const { ask, seen, logLines } = await startAffinity();
+
+    assert.equal((await ask({ sid: 'session-one' })).status, 200);
+    assert.equal((await ask({ sid: 'session-two' })).status, 200);
+
+    assert.deepEqual(seen, ['Bearer token-acct_a', 'Bearer token-acct_b']);
+    assert.equal(eventLines(logLines, 'affinity_bind').length, 2, '新規バインドは2件');
+  });
+
+  it('②: ten requests of one session stay on the bound account after another account gains headroom', async () => {
+    const { ask, seen, accountManager, logLines } = await startAffinity();
+
+    // 先に別セッションを acct_a へ載せ、対象のセッションが acct_b（＝`currentIndex` が
+    // 指していない口座）へ結び付く状態を作る。固定していなければ acct_a へ戻ってしまう。
+    assert.equal((await ask({ sid: 'session-zero' })).status, 200);
+    assert.equal((await ask({ sid: 'session-one' })).status, 200);
+    // 結び付け先の残枠が減り、他口座の残枠が上回っても既存セッションは動かない（R2）。
+    accountManager.updateQuota('acct_a', { 'anthropic-ratelimit-unified-5h-utilization': '0.01' });
+    accountManager.updateQuota('acct_b', { 'anthropic-ratelimit-unified-5h-utilization': '0.8' });
+    for (let index = 0; index < 9; index += 1) {
+      assert.equal((await ask({ sid: 'session-one' })).status, 200);
+    }
+
+    assert.equal(seen.length, 11);
+    assert.equal(seen[0], 'Bearer token-acct_a');
+    assert.deepEqual(new Set(seen.slice(1)), new Set(['Bearer token-acct_b']));
+    assert.deepEqual(eventLines(logLines, 'affinity_switch'), []);
+  });
+
+  it('③: a side request on another model family keeps the session on its account', async () => {
+    const { ask, seen } = await startAffinity();
+
+    await ask({ sid: 'session-zero' });
+    await ask({ sid: 'session-one', model: 'claude-fable-5' });
+    await ask({ sid: 'session-one', model: 'claude-3-5-haiku-20241022' });
+
+    assert.deepEqual(seen, [
+      'Bearer token-acct_a',
+      'Bearer token-acct_b',
+      'Bearer token-acct_b',
+    ]);
+  });
+
+  it('④: a sub-agent request with an agent id stays on the parent account', async () => {
+    const { ask, seen } = await startAffinity();
+
+    await ask({ sid: 'session-one' });
+    // 別セッションを先に作って、鍵に agent-id が混ざれば別口座へ行く状態にする。
+    await ask({ sid: 'session-two' });
+    await ask({ sid: 'session-one', headers: { 'x-claude-code-agent-id': 'agent-7' } });
+
+    assert.deepEqual(seen, [
+      'Bearer token-acct_a',
+      'Bearer token-acct_b',
+      'Bearer token-acct_a',
+    ]);
+  });
+
+  it('⑥: a Fable-only sub-cap moves only the Fable sub-binding', async () => {
+    const { ask, seen, accountManager, logLines } = await startAffinity();
+
+    await ask({ sid: 'session-one' });
+    accountManager.applyUsage('acct_a', {
+      scoped_weekly: [{ key: 'fable', label: 'Fable', utilization: 1, resets_at: futureReset() }],
+    });
+
+    await ask({ sid: 'session-one', model: 'claude-fable-5' });
+    await ask({ sid: 'session-one', model: 'sonnet' });
+
+    assert.deepEqual(seen, [
+      'Bearer token-acct_a',
+      'Bearer token-acct_b',
+      'Bearer token-acct_a',
+    ]);
+    const switches = eventLines(logLines, 'affinity_switch');
+    assert.equal(switches.length, 1);
+    assert.match(switches[0], / reason=family_exhausted family=fable switches=1$/);
+  });
+
+  it('⑦: the assign-stop gate skips a loaded account for a new session but keeps the bound one', async () => {
+    const { ask, seen, accountManager } = await startAffinity();
+
+    await ask({ sid: 'session-one' });
+    accountManager.updateQuota('acct_a', { 'anthropic-ratelimit-unified-5h-utilization': '0.95' });
+    accountManager.updateQuota('acct_b', { 'anthropic-ratelimit-unified-5h-utilization': '0.1' });
+
+    await ask({ sid: 'session-one' });
+    await ask({ sid: 'session-two' });
+
+    assert.deepEqual(seen, [
+      'Bearer token-acct_a',
+      'Bearer token-acct_a',
+      'Bearer token-acct_b',
+    ]);
+  });
+
+  it('⑫: two concurrent requests of one session share the account across the credential await', async () => {
+    const secretStore = new GatedSecretStore();
+    const { ask, seen, logLines } = await startAffinity({ secretStore });
+
+    // 先に別セッションを acct_a へ載せ、K3（バインド数の少ない口座）で acct_b が選ばれる
+    // 状態を作る。予約が無い実装では、2本目が独立に選び直して acct_a へ割れる。
+    assert.equal((await ask({ sid: 'session-zero' })).status, 200);
+
+    const release = secretStore.openGate('acct_b');
+    const first = ask({ sid: 'session-one' }).catch(error => ({ error }));
+    const firstWaited = await waitFor(() => secretStore.entered.length === 1);
+    const second = ask({ sid: 'session-one' }).catch(error => ({ error }));
+    const secondWaited = await waitFor(() => secretStore.entered.length === 2);
+    release();
+    const firstResult = await first;
+    const secondResult = await second;
+
+    assert.ok(firstWaited, '1本目が資格情報の解決で待つ');
+    assert.ok(secondWaited, '2本目も同じ口座の解決へ入る');
+    assert.equal(firstResult.status, 200);
+    assert.equal(secondResult.status, 200);
+    assert.deepEqual(seen, [
+      'Bearer token-acct_a',
+      'Bearer token-acct_b',
+      'Bearer token-acct_b',
+    ]);
+    assert.equal(eventLines(logLines, 'affinity_bind').length, 2, '2本目は新規バインドを作らない');
+  });
+
+  it('⑬: a short rate limit on the bound account leaves the binding alone', async () => {
+    const clock = { ms: Date.now() };
+    let rateLimited = false;
+    const { ask, seen, logLines } = await startAffinity({
+      clock,
+      upstream: ({ req, res }) => {
+        if (!rateLimited || req.headers.authorization !== 'Bearer token-acct_a') return false;
+        res.writeHead(429, { 'Content-Type': 'application/json', 'retry-after': '60' });
+        res.end(JSON.stringify({ type: 'error', error: { type: 'rate_limit_error', message: 'slow down' } }));
+        return true;
+      },
+    });
+
+    assert.equal((await ask({ sid: 'session-one' })).status, 200);
+    rateLimited = true;
+    assert.equal((await ask({ sid: 'session-one' })).status, 429, '短期レート制限はそのまま返る');
+    rateLimited = false;
+    clock.ms += 61_000;
+    assert.equal((await ask({ sid: 'session-one' })).status, 200);
+
+    assert.deepEqual(seen, [
+      'Bearer token-acct_a',
+      'Bearer token-acct_a',
+      'Bearer token-acct_a',
+    ], 'バインド先は一度も変わらない');
+    assert.deepEqual(eventLines(logLines, 'affinity_switch'), []);
+    assert.deepEqual(
+      proxyLines(logLines).map(line => line.split(' aff=')[1]),
+      ['new fam=other', 'bound fam=other', 'bound fam=other'],
+    );
+  });
+
+  it('⑯: a late confirmation does not overwrite the binding a newer request made', async () => {
+    const secretStore = new GatedSecretStore();
+    const { ask, seen, accountManager, logLines } = await startAffinity({ secretStore });
+
+    const release = secretStore.openGate('acct_a');
+    const first = ask({ sid: 'session-one' }).catch(error => ({ error }));
+    const waited = await waitFor(() => secretStore.entered.length === 1);
+
+    // R1 が待っているあいだに acct_a の共通枠が枯れ、R2 が acct_b へ付け替える。
+    accountManager.updateQuota('acct_a', {
+      'anthropic-ratelimit-unified-5h-utilization': '1',
+      'anthropic-ratelimit-unified-5h-reset': futureResetSeconds(),
+    });
+    const second = await ask({ sid: 'session-one' }).catch(error => ({ error }));
+    release();
+    const firstResult = await first;
+
+    assert.ok(waited, 'R1 が acct_a を予約して待つ');
+    assert.equal(second.status, 200);
+    assert.equal(firstResult.status, 200);
+
+    const stale = eventLines(logLines, 'affinity_stale');
+    assert.equal(stale.length, 1);
+    assert.match(stale[0], / myGen=1 curGen=2 dropped=acct_a$/);
+    const switches = eventLines(logLines, 'affinity_switch');
+    assert.equal(switches.length, 1);
+    assert.match(switches[0], / from=acct_a to=acct_b reason=common_exhausted family=other switches=1$/);
+
+    // 表は R2 が作ったバインド（acct_b）のままである。
+    assert.equal((await ask({ sid: 'session-one' })).status, 200);
+    assert.equal(seen.at(-1), 'Bearer token-acct_b');
+  });
+
+  it('㉑: a transient auth failure completes on another account without moving the binding', async () => {
+    let authFails = true;
+    const { ask, seen, accountManager, logLines } = await startAffinity({
+      tokenRefresher: async () => ({
+        accessToken: 'token-acct_a-fresh',
+        refreshToken: 'refresh-acct_a-2',
+        expiresAt: Date.now() + 3_600_000,
+      }),
+      upstream: ({ req, res }) => {
+        if (!authFails || !String(req.headers.authorization).startsWith('Bearer token-acct_a')) return false;
+        res.writeHead(401, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: { message: 'Invalid authentication credentials' } }));
+        return true;
+      },
+    });
+
+    const response = await ask({ sid: 'session-one' });
+
+    assert.equal(response.status, 200, '別口座で完走する');
+    assert.equal(seen.at(-1), 'Bearer token-acct_b');
+    assert.deepEqual(eventLines(logLines, 'affinity_switch'), [], 'バインドは動かない');
+
+    // 一時障害が解けたら、次の要求は元の口座へ戻る。
+    authFails = false;
+    accountManager.markAuthenticated('acct_a');
+    assert.equal((await ask({ sid: 'session-one' })).status, 200);
+    assert.equal(seen.at(-1), 'Bearer token-acct_a-fresh');
+  });
+
+  it('records fam=fable / fam=other while affinity runs and keeps the line byte-identical while it is off', async () => {
+    const enabled = await startAffinity();
+    await enabled.ask({ sid: 'session-one', model: 'claude-fable-5' });
+    await enabled.ask({ sid: 'session-one', model: 'sonnet' });
+    await enabled.ask({ model: 'sonnet' });
+
+    const lines = proxyLines(enabled.logLines);
+    assert.equal(lines.length, 3);
+    for (const line of lines) assert.match(line, AFFINITY_PROXY_LINE);
+    assert.match(lines[0], / sid=[0-9a-f]{12} aff=new fam=fable$/);
+    assert.match(lines[1], / sid=[0-9a-f]{12} aff=bound fam=other$/);
+    assert.match(lines[2], / outcome=ok aff=none fam=other$/, '鍵の無い要求に sid は出ない');
+
+    const off = await startAffinity({ sessionAffinity: null });
+    await off.ask({ sid: 'session-one', model: 'claude-fable-5' });
+    await off.ask({ model: 'sonnet' });
+    const offLines = proxyLines(off.logLines);
+    assert.equal(offLines.length, 2);
+    for (const line of offLines) assert.match(line, LEGACY_PROXY_LINE_RS7);
+    assert.deepEqual(off.logLines.filter(line => line.includes(' affinity_')), []);
+  });
+
+  it('F9: releases the table row of a long stream when the client aborts', async () => {
+    const streams = [];
+    const upstreamClosed = [];
+    const { proxy, ask, logLines } = await startAffinity({
+      sessionAffinity: { mode: 'on', maxSessions: 1 },
+      upstream: ({ req, res }) => {
+        if (req.headers['x-stream-forever'] !== '1') return false;
+        streams.push(res);
+        // クライアントが切ると proxy は上流要求を destroy する。その到達を待って
+        // 「proxy の res close が既に走った」ことを確定させる（解放の観測点）。
+        req.on('close', () => upstreamClosed.push(1));
+        res.writeHead(200, { 'Content-Type': 'text/event-stream' });
+        res.write('event: ping\n\n');
+        return true;
+      },
+    });
+    cleanupAfterTest(async () => { for (const res of streams) res.end(); });
+
+    const target = new URL(proxy.url);
+    const stream = http.request({
+      hostname: target.hostname,
+      port: target.port,
+      path: '/v1/messages',
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        'x-claude-code-session-id': 'session-stream',
+        'x-stream-forever': '1',
+      },
+    });
+    stream.on('error', () => {});
+    cleanupAfterTest(async () => stream.destroy());
+    stream.end(JSON.stringify({ model: 'sonnet' }));
+    assert.ok(await waitFor(() => streams.length === 1), '長時間 SSE が上流まで届く');
+
+    // 応答中の行は落とさない（maxSessions=1 でも退避されない）。
+    assert.equal((await ask({ sid: 'session-two' })).status, 200);
+    assert.deepEqual(eventLines(logLines, 'affinity_evict'), [], '応答終了まで表の行を保持する');
+
+    stream.destroy();
+    assert.ok(await waitFor(() => upstreamClosed.length === 1), 'abort が proxy まで伝わる');
+    assert.equal((await ask({ sid: 'session-three' })).status, 200);
+
+    const evicted = eventLines(logLines, 'affinity_evict');
+    assert.ok(evicted.length >= 1, '解放された行は容量退避の対象へ戻る');
+    assert.match(evicted[0], / reason=capacity /);
+    assert.ok(
+      evicted.some(line => line.includes(` sid=${sidHash('session-stream')} `)),
+      '切られた SSE の行が退避された',
+    );
   });
 });

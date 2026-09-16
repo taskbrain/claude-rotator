@@ -5,6 +5,7 @@ import https from 'node:https';
 import {
   familyQuotaExhaustedOnly,
   isAuthExpiredReason,
+  isCommonQuotaExhausted,
   isCredentialRefreshCooldown,
   isUnifiedQuotaExhaustion,
 } from './account-manager.js';
@@ -42,6 +43,13 @@ import {
   resolveOpenAiBridgeSettings,
   shouldRouteToOpenAiBridge,
 } from './openai-bridge.js';
+import {
+  SessionAffinity,
+  logSessionAffinityStartupNotice,
+  normalizeSessionAffinity,
+  sessionKeyFrom,
+  sidHash,
+} from './session-affinity.js';
 
 const HOP_HEADERS = new Set([
   'host',
@@ -257,6 +265,25 @@ export function createProxyServer({
   // degradeMapping の設定通知（設計書 §7.2・§7.3-4）。reload 時も同じ関数を呼ぶ。
   // degradeMapping を書いていない構成では1行も出ない。
   logDegradeMappingConfigNotice(openaiBridgeSettings, logger);
+
+  // sticky affinity（設計書 §4・§6・§7）。設定は必ず normalizeSessionAffinity() を通す
+  // ——生の config.sessionAffinity を渡すとクランプも未知 mode→off も効かない。
+  // `mode:"off"`（既定・未記載構成）では表そのものを作らず forwardWithRotation へも渡さない
+  // ので、応答もログも現行とバイト単位で同一になる。起動時の1行（U17）も出ない。
+  const sessionAffinitySettings = normalizeSessionAffinity(config.sessionAffinity);
+  logSessionAffinityStartupNotice(sessionAffinitySettings, {
+    switchThreshold: accountManager.switchThreshold,
+    logger,
+  });
+  const sessionAffinity = sessionAffinitySettings.mode === 'off'
+    ? null
+    : new SessionAffinity({
+      idleTtlMs: sessionAffinitySettings.idleTtlMs,
+      maxSessions: sessionAffinitySettings.maxSessions,
+      // 台帳と同じ時計を読む（試験クロックを注入した検証で TTL がずれない）。
+      now: () => accountManager.now(),
+      logger,
+    });
 
   // GPT プール状態（設計書 §11.1 R3-4・契約 §C10.2）。プロセス内メモリだけで持ち、
   // degradeMapping が無効な構成では生成しない（null＝forwardToOpenAiBridge へも渡らず、
@@ -569,6 +596,8 @@ export function createProxyServer({
         ...(openaiBridgeSettings.degradeMapping?.enabled === true
           ? { exhaustionMapper: applyClaudeExhaustionMapping }
           : {}),
+        // mode:"off" では渡さない（現行と完全に同一の経路）。
+        ...(sessionAffinity ? { sessionAffinity, sessionAffinitySettings } : {}),
       });
       await persistState();
     } catch (error) {
@@ -1396,6 +1425,139 @@ function isFableRoutingModelId(value) {
   return /^claude-fable-\d/.test(value.trim().toLowerCase());
 }
 
+/**
+ * 1要求分の sticky affinity（設計書 §4.1・§4.4・§7.1）。
+ *
+ * 返すのは ①proxy 行へ足す `sid` / `aff` / `fam` ②`select()`＝§4.1 の選択
+ * ③`confirm()`＝§4.4 ②の確定 ④F9 の解放、の4つだけを持つ小さな状態である。
+ * `mode:"off"` では呼び出し側が表を作らないので、この関数は `null` を返す。
+ * `mode:"observe"` は鍵の抽出とログだけを行い、口座の選択は現行のまま（§6）。
+ *
+ * @returns {object|null} 要求スコープの状態。affinity が無効なら `null`。
+ */
+function createSessionAffinityRequest({
+  req,
+  res,
+  body,
+  modelFamily,
+  accountManager,
+  affinity,
+  settings,
+}) {
+  if (!affinity || !settings || settings.mode === 'off') return null;
+  const key = sessionKeyFrom(req, body);
+  const state = {
+    sid: key ? sidHash(key) : null,
+    aff: 'none',
+    fam: modelFamily === 'fable' ? 'fable' : 'other',
+    pinned: settings.mode === 'on' && key !== null,
+    gen: null,
+    reservedId: null,
+    pendingReason: null,
+    select: () => null,
+    confirm: () => {},
+  };
+  if (!state.pinned) return state;
+
+  const threshold = accountManager.switchThreshold;
+  // 除外集合は必ず口座 id（文字列）で渡す（FU-60）。`attemptedAccountIds` は id の Set。
+  const assign = excludeAccountIds => accountManager.selectForNewAssignment({
+    modelFamily,
+    excludeAccountIds,
+    assignStopUtilization: settings.assignStopUtilization,
+    sessionCounts: affinity.summary().sessionsByAccount,
+  });
+
+  // ① 予約（§4.4 ①）。表を引き、結び付け先が使えるならそれを、使えないなら §4.1 の
+  //    条件で付け替え先を決めて、この同期区間で `Map.set` まで済ませる。
+  const entry = affinity.get(key, { modelFamily });
+  const bound = entry ? accountManager.findOrNull(entry.bound) : null;
+  let binding = null;
+  let sendTo = null;
+  let reason = null;
+  if (!entry) {
+    binding = assign(null);
+    sendTo = binding;
+  } else if (!bound) {
+    // 口座が台帳から消えた（F2）。予約段では付け替えてよい（D-142）。
+    binding = assign(null);
+    sendTo = binding;
+    reason = binding ? 'account_removed' : null;
+  } else if (accountManager.isAvailable(bound, modelFamily)) {
+    binding = bound;
+    sendTo = bound;
+  } else if (familyQuotaExhaustedOnly(bound, threshold, modelFamily, accountManager.now())) {
+    // 当該系統枠だけが枯れた: その系統専用の副バインドを1つ作る（D-54-3・D-56-3）。
+    binding = assign([bound.id]);
+    sendTo = binding;
+    reason = binding ? 'family_exhausted' : null;
+  } else if (isCommonQuotaExhausted(bound, threshold)) {
+    // 共通枠が枯れた: 使えなかった結び付け先だけを付け替える（D-56-4・D-63 C2）。
+    // 猶予（D-60-2・§4.3.1）は R-S10 の範囲なのでここでは待たない。
+    binding = assign([bound.id]);
+    sendTo = binding;
+    reason = binding ? 'common_exhausted' : null;
+  } else {
+    // 認証失敗・throttled・資格情報 cooldown・短期レート制限: バインドは変えず、
+    // この要求だけ別の口座で完走させる（D-56-3・D-63 C3・§4.3 の表）。
+    binding = bound;
+    sendTo = assign([bound.id]);
+  }
+
+  if (binding) {
+    const reserved = affinity.note(key, { account: binding.id, modelFamily, reason });
+    if (reserved) {
+      state.gen = reserved.gen;
+      state.aff = reserved.disposition;
+      state.reservedId = reserved.account;
+      // F9: 応答が終わるまで表の行を保持し、`close` / `abort` でも必ず解放する。
+      const release = affinity.hold(key);
+      res.once('close', release);
+      if (res.destroyed || res.writableEnded) release();
+    }
+  }
+
+  let pending = sendTo;
+  let firstSelect = true;
+  state.select = attemptedAccountIds => {
+    if (firstSelect) {
+      firstSelect = false;
+      return pending;
+    }
+    // 2周目以降。表はここでは書かず、確定（②）が枠の枯渇由来のときだけ書き換える。
+    const current = affinity.get(key, { modelFamily });
+    const previous = current ? accountManager.findOrNull(current.bound) : null;
+    state.pendingReason = quotaRebindReason(previous, threshold, modelFamily, accountManager.now());
+    pending = assign(attemptedAccountIds);
+    return pending;
+  };
+  state.confirm = account => {
+    if (state.gen === null) return;
+    // `aff` はこの要求が実際にどの口座へ行ったかを表す（§7.4 の遷移回数と揃える）。
+    if (account.id !== state.reservedId) state.aff = 'switch';
+    const confirmed = affinity.note(key, {
+      account: account.id,
+      modelFamily,
+      expectedGen: state.gen,
+      reason: state.pendingReason,
+    });
+    if (confirmed && confirmed.disposition !== 'stale') state.gen = confirmed.gen;
+    state.pendingReason = null;
+  };
+  return state;
+}
+
+/**
+ * 確定（§4.4 ②）で付け替えてよい理由（D-63 C3・D-142）。枠の枯渇以外は `null` を返し、
+ * その要求だけ別の口座で完走させて表は元の口座を指したままにする。
+ */
+function quotaRebindReason(account, threshold, modelFamily, now) {
+  if (!account) return null;
+  if (familyQuotaExhaustedOnly(account, threshold, modelFamily, now)) return 'family_exhausted';
+  if (isCommonQuotaExhausted(account, threshold)) return 'common_exhausted';
+  return null;
+}
+
 function routingModelFamily(body) {
   try {
     const model = JSON.parse(body.toString('utf8'))?.model;
@@ -1954,6 +2116,8 @@ async function forwardWithRotation({
   upstreamConnectRetries,
   upstreamConnectRetryDelayMs,
   exhaustionMapper = null,
+  sessionAffinity = null,
+  sessionAffinitySettings = null,
 }) {
   const maxAttempts = Math.max(1, accountManager.accounts.length);
   const attemptedAccountIds = new Set();
@@ -1969,6 +2133,24 @@ async function forwardWithRotation({
   // suffix must still route away from a Fable-exhausted account, unlike the
   // strict `requestModelFamily` used to gate reactive Usage confirmation.
   const modelFamily = routingModelFamily(body);
+  // 設計書 §4.4 ①: 鍵の抽出と予約は、最初の `await` より前のこの同期区間で終える。
+  // Node は単一スレッドなのでここへ他の要求は割り込めない（ロックは要らない）。
+  // 鍵の抽出が `shouldRouteToOpenAiBridge` より後であることも重要で、gpt-* 宛の要求は
+  // そもそもこの関数へ来ない（§1・R9）。
+  const affinityRequest = createSessionAffinityRequest({
+    req,
+    res,
+    body,
+    modelFamily,
+    accountManager,
+    affinity: sessionAffinity,
+    settings: sessionAffinitySettings,
+  });
+  // 設計書 §4.1 の `selectAccountForRequest`。鍵を持たない要求と `mode:"on"` 以外では
+  // 現行の `getActiveAccount` をそのまま呼ぶ（R-S1 の `trigger='request'` も同じ契機で渡す）。
+  const selectAccountForRequest = () => (affinityRequest?.pinned
+    ? affinityRequest.select(attemptedAccountIds)
+    : accountManager.getActiveAccount(modelFamily, { trigger: 'request' }));
   // 設計書 §4.2: 7系統すべてが通る単一の判定点。modelFamily をここで束ねてから
   // 下位（P-a / P-c〜P-g）へ渡す。null なら下位も一切受け取らない＝現行と同一。
   const mapExhaustion = exhaustionMapper
@@ -2010,7 +2192,7 @@ async function forwardWithRotation({
       : null;
     const account = reactiveQuotaRetryUsed
       ? reactiveSelection?.account
-      : accountManager.getActiveAccount(modelFamily, { trigger: 'request' });
+      : selectAccountForRequest();
     if (!account) {
       if (reactiveQuotaRetryUsed && lastRetryableResponse) {
         sendLastRetryable();
@@ -2023,6 +2205,7 @@ async function forwardWithRotation({
         logger,
         modelFamily,
         exhaustionMapper: mapExhaustion,
+        affinityLog: affinityRequest,
       })) return;
       if (lastRetryableResponse) {
         sendLastRetryable();
@@ -2046,6 +2229,7 @@ async function forwardWithRotation({
         upstreamConnectRetryDelayMs,
         modelFamily,
         exhaustionMapper: mapExhaustion,
+        affinityLog: affinityRequest,
       })) return;
       sendUnavailableAccounts(res, accountManager, mapExhaustion);
       return;
@@ -2184,6 +2368,9 @@ async function forwardWithRotation({
       return;
     }
     attemptedAccountIds.add(account.id);
+    // 設計書 §4.4 ②: 実際に上流へ送ると決まった口座で予約を確定する。世代が進んで
+    // いれば遅着として捨て（`affinity_stale`）、付け替えるのは枠の枯渇由来のときだけ。
+    affinityRequest?.confirm(account);
     // 設計書 §5.1（D-54-12）: 系統枠だけが枯れた 429 では currentIndex を動かさない。
     // その口座は他の系統では現役のままなので、先回り経路（getActiveAccount の
     // `leave currentIndex untouched`）と同じく、この要求の送信先としてだけ候補を使う。
@@ -2221,6 +2408,7 @@ async function forwardWithRotation({
       upstreamConnectRetries,
       upstreamConnectRetryDelayMs,
       exhaustionMapper: mapExhaustion,
+      affinityLog: affinityRequest,
     });
     if (!accountManager.accounts.includes(account)) {
       finishStaleAccountResponse(res, result.passthroughResponse, mapExhaustion);
@@ -2270,6 +2458,7 @@ async function forwardWithRotation({
         upstreamConnectRetries,
         upstreamConnectRetryDelayMs,
         exhaustionMapper: mapExhaustion,
+        affinityLog: affinityRequest,
       });
       if (!accountManager.accounts.includes(account)) {
         finishStaleAccountResponse(res, retryResult.passthroughResponse, mapExhaustion);
@@ -2327,6 +2516,7 @@ async function forwardWithRotation({
       logger,
       modelFamily,
       exhaustionMapper: mapExhaustion,
+      affinityLog: affinityRequest,
     })) return;
     if (lastRetryableResponse) {
       sendLastRetryable();
@@ -2350,6 +2540,7 @@ async function forwardWithRotation({
       upstreamConnectRetryDelayMs,
       modelFamily,
       exhaustionMapper: mapExhaustion,
+      affinityLog: affinityRequest,
     })) return;
     sendUnavailableAccounts(res, accountManager, mapExhaustion);
   }
@@ -2373,6 +2564,7 @@ async function forwardCurrentUnavailableAccount({
   upstreamConnectRetryDelayMs,
   modelFamily = null,
   exhaustionMapper = null,
+  affinityLog = null,
 }) {
   if (sendCurrentQuotaUnavailableResponse({
     req,
@@ -2381,6 +2573,7 @@ async function forwardCurrentUnavailableAccount({
     logger,
     modelFamily,
     exhaustionMapper,
+    affinityLog,
   })) return true;
 
   const account = accountManager.getFallbackAccount();
@@ -2448,6 +2641,7 @@ async function forwardCurrentUnavailableAccount({
     upstreamConnectRetries,
     upstreamConnectRetryDelayMs,
     exhaustionMapper,
+    affinityLog,
   });
   return true;
 }
@@ -2778,6 +2972,7 @@ async function forwardOnce({
   account,
   secret,
   accountManager,
+  affinityLog = null,
   passthroughErrors = false,
   reactiveQuotaConfirmer = null,
   allowReactiveQuotaConfirmation = false,
@@ -2916,6 +3111,7 @@ async function forwardOnce({
       recordProxyRequest({
         accountManager,
         logger,
+        affinityLog,
         account,
         method: req.method,
         path: target.pathname,
@@ -2980,6 +3176,7 @@ async function forwardOnce({
     recordProxyRequest({
       accountManager,
       logger,
+      affinityLog,
       account,
       method: req.method,
       path: target.pathname,
@@ -3343,6 +3540,8 @@ function outcomeForResponse(outcome, statusCode) {
 function recordProxyRequest({
   accountManager,
   logger,
+  // sticky affinity の1要求分の状態（§7.1）。`mode:"off"` では渡らないので null。
+  affinityLog = null,
   account,
   method,
   path,
@@ -3369,7 +3568,20 @@ function recordProxyRequest({
     durationMs,
     errorType,
   });
-  writeProxyLog(logger, event, degradeLog);
+  writeProxyLog(logger, event, degradeLog, affinityLog);
+}
+
+/**
+ * proxy ログ行へ足す sticky affinity の3項目（設計書 §7.1・D-95）。
+ * `sid` は 48bit ハッシュで、生のセッション id は出さない（R7・D-54-1）。`aff` は
+ * `bound` / `new` / `switch` / `none` の4値、`fam` は `fable` / `other` の2値。
+ * `mode:"off"` では呼び出し側が null を渡すので空文字列になり、行は現行とバイト同一。
+ * 追記は末尾で、順序に依存しない読み方をすること（§7.1・D-63 記載是正⑤）。
+ */
+function affinityLogFields(affinityLog) {
+  if (!affinityLog) return '';
+  const sid = affinityLog.sid ? ` sid=${affinityLog.sid}` : '';
+  return `${sid} aff=${affinityLog.aff} fam=${affinityLog.fam}`;
 }
 
 /**
@@ -3386,7 +3598,7 @@ function degradeLogFields(degradeLog) {
   ));
 }
 
-function writeProxyLog(logger, event, degradeLog = null) {
+function writeProxyLog(logger, event, degradeLog = null, affinityLog = null) {
   if (!logger) return;
   const fields = [
     `${event.at} proxy`,
@@ -3400,7 +3612,7 @@ function writeProxyLog(logger, event, degradeLog = null) {
   if (event.requestId) fields.push(`requestId=${event.requestId}`);
   if (event.errorType) fields.push(`errorType=${event.errorType}`);
   // 追記は必ず末尾へ（§9.2）。値が1つも無ければ行は現行とバイト単位で同一になる。
-  logger(`${fields.join(' ')}${degradeLogFields(degradeLog)}`);
+  logger(`${fields.join(' ')}${degradeLogFields(degradeLog)}${affinityLogFields(affinityLog)}`);
 }
 
 function syntheticUpstreamErrorResponse(error) {
@@ -3426,6 +3638,7 @@ function sendCurrentQuotaUnavailableResponse({
   logger,
   modelFamily = null,
   exhaustionMapper = null,
+  affinityLog = null,
 }) {
   let account = accountManager.getCurrentAccount();
   // Use the modelFamily-aware reason so a non-matching-family request never
@@ -3451,6 +3664,7 @@ function sendCurrentQuotaUnavailableResponse({
   recordProxyRequest({
     accountManager,
     logger,
+    affinityLog,
     account,
     method: req.method,
     path: new URL(req.url, 'http://claude-rotator.local').pathname,

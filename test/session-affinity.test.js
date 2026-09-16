@@ -297,6 +297,32 @@ describe('SessionAffinity generations', () => {
     assert.equal(linesOf(logger, 'affinity_switch').length, 0);
   });
 
+  it('never rebinds on account_removed at the confirmation stage (D-142)', () => {
+    // 確定段で付け替えてよい理由は枠の枯渇（共通枠・当該系統枠）の2値だけである。
+    // 台帳から口座が消えたことは予約段（affinity_switch）と退避段（affinity_evict）の
+    // 事象であり、送信直前の確定でバインドを動かす理由にはならない（D-142）。
+    const { affinity, logger } = createAffinity();
+    const reserved = reserve(affinity, SESSION_ID, 'acct-a');
+
+    const confirmed = affinity.note(SESSION_ID, {
+      account: 'acct-b',
+      expectedGen: reserved.gen,
+      reason: 'account_removed',
+    });
+
+    assert.equal(confirmed.disposition, 'bound');
+    assert.equal(affinity.get(SESSION_ID).home, 'acct-a');
+    assert.equal(affinity.get(SESSION_ID).gen, reserved.gen);
+    assert.equal(affinity.get(SESSION_ID).switches, 0);
+    assert.deepEqual(linesOf(logger, 'affinity_switch'), []);
+
+    // 予約段では同じ理由でそのまま付け替わる（予約段は2値に絞らない）。
+    const reserved2 = reserve(affinity, SESSION_ID, 'acct-b', { reason: 'account_removed' });
+    assert.equal(reserved2.disposition, 'switch');
+    assert.equal(affinity.get(SESSION_ID).home, 'acct-b');
+    assert.equal(linesOf(logger, 'affinity_switch').length, 1);
+  });
+
   it('rebinds on a quota exhaustion and counts one switch', () => {
     const { affinity, logger } = createAffinity();
     const reserved = reserve(affinity, SESSION_ID, 'acct-a');
@@ -758,6 +784,56 @@ const FULL_SECTION = {
   rebindGraceMs: 30_000,
   persist: false,
 };
+
+describe('SessionAffinity holds (F9)', () => {
+  it('keeps a held row through a ttl sweep and drops it once the response is released', () => {
+    const { affinity, clock, logger } = createAffinity({ idleTtlMs: 60_000 });
+    reserve(affinity, SESSION_ID, 'acct-a');
+    const release = affinity.hold(SESSION_ID);
+
+    clock.ms += 61_000;
+
+    assert.deepEqual(affinity.prune(), [], '応答中の行は TTL でも落とさない');
+    assert.equal(affinity.get(SESSION_ID).home, 'acct-a');
+
+    release();
+    const evicted = affinity.prune();
+
+    assert.deepEqual(evicted.map(record => record.reason), ['ttl']);
+    assert.equal(affinity.size, 0);
+    assert.equal(linesOf(logger, 'affinity_evict').length, 1);
+  });
+
+  it('keeps a held row when the capacity is reached and reclaims it after release', () => {
+    const { affinity } = createAffinity({ maxSessions: 1 });
+    reserve(affinity, 'session-stream', 'acct-a');
+    const release = affinity.hold('session-stream');
+
+    reserve(affinity, 'session-two', 'acct-b');
+
+    assert.equal(affinity.size, 2, '応答中の行も、作ったばかりの行も退避しない');
+    release();
+    reserve(affinity, 'session-three', 'acct-c');
+
+    assert.equal(affinity.get('session-stream'), null);
+    assert.equal(affinity.size, 1);
+  });
+
+  it('releases only once and ignores an unknown key', () => {
+    const { affinity } = createAffinity({ maxSessions: 1 });
+    reserve(affinity, 'session-one', 'acct-a');
+    const release = affinity.hold('session-one');
+    release();
+    release();
+    assert.equal(typeof affinity.hold('session-missing'), 'function');
+    assert.equal(typeof affinity.hold(''), 'function');
+
+    reserve(affinity, 'session-two', 'acct-b');
+
+    assert.equal(affinity.get('session-one'), null, '二重解放で保持数が負にならない');
+    assert.equal(affinity.size, 1);
+  });
+});
 
 describe('normalizeSessionAffinity (R-S6 / 設計書 §6)', () => {
   it('falls back to the shared defaults when the section is absent or is not an object', () => {

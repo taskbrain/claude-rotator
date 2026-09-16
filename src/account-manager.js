@@ -1448,12 +1448,24 @@ function compareNewAssignmentCandidates(left, right) {
   return left.index - right.index;
 }
 
+/**
+ * The exclusion set is addressed by account id (FU-60). An earlier version put
+ * every element of any iterable straight into a Set, so an account OBJECT was
+ * accepted silently and then never matched an id - the caller believed it had
+ * excluded an account while the selector could still return it. Only strings
+ * and account-shaped objects (`{ id }`) are honoured now; anything else is
+ * dropped instead of becoming an entry that can never match.
+ */
 function normalizeExcludedAccountIds(value) {
   if (!value) return new Set();
-  if (value instanceof Set) return value;
   if (typeof value === 'string') return new Set([value]);
-  if (typeof value[Symbol.iterator] === 'function') return new Set(value);
-  return new Set();
+  if (typeof value[Symbol.iterator] !== 'function') return new Set();
+  const excluded = new Set();
+  for (const item of value) {
+    if (typeof item === 'string' && item !== '') excluded.add(item);
+    else if (item && typeof item.id === 'string' && item.id !== '') excluded.add(item.id);
+  }
+  return excluded;
 }
 
 function normalizeAssignStopUtilization(value) {

@@ -2701,6 +2701,34 @@ describe('selectForNewAssignment (D-56-1 / D-60-4 / 設計書 §4.2)', () => {
     assert.equal(manager.selectForNewAssignment({ excludeAccountIds: ['cand1', 'cand2'] }), null);
   });
 
+  it('reads an account object or a plain id in the exclusion set and ignores anything else (FU-60)', () => {
+    // 除外集合は口座 id（文字列）で渡すのが結線側の約束（R-S7）。口座オブジェクトが
+    // 紛れ込んでも黙って一致しないまま通すのではなく id を取り出し、それ以外の値は
+    // 集合へ入れない——旧実装は任意の反復可能物をそのまま Set にしていた（FU-60）。
+    const manager = makeManager(['cand1', 'cand2', 'cand3']);
+    setWindows(manager, 'cand1', { fiveHour: 0.90, weekly: 0.90 });
+    setWindows(manager, 'cand2', { fiveHour: 0.80, weekly: 0.80 });
+    setWindows(manager, 'cand3', { fiveHour: 0.40, weekly: 0.40 });
+
+    assert.equal(
+      manager.selectForNewAssignment({ excludeAccountIds: [manager.find('cand1')] })?.id,
+      'cand2',
+      '口座オブジェクトは id として読む',
+    );
+    assert.equal(
+      manager.selectForNewAssignment({
+        excludeAccountIds: [manager.find('cand1'), 'cand2', null, 42, {}, undefined],
+      })?.id,
+      'cand3',
+      '文字列と口座オブジェクトだけが効き、残りは無視される',
+    );
+    assert.equal(
+      manager.selectForNewAssignment({ excludeAccountIds: [null, 42, {}, ['cand1']] })?.id,
+      'cand1',
+      '非 id の値は誰も除外しない',
+    );
+  });
+
   it('lets the weekly-reset priority decide only inside the band', () => {
     const manager = makeManager(['soon', 'late']);
     setWindows(manager, 'soon', { fiveHour: 0.80, weekly: 0.90, weeklyResetAt: SOON_WEEKLY });

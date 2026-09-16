@@ -58,6 +58,10 @@ const SID_HASH_PATTERN = /^[0-9a-f]{12}$/;
 // 来たときは表を書き換えない——認証失敗・throttled・error・上流 5xx・切断・timeout・短期
 // レート制限は、その要求だけ別の口座で完走させ、次の要求は元の口座へ戻す（D-63 C3）。
 const REBIND_REASONS = new Set(['common_exhausted', 'family_exhausted', 'account_removed']);
+// 確定（§4.4 ②）で付け替えてよい理由は枠の枯渇の2値だけである（D-142）。台帳から口座が
+// 消えたことは予約段（`affinity_switch`）と退避段（`affinity_evict`）の事象であって、
+// 送信直前にバインドを動かす理由にはならない。
+const CONFIRM_REBIND_REASONS = new Set(['common_exhausted', 'family_exhausted']);
 // 退避の理由（§7.2 の `affinity_evict` ＋ §8.1 の reload で台帳から消えた口座）。
 const EVICT_REASONS = new Set(['ttl', 'capacity', 'credential_changed', 'account_removed']);
 const UNKNOWN_REASON = 'unknown';
@@ -299,7 +303,8 @@ export class SessionAffinity {
     const evicted = [];
 
     for (const [hash, entry] of [...this.entries]) {
-      if (this.expired(entry, now)) {
+      // F4 の丸めは保持中でも行うので、判定は必ず expired() を通す。
+      if (this.expired(entry, now) && !held(entry)) {
         evicted.push(this.dropEntry(hash, entry, 'ttl', now));
         continue;
       }
@@ -344,6 +349,28 @@ export class SessionAffinity {
       }
     }
     return evicted;
+  }
+
+  /**
+   * 応答が終わるまで表の行を保持する（§9 F9）。長時間 SSE の途中で TTL・容量の退避に
+   * 落とされると、確定（§4.4 ②）が行を見失い、次の要求が別の口座へ載る。
+   * 戻り値は解放する関数で、二重に呼んでも保持数は負にならない。
+   * `close` / `abort` を含む応答終了で**必ず**呼ぶこと。
+   *
+   * @param {unknown} key セッション鍵。
+   * @returns {() => void} 解放する関数（鍵が使えない・行が無いときは何もしない）。
+   */
+  hold(key) {
+    const hash = sidHash(key);
+    const entry = hash ? this.entries.get(hash) : null;
+    if (!entry) return () => {};
+    entry.holds = (entry.holds ?? 0) + 1;
+    let released = false;
+    return () => {
+      if (released) return;
+      released = true;
+      entry.holds = Math.max(0, (entry.holds ?? 1) - 1);
+    };
   }
 
   /**
@@ -531,6 +558,8 @@ export class SessionAffinity {
     const entry = this.entries.get(hash);
     if (!entry) return null;
     if (!this.expired(entry, now)) return entry;
+    // F9: 応答中の行は落とさない。解放されてから次の掃除で落ちる。
+    if (held(entry)) return entry;
     this.dropEntry(hash, entry, 'ttl', now);
     return null;
   }
@@ -554,7 +583,7 @@ export class SessionAffinity {
         switches: 0,
       };
       this.entries.set(hash, created);
-      this.trimToCapacity(now);
+      this.trimToCapacity(now, hash);
       this.write(now, `affinity_bind sid=${hash} account=${account} reason=new_session sessions=${this.entries.size}`);
       return result(hash, account, created, 'new', 'home', 'new_session');
     }
@@ -588,7 +617,7 @@ export class SessionAffinity {
     if (bound === account) return result(hash, account, entry, 'bound', null, reason);
     // 枠の枯渇由来のときだけ付け替える。一時障害（認証失敗・throttled・error・上流 5xx・
     // 切断・timeout・短期レート制限）では表を書き換えない（D-63 C3・§4.3 の表）。
-    if (!REBIND_REASONS.has(reason)) return result(hash, bound, entry, 'bound', null, reason);
+    if (!CONFIRM_REBIND_REASONS.has(reason)) return result(hash, bound, entry, 'bound', null, reason);
     return this.rebind(hash, entry, { account, modelFamily, reason, now, gen: expectedGen + 1 });
   }
 
@@ -624,11 +653,19 @@ export class SessionAffinity {
     this.entries.set(hash, entry);
   }
 
-  trimToCapacity(now) {
+  trimToCapacity(now, protectedHash = null) {
     const evicted = [];
     while (this.entries.size > this.maxSessions) {
-      const [hash, entry] = this.entries.entries().next().value;
-      evicted.push(this.dropEntry(hash, entry, 'capacity', now));
+      // 古い順に、応答中（F9）でも作ったばかりでもない行を1つ選ぶ。候補が無ければ
+      // 容量超過を一時的に許す——要求は必ず通す方を優先する（R1）。
+      let victim = null;
+      for (const candidate of this.entries) {
+        if (candidate[0] === protectedHash || held(candidate[1])) continue;
+        victim = candidate;
+        break;
+      }
+      if (!victim) break;
+      evicted.push(this.dropEntry(victim[0], victim[1], 'capacity', now));
     }
     return evicted;
   }
@@ -650,6 +687,11 @@ export class SessionAffinity {
     if (!this.logger) return;
     this.logger(`${new Date(now).toISOString()} ${line}`);
   }
+}
+
+// F9 の保持数。復元・保存には現れない（`export` は項目を明示して組み立てる）。
+function held(entry) {
+  return (entry.holds ?? 0) > 0;
 }
 
 function snapshot(hash, entry, modelFamily) {
