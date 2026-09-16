@@ -10,7 +10,8 @@ import {
 } from '../src/session-affinity.js';
 
 // sticky affinity の鍵・表・世代番号（設計書 v1.5 §2 / §3 / §4.4 / §8 / §9）。
-// このファイルは src/session-affinity.js だけを見る単体テストであり、HTTP も fs も触らない。
+// このファイルは src/session-affinity.js の単体テストであり（未記載構成の確認に限り src/config.js の
+// createDefaultConfig も読む）、HTTP も fs も触らない。
 // 時刻はすべて注入したクロックから読むので、TTL・LRU・savedAt を決定的に検証できる。
 
 const SESSION_ID = 'bae7a638-9f3a-4b7c-8d21-0f4e6c2a11b9';
@@ -1081,5 +1082,124 @@ describe('logSessionAffinityStartupNotice (R-S6 / U17)', () => {
       { switchThreshold: undefined, logger: line => lines.push(line), now: START_MS },
     );
     assert.deepEqual(lines, [`${isoAt(START_MS)} affinity config mode=on switchThreshold=unknown`]);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// reload のモード記憶と表の変化通知（R-S11 / FU-69・D-175・設計書 §6・§8）
+//
+// FU-69: 直前のモードを結線側が渡す方式だと、渡し忘れた瞬間に「有効→off」の
+// `affinity_disabled` が黙って消える。モードはインスタンスが持ち、`applySettings` は
+// 明示の `previousMode` が無ければ自分の値を使う。
+//
+// 表の変化通知（`onChange`）は永続化の dirty 判定の唯一の入口である。バインドが
+// 変わったときだけ呼ばれ、`lastSeen` の更新（再訪）では呼ばれない（設計書 §8）。
+// ---------------------------------------------------------------------------
+
+describe('SessionAffinity mode memory and change notice (R-S11 / FU-69)', () => {
+  function createTracked(overrides = {}) {
+    const clock = { ms: overrides.startMs ?? START_MS };
+    const logger = overrides.logger ?? collectingLogger();
+    const changes = [];
+    const affinity = new SessionAffinity({
+      mode: overrides.mode ?? 'on',
+      idleTtlMs: overrides.idleTtlMs ?? 21_600_000,
+      maxSessions: overrides.maxSessions ?? 10_000,
+      now: () => clock.ms,
+      logger,
+      onChange: () => changes.push(affinity.size),
+    });
+    return { affinity, clock, logger, changes };
+  }
+
+  it('remembers the mode it was built with and reports it', () => {
+    const { affinity } = createTracked({ mode: 'observe' });
+
+    assert.equal(affinity.mode, 'observe');
+    assert.equal(new SessionAffinity().mode, 'off', '既定は off（R-S6 の未記載構成と同じ）');
+  });
+
+  it('uses its own mode as previousMode when the caller does not pass one', () => {
+    const { affinity, clock, logger } = createTracked({ mode: 'on' });
+    reserve(affinity, 'session-a', 'acct-a');
+    reserve(affinity, 'session-b', 'acct-b');
+
+    // 結線側が previousMode を渡し忘れても、有効→off の1行は消えない（FU-69）。
+    const result = affinity.applySettings({ mode: 'off' });
+
+    assert.equal(result.previousMode, 'on');
+    assert.equal(affinity.size, 0);
+    assert.deepEqual(linesOf(logger, 'affinity_disabled'), [
+      `${isoAt(clock.ms)} affinity_disabled sessions=2`,
+    ]);
+  });
+
+  it('records the new mode so a second reload to off stays silent', () => {
+    const { affinity, logger } = createTracked({ mode: 'on' });
+    reserve(affinity, 'session-a', 'acct-a');
+
+    affinity.applySettings({ mode: 'off' });
+    affinity.applySettings({ mode: 'off' });
+
+    assert.equal(affinity.mode, 'off');
+    assert.equal(linesOf(logger, 'affinity_disabled').length, 1, '2回目の reload では出さない');
+  });
+
+  it('starts from an empty table when its own mode was off and the reload enables it', () => {
+    const { affinity, logger } = createTracked({ mode: 'off' });
+    reserve(affinity, 'session-a', 'acct-a');
+
+    const result = affinity.applySettings({ mode: 'on' });
+
+    assert.equal(result.previousMode, 'off');
+    assert.equal(affinity.mode, 'on');
+    assert.equal(affinity.size, 0, 'off→on は空表から開始する（§6）');
+    assert.deepEqual(linesOf(logger, 'affinity_disabled'), []);
+  });
+
+  it('still honours an explicit previousMode over its own', () => {
+    const { affinity, logger } = createTracked({ mode: 'off' });
+    reserve(affinity, 'session-a', 'acct-a');
+
+    const result = affinity.applySettings({ mode: 'off' }, { previousMode: 'on' });
+
+    assert.equal(result.previousMode, 'on');
+    assert.equal(linesOf(logger, 'affinity_disabled').length, 1);
+  });
+
+  it('notifies onChange for a new binding, a rebind and an eviction', () => {
+    const { affinity, changes } = createTracked();
+
+    reserve(affinity, 'session-a', 'acct-a');
+    assert.equal(changes.length, 1, '新規バインド');
+
+    reserve(affinity, 'session-a', 'acct-b', { reason: 'quota-exhausted' });
+    assert.equal(changes.length, 2, '付け替え');
+
+    affinity.evictAccounts(['acct-b']);
+    assert.equal(changes.length, 3, '退避');
+  });
+
+  it('does not notify onChange when a bound session is simply revisited', () => {
+    const { affinity, clock, changes } = createTracked();
+    reserve(affinity, 'session-a', 'acct-a');
+    const afterBind = changes.length;
+
+    clock.ms += 1_000;
+    reserve(affinity, 'session-a', 'acct-a');
+    clock.ms += 1_000;
+    affinity.get('session-a');
+
+    assert.equal(changes.length, afterBind, 'lastSeen の更新だけでは表は「変わっていない」');
+  });
+
+  it('notifies onChange when a reload to off discards the table', () => {
+    const { affinity, changes } = createTracked({ mode: 'on' });
+    reserve(affinity, 'session-a', 'acct-a');
+    const afterBind = changes.length;
+
+    affinity.applySettings({ mode: 'off' });
+
+    assert.equal(changes.length, afterBind + 1);
   });
 });

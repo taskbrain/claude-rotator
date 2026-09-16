@@ -12231,3 +12231,588 @@ describe('session affinity rebind grace (R-S10)', () => {
     assert.deepEqual(eventLines(logLines, 'affinity_switch'), [], 'バインドも変えない');
   });
 });
+
+// ---------------------------------------------------------------------------
+// 永続化・復元・reload の結線（R-S11 / 設計書 v1.5 §8・§8.1・§6・F1/F4/F5/F10）
+//
+// 固定するのは次の3群である。
+//   (a) 保存: 既存の runtime-state.json へ相乗りし、新しいファイルは作らない。
+//       `mode:"off"`／`persist:false` では節そのものを書かない。保存 JSON に秘密・
+//       口座メール・生のセッション UUID が1つも無く、世代番号 `gen` も保存しない。
+//   (b) 復元: §8 の破棄条件①〜⑥（version／未来の savedAt／未知口座／TTL 超過／容量／
+//       資格情報の変化）と F1（壊れた保存データでも起動する）・F4（時計の逆行）。
+//   (c) reload: 設定の再正規化 → applySettings → U17 の通知 →
+//       evictAccounts(credential_changed) → prune(account_removed)（D-155 ①〜④）。
+//
+// 時刻は AccountManager へ注入したクロックから読む（SessionAffinity も同じ時計を使う）
+// ので、TTL・savedAt・ageMs はすべて決定的である。
+// ---------------------------------------------------------------------------
+
+describe('session affinity persistence and reload (R-S11)', () => {
+  // 生のセッション UUID が保存 JSON・ログへ出ないことを見るための既知の値。
+  const RAW_SESSION_ID = 'c7e1a904-5b6d-4f28-9a31-2e8b70d4f6c1';
+  const OTHER_SESSION_ID = 'd18f2b35-6c7e-4a19-b042-3f9c81e5a7d2';
+  const CLOCK_START_MS = Date.parse('2026-09-16T09:00:00.000Z');
+  // 追記が1つも無い現行の proxy 行（`mode:"off"` へ戻したあとで守る形）。
+  const LEGACY_PROXY_LINE = /^\d{4}-\d{2}-\d{2}T[\d:.]+Z proxy account=\S+ method=\S+ path=\S+ status=\S+ durationMs=\d+ outcome=[a-z-]+(?: requestId=\S+)?(?: errorType=\S+)?$/;
+
+  function eventLines(logLines, kind) {
+    return logLines.filter(line => line.includes(` ${kind} `));
+  }
+
+  function proxyLines(logLines) {
+    return logLines.filter(line => line.includes(' proxy account='));
+  }
+
+  function futureReset() {
+    return new Date(Date.now() + 7 * 24 * 60 * 60 * 1000).toISOString();
+  }
+
+  async function waitFor(predicate, timeoutMs = 2000) {
+    const startedAt = Date.now();
+    while (!predicate() && Date.now() - startedAt < timeoutMs) await sleep(5);
+    return predicate();
+  }
+
+  async function startPersisting({
+    accounts = ['acct_a', 'acct_b'],
+    sessionAffinity = { mode: 'on' },
+    savedState = null,
+    credentialChangedAccountIds = null,
+    reloadable = false,
+    stateWriter = null,
+    sessionAffinityPersistIntervalMs = null,
+    upstream: upstreamHandler = null,
+  } = {}) {
+    const logLines = [];
+    const seen = [];
+    const persisted = [];
+    const clock = { ms: CLOCK_START_MS };
+    const upstream = await listen(http.createServer((req, res) => {
+      seen.push(req.headers.authorization);
+      if (upstreamHandler && upstreamHandler({ req, res, seen }) === true) return;
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ ok: true }));
+    }));
+    const secretStore = new MemorySecretStore();
+    for (const id of accounts) {
+      await secretStore.set(id, {
+        accessToken: `token-${id}`,
+        refreshToken: `refresh-${id}`,
+        expiresAt: Date.now() + 3_600_000,
+      });
+    }
+    const logger = line => logLines.push(line);
+    const accountManager = new AccountManager({
+      // 口座のメールアドレスは台帳にだけ載る合成値。保存 JSON には出てはならない。
+      accounts: accounts.map(id => ({ id, name: `${id}@example.com`, type: 'oauth' })),
+      logger,
+      now: () => clock.ms,
+    });
+    // reload で差し替える設定はここに置き、両 reloader が同じものを読む。
+    const holder = {
+      accounts: accounts.map(id => ({ id, name: `${id}@example.com`, type: 'oauth' })),
+      sessionAffinity,
+    };
+    const proxy = await listen(createProxyServer({
+      accountManager,
+      secretStore,
+      logger,
+      savedState,
+      ...(credentialChangedAccountIds ? { credentialChangedAccountIds } : {}),
+      ...(sessionAffinityPersistIntervalMs == null
+        ? {}
+        : { sessionAffinityPersistIntervalMs }),
+      ...(reloadable
+        ? {
+          reloadAccounts: async () => holder.accounts,
+          reloadSessionAffinity: async () => holder.sessionAffinity,
+        }
+        : {}),
+      stateWriter: stateWriter || (async state => { persisted.push(state); }),
+      config: {
+        upstream: upstream.url,
+        usagePolling: { enabled: false },
+        ...(sessionAffinity ? { sessionAffinity } : {}),
+      },
+    }));
+    cleanupAfterTest(async () => { await close(proxy.server); await close(upstream.server); });
+
+    const ask = ({ sid = null, model = 'sonnet' } = {}) => requestJson(
+      `${proxy.url}/v1/messages`,
+      {
+        method: 'POST',
+        body: JSON.stringify({ model }),
+        headers: { ...(sid ? { 'x-claude-code-session-id': sid } : {}) },
+      },
+    );
+    const reload = () => requestJson(`${proxy.url}/internal/reload`, { method: 'POST' });
+    return {
+      proxy, upstream, seen, persisted, secretStore, accountManager,
+      logLines, logger, ask, reload, holder, clock,
+    };
+  }
+
+  // 保存済みの表を手で組む（復元の破棄条件を1つずつ狙うため）。
+  function savedTable(entries, { version = 1, savedAtMs = CLOCK_START_MS - 1_000 } = {}) {
+    return {
+      version: 1,
+      savedAt: new Date(savedAtMs).toISOString(),
+      currentAccount: 'acct_a',
+      accounts: [],
+      sessionAffinity: {
+        version,
+        savedAt: new Date(savedAtMs).toISOString(),
+        entries,
+      },
+    };
+  }
+
+  function entryFor(sid, account, { t = CLOCK_START_MS - 1_000, s = 0, f = null } = {}) {
+    return { k: sidHash(sid), a: account, ...(f ? { f } : {}), t, s };
+  }
+
+  // -- (a) 保存 ------------------------------------------------------------
+
+  it('rides along the existing runtime state instead of writing a second file', async () => {
+    const { ask, persisted } = await startPersisting();
+
+    assert.equal((await ask({ sid: RAW_SESSION_ID })).status, 200);
+
+    const saved = persisted.at(-1);
+    assert.ok(saved.accounts, '口座台帳の節はそのまま');
+    assert.equal(saved.sessionAffinity.version, 1);
+    assert.equal(saved.sessionAffinity.entries.length, 1);
+    assert.equal(saved.sessionAffinity.entries[0].a, 'acct_a');
+    assert.equal(saved.sessionAffinity.entries[0].k, sidHash(RAW_SESSION_ID));
+  });
+
+  it('keeps secrets, account mail addresses, the raw session id and gen out of the saved state', async () => {
+    const { ask, persisted } = await startPersisting();
+
+    await ask({ sid: RAW_SESSION_ID });
+    await ask({ sid: OTHER_SESSION_ID });
+
+    const saved = persisted.at(-1);
+    const text = JSON.stringify(saved);
+    for (const forbidden of [
+      RAW_SESSION_ID,
+      OTHER_SESSION_ID,
+      'token-acct_a',
+      'refresh-acct_a',
+      'acct_a@example.com',
+      'acct_b@example.com',
+    ]) {
+      assert.equal(text.includes(forbidden), false, `保存 JSON に ${forbidden} が入っている`);
+    }
+    for (const entry of saved.sessionAffinity.entries) {
+      assert.deepEqual(
+        Object.keys(entry).sort(),
+        ['a', 'k', 's', 't'],
+        '保存するのは ①ハッシュ ②口座ラベル ③副バインド ④epoch ms ⑤切替回数だけ',
+      );
+      assert.equal('gen' in entry, false, '世代番号は保存しない（D-60-1）');
+      assert.match(entry.k, /^[0-9a-f]{12}$/);
+    }
+  });
+
+  it('writes no sessionAffinity section at all while the mode is off', async () => {
+    const { ask, persisted, accountManager } = await startPersisting({ sessionAffinity: null });
+
+    assert.equal((await ask({ sid: RAW_SESSION_ID })).status, 200);
+
+    const saved = persisted.at(-1);
+    assert.equal('sessionAffinity' in saved, false);
+    // 時計を固定しているので savedAt まで含めてバイト同一を比べられる。
+    assert.equal(JSON.stringify(saved), JSON.stringify(accountManager.exportState()));
+  });
+
+  it('keeps the table in memory only when persist is false', async () => {
+    const { ask, persisted } = await startPersisting({
+      sessionAffinity: { mode: 'on', persist: false },
+    });
+
+    assert.equal((await ask({ sid: RAW_SESSION_ID })).status, 200);
+
+    assert.equal('sessionAffinity' in persisted.at(-1), false);
+  });
+
+  it('does not read a saved table back when persist is false', async () => {
+    const { ask, seen, logLines } = await startPersisting({
+      sessionAffinity: { mode: 'on', persist: false },
+      savedState: savedTable([entryFor(RAW_SESSION_ID, 'acct_b')]),
+    });
+
+    await ask({ sid: RAW_SESSION_ID });
+
+    assert.deepEqual(seen, ['Bearer token-acct_a'], '復元しないので新規割当になる');
+    assert.deepEqual(eventLines(logLines, 'affinity_restore'), []);
+  });
+
+  it('flushes a binding into the state within the persist interval while a long response is still open', async () => {
+    let release = null;
+    const held = new Promise(resolve => { release = resolve; });
+    const { ask, persisted } = await startPersisting({
+      sessionAffinityPersistIntervalMs: 25,
+      upstream: ({ res }) => {
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        held.then(() => res.end(JSON.stringify({ ok: true })));
+        return true;
+      },
+    });
+
+    const pending = ask({ sid: RAW_SESSION_ID });
+    const flushed = await waitFor(() => persisted.some(
+      state => state.sessionAffinity?.entries?.length === 1,
+    ));
+    release();
+    await pending;
+
+    assert.equal(flushed, true, 'バインドは応答の完了を待たずに保存される（5秒上限の合流）');
+  });
+
+  it('keeps serving and logs one warning when the state write fails (F10)', async () => {
+    const { ask, logLines } = await startPersisting({
+      stateWriter: async () => { throw new Error('disk full'); },
+    });
+
+    assert.equal((await ask({ sid: RAW_SESSION_ID })).status, 200, 'HTTP 処理は続く');
+
+    assert.ok(
+      await waitFor(() => logLines.some(line => line.includes('state persist failed: disk full'))),
+      '警告が1行出る',
+    );
+  });
+
+  // -- (b) 復元 ------------------------------------------------------------
+
+  it('⑩: a restart puts the same session back on the same account', async () => {
+    const first = await startPersisting();
+    await first.ask({ sid: RAW_SESSION_ID });
+    await first.ask({ sid: OTHER_SESSION_ID });
+    const saved = first.persisted.at(-1);
+    assert.deepEqual(first.seen, ['Bearer token-acct_a', 'Bearer token-acct_b']);
+
+    const second = await startPersisting({ savedState: saved });
+    // 空表から始めれば acct_a へ載る順番の要求を、わざと先に投げる。
+    await second.ask({ sid: OTHER_SESSION_ID });
+    await second.ask({ sid: RAW_SESSION_ID });
+
+    assert.deepEqual(second.seen, ['Bearer token-acct_b', 'Bearer token-acct_a']);
+    assert.deepEqual(eventLines(second.logLines, 'affinity_bind'), [], '新規バインドは1件も無い');
+    assert.deepEqual(
+      proxyLines(second.logLines).map(line => line.split(' aff=')[1].split(' ')[0]),
+      ['bound', 'bound'],
+    );
+  });
+
+  it('F1: starts with an empty table and logs one reason code when the saved table is unreadable', async () => {
+    const { ask, seen, logLines } = await startPersisting({
+      savedState: { version: 1, accounts: [], sessionAffinity: 'not-a-table' },
+    });
+
+    assert.equal((await ask({ sid: RAW_SESSION_ID })).status, 200, '起動も応答も成功させる');
+
+    const restore = eventLines(logLines, 'affinity_restore');
+    assert.equal(restore.length, 1);
+    assert.match(restore[0], / affinity_restore skipped=malformed$/);
+    assert.equal(restore[0].includes('not-a-table'), false, '本文はログへ出さない');
+    assert.deepEqual(seen, ['Bearer token-acct_a']);
+  });
+
+  it('①: drops the whole table when the saved version does not match', async () => {
+    const { logLines } = await startPersisting({
+      savedState: savedTable([entryFor(RAW_SESSION_ID, 'acct_b')], { version: 99 }),
+    });
+
+    assert.match(eventLines(logLines, 'affinity_restore')[0], / affinity_restore skipped=version$/);
+  });
+
+  it('②: drops the whole table when savedAt is in the future', async () => {
+    const { logLines } = await startPersisting({
+      savedState: savedTable(
+        [entryFor(RAW_SESSION_ID, 'acct_b')],
+        { savedAtMs: CLOCK_START_MS + 60_000 },
+      ),
+    });
+
+    assert.match(eventLines(logLines, 'affinity_restore')[0], / affinity_restore skipped=saved-at$/);
+  });
+
+  it('logs nothing when the saved state simply has no table yet', async () => {
+    const { ask, logLines } = await startPersisting({
+      savedState: { version: 1, savedAt: new Date(CLOCK_START_MS).toISOString(), accounts: [] },
+    });
+
+    await ask({ sid: RAW_SESSION_ID });
+
+    assert.deepEqual(eventLines(logLines, 'affinity_restore'), [], '節が無いのは「壊れている」ではない');
+  });
+
+  it('③: drops the rows of accounts the ledger no longer has', async () => {
+    const { ask, seen, logLines } = await startPersisting({
+      savedState: savedTable([
+        entryFor(RAW_SESSION_ID, 'acct_gone'),
+        entryFor(OTHER_SESSION_ID, 'acct_b'),
+      ]),
+    });
+
+    await ask({ sid: OTHER_SESSION_ID });
+    await ask({ sid: RAW_SESSION_ID });
+
+    assert.deepEqual(seen, ['Bearer token-acct_b', 'Bearer token-acct_a']);
+    assert.equal(eventLines(logLines, 'affinity_bind').length, 1, '消えた口座の行だけ作り直す');
+  });
+
+  it('④/F5: drops the rows whose last visit is older than the idle ttl', async () => {
+    const { ask, logLines } = await startPersisting({
+      sessionAffinity: { mode: 'on', idleTtlMs: 60_000 },
+      savedState: savedTable([
+        entryFor(RAW_SESSION_ID, 'acct_b', { t: CLOCK_START_MS - 120_000 }),
+        entryFor(OTHER_SESSION_ID, 'acct_b', { t: CLOCK_START_MS - 30_000 }),
+      ]),
+    });
+
+    await ask({ sid: OTHER_SESSION_ID });
+    await ask({ sid: RAW_SESSION_ID });
+
+    assert.equal(eventLines(logLines, 'affinity_bind').length, 1, 'TTL 超過の1件だけ作り直す');
+  });
+
+  it('⑤: keeps only the most recent rows when the saved table exceeds maxSessions', async () => {
+    const { ask, seen, logLines } = await startPersisting({
+      sessionAffinity: { mode: 'on', maxSessions: 1 },
+      savedState: savedTable([
+        entryFor(RAW_SESSION_ID, 'acct_b', { t: CLOCK_START_MS - 300_000 }),
+        entryFor(OTHER_SESSION_ID, 'acct_b', { t: CLOCK_START_MS - 1_000 }),
+      ]),
+    });
+
+    await ask({ sid: OTHER_SESSION_ID });
+
+    assert.deepEqual(seen, ['Bearer token-acct_b'], '新しいほうが残る');
+    assert.deepEqual(eventLines(logLines, 'affinity_bind'), []);
+  });
+
+  it('⑥: drops the rows of accounts whose credential identity changed before the restart', async () => {
+    const { ask, seen, logLines } = await startPersisting({
+      savedState: savedTable([
+        entryFor(RAW_SESSION_ID, 'acct_b'),
+        entryFor(OTHER_SESSION_ID, 'acct_a'),
+      ]),
+      credentialChangedAccountIds: ['acct_b'],
+    });
+
+    await ask({ sid: OTHER_SESSION_ID });
+    await ask({ sid: RAW_SESSION_ID });
+
+    assert.deepEqual(seen, ['Bearer token-acct_a', 'Bearer token-acct_b']);
+    assert.equal(eventLines(logLines, 'affinity_bind').length, 1, '資格情報が変わった口座の行だけ作り直す');
+  });
+
+  it('F4: keeps a row whose last visit is ahead of the clock instead of dropping it', async () => {
+    const { ask, seen, logLines } = await startPersisting({
+      sessionAffinity: { mode: 'on', idleTtlMs: 60_000 },
+      savedState: savedTable([
+        entryFor(RAW_SESSION_ID, 'acct_b', { t: CLOCK_START_MS + 3_600_000 }),
+      ]),
+    });
+
+    await ask({ sid: RAW_SESSION_ID });
+
+    assert.deepEqual(seen, ['Bearer token-acct_b'], '時計の逆行でエントリを捨てない');
+    assert.deepEqual(eventLines(logLines, 'affinity_bind'), []);
+  });
+
+  // -- (c) reload ----------------------------------------------------------
+
+  it('⑨: a reload that removes one account rebinds only that account\'s sessions', async () => {
+    const { ask, seen, reload, holder, logLines } = await startPersisting({ reloadable: true });
+
+    await ask({ sid: RAW_SESSION_ID });
+    await ask({ sid: OTHER_SESSION_ID });
+    holder.accounts = holder.accounts.filter(account => account.id !== 'acct_b');
+
+    assert.equal((await reload()).status, 200);
+    await ask({ sid: RAW_SESSION_ID });
+    await ask({ sid: OTHER_SESSION_ID });
+
+    const evicted = eventLines(logLines, 'affinity_evict');
+    assert.equal(evicted.length, 1);
+    assert.match(evicted[0], / account=acct_b reason=account_removed /);
+    assert.equal(evicted[0].includes(sidHash(OTHER_SESSION_ID)), true);
+    assert.deepEqual(seen, [
+      'Bearer token-acct_a',
+      'Bearer token-acct_b',
+      'Bearer token-acct_a',
+      'Bearer token-acct_a',
+    ]);
+  });
+
+  it('⑱: a reload that changes a credential drops the home binding and its family sub-binding', async () => {
+    const { ask, seen, reload, holder, accountManager, logLines } = await startPersisting({
+      reloadable: true,
+    });
+
+    await ask({ sid: RAW_SESSION_ID });
+    accountManager.applyUsage('acct_a', {
+      scoped_weekly: [{ key: 'fable', label: 'Fable', utilization: 1, resets_at: futureReset() }],
+    });
+    await ask({ sid: RAW_SESSION_ID, model: 'claude-fable-5' });
+    assert.deepEqual(seen, ['Bearer token-acct_a', 'Bearer token-acct_b'], 'Fable は副バインドへ');
+
+    holder.accounts = holder.accounts.map(account => (account.id === 'acct_a'
+      ? { ...account, accountUuid: 'uuid-acct-a-2' }
+      : account));
+    assert.equal((await reload()).status, 200);
+    await ask({ sid: RAW_SESSION_ID, model: 'claude-fable-5' });
+
+    const evicted = eventLines(logLines, 'affinity_evict');
+    assert.equal(evicted.length, 1, '基本バインドごと落ちるので行は1つ');
+    assert.match(evicted[0], / account=acct_a reason=credential_changed /);
+    assert.equal(
+      seen.at(-1),
+      'Bearer token-acct_a',
+      '副バインドも一緒に消えているので acct_b へは戻らない',
+    );
+    assert.equal(eventLines(logLines, 'affinity_bind').length, 2, '次の要求で作り直す');
+  });
+
+  it('⑱: a credential change on the sub-binding account drops only the sub-binding', async () => {
+    const { ask, seen, reload, holder, accountManager, logLines } = await startPersisting({
+      reloadable: true,
+    });
+
+    await ask({ sid: RAW_SESSION_ID });
+    accountManager.applyUsage('acct_a', {
+      scoped_weekly: [{ key: 'fable', label: 'Fable', utilization: 1, resets_at: futureReset() }],
+    });
+    await ask({ sid: RAW_SESSION_ID, model: 'claude-fable-5' });
+
+    holder.accounts = holder.accounts.map(account => (account.id === 'acct_b'
+      ? { ...account, accountUuid: 'uuid-acct-b-2' }
+      : account));
+    assert.equal((await reload()).status, 200);
+    await ask({ sid: RAW_SESSION_ID });
+
+    const evicted = eventLines(logLines, 'affinity_evict');
+    assert.equal(evicted.length, 1);
+    assert.match(evicted[0], / account=acct_b reason=credential_changed /);
+    assert.equal(seen.at(-1), 'Bearer token-acct_a', '基本バインドは残る');
+    assert.equal(eventLines(logLines, 'affinity_bind').length, 1, '新規バインドは最初の1件だけ');
+  });
+
+  it('FU-65: no account is handled as both credential_changed and account_removed', async () => {
+    const { ask, reload, holder, logLines } = await startPersisting({
+      reloadable: true,
+      accounts: ['acct_a', 'acct_b', 'acct_c'],
+    });
+
+    await ask({ sid: RAW_SESSION_ID });
+    await ask({ sid: OTHER_SESSION_ID });
+    await ask({ sid: 'e2f9c108-7a4b-4d36-91c5-6b0d24e8f3a7' });
+    holder.accounts = holder.accounts
+      .filter(account => account.id !== 'acct_b')
+      .map(account => (account.id === 'acct_c'
+        ? { ...account, accountUuid: 'uuid-acct-c-2' }
+        : account));
+
+    assert.equal((await reload()).status, 200);
+
+    const evicted = eventLines(logLines, 'affinity_evict');
+    const byAccount = new Map();
+    for (const line of evicted) {
+      const account = line.match(/ account=(\S+) /)[1];
+      const reason = line.match(/ reason=(\S+) /)[1];
+      byAccount.set(account, [...(byAccount.get(account) ?? []), reason]);
+    }
+    assert.deepEqual([...byAccount.keys()].sort(), ['acct_b', 'acct_c']);
+    assert.deepEqual(byAccount.get('acct_b'), ['account_removed'], '消えた口座は prune 側だけ');
+    assert.deepEqual(byAccount.get('acct_c'), ['credential_changed'], '残った口座は evictAccounts 側だけ');
+    assert.equal(evicted.length, 2, '同じ口座が両方で処理されない');
+  });
+
+  it('D-155 ①②: a reload re-normalizes the section instead of keeping the startup values', async () => {
+    const { ask, reload, holder, logLines } = await startPersisting({ reloadable: true });
+
+    await ask({ sid: RAW_SESSION_ID });
+    await ask({ sid: OTHER_SESSION_ID });
+    // 0 は 1 へクランプされる。再正規化していなければ maxSessions は起動時の 10,000 のまま。
+    holder.sessionAffinity = { mode: 'on', maxSessions: 0 };
+
+    assert.equal((await reload()).status, 200);
+
+    const evicted = eventLines(logLines, 'affinity_evict');
+    assert.equal(evicted.length, 1);
+    assert.match(evicted[0], / reason=capacity /);
+  });
+
+  it('D-155 ③: a reload records the U17 config line again', async () => {
+    const { reload, holder, logLines } = await startPersisting({ reloadable: true });
+    const atStartup = eventLines(logLines, 'affinity').filter(line => line.includes(' affinity config '));
+    assert.equal(atStartup.length, 1);
+
+    holder.sessionAffinity = { mode: 'observe' };
+    assert.equal((await reload()).status, 200);
+
+    const after = logLines.filter(line => line.includes(' affinity config '));
+    assert.equal(after.length, 2);
+    assert.match(after[1], / affinity config mode=observe switchThreshold=\S+$/);
+  });
+
+  it('FU-69: a reload to off logs affinity_disabled once and returns the proxy line to its current shape', async () => {
+    const { ask, reload, holder, logLines, persisted } = await startPersisting({ reloadable: true });
+
+    await ask({ sid: RAW_SESSION_ID });
+    await ask({ sid: OTHER_SESSION_ID });
+    holder.sessionAffinity = undefined;
+
+    assert.equal((await reload()).status, 200);
+    assert.equal((await ask({ sid: RAW_SESSION_ID })).status, 200);
+
+    assert.deepEqual(
+      eventLines(logLines, 'affinity_disabled').map(line => line.split(' affinity_disabled ')[1]),
+      ['sessions=2'],
+    );
+    assert.match(proxyLines(logLines).at(-1), LEGACY_PROXY_LINE);
+    assert.equal('sessionAffinity' in persisted.at(-1), false, '無効化のあとは節を書かない');
+  });
+
+  it('a reload from off to on starts from an empty table and begins binding', async () => {
+    const { ask, seen, reload, holder, logLines, persisted } = await startPersisting({
+      reloadable: true,
+      sessionAffinity: null,
+    });
+
+    await ask({ sid: RAW_SESSION_ID });
+    assert.match(proxyLines(logLines).at(-1), LEGACY_PROXY_LINE);
+    holder.sessionAffinity = { mode: 'on' };
+
+    assert.equal((await reload()).status, 200);
+    await ask({ sid: RAW_SESSION_ID });
+    await ask({ sid: RAW_SESSION_ID });
+
+    assert.equal(eventLines(logLines, 'affinity_bind').length, 1);
+    assert.deepEqual(seen.slice(1), ['Bearer token-acct_a', 'Bearer token-acct_a']);
+    assert.equal(persisted.at(-1).sessionAffinity.entries.length, 1);
+    assert.equal(
+      logLines.filter(line => line.includes(' affinity config ')).length,
+      1,
+      '起動時は off なので1行も出ず、reload で初めて出る',
+    );
+  });
+
+  it('persists the table once when a reload changes it', async () => {
+    const { ask, reload, holder, persisted } = await startPersisting({ reloadable: true });
+
+    await ask({ sid: RAW_SESSION_ID });
+    await ask({ sid: OTHER_SESSION_ID });
+    const beforeReload = persisted.length;
+    holder.accounts = holder.accounts.filter(account => account.id !== 'acct_b');
+
+    assert.equal((await reload()).status, 200);
+
+    assert.ok(persisted.length > beforeReload, 'reload で表が変わったら保存する');
+    assert.equal(persisted.at(-1).sessionAffinity.entries.length, 1);
+  });
+});

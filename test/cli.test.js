@@ -13,11 +13,13 @@ import {
   assertAnthropicGatewayProviderCompatible,
   assertGatewayCompatibleAccounts,
   claudeLoginOverrideSource,
+  createRuntimeStateWriter,
   credentialOwnershipConfiguration,
   ensureCredentialRevisions,
   internalApiUrl,
   removeServiceFile,
   requestJson,
+  restoreRuntimeState,
   runCli,
   runMacosCliActionWithLock,
   startService,
@@ -2220,3 +2222,75 @@ async function unusedCodexLoopbackPort() {
   await closeCodexServer(server);
   return port;
 }
+
+// ---------------------------------------------------------------------------
+// runtime-state の耐久書き込みと起動時の復元（R-S11 / 設計書 v1.5 §8・§8.1）
+//
+// `runServer` は実サーバを起動しないと呼べないので、状態の入出力だけを2つの小さな
+// 関数として切り出し、ここで直接押さえる。実 Keychain・実サービスには触れない
+// （一時ディレクトリと差し替えた読み取り関数だけを使う）。
+// ---------------------------------------------------------------------------
+
+describe('runtime state wiring (R-S11)', () => {
+  it('writes the runtime state durably, with a private parent directory', async () => {
+    const sandbox = await mkdtemp(join(tmpdir(), 'claude-rotator-runtime-state-'));
+    try {
+      // 親ディレクトリごと新規に作らせる。durable でない writeJsonFile は 0700 を付けない。
+      const statePath = join(sandbox, 'nested', 'runtime-state.json');
+      const write = createRuntimeStateWriter(statePath);
+
+      await write({ version: 1, accounts: [] });
+
+      assert.deepEqual(JSON.parse(await readFile(statePath, 'utf8')), { version: 1, accounts: [] });
+      assert.equal((await stat(statePath)).mode & 0o777, 0o600);
+      assert.equal((await stat(join(sandbox, 'nested'))).mode & 0o777, 0o700);
+    } finally {
+      await rm(sandbox, { recursive: true, force: true });
+    }
+  });
+
+  it('restores the ledger first and hands back the accounts whose credential changed', async () => {
+    const calls = [];
+    const accountManager = {
+      restoreState(state) {
+        calls.push(state);
+        return ['acct_b'];
+      },
+    };
+
+    const result = await restoreRuntimeState('/tmp/does-not-matter', accountManager, {
+      readJson: async () => ({ version: 1, sessionAffinity: { version: 1, entries: [] } }),
+    });
+
+    assert.equal(calls.length, 1, '台帳の復元が先（順序を逆にすると F3 を取り逃がす）');
+    assert.deepEqual(result.credentialChangedAccountIds, ['acct_b']);
+    assert.deepEqual(result.savedState.sessionAffinity, { version: 1, entries: [] });
+  });
+
+  it('returns an empty id list and no saved state when there is nothing to restore', async () => {
+    let restored = 0;
+    const accountManager = { restoreState() { restored += 1; return ['never']; } };
+
+    const result = await restoreRuntimeState('/tmp/does-not-matter', accountManager, {
+      readJson: async () => null,
+    });
+
+    assert.equal(restored, 0);
+    assert.equal(result.savedState, null);
+    assert.deepEqual(result.credentialChangedAccountIds, []);
+  });
+
+  it('reports an unreadable state file and still starts with an empty restore', async () => {
+    const skipped = [];
+    const accountManager = { restoreState() { return ['never']; } };
+
+    const result = await restoreRuntimeState('/tmp/does-not-matter', accountManager, {
+      readJson: async () => { throw new Error('permission denied'); },
+      onSkipped: message => skipped.push(message),
+    });
+
+    assert.deepEqual(skipped, ['permission denied']);
+    assert.equal(result.savedState, null);
+    assert.deepEqual(result.credentialChangedAccountIds, []);
+  });
+});

@@ -227,13 +227,22 @@ function clampSetting(value, key) {
  */
 export class SessionAffinity {
   constructor({
+    mode = DEFAULT_SESSION_AFFINITY.mode,
     idleTtlMs = DEFAULT_IDLE_TTL_MS,
     maxSessions = DEFAULT_MAX_SESSIONS,
     now = () => Date.now(),
     logger = null,
+    onChange = null,
   } = {}) {
     this.now = typeof now === 'function' ? now : () => Date.now();
     this.logger = typeof logger === 'function' ? logger : null;
+    // 現在のモードはインスタンスが持つ（FU-69・D-175）。結線側が reload のたびに
+    // 直前のモードを渡す方式だと、渡し忘れた瞬間に「有効→off」の affinity_disabled が
+    // 黙って消える。applySettings は明示の previousMode が無ければこの値を使う。
+    this.mode = normalizeMode(mode);
+    // 表が変わったことの唯一の通知口（設計書 §8 の dirty）。バインドが変わったときだけ
+    // 呼び、`lastSeen` の更新（再訪）では呼ばない。
+    this.onChange = typeof onChange === 'function' ? onChange : null;
     this.idleTtlMs = positiveInteger(idleTtlMs, DEFAULT_IDLE_TTL_MS);
     this.maxSessions = positiveInteger(maxSessions, DEFAULT_MAX_SESSIONS);
     this.entries = new Map();
@@ -414,22 +423,27 @@ export class SessionAffinity {
    * それ以外は上限を入れ直すだけで、結び付け先は保つ。
    *
    * @param {object} settings 生の `config.sessionAffinity` でも正規化済みでもよい。
-   * @param {{previousMode?:string, now?:number}} [options] 直前のモード（既定は `off`）。
+   * @param {{previousMode?:string, now?:number}} [options] 直前のモード。**既定はインスタンスが
+   *   覚えている現在のモード**（FU-69・D-175）——結線側の渡し忘れで `affinity_disabled` が
+   *   消えないように、明示されたときだけそちらを優先する。
    * @returns {{mode:string, previousMode:string, cleared:number, evicted:Array}}
    */
-  applySettings(settings, { previousMode = 'off', now = this.now() } = {}) {
+  applySettings(settings, { previousMode = this.mode, now = this.now() } = {}) {
     const next = normalizeSessionAffinity(settings);
     const previous = normalizeMode(previousMode);
+    this.mode = next.mode;
 
     if (next.mode === 'off') {
       const cleared = this.entries.size;
       this.entries.clear();
       if (previous !== 'off') this.write(now, `affinity_disabled sessions=${cleared}`);
+      if (cleared > 0) this.markChanged();
       return { mode: next.mode, previousMode: previous, cleared, evicted: [] };
     }
 
     const cleared = previous === 'off' ? this.entries.size : 0;
     if (previous === 'off') this.entries.clear();
+    if (cleared > 0) this.markChanged();
     const evicted = this.configure(
       { idleTtlMs: next.idleTtlMs, maxSessions: next.maxSessions },
       { now },
@@ -606,6 +620,7 @@ export class SessionAffinity {
       this.entries.set(hash, created);
       this.trimToCapacity(now, hash);
       this.write(now, `affinity_bind sid=${hash} account=${account} reason=new_session sessions=${this.entries.size}`);
+      this.markChanged();
       return result(hash, account, created, 'new', 'home', 'new_session');
     }
 
@@ -664,6 +679,7 @@ export class SessionAffinity {
       `affinity_switch sid=${hash} from=${from} to=${account}`
       + ` reason=${label} family=${modelFamily === 'fable' ? 'fable' : 'other'} switches=${entry.switches}`,
     );
+    this.markChanged();
     return result(hash, account, entry, 'switch', slot, label);
   }
 
@@ -701,7 +717,19 @@ export class SessionAffinity {
     const label = EVICT_REASONS.has(reason) ? reason : UNKNOWN_REASON;
     bump(this.evictCounts, label);
     this.write(now, `affinity_evict sid=${hash} account=${account} reason=${label} ageMs=${ageMs}`);
+    this.markChanged();
     return { sid: hash, account, reason: label, ageMs };
+  }
+
+  // 表が変わったことを結線側へ知らせる（設計書 §8 の dirty）。通知そのものが失敗しても
+  // HTTP 処理を巻き添えにしない——永続化は次の書き込みで必ず追いつく。
+  markChanged() {
+    if (!this.onChange) return;
+    try {
+      this.onChange();
+    } catch {
+      // 保存の予約に失敗しても表の一貫性は保たれる。
+    }
   }
 
   write(now, line) {

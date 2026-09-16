@@ -71,7 +71,7 @@ import {
   runtimeStatePath,
   xdgConfigHome,
 } from './paths.js';
-import { readJsonFile, writeJsonFile } from './json-file.js';
+import { readJsonFile, writeJsonFileDurable } from './json-file.js';
 
 const execFileAsync = promisify(execFile);
 const CURRENT_ACCOUNT_ID = 'current';
@@ -372,11 +372,13 @@ async function runServer({ write }) {
     logger,
   });
   const statePath = runtimeStatePath();
-  const savedState = await readJsonFile(statePath, null).catch(error => {
-    write(`runtime state restore skipped: ${shortErrorMessage(error)}\n`);
-    return null;
-  });
-  if (savedState) accountManager.restoreState(savedState);
+  // 台帳を先に復元し、その戻り値（資格情報が別物になった口座 ID）を createProxyServer へ
+  // 渡す。sticky の表はそこで、口座台帳の復元が終わった後に読み戻される（設計書 §8.1）。
+  const { savedState, credentialChangedAccountIds } = await restoreRuntimeState(
+    statePath,
+    accountManager,
+    { onSkipped: message => write(`runtime state restore skipped: ${message}\n`) },
+  );
   const server = createProxyServer({
     accountManager,
     secretStore,
@@ -391,8 +393,11 @@ async function runServer({ write }) {
       });
     },
     reloadOpenAiBridge: () => loadConfig().then(nextConfig => nextConfig?.openaiBridge),
+    reloadSessionAffinity: () => loadConfig().then(nextConfig => nextConfig?.sessionAffinity),
     logger,
-    stateWriter: state => writeJsonFile(statePath, state),
+    savedState,
+    credentialChangedAccountIds,
+    stateWriter: createRuntimeStateWriter(statePath),
     serviceGeneration: process.env.CLAUDE_ROTATOR_SERVICE_GENERATION || null,
   });
   await new Promise(resolve => server.listen(
@@ -406,6 +411,51 @@ async function runServer({ write }) {
   } finally {
     logWriter?.close();
   }
+}
+
+/**
+ * `runtime-state.json` の書き込み口（設計書 §8・D-56-5）。
+ *
+ * `writeJsonFile` は `writeFile` → `rename` だけで `fsync` を1回も呼ばないため、電源断・
+ * カーネルパニックでは直前の書き込みがまるごと失われる。バインド表は「再起動をまたいで
+ * 上流のキャッシュを救う」ことが存在理由なので、失われれば機能そのものが無効になる。
+ * `writeJsonFileDurable` は tmp を `wx` で作り、`fsync` してから `rename` し、親ディレクトリ
+ * まで同期する。口座台帳の永続化も同じ口を共有しているので、そちらも同時に durable になる。
+ *
+ * @param {string} statePath `runtime-state.json` の絶対パス。
+ * @returns {(state: object) => Promise<void>} `createProxyServer` へ渡す `stateWriter`。
+ */
+export function createRuntimeStateWriter(statePath) {
+  return state => writeJsonFileDurable(statePath, state);
+}
+
+/**
+ * 起動時の runtime-state 復元（設計書 §8.1）。
+ *
+ * **順序が仕様である。** `restoreState` を先に呼び、その戻り値（`credentialIdentityChanged`
+ * と判定した口座 ID の一覧）を受け取ってから sticky の表を読み戻す。逆順にすると、台帳の
+ * quota・status が初期化される前に口座の実在を判定してしまい、資格情報が別物になった口座
+ * へのバインドがそのまま残る（§8 の破棄条件⑥・F3）。
+ *
+ * 読み取りに失敗しても起動は必ず成功させる（F1）。その場合は「保存状態なし」として扱う。
+ *
+ * @param {string} statePath `runtime-state.json` の絶対パス。
+ * @param {{restoreState: (state: object) => string[]}} accountManager 口座台帳。
+ * @param {{readJson?: Function, onSkipped?: ((message: string) => void)|null}} [options]
+ * @returns {Promise<{savedState: object|null, credentialChangedAccountIds: string[]}>}
+ */
+export async function restoreRuntimeState(statePath, accountManager, {
+  readJson = readJsonFile,
+  onSkipped = null,
+} = {}) {
+  const savedState = await readJson(statePath, null).catch(error => {
+    onSkipped?.(shortErrorMessage(error));
+    return null;
+  });
+  const credentialChangedAccountIds = savedState
+    ? accountManager.restoreState(savedState)
+    : [];
+  return { savedState, credentialChangedAccountIds };
 }
 
 export function assertGatewayCompatibleAccounts(accounts = []) {

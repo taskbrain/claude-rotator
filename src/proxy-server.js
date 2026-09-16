@@ -77,6 +77,10 @@ const SCOPED_USAGE_PRESERVE_PREFIX = 'scoped_weekly_preserve:';
 const DEFAULT_RESET_CHECK_DELAY_MS = 1000;
 const MAX_TIMER_DELAY_MS = 2_147_483_647;
 const MIN_USABLE_ACCESS_TOKEN_LIFETIME_MS = 60_000;
+// バインドが変わってから runtime-state.json へ合流するまでの上限（設計書 §8）。
+// 表そのものは persistState が走るたびに載るので、この時計は「要求の完了を待たない」
+// ための予備であり（長時間 SSE・reload 以外の掃除）、新しいファイルは作らない。
+const SESSION_AFFINITY_PERSIST_INTERVAL_MS = 5_000;
 const guardedUpstreamSockets = new WeakSet();
 
 export function createProxyServer({
@@ -86,6 +90,7 @@ export function createProxyServer({
   config,
   reloadAccounts = null,
   reloadOpenAiBridge = null,
+  reloadSessionAffinity = null,
   allowLiveClaudeCodeCredentials = true,
   tokenRefresher = null,
   currentCredentialReader = readCurrentClaudeCredentials,
@@ -94,6 +99,11 @@ export function createProxyServer({
   reactiveQuotaConfirmTimeoutMs = REACTIVE_QUOTA_CONFIRM_TIMEOUT_MS,
   logger = null,
   stateWriter = null,
+  // 起動時の復元（設計書 §8.1）。`credentialChangedAccountIds` は cli.js が
+  // `accountManager.restoreState()` の戻り値をそのまま渡す（F3 の破棄条件⑥）。
+  savedState = null,
+  credentialChangedAccountIds = null,
+  sessionAffinityPersistIntervalMs = SESSION_AFFINITY_PERSIST_INTERVAL_MS,
   platform = process.platform,
   serviceGeneration = null,
 }) {
@@ -190,10 +200,46 @@ export function createProxyServer({
     usageRefresher,
     persistState,
   });
+  // sticky affinity の表と設定は reload で差し替わるので `let` で持つ。宣言だけを
+  // persistState より前に置き、生成は degradeMapping の通知の直後（下）で行う——
+  // 起動ログの並びを1行も変えないためである。
+  let sessionAffinitySettings = null;
+  let sessionAffinity = null;
+  // 表が変わってから保存されるまでの繋ぎ（設計書 §8 の dirty）。バインドが変わったときだけ
+  // 立ち、`lastSeen` の更新では立たない。persistState が走れば下ろす。
+  let affinityDirty = false;
+  let affinityPersistTimer = null;
+  function affinityPersistEnabled() {
+    // `mode:"off"` と `persist:false` では節そのものを作らない（未記載構成の
+    // runtime-state.json を現行とバイト同一に保つ・§8・D-56-6）。
+    return Boolean(sessionAffinity) && sessionAffinitySettings?.persist === true;
+  }
+  function cancelAffinityPersistTimer() {
+    if (!affinityPersistTimer) return;
+    clearTimeout(affinityPersistTimer);
+    affinityPersistTimer = null;
+  }
+  function scheduleAffinityPersist() {
+    if (!stateWriter || !affinityPersistEnabled()) return;
+    affinityDirty = true;
+    if (affinityPersistTimer) return;
+    affinityPersistTimer = setTimeout(() => {
+      affinityPersistTimer = null;
+      if (affinityDirty) persistState();
+    }, sessionAffinityPersistIntervalMs);
+    // 保存の予約でプロセスを生かし続けない（要求が無ければ落ちてよい）。
+    affinityPersistTimer.unref?.();
+  }
   let persistTail = Promise.resolve();
   function persistState() {
     if (!stateWriter) return;
     const snapshot = accountManager.exportState();
+    // 既存の runtime-state.json へ相乗りする。新しいファイルは作らない（§8）。
+    if (affinityPersistEnabled()) {
+      snapshot.sessionAffinity = sessionAffinity.export();
+      affinityDirty = false;
+      cancelAffinityPersistTimer();
+    }
     const write = persistTail.then(() => stateWriter(snapshot));
     persistTail = write.catch(error => {
       logger?.(`state persist failed: ${shortErrorMessage(error)}`);
@@ -270,20 +316,34 @@ export function createProxyServer({
   // ——生の config.sessionAffinity を渡すとクランプも未知 mode→off も効かない。
   // `mode:"off"`（既定・未記載構成）では表そのものを作らず forwardWithRotation へも渡さない
   // ので、応答もログも現行とバイト単位で同一になる。起動時の1行（U17）も出ない。
-  const sessionAffinitySettings = normalizeSessionAffinity(config.sessionAffinity);
+  function createSessionAffinityFor(settings) {
+    if (settings.mode === 'off') return null;
+    return new SessionAffinity({
+      mode: settings.mode,
+      idleTtlMs: settings.idleTtlMs,
+      maxSessions: settings.maxSessions,
+      // 台帳と同じ時計を読む（試験クロックを注入した検証で TTL がずれない）。
+      now: () => accountManager.now(),
+      logger,
+      onChange: scheduleAffinityPersist,
+    });
+  }
+  sessionAffinitySettings = normalizeSessionAffinity(config.sessionAffinity);
   logSessionAffinityStartupNotice(sessionAffinitySettings, {
     switchThreshold: accountManager.switchThreshold,
     logger,
   });
-  const sessionAffinity = sessionAffinitySettings.mode === 'off'
-    ? null
-    : new SessionAffinity({
-      idleTtlMs: sessionAffinitySettings.idleTtlMs,
-      maxSessions: sessionAffinitySettings.maxSessions,
-      // 台帳と同じ時計を読む（試験クロックを注入した検証で TTL がずれない）。
-      now: () => accountManager.now(),
-      logger,
+  sessionAffinity = createSessionAffinityFor(sessionAffinitySettings);
+  // 保存済みの表を読み戻す（§8.1）。台帳の復元（cli.js の restoreState）は既に終わっていて、
+  // その戻り値が `credentialChangedAccountIds` として届いている——順序を逆にすると資格情報が
+  // 別物になった口座へのバインドを残す（破棄条件⑥・F3）。節が無いのは「壊れている」ではない
+  // ので、その場合は F1 の1行を出さない。
+  if (sessionAffinity && sessionAffinitySettings.persist && savedState?.sessionAffinity != null) {
+    sessionAffinity.restore(savedState.sessionAffinity, {
+      accountManager,
+      credentialChangedAccountIds,
     });
+  }
 
   // GPT プール状態（設計書 §11.1 R3-4・契約 §C10.2）。プロセス内メモリだけで持ち、
   // degradeMapping が無効な構成では生成しない（null＝forwardToOpenAiBridge へも渡らず、
@@ -438,7 +498,21 @@ export function createProxyServer({
             duplicateRefreshAccountIds: nextDuplicateIds,
             duplicateRefreshAccounts,
           });
-          accountManager.replaceAccounts(accounts);
+          const credentialChangedIds = accountManager.replaceAccounts(accounts);
+          // 設計書 §8.1: `replaceAccounts` の直後に evictAccounts → prune。
+          // 台帳に残ったまま資格情報が別物になった口座は戻り値で届き（F3）、台帳から
+          // 消えた口座は prune 側が拾う（F2）。**同じ口座が両方で処理されることはない**
+          // ——`replaceAccounts` は残った口座しか報告しないからである。
+          const affinityEvicted = sessionAffinity
+            ? [
+              ...sessionAffinity.evictAccounts(credentialChangedIds, {
+                reason: 'credential_changed',
+              }),
+              ...sessionAffinity.prune({
+                knownAccountIds: accountManager.accounts.map(account => account.id),
+              }),
+            ]
+            : [];
           replaceSet(duplicateRefreshAccountIds, nextDuplicateIds);
           duplicateStateChanged = parkDuplicateRefreshTokenAccounts({
             accountManager,
@@ -446,7 +520,8 @@ export function createProxyServer({
             duplicateRefreshAccounts,
             ownedDuplicateIds,
           }) || duplicateStateChanged;
-          if (duplicateStateChanged) await persistState();
+          // 表が変わったときも既存の `duplicateStateChanged` と同じ扱いで1回保存する。
+          if (duplicateStateChanged || affinityEvicted.length > 0) await persistState();
         }
         // 既存の口座再読込に続けて openaiBridge を再読込する（仕様書 4.2.6 節）。
         // 口座再読込のロジックには一切触れない。
@@ -468,6 +543,32 @@ export function createProxyServer({
             + `url=${openaiBridgeSettings.url}${openaiBridgeSettings.warning ? ` warning="${openaiBridgeSettings.warning}"` : ''}`,
           );
           logDegradeMappingConfigNotice(openaiBridgeSettings, logger);
+        }
+        // sticky affinity の再読込（設計書 §5.1 ⑤・§6 の reload・D-155）。設定は必ず
+        // `normalizeSessionAffinity()` を通し直す——起動時に1度だけ正規化したものを使い回すと、
+        // reload で書き換えた値にクランプも未知 mode→off も効かない。
+        // `sessionAffinity` セクションを消した構成は既定（＝off）へ戻す。
+        if (reloadSessionAffinity) {
+          const nextSessionAffinity = await reloadSessionAffinity();
+          config.sessionAffinity = nextSessionAffinity;
+          sessionAffinitySettings = normalizeSessionAffinity(config.sessionAffinity);
+          if (sessionAffinity) {
+            // 直前のモードはインスタンスが覚えている（FU-69・D-175）。渡し忘れで
+            // 「有効→off」の `affinity_disabled` が消えることがない。
+            sessionAffinity.applySettings(sessionAffinitySettings);
+            if (sessionAffinitySettings.mode === 'off') {
+              sessionAffinity = null;
+              cancelAffinityPersistTimer();
+              affinityDirty = false;
+            }
+          } else {
+            sessionAffinity = createSessionAffinityFor(sessionAffinitySettings);
+          }
+          // U17 の通知は degradeMapping と同じ位置・同じ関数で（`mode:"off"` では1行も出ない）。
+          logSessionAffinityStartupNotice(sessionAffinitySettings, {
+            switchThreshold: accountManager.switchThreshold,
+            logger,
+          });
         }
         // Reconcile in the background instead of awaiting it (or replacing
         // the shared operationalStateCheck gate other requests await): each
@@ -615,6 +716,7 @@ export function createProxyServer({
   });
 
   usageScheduler.start(server);
+  server.on('close', cancelAffinityPersistTimer);
   return server;
 }
 
