@@ -1456,6 +1456,7 @@ function createSessionAffinityRequest({
     pendingReason: null,
     select: () => null,
     confirm: () => {},
+    noteUpstreamQuota: () => {},
   };
   if (!state.pinned) return state;
 
@@ -1544,7 +1545,34 @@ function createSessionAffinityRequest({
     if (confirmed && confirmed.disposition !== 'stale') state.gen = confirmed.gen;
     state.pendingReason = null;
   };
+  // D-154: 反応的 429 の再試行の周は、選択を replay 対象に絞った既存経路が行うので
+  // `select()` を経ずに確定へ入る。そのままだと付け替えの理由が立たず、表は果てた
+  // 結び付け先を指したままになる。**429 を返したのが結び付け先そのもの**で、
+  // その 429 が系統枠／共通枠の枯渇を示しているときだけ、その周のうちに付け替えの
+  // 理由を立てる（設計書 §4.3「上流 429 → その系統の副バインドを作る」）。
+  // 理由の語彙は確定段と同じ 2 値だけである（D-142）。
+  state.noteUpstreamQuota = source => {
+    if (state.gen === null || !source) return;
+    const current = affinity.get(key, { modelFamily });
+    const previous = current ? accountManager.findOrNull(current.bound) : null;
+    if (!previous || previous.id !== source.id) return;
+    state.pendingReason = quotaRebindReason(previous, threshold, modelFamily, accountManager.now());
+  };
   return state;
+}
+
+/**
+ * 固定セッションの試行ループの上限（設計書 §5.3(a)・P-1・P-3）。
+ *
+ * 「バインド先 1 ＋ 再バインド候補数」で数える。口座総数をそのまま使わず、
+ * **鍵の無い要求の上限（口座総数）とは別に持つ**ことで、鍵の無い要求の振る舞いが
+ * 1つも変わらないことを構造で示す。結び付け先が台帳から消えているときは、台帳の
+ * 口座がすべて再バインド候補になるので 1 ＋ 口座総数になる。
+ */
+function pinnedAttemptBudget(accountManager, boundAccountId) {
+  const rebindCandidates = accountManager.accounts
+    .filter(account => account.id !== boundAccountId).length;
+  return Math.max(1, 1 + rebindCandidates);
 }
 
 /**
@@ -2119,7 +2147,6 @@ async function forwardWithRotation({
   sessionAffinity = null,
   sessionAffinitySettings = null,
 }) {
-  const maxAttempts = Math.max(1, accountManager.accounts.length);
   const attemptedAccountIds = new Set();
   let lastRetryableResponse = null;
   // 再生する応答を作った口座（P-b の replay 行の account= に使う。写像したときだけ読む）。
@@ -2146,6 +2173,14 @@ async function forwardWithRotation({
     affinity: sessionAffinity,
     settings: sessionAffinitySettings,
   });
+  // 設計書 §5.3(a): 試行ループの上限は固定セッションと鍵の無い要求で別々に持つ。
+  // 鍵の無い要求は現行どおり口座総数、固定セッションは「バインド先 1 ＋ 再バインド候補数」である。
+  // 再バインドは周の先頭（重複ガードより手前）で済むので、この本数で結び付け先と
+  // 全候補を一周できる——口座総数のままにしておくと、台帳に使える口座が残っていても
+  // 素の 429 を返しうる（I-5・P-1・P-3）。
+  const maxAttempts = affinityRequest?.pinned
+    ? pinnedAttemptBudget(accountManager, affinityRequest.reservedId)
+    : Math.max(1, accountManager.accounts.length);
   // 設計書 §4.1 の `selectAccountForRequest`。鍵を持たない要求と `mode:"on"` 以外では
   // 現行の `getActiveAccount` をそのまま呼ぶ（R-S1 の `trigger='request'` も同じ契機で渡す）。
   const selectAccountForRequest = () => (affinityRequest?.pinned
@@ -2368,6 +2403,10 @@ async function forwardWithRotation({
       return;
     }
     attemptedAccountIds.add(account.id);
+    // D-154: 反応的 429 の周は `selectAccountForRequest` を経ないので付け替えの理由が
+    // 立っていない。429 を返したのが結び付け先で、それが枠の枯渇を示しているときだけ、
+    // ここで理由を立ててその周のうちに副バインド／home の付け替えを確定させる（§4.3）。
+    if (reactiveQuotaRetryUsed) affinityRequest?.noteUpstreamQuota(reactiveQuotaSource);
     // 設計書 §4.4 ②: 実際に上流へ送ると決まった口座で予約を確定する。世代が進んで
     // いれば遅着として捨て（`affinity_stale`）、付け替えるのは枠の枯渇由来のときだけ。
     affinityRequest?.confirm(account);
@@ -2378,8 +2417,12 @@ async function forwardWithRotation({
     // 切替先で判定すると、枯れていない新候補を見て「共通枠は無事」と読み、
     // 系統枠由来でもグローバル切替を実行してしまう（是正が逆に効く）。
     // reactiveQuotaSource が無いときは述語が偽になり、従来どおり切り替える。
+    // D-54-2（再定義・§5.3(b)）: 固定セッションの要求の処理中は、`currentIndex` を
+    // 変更するいかなる経路も通らない。そのセッションの付け替えは上の確定が行い、
+    // グローバル稼働口座の移動は**鍵の無い要求のために**既存ロジックが別途行う（§4.5）。
     if (
       reactiveQuotaRetryUsed
+      && !affinityRequest?.pinned
       && !familyQuotaExhaustedOnly(
         reactiveQuotaSource,
         accountManager.switchThreshold,
@@ -3647,7 +3690,13 @@ function sendCurrentQuotaUnavailableResponse({
   let reason = accountManager.unavailableReasonForModelFamily(account, modelFamily);
   if (!isUnifiedQuotaExhaustion(reason)) return false;
 
-  const shortestResetAccount = accountManager.selectBestExhaustedFallback({ trigger: 'request' });
+  // D-64 P-2（§4.5・§5.3(b)）: 固定セッションは `selectBestExhaustedFallback` を通さない。
+  // これは `switchTo` / `switchToCandidate` とは別の第3の `currentIndex` 代入経路であり、
+  // `fallback-switch` イベントも積む。読み取りだけの `bestExhaustedFallbackCandidate` で
+  // 同じ口座を選ぶので、応答の中身（合成 429 の account / window / reset）は変わらない。
+  const shortestResetAccount = affinityLog?.pinned
+    ? (accountManager.bestExhaustedFallbackCandidate()?.account || null)
+    : accountManager.selectBestExhaustedFallback({ trigger: 'request' });
   if (shortestResetAccount) {
     account = shortestResetAccount;
     reason = accountManager.unavailableReasonForModelFamily(account, modelFamily);

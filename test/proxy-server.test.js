@@ -3,9 +3,10 @@ import assert from 'node:assert/strict';
 import { randomUUID } from 'node:crypto';
 import http from 'node:http';
 import { EventEmitter } from 'node:events';
-import { mkdtemp, rm } from 'node:fs/promises';
+import { mkdtemp, readFile, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { dirname, join, resolve } from 'node:path';
+import { fileURLToPath } from 'node:url';
 
 import { AccountManager, familyQuotaExhaustedOnly } from '../src/account-manager.js';
 import { LOCAL_GATEWAY_AUTH_TOKEN } from '../src/config.js';
@@ -11086,7 +11087,7 @@ describe('session affinity wiring (R-S7)', () => {
 
   it('⑫: two concurrent requests of one session share the account across the credential await', async () => {
     const secretStore = new GatedSecretStore();
-    const { ask, seen, logLines } = await startAffinity({ secretStore });
+    const { ask, seen, accountManager, logLines } = await startAffinity({ secretStore });
 
     // 先に別セッションを acct_a へ載せ、K3（バインド数の少ない口座）で acct_b が選ばれる
     // 状態を作る。予約が無い実装では、2本目が独立に選び直して acct_a へ割れる。
@@ -11095,6 +11096,10 @@ describe('session affinity wiring (R-S7)', () => {
     const release = secretStore.openGate('acct_b');
     const first = ask({ sid: 'session-one' }).catch(error => ({ error }));
     const firstWaited = await waitFor(() => secretStore.entered.length === 1);
+    // ② と同じ手法を足す（R-S7 の L1 申し送り）: 1本目がゲートで待つあいだに
+    // acct_a の残枠を acct_b より良くし、新規割当の帯を acct_a だけにする。確定1点だけの
+    // 実装はここで 2本目が acct_a を選び直し、同じセッションが2口座へ割れる。
+    accountManager.updateQuota('acct_a', { 'anthropic-ratelimit-unified-5h-utilization': '0.01' });
     const second = ask({ sid: 'session-one' }).catch(error => ({ error }));
     const secondWaited = await waitFor(() => secretStore.entered.length === 2);
     release();
@@ -11111,6 +11116,10 @@ describe('session affinity wiring (R-S7)', () => {
       'Bearer token-acct_b',
     ]);
     assert.equal(eventLines(logLines, 'affinity_bind').length, 2, '2本目は新規バインドを作らない');
+    // 帯が acct_a だけになっていたことの直接確認。新規セッションは acct_a へ行くので、
+    // 予約を持たない実装なら 2本目も acct_a を選んで上の deepEqual が割れる。
+    assert.equal((await ask({ sid: 'session-two' })).status, 200);
+    assert.equal(seen.at(-1), 'Bearer token-acct_a');
   });
 
   it('⑬: a short rate limit on the bound account leaves the binding alone', async () => {
@@ -11279,5 +11288,413 @@ describe('session affinity wiring (R-S7)', () => {
       evicted.some(line => line.includes(` sid=${sidHash('session-stream')} `)),
       '切られた SSE の行が退避された',
     );
+  });
+});
+
+// ---------------------------------------------------------------------------
+// R-S8: 固定セッションの試行ループと終端（設計書 §4.1・§4.3・§4.5・§5.3(a)(b)）。
+//
+// 押さえるのは3点である。
+//   (a) 再バインドは重複ガードへ到達する前に終わっており、固定セッションの試行ループの
+//       上限は「バインド先1 ＋ 再バインド候補数」である（鍵の無い要求は口座総数のまま）。
+//   (b) 固定セッションの枯渇応答は `selectBestExhaustedFallback` を通らない（P-2）。
+//   (c) 付け替える範囲は「いま使えなかった結び付け先」だけである（D-63 C2）。
+// 加えて D-154（反応的 429 の周のうちに系統別の副バインドを作る）を固定する。
+// ---------------------------------------------------------------------------
+describe('session affinity rebind and terminal (R-S8)', () => {
+  function eventLines(logLines, kind) {
+    return logLines.filter(line => line.includes(` ${kind} `));
+  }
+
+  function futureResetSeconds(offsetMs = 3_600_000) {
+    return String(Math.floor((Date.now() + offsetMs) / 1000));
+  }
+
+  // 「枠が枯れたことが確定した」429（`unifiedQuotaHeaderEvidence.confirmsExhaustion`）。
+  function exhaustedQuota429(res, offsetMs = 3_600_000) {
+    res.writeHead(429, {
+      'Content-Type': 'application/json',
+      'anthropic-ratelimit-unified-5h-utilization': '1',
+      'anthropic-ratelimit-unified-5h-reset': futureResetSeconds(offsetMs),
+    });
+    res.end(JSON.stringify({
+      type: 'error',
+      error: { type: 'rate_limit_error', message: 'usage limit reached' },
+    }));
+  }
+
+  // 枠の証拠を持たない Fable の 429（反応的確認へ落ちる形）。
+  function bareFable429(res) {
+    res.writeHead(429, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({
+      type: 'error',
+      error: { type: 'rate_limit_error', message: 'Fable limit' },
+    }));
+  }
+
+  function commonExhaustedHeaders(offsetMs = 3_600_000) {
+    return {
+      'anthropic-ratelimit-unified-5h-utilization': '1',
+      'anthropic-ratelimit-unified-5h-reset': futureResetSeconds(offsetMs),
+    };
+  }
+
+  /**
+   * `currentIndex` の全代入点を直接見張る（統合⑪・D-54-2 の再定義）。関数名ではなく
+   * インスタンスへの代入そのものを捕まえるので、7点のどれから書かれても記録に残る。
+   */
+  function watchCurrentIndex(accountManager) {
+    const assignments = [];
+    let value = accountManager.currentIndex;
+    Object.defineProperty(accountManager, 'currentIndex', {
+      configurable: true,
+      enumerable: true,
+      get: () => value,
+      set: next => { assignments.push(next); value = next; },
+    });
+    return assignments;
+  }
+
+  async function startAffinity({
+    accounts = ['acct_a', 'acct_b'],
+    sessionAffinity = { mode: 'on' },
+    upstream: upstreamHandler = null,
+    usageFetcher = null,
+  } = {}) {
+    const logLines = [];
+    const seen = [];
+    const upstream = await listen(http.createServer((req, res) => {
+      seen.push(req.headers.authorization);
+      if (upstreamHandler && upstreamHandler({ req, res, seen }) === true) return;
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ ok: true }));
+    }));
+    const secretStore = new MemorySecretStore();
+    for (const id of accounts) {
+      await secretStore.set(id, {
+        accessToken: `token-${id}`,
+        refreshToken: `refresh-${id}`,
+        expiresAt: Date.now() + 3_600_000,
+      });
+    }
+    const logger = line => logLines.push(line);
+    const accountManager = new AccountManager({
+      accounts: accounts.map(id => ({ id, type: 'oauth' })),
+      logger,
+    });
+    const proxy = await listen(createProxyServer({
+      accountManager,
+      secretStore,
+      logger,
+      ...(usageFetcher ? { usageFetcher } : {}),
+      config: {
+        upstream: upstream.url,
+        usagePolling: { enabled: false },
+        ...(sessionAffinity ? { sessionAffinity } : {}),
+      },
+    }));
+    cleanupAfterTest(async () => { await close(proxy.server); await close(upstream.server); });
+
+    const ask = ({ sid = null, model = 'sonnet', headers = {} } = {}) => requestJson(
+      `${proxy.url}/v1/messages`,
+      {
+        method: 'POST',
+        body: JSON.stringify({ model }),
+        headers: { ...(sid ? { 'x-claude-code-session-id': sid } : {}), ...headers },
+      },
+    );
+    return { proxy, upstream, seen, secretStore, accountManager, logLines, logger, ask };
+  }
+
+  it('⑤: a confirmed quota 429 on the bound account rebinds and completes in the same request', async () => {
+    let exhausted = false;
+    const { ask, seen, logLines } = await startAffinity({
+      upstream: ({ req, res }) => {
+        if (!exhausted || req.headers.authorization !== 'Bearer token-acct_a') return false;
+        exhaustedQuota429(res);
+        return true;
+      },
+    });
+
+    assert.equal((await ask({ sid: 'session-one' })).status, 200);
+    exhausted = true;
+    const response = await ask({ sid: 'session-one' });
+
+    assert.equal(response.status, 200, '素の 429 ではなく再バインドして完走する');
+    assert.deepEqual(seen, [
+      'Bearer token-acct_a',
+      'Bearer token-acct_a',
+      'Bearer token-acct_b',
+    ]);
+    const switches = eventLines(logLines, 'affinity_switch');
+    assert.equal(switches.length, 1);
+    assert.match(switches[0], / from=acct_a to=acct_b reason=common_exhausted family=other switches=1$/);
+
+    exhausted = false;
+    assert.equal((await ask({ sid: 'session-one' })).status, 200);
+    assert.equal(seen.at(-1), 'Bearer token-acct_b', '次の要求は新しい結び付け先へ行く');
+  });
+
+  it('⑪: a pinned request reaches none of the 7 currentIndex assignment points', async () => {
+    // まず「代入点は7点・6関数」という前提そのものを固定する（D-54-2 の再定義・§5.3(b)）。
+    // 8点目が増えたらこの行で落ちるので、見張りの網が実装より遅れない。
+    const source = await readFile(
+      resolve(dirname(fileURLToPath(import.meta.url)), '../src/account-manager.js'),
+      'utf8',
+    );
+    const sourceLines = source.split('\n');
+    const methodPattern = /^ {2}([A-Za-z_$][\w$]*)\(/;
+    const assignmentPoints = [];
+    let enclosingMethod = null;
+    for (const line of sourceLines) {
+      const method = methodPattern.exec(line);
+      if (method) enclosingMethod = method[1];
+      if (line.includes('currentIndex = ')) assignmentPoints.push(enclosingMethod);
+    }
+    assert.equal(assignmentPoints.length, 7, 'currentIndex の代入点は7点');
+    assert.deepEqual(new Set(assignmentPoints), new Set([
+      'constructor',
+      'switchTo',
+      'replaceAccounts',
+      'restoreState',
+      'switchToCandidate',
+      'switchToExhaustedFallbackCandidate',
+    ]), '代入点を持つのは6関数');
+
+    // (i) 反応的 429 の再試行の周（`switchToCandidate` が第5の代入点）。
+    let fableLimited = false;
+    const reactive = await startAffinity({
+      usageFetcher: async () => ({
+        five_hour: { utilization: 1, resets_at: futureReset() },
+      }),
+      upstream: ({ req, res }) => {
+        if (!fableLimited || req.headers.authorization !== 'Bearer token-acct_a') return false;
+        bareFable429(res);
+        return true;
+      },
+    });
+    // 反応的確認の再生先は `switchTargetScore` が非 null の口座だけなので、
+    // acct_b に既知の利用率を与えておく（枠の数字が1つも無い口座は候補にならない）。
+    reactive.accountManager.updateQuota('acct_a', { 'anthropic-ratelimit-unified-5h-utilization': '0.01' });
+    reactive.accountManager.updateQuota('acct_b', { 'anthropic-ratelimit-unified-5h-utilization': '0.1' });
+    assert.equal((await reactive.ask({ sid: 'session-one', model: 'claude-fable-5' })).status, 200);
+    const reactiveAssignments = watchCurrentIndex(reactive.accountManager);
+    fableLimited = true;
+    assert.equal((await reactive.ask({ sid: 'session-one', model: 'claude-fable-5' })).status, 200);
+    assert.deepEqual(
+      reactiveAssignments,
+      [],
+      '反応的 429 の周でも固定セッションは currentIndex を代入しない',
+    );
+    assert.deepEqual(eventLines(reactive.logLines, 'account_switch'), []);
+
+    // (ii) 枯渇応答の生成（`switchToExhaustedFallbackCandidate` が第6の代入点）。
+    const terminal = await startAffinity();
+    assert.equal((await terminal.ask({ sid: 'session-one' })).status, 200);
+    const terminalAssignments = watchCurrentIndex(terminal.accountManager);
+    terminal.accountManager.updateQuota('acct_a', commonExhaustedHeaders(7_200_000));
+    terminal.accountManager.updateQuota('acct_b', commonExhaustedHeaders(1_800_000));
+    assert.equal((await terminal.ask({ sid: 'session-one' })).status, 429);
+    assert.deepEqual(
+      terminalAssignments,
+      [],
+      '枯渇応答の生成でも固定セッションは currentIndex を代入しない',
+    );
+  });
+
+  it('⑮: a common-quota exhaustion rebinds each pinned session on its own and moves currentIndex only for a keyless request', async () => {
+    const { ask, seen, accountManager, logLines } = await startAffinity();
+    // acct_b を新規割当の帯の外へ出して、2セッションとも acct_a へ結び付ける。
+    accountManager.updateQuota('acct_a', { 'anthropic-ratelimit-unified-5h-utilization': '0.01' });
+    accountManager.updateQuota('acct_b', { 'anthropic-ratelimit-unified-5h-utilization': '0.5' });
+    assert.equal((await ask({ sid: 'session-one' })).status, 200);
+    assert.equal((await ask({ sid: 'session-two' })).status, 200);
+    assert.deepEqual(seen, ['Bearer token-acct_a', 'Bearer token-acct_a']);
+
+    const assignments = watchCurrentIndex(accountManager);
+    accountManager.updateQuota('acct_a', commonExhaustedHeaders());
+    assert.equal((await ask({ sid: 'session-one' })).status, 200);
+    assert.equal((await ask({ sid: 'session-two' })).status, 200);
+
+    assert.deepEqual(seen.slice(2), ['Bearer token-acct_b', 'Bearer token-acct_b']);
+    const switches = eventLines(logLines, 'affinity_switch');
+    assert.equal(switches.length, 2, '縛られていた2セッションが1本ずつ個別に付け替わる');
+    for (const line of switches) {
+      assert.match(line, / from=acct_a to=acct_b reason=common_exhausted family=other /);
+    }
+    assert.deepEqual(assignments, [], '固定セッションの付け替えでは currentIndex は動かない');
+    assert.deepEqual(eventLines(logLines, 'account_switch'), []);
+
+    // 鍵の無い要求のためだけに、既存ロジックが currentIndex を動かす（§4.5）。
+    assert.equal((await ask({})).status, 200);
+    assert.deepEqual(assignments, [1]);
+    const globalSwitches = eventLines(logLines, 'account_switch');
+    assert.equal(globalSwitches.length, 1);
+    assert.match(globalSwitches[0], / from=acct_a to=acct_b reason=\S+ trigger=request$/);
+  });
+
+  it('⑳: a common-quota exhaustion on the sub-binding moves only that family binding', async () => {
+    const { ask, seen, accountManager, logLines } = await startAffinity({
+      accounts: ['acct_a', 'acct_b', 'acct_c'],
+    });
+    accountManager.updateQuota('acct_a', { 'anthropic-ratelimit-unified-5h-utilization': '0.01' });
+    accountManager.updateQuota('acct_b', { 'anthropic-ratelimit-unified-5h-utilization': '0.02' });
+    accountManager.updateQuota('acct_c', { 'anthropic-ratelimit-unified-5h-utilization': '0.03' });
+    assert.equal((await ask({ sid: 'session-one' })).status, 200);
+    assert.equal(seen.at(-1), 'Bearer token-acct_a', 'home は acct_a');
+
+    // Fable のサブキャップだけが枯れる -> その系統専用の副バインドが acct_b にできる。
+    accountManager.applyUsage('acct_a', {
+      scoped_weekly: [{ key: 'fable', label: 'Fable', utilization: 1, resets_at: futureReset() }],
+    });
+    assert.equal((await ask({ sid: 'session-one', model: 'claude-fable-5' })).status, 200);
+    assert.equal(seen.at(-1), 'Bearer token-acct_b');
+
+    // 副バインド先の共通枠が枯れる -> 動くのは副バインドだけである（D-63 C2）。
+    const assignments = watchCurrentIndex(accountManager);
+    accountManager.updateQuota('acct_b', commonExhaustedHeaders());
+    assert.equal((await ask({ sid: 'session-one', model: 'claude-fable-5' })).status, 200);
+    assert.equal(seen.at(-1), 'Bearer token-acct_c', '副バインドだけが acct_c へ移る');
+    assert.equal((await ask({ sid: 'session-one' })).status, 200);
+    assert.equal(seen.at(-1), 'Bearer token-acct_a', 'home は acct_a のまま動かない');
+
+    const switches = eventLines(logLines, 'affinity_switch');
+    assert.equal(switches.length, 2);
+    assert.match(switches[0], / from=acct_a to=acct_b reason=family_exhausted family=fable switches=1$/);
+    assert.match(switches[1], / from=acct_b to=acct_c reason=common_exhausted family=fable switches=2$/);
+    assert.deepEqual(assignments, []);
+  });
+
+  it('㉒: a pinned session walks its rebind candidates instead of returning the bare all-unavailable 429', async () => {
+    const exhaustedIds = new Set();
+    const { ask, seen, accountManager, logLines } = await startAffinity({
+      accounts: ['acct_a', 'acct_b', 'acct_c'],
+      upstream: ({ req, res }) => {
+        const id = String(req.headers.authorization).replace('Bearer token-', '');
+        if (!exhaustedIds.has(id)) return false;
+        exhaustedQuota429(res);
+        return true;
+      },
+    });
+    accountManager.updateQuota('acct_a', { 'anthropic-ratelimit-unified-5h-utilization': '0.01' });
+    accountManager.updateQuota('acct_b', { 'anthropic-ratelimit-unified-5h-utilization': '0.02' });
+    accountManager.updateQuota('acct_c', { 'anthropic-ratelimit-unified-5h-utilization': '0.03' });
+    assert.equal((await ask({ sid: 'session-one' })).status, 200);
+
+    exhaustedIds.add('acct_a');
+    exhaustedIds.add('acct_b');
+    const response = await ask({ sid: 'session-one' });
+
+    assert.equal(response.status, 200, '台帳に使える口座が残るかぎり完走する');
+    assert.ok(
+      !response.bodyText.includes('All configured accounts are unavailable'),
+      '素の 429 を返さない',
+    );
+    assert.deepEqual(seen.slice(1), [
+      'Bearer token-acct_a',
+      'Bearer token-acct_b',
+      'Bearer token-acct_c',
+    ], 'バインド先1 ＋ 再バインド候補2 を最後まで試す');
+    const switches = eventLines(logLines, 'affinity_switch');
+    assert.equal(switches.length, 2);
+    assert.match(switches[0], / from=acct_a to=acct_b reason=common_exhausted family=other switches=1$/);
+    assert.match(switches[1], / from=acct_b to=acct_c reason=common_exhausted family=other switches=2$/);
+  });
+
+  it('㉓: the exhausted terminal of a pinned session moves neither currentIndex nor the fallback-switch event', async () => {
+    const { ask, accountManager, logLines } = await startAffinity();
+    assert.equal((await ask({ sid: 'session-one' })).status, 200);
+
+    const assignments = watchCurrentIndex(accountManager);
+    accountManager.updateQuota('acct_a', commonExhaustedHeaders(7_200_000));
+    accountManager.updateQuota('acct_b', commonExhaustedHeaders(1_800_000));
+    const response = await ask({ sid: 'session-one' });
+
+    assert.equal(response.status, 429);
+    assert.equal(
+      response.body.error.details.account,
+      'acct_b',
+      '応答はいちばん早く回復する口座で合成する（現行と同じ中身）',
+    );
+    assert.deepEqual(assignments, [], 'selectBestExhaustedFallback を通らない');
+    assert.deepEqual(
+      accountManager.events.filter(event => event.type === 'fallback-switch'),
+      [],
+      'fallback-switch も積まれない',
+    );
+    assert.deepEqual(eventLines(logLines, 'account_switch'), []);
+
+    // 鍵の無い要求は現行どおり動く（固定セッション用の経路と分かれている証拠）。
+    assert.equal((await ask({})).status, 429);
+    assert.deepEqual(assignments, [1]);
+    assert.equal(
+      accountManager.events.filter(event => event.type === 'fallback-switch').length,
+      1,
+    );
+  });
+
+  it('D-154: an upstream 429 with family-quota evidence creates the sub-binding inside the same round', async () => {
+    let fableLimited = true;
+    const { ask, seen, accountManager, logLines } = await startAffinity({
+      usageFetcher: async () => ({
+        scoped_weekly: [{ key: 'fable', label: 'Fable', utilization: 1, resets_at: futureReset() }],
+      }),
+      upstream: ({ req, res }) => {
+        if (!fableLimited || req.headers.authorization !== 'Bearer token-acct_a') return false;
+        bareFable429(res);
+        return true;
+      },
+    });
+
+    // 再生先の候補になれるのは枠の数字が既知の口座だけである（`switchTargetScore`）。
+    // acct_a を帯の先頭に置いて、新規セッションが acct_a へ結び付くようにする。
+    accountManager.updateQuota('acct_a', { 'anthropic-ratelimit-unified-5h-utilization': '0.01' });
+    accountManager.updateQuota('acct_b', { 'anthropic-ratelimit-unified-5h-utilization': '0.1' });
+    const response = await ask({ sid: 'session-one', model: 'claude-fable-5' });
+
+    assert.equal(response.status, 200);
+    assert.deepEqual(seen, ['Bearer token-acct_a', 'Bearer token-acct_b']);
+    const switches = eventLines(logLines, 'affinity_switch');
+    assert.equal(switches.length, 1, '反応的 429 の周のうちに副バインドを作る');
+    assert.match(switches[0], / from=acct_a to=acct_b reason=family_exhausted family=fable switches=1$/);
+
+    // home は動いていないので、非 Fable の要求は acct_a のままである。
+    fableLimited = false;
+    assert.equal((await ask({ sid: 'session-one' })).status, 200);
+    assert.equal(seen.at(-1), 'Bearer token-acct_a');
+    // 次の Fable 要求は、表に載った副バインドへ直行する。
+    assert.equal((await ask({ sid: 'session-one', model: 'claude-fable-5' })).status, 200);
+    assert.equal(seen.at(-1), 'Bearer token-acct_b');
+    assert.equal(eventLines(logLines, 'affinity_switch').length, 1, '付け替えは1回だけ');
+  });
+
+  it('D-154: an upstream 429 with common-quota evidence rebinds the home in the same round', async () => {
+    let limited = true;
+    const { ask, seen, accountManager, logLines } = await startAffinity({
+      usageFetcher: async () => ({
+        five_hour: { utilization: 1, resets_at: futureReset() },
+      }),
+      upstream: ({ req, res }) => {
+        if (!limited || req.headers.authorization !== 'Bearer token-acct_a') return false;
+        bareFable429(res);
+        return true;
+      },
+    });
+
+    accountManager.updateQuota('acct_a', { 'anthropic-ratelimit-unified-5h-utilization': '0.01' });
+    accountManager.updateQuota('acct_b', { 'anthropic-ratelimit-unified-5h-utilization': '0.1' });
+    assert.equal((await ask({ sid: 'session-one', model: 'claude-fable-5' })).status, 200);
+
+    assert.deepEqual(seen, ['Bearer token-acct_a', 'Bearer token-acct_b']);
+    const switches = eventLines(logLines, 'affinity_switch');
+    assert.equal(switches.length, 1);
+    assert.match(switches[0], / from=acct_a to=acct_b reason=common_exhausted family=fable switches=1$/);
+    assert.deepEqual(eventLines(logLines, 'account_switch'), [], 'currentIndex は動かない');
+
+    // home が移ったので、非 Fable の要求も acct_b へ行く（副バインドは破棄・§4.1）。
+    limited = false;
+    assert.equal((await ask({ sid: 'session-one' })).status, 200);
+    assert.equal(seen.at(-1), 'Bearer token-acct_b');
+    assert.equal(accountManager.getCurrentAccount().id, 'acct_a', '稼働口座は据え置き');
   });
 });
