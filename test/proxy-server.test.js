@@ -9552,8 +9552,9 @@ describe('Claude 全枯渇 429 の 529 写像を7系統へ結線する (R4-2/R4-
   });
 
   // 写像したときだけ出る痕跡（degradeLog）。R4-5 で暫定行を廃止し、その要求の proxy ログ行へ併記する形にしたので、ここも proxy 行を見る。
-  // **proxy ログ行を持たない経路（P-b / P-d / P-g）では痕跡が残らない**ため、
+  // **proxy ログ行を持たない経路（P-b / P-g）では痕跡が残らない**ため、
   // それらのケースは応答（status・上流が付けた x-path-test ヘッダ）で経路を固定する。
+  // P-d は R-S9b（母艦裁定 D-197）で proxy 行を持つようになった（下の 4-d 2件）。
   const mapLines = logLines => logLines.filter(line => / proxy account=/.test(line) && /mapReason=/.test(line));
   const lastMapLine = logLines => mapLines(logLines).at(-1);
 
@@ -9646,14 +9647,11 @@ describe('Claude 全枯渇 429 の 529 写像を7系統へ結線する (R4-2/R4-
     assert.equal(response.status, 529);
     assert.equal(response.body.error.type, 'overloaded_error');
     assert.deepEqual(seen, []);
-    // P-d（sendUnavailableAccounts）は c0f79d4 の時点から proxy ログ行を1行も出さない
-    // 経路であり、R4-5 は「既存の行へ併記する」タスクなので痕跡の残し先が無い。
-    // 経路の固定は「上流へ1件も送っていない」＋「529 の本文」で行う。
-    assert.deepEqual(
-      logLines.filter(line => / proxy account=/.test(line)),
-      [],
-      'P-d はログ行を持たない（写像の痕跡も残らない＝R4-5 の残課題）',
-    );
+    // R-S9b（母艦裁定 D-197）でこの経路にも痕跡が残るようになった。R4-5 の時点では
+    // P-d は proxy ログ行を1行も持たず、写像したことがログのどこにも出なかった。
+    const pdLines = logLines.filter(line => / proxy account=/.test(line));
+    assert.equal(pdLines.length, 1, 'P-d の痕跡は1行だけ（R-S9b）');
+    assert.match(pdLines[0], /mapPath=d rotatorReason=quota_exhausted$/);
   });
 
   // 【R-S9】この経路の期待値は 503 → 529 へ変わった（設計書 §5.3(d)・§14.2 案イ・
@@ -9675,12 +9673,11 @@ describe('Claude 全枯渇 429 の 529 写像を7系統へ結線する (R4-2/R4-
 
     assert.equal(response.status, 529, '認証失敗でも全滅時の終端は写像入口を通す（I-6）');
     assert.equal(response.body.error.type, 'overloaded_error');
-    // P-d は proxy ログ行を持たない経路なので、写像しても痕跡は残らない（4-d 上段と同じ）。
-    assert.deepEqual(
-      logLines.filter(line => / proxy account=/.test(line)),
-      [],
-      'P-d はログ行を持たない（写像の痕跡も残らない＝R4-5 の残課題）',
-    );
+    // R-S9b（母艦裁定 D-197）: 資格情報起因の全滅は理由まで痕跡に残す（4-d 上段と同じ1行）。
+    // D-199 で語彙を分割したので、認証失効は「人を呼ぶ」側の credential_login_required。
+    const pdLines = logLines.filter(line => / proxy account=/.test(line));
+    assert.equal(pdLines.length, 1, 'P-d の痕跡は1行だけ（R-S9b）');
+    assert.match(pdLines[0], /mapPath=d rotatorReason=credential_login_required$/);
   });
 
   it('5-b: keeps the P-a response at 429 while degradeMapping is unset (§14.4)', async () => {
@@ -10539,6 +10536,245 @@ describe('写像フィールドを既存の proxy ログ行へ併記する (R4-5
 
     assert.equal(response.status, 529, '写像そのものは起きている');
     assert.deepEqual(logLines.filter(line => line.includes('claude-exhaustion-map')), []);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// R-S9b（母艦裁定 D-197。語彙は D-199 で分割した）: 写像後の 529 / 403 が「なぜ止まって
+// いるのか」を機械可読で名乗る。ヘッダは `x-claude-rotator-reason` の1本だけで、語彙は
+// 既存の分類をそのまま写した3値（`quota_exhausted` / `credential_cooldown` /
+// `credential_login_required`）。新しい分類は作らない。読み手が最初に知りたいのは
+// 「待てば回復するのか、人を呼ぶのか」なので、資格情報起因はそこで2つに割る。
+// あわせて、これまで proxy ログ行を1行も持たなかった P-d（sendUnavailableAccounts）に、
+// 写像したときだけ既存と同じ形の行を1行出す（末尾に mapPath=d と rotatorReason）。
+// degradeMapping を書いていない構成では、ヘッダも行も1つも増えない（§14.4）。
+// ---------------------------------------------------------------------------
+describe('写像後 529 の理由ヘッダと P-d の proxy 行 (R-S9b / 母艦裁定 D-197)', () => {
+  const ENABLED = { enabled: true };
+  const REASON_HEADER = 'x-claude-rotator-reason';
+
+  async function startProxy({
+    accountManager,
+    secretStore = new MemorySecretStore(),
+    upstreamUrl,
+    logLines,
+    degradeMapping = ENABLED,
+  }) {
+    const proxy = await listen(createProxyServer({
+      accountManager,
+      secretStore,
+      config: {
+        upstream: upstreamUrl,
+        usagePolling: { enabled: false },
+        openaiBridge: { enabled: false, ...(degradeMapping ? { degradeMapping } : {}) },
+      },
+      currentCredentialReader: async () => null,
+      logger: line => logLines.push(line),
+    }));
+    cleanupAfterTest(async () => close(proxy.server));
+    return proxy;
+  }
+
+  // P-a も P-d も上流へは送らずに終端する（上流に1件も届かないことで経路を固定する）。
+  async function startUnusedUpstream() {
+    const seen = [];
+    const upstream = await listen(http.createServer((req, res) => {
+      seen.push(req.headers.authorization);
+      req.resume();
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end('{}');
+    }));
+    cleanupAfterTest(async () => close(upstream.server));
+    return { upstream, seen };
+  }
+
+  const ask = proxy => requestJson(`${proxy.url}/v1/messages`, {
+    method: 'POST',
+    body: JSON.stringify({ model: 'sonnet' }),
+    headers: { 'content-type': 'application/json' },
+    timeoutMs: 3_000,
+  });
+
+  const proxyLines = logLines => logLines.filter(line => / proxy account=/.test(line));
+
+  function singleAccountManager() {
+    return new AccountManager({ accounts: [{ id: 'acct_1', type: 'oauth' }], now: () => 1000 });
+  }
+
+  it('9b-1: labels the mapped P-a 529 as quota_exhausted', async () => {
+    const { upstream, seen } = await startUnusedUpstream();
+    const secretStore = new MemorySecretStore();
+    await secretStore.set('acct_1', { accessToken: 'access-token-1' });
+    const accountManager = singleAccountManager();
+    accountManager.updateQuota('acct_1', {
+      'anthropic-ratelimit-unified-5h-utilization': '1',
+      'anthropic-ratelimit-unified-5h-reset': '10',
+    });
+    const logLines = [];
+    const proxy = await startProxy({
+      accountManager, secretStore, upstreamUrl: upstream.url, logLines,
+    });
+
+    const response = await ask(proxy);
+
+    assert.equal(response.status, 529);
+    assert.equal(response.headers[REASON_HEADER], 'quota_exhausted', '枠の枯渇は quota_exhausted');
+    assert.deepEqual(seen, [], 'P-a は上流へ送らない');
+  });
+
+  it('9b-2: labels the mapped P-d 529 as credential_login_required and writes one proxy line with mapPath=d', async () => {
+    const { upstream, seen } = await startUnusedUpstream();
+    const accountManager = singleAccountManager();
+    accountManager.markError('acct_1', 'authentication_error', 'OAuth token rejected');
+    const logLines = [];
+    const proxy = await startProxy({ accountManager, upstreamUrl: upstream.url, logLines });
+
+    const response = await ask(proxy);
+
+    assert.equal(response.status, 529, '資格情報の全滅でも終端は写像入口を通す（R-S9 / I-6）');
+    assert.equal(response.headers[REASON_HEADER], 'credential_login_required');
+    assert.deepEqual(seen, [], 'P-d は上流へ送らない');
+    const lines = proxyLines(logLines);
+    assert.equal(lines.length, 1, 'P-d の痕跡は1行だけ');
+    assert.match(lines[0], / status=529 durationMs=0 outcome=unavailable-accounts-local/);
+    assert.match(lines[0], /mapReason=all_claude_accounts_exhausted/);
+    assert.match(lines[0], /mapPath=d rotatorReason=credential_login_required$/);
+    // D-199 (B): 行頭の時刻は実時計ではなく注入した時計（now: () => 1000）から取る。
+    // 他の proxy 行（accountManager.recordProxyRequest）と同じ出所にしておかないと、
+    // 時刻を固定したテストでこの行だけがずれる。
+    assert.match(lines[0], /^1970-01-01T00:00:01\.000Z proxy account=acct_1 /);
+  });
+
+  it('9b-3: keeps quota_exhausted on a P-d whose terminal reason is not a credential failure', async () => {
+    const { upstream } = await startUnusedUpstream();
+    const accountManager = singleAccountManager();
+    accountManager.markRateLimited('acct_1', 60);
+    const logLines = [];
+    const proxy = await startProxy({ accountManager, upstreamUrl: upstream.url, logLines });
+
+    const response = await ask(proxy);
+
+    assert.equal(response.status, 529);
+    assert.equal(response.headers[REASON_HEADER], 'quota_exhausted', '新しい分類は作らない');
+    assert.match(proxyLines(logLines).at(-1), /mapPath=d rotatorReason=quota_exhausted$/);
+  });
+
+  it('9b-4: adds neither the header nor the P-d line while degradeMapping is unset (§14.4)', async () => {
+    const { upstream } = await startUnusedUpstream();
+    const accountManager = singleAccountManager();
+    accountManager.markError('acct_1', 'authentication_error', 'OAuth token rejected');
+    const logLines = [];
+    const proxy = await startProxy({
+      accountManager, upstreamUrl: upstream.url, logLines, degradeMapping: null,
+    });
+
+    const response = await ask(proxy);
+
+    assert.equal(response.status, 503, '写像しない構成では現行どおり 503 を返す');
+    assert.equal(response.headers[REASON_HEADER], undefined, '無効な構成ではヘッダを足さない');
+    assert.deepEqual(proxyLines(logLines), [], 'P-d のログ行も出ない');
+  });
+
+  it('9b-5: leaves the P-a 429 without the header while degradeMapping is unset (§14.4)', async () => {
+    const { upstream } = await startUnusedUpstream();
+    const secretStore = new MemorySecretStore();
+    await secretStore.set('acct_1', { accessToken: 'access-token-1' });
+    const accountManager = singleAccountManager();
+    accountManager.updateQuota('acct_1', {
+      'anthropic-ratelimit-unified-5h-utilization': '1',
+      'anthropic-ratelimit-unified-5h-reset': '10',
+    });
+    const logLines = [];
+    const proxy = await startProxy({
+      accountManager, secretStore, upstreamUrl: upstream.url, logLines, degradeMapping: null,
+    });
+
+    const response = await ask(proxy);
+
+    assert.equal(response.status, 429);
+    assert.equal(response.headers[REASON_HEADER], undefined);
+  });
+
+  // -------------------------------------------------------------------------
+  // D-199 (A): P-d の分類は `currentIndex` が指す1口座の理由ではなく、**全口座**の
+  // `unavailableReason` を走査して決める。このヘッダの用途は「待てばよいのか、人を呼ぶ
+  // のか」の機械判別なので、現在口座が枠切れでも別の口座が再ログイン待ちなら人を呼ぶ
+  // 価値がある。優先は credential_login_required ＞ credential_cooldown ＞ quota_exhausted。
+  // 503 分岐（写像しない構成）の述語と挙動は変えていない（9b-4 が押さえる）。
+  // -------------------------------------------------------------------------
+
+  function twoAccountManager() {
+    return new AccountManager({
+      accounts: [{ id: 'acct_1', type: 'oauth' }, { id: 'acct_2', type: 'oauth' }],
+      now: () => 1000,
+    });
+  }
+
+  it('9b-6: reports credential_login_required when any account needs a re-login', async () => {
+    const { upstream } = await startUnusedUpstream();
+    const accountManager = twoAccountManager();
+    accountManager.markRateLimited('acct_1', 60);
+    accountManager.markError('acct_2', 'authentication_error', 'OAuth token rejected');
+    const logLines = [];
+    const proxy = await startProxy({ accountManager, upstreamUrl: upstream.url, logLines });
+
+    const response = await ask(proxy);
+
+    assert.equal(response.status, 529);
+    assert.equal(
+      response.headers[REASON_HEADER],
+      'credential_login_required',
+      '現在口座が枠切れでも、別口座が再ログイン待ちなら人を呼ぶ側を名乗る',
+    );
+    assert.match(proxyLines(logLines).at(-1), /mapPath=d rotatorReason=credential_login_required$/);
+  });
+
+  it('9b-7: reports credential_cooldown when any account only waits out a refresh cooldown', async () => {
+    const { upstream } = await startUnusedUpstream();
+    const accountManager = twoAccountManager();
+    accountManager.markRateLimited('acct_1', 60);
+    accountManager.markCredentialRefreshRateLimited('acct_2', 60);
+    const logLines = [];
+    const proxy = await startProxy({ accountManager, upstreamUrl: upstream.url, logLines });
+
+    const response = await ask(proxy);
+
+    assert.equal(response.status, 529);
+    assert.equal(
+      response.headers[REASON_HEADER],
+      'credential_cooldown',
+      '資格情報側だが待てば回復する（人を呼ぶ必要は無い）',
+    );
+    assert.match(proxyLines(logLines).at(-1), /mapPath=d rotatorReason=credential_cooldown$/);
+  });
+
+  it('9b-8: stays quota_exhausted while no account has a credential problem', async () => {
+    const { upstream } = await startUnusedUpstream();
+    const accountManager = twoAccountManager();
+    accountManager.markRateLimited('acct_1', 60);
+    accountManager.markRateLimited('acct_2', 60);
+    const logLines = [];
+    const proxy = await startProxy({ accountManager, upstreamUrl: upstream.url, logLines });
+
+    const response = await ask(proxy);
+
+    assert.equal(response.status, 529);
+    assert.equal(response.headers[REASON_HEADER], 'quota_exhausted');
+    assert.match(proxyLines(logLines).at(-1), /mapPath=d rotatorReason=quota_exhausted$/);
+  });
+
+  it('9b-9: prefers credential_login_required over a concurrent cooldown (優先順位)', async () => {
+    const { upstream } = await startUnusedUpstream();
+    const accountManager = twoAccountManager();
+    accountManager.markCredentialRefreshRateLimited('acct_1', 60);
+    accountManager.markError('acct_2', 'oauth_refresh_failed', 'refresh failed');
+    const logLines = [];
+    const proxy = await startProxy({ accountManager, upstreamUrl: upstream.url, logLines });
+
+    const response = await ask(proxy);
+
+    assert.equal(response.status, 529);
+    assert.equal(response.headers[REASON_HEADER], 'credential_login_required');
   });
 });
 

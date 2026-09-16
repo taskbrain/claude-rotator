@@ -33,6 +33,9 @@ import {
   claudeEarliestResetAt,
   claudeQuotaState,
   createGptPoolState,
+  DEGRADE_REASON_CREDENTIAL_COOLDOWN,
+  DEGRADE_REASON_CREDENTIAL_LOGIN_REQUIRED,
+  DEGRADE_REASON_QUOTA_EXHAUSTED,
   formatLogMeta,
   mapClaudeExhaustion,
 } from './degrade-state.js';
@@ -409,6 +412,10 @@ export function createProxyServer({
     mapPath = null,
     modelFamily = null,
     headersSent = false,
+    // R-S9b（母艦裁定 D-197）: 写像後の応答が名乗る理由（`x-claude-rotator-reason`）。
+    // 資格情報起因になりうるのは P-d だけなので、そこだけが明示的に分類を渡す。
+    // 渡さない経路（上流 429 と局所合成の 429）は既定の quota_exhausted になる。
+    reason = null,
   } = {}) => {
     const mapping = openaiBridgeSettings.degradeMapping;
     if (mapping?.enabled !== true || !candidate) return candidate;
@@ -437,6 +444,7 @@ export function createProxyServer({
       enabled: true,
       mapPath,
       headersSent,
+      reason,
       claudeAllUnusable: allUnusable,
       commonFamilyAllUnusable: commonAllUnusable,
       recoveryWaitEnabled,
@@ -2539,7 +2547,7 @@ async function forwardWithRotation({
         exhaustionMapper: mapExhaustion,
         affinityLog: affinityRequest,
       })) return;
-      sendUnavailableAccounts(res, accountManager, mapExhaustion);
+      sendUnavailableAccounts(res, accountManager, mapExhaustion, { req, logger, affinityLog: affinityRequest });
       return;
     }
 
@@ -2566,7 +2574,7 @@ async function forwardWithRotation({
       })
     ) {
       if (lastRetryableResponse) sendLastRetryable();
-      else sendUnavailableAccounts(res, accountManager, mapExhaustion);
+      else sendUnavailableAccounts(res, accountManager, mapExhaustion, { req, logger, affinityLog: affinityRequest });
       return;
     }
 
@@ -2683,7 +2691,7 @@ async function forwardWithRotation({
     }
     if (attemptedAccountIds.has(account.id)) {
       if (lastRetryableResponse) sendLastRetryable();
-      else sendUnavailableAccounts(res, accountManager, mapExhaustion);
+      else sendUnavailableAccounts(res, accountManager, mapExhaustion, { req, logger, affinityLog: affinityRequest });
       return;
     }
     attemptedAccountIds.add(account.id);
@@ -2869,7 +2877,7 @@ async function forwardWithRotation({
       exhaustionMapper: mapExhaustion,
       affinityLog: affinityRequest,
     })) return;
-    sendUnavailableAccounts(res, accountManager, mapExhaustion);
+    sendUnavailableAccounts(res, accountManager, mapExhaustion, { req, logger, affinityLog: affinityRequest });
   }
 }
 
@@ -4163,7 +4171,65 @@ function sendJson(res, status, body) {
   res.end(JSON.stringify(body));
 }
 
-function sendUnavailableAccounts(res, accountManager = null, exhaustionMapper = null) {
+/**
+ * P-d（sendUnavailableAccounts）で写像が起きたときの proxy ログ行（R-S9b・母艦裁定 D-197）。
+ * この経路は c0f79d4 の時点から proxy 行を1行も持たず、写像の痕跡がどこにも残らなかった
+ * （degradeLog が捨てられていた）。行の形・フィールドの順序は writeProxyLog のまま使い、
+ * mapPath=d と rotatorReason は既存の追記位置（末尾）へ載る。台帳
+ * （accountManager.recordProxyRequest）は経由しないのでイベントは増えず、写像しなかった
+ * 要求と degradeMapping を書いていない構成では1行も増えない（§14.4）。
+ */
+function logMappedUnavailableAccounts({
+  logger, req, accountManager, account, mapped, affinityLog = null,
+}) {
+  if (!logger || !req || !mapped?.degradeLog?.mapReason) return;
+  writeProxyLog(logger, {
+    // D-199 (B): 時刻は他の proxy 行（accountManager.recordProxyRequest）とまったく同じ
+    // 出所、すなわち注入された時計から取る。ここだけ実時計を読むと、時刻を固定した
+    // 構成・テストでこの1行だけが別の時間軸で並ぶ。
+    at: new Date(accountManager?.now?.() ?? Date.now()).toISOString(),
+    account: account?.id || '-',
+    method: req.method,
+    path: new URL(req.url, 'http://claude-rotator.local').pathname,
+    statusCode: mapped.statusCode,
+    durationMs: 0,
+    outcome: 'unavailable-accounts-local',
+  }, mapped.degradeLog, affinityLog);
+}
+
+/**
+ * P-d で写像した応答が名乗る理由（R-S9b・母艦裁定 D-197 / D-199）。分類はこの1箇所だけで
+ * 行い、503 分岐が使う述語 `isCredentialUnavailable` には触らない（status 画面と共有して
+ * いるため。§5.3(d)）。
+ *
+ * 見るのは `getCurrentAccount()` が指す1口座ではなく**全口座**の `unavailableReason` である。
+ * このヘッダの用途は「待てばよいのか、人を呼ぶのか」の機械判別なので、現在口座が枠切れでも
+ * 別の口座が再ログイン待ちなら人を呼ぶ価値がある（D-199 (A)）。優先順位は
+ * credential_login_required ＞ credential_cooldown ＞ quota_exhausted。
+ *
+ * 語彙に包括値を置いていないのは、`isCredentialUnavailable` がこの2述語の和そのもの
+ * （同ファイル `isCredentialUnavailable`）で、「資格情報起因だがどちらでもない」が構造上
+ * あり得ないためである。
+ */
+function classifyUnavailableAccountsReason(accountManager) {
+  const reasons = (accountManager?.accounts || [])
+    .map(account => accountManager.unavailableReason(account));
+  if (reasons.some(reason => isAuthExpiredReason(reason))) {
+    return DEGRADE_REASON_CREDENTIAL_LOGIN_REQUIRED;
+  }
+  if (reasons.some(reason => isCredentialRefreshCooldown(reason))) {
+    return DEGRADE_REASON_CREDENTIAL_COOLDOWN;
+  }
+  return DEGRADE_REASON_QUOTA_EXHAUSTED;
+}
+
+function sendUnavailableAccounts(res, accountManager = null, exhaustionMapper = null, {
+  // R-S9b（母艦裁定 D-197）: 写像したときだけ proxy ログ行を1行出すための文脈。
+  // 渡さなければ（既存の呼び出し形のままなら）行は1行も増えない。
+  req = null,
+  logger = null,
+  affinityLog = null,
+} = {}) {
   const current = accountManager?.getCurrentAccount();
   const reason = current ? accountManager.unavailableReason(current) : null;
   const body = {
@@ -4179,12 +4245,23 @@ function sendUnavailableAccounts(res, accountManager = null, exhaustionMapper = 
   // 写像しないと決まったとき（台帳が全枯渇でない・degradeMapping 無効）は、下の 503 を
   // 現行のまま返す。述語 `isCredentialUnavailable` は status 画面（monitor.js の
   // `login expired` / `needs login`）と共有しているので触らない（§5.3(d) の実装位置）。
+  // R-S9b（D-197 / D-199）: 写像後の 529 が「枠の枯渇」なのか「待てば回復する資格情報の
+  // cooldown」なのか「人が再ログインするまで戻らない失効」なのかを名乗れるように、下の
+  // 503 分岐と同じ述語（isAuthExpiredReason / isCredentialRefreshCooldown）で分類して
+  // から写像器へ渡す。分類は既存のものを写すだけで、新しい語彙は作らない。
   const mapped = exhaustionMapper?.({
     statusCode: 429,
     headers: { 'Content-Type': 'application/json' },
     body: Buffer.from(JSON.stringify(body)),
-  }, { mapPath: 'd', headersSent: res.headersSent });
+  }, {
+    mapPath: 'd',
+    headersSent: res.headersSent,
+    reason: classifyUnavailableAccountsReason(accountManager),
+  });
   if (mapped && mapped.statusCode !== 429) {
+    logMappedUnavailableAccounts({
+      logger, req, accountManager, account: current, mapped, affinityLog,
+    });
     sendBufferedResponse(res, mapped);
     return;
   }

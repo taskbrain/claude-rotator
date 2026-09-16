@@ -28,6 +28,39 @@ const DEGRADE_REASONS = new Set([
 ]);
 const UNKNOWN_DEGRADE_REASON = 'unknown';
 
+// R-S9b（母艦裁定 D-197。語彙は D-199 で分割した）: 写像後の応答が「なぜ止まっているのか」を
+// 1本のヘッダで名乗る。語彙は rotator に既にある分類をそのまま写した3値だけで、新しい分類は
+// 作らない。読み手（bridge・運用者）が最初に知りたいのは「待てば回復するのか、人を呼ぶのか」
+// なので、資格情報起因はそこで2つに割る:
+//   quota_exhausted           … 共通枠／系統枠の枯渇（局所合成した 429 と上流 429 の写像＝
+//                               P-a〜P-c ほか）。待てば回復する。
+//   credential_cooldown       … 資格情報の更新が cooldown 中（isCredentialRefreshCooldown
+//                               ＝ oauth_refresh_rate_limit / oauth_refresh_retry）。待てば回復する。
+//   credential_login_required … 認証が失効している（isAuthExpiredReason ＝ oauth_refresh_failed /
+//                               authentication_error）。人が `claude-rotator login` を実行する
+//                               まで回復しない。
+// 包括値（credential_failure）は置かない。P-d が使う述語 `isCredentialUnavailable` は
+// `isCredentialRefreshCooldown(reason) || isAuthExpiredReason(reason)`（src/proxy-server.js の
+// `isCredentialUnavailable`）
+// と定義されており、上の2述語の**和そのもの**なので、「資格情報起因だがどちらでもない」は
+// 構造上あり得ない。両方に該当したときは credential_login_required を優先する（人を呼ぶ側）。
+// 値は小文字スネークケース固定。写像するのは 429 だけなので、呼び出し側が分類を渡さない
+// 経路の既定は quota_exhausted である（資格情報起因になりうるのは P-d だけ）。
+export const DEGRADE_REASON_HEADER = 'x-claude-rotator-reason';
+export const DEGRADE_REASON_QUOTA_EXHAUSTED = 'quota_exhausted';
+export const DEGRADE_REASON_CREDENTIAL_COOLDOWN = 'credential_cooldown';
+export const DEGRADE_REASON_CREDENTIAL_LOGIN_REQUIRED = 'credential_login_required';
+const DEGRADE_REASON_VALUES = new Set([
+  DEGRADE_REASON_QUOTA_EXHAUSTED,
+  DEGRADE_REASON_CREDENTIAL_COOLDOWN,
+  DEGRADE_REASON_CREDENTIAL_LOGIN_REQUIRED,
+]);
+
+/** 呼び出し側が明示的に語彙内の分類を渡したときだけ真（ログ行へ出すかの判定にも使う）。 */
+function classifiedDegradeReason(reason) {
+  return DEGRADE_REASON_VALUES.has(reason) ? reason : null;
+}
+
 const POOL_STATES = new Set([
   'ok', 'degraded', 'exhausted', 'needs-login', 'mixed', 'no-account-for-model',
   // 契約 v1.5。needs-login と同じ扱い（利用不可として学習するが 403 書換の根拠にはしない）。
@@ -569,6 +602,11 @@ export function mapClaudeExhaustion(candidate, ctx = {}) {
     : withoutBodyHeaders(candidate.headers);
   headers['content-type'] = 'application/json';
   headers['content-length'] = String(body.length);
+  // R-S9b（D-197）: ヘッダ組み立ての共通箇所に1本だけ置く。ここを通るのは写像した応答
+  // だけなので、写像しなかった応答（と degradeMapping が無効な構成）には付かない。
+  // 403 でも 529 でも、将来この経路を通る別のステータスでも同じ1本が付く。
+  const classified = classifiedDegradeReason(ctx.reason);
+  headers[DEGRADE_REASON_HEADER] = classified || DEGRADE_REASON_QUOTA_EXHAUSTED;
   return {
     ...candidate,
     statusCode: status,
@@ -584,6 +622,10 @@ export function mapClaudeExhaustion(candidate, ctx = {}) {
       mappedTo: status,
       retryAfter: waits ? RECOVERY_WAIT_RETRY_AFTER_SECONDS : undefined,
       mapReason: waits || bothUnusable ? 'both_pools_unusable' : 'all_claude_accounts_exhausted',
+      // ログ行へ出すのは、呼び出し側が経路を明示的に分類したとき（P-d）だけ。既定の
+      // quota_exhausted を毎回書くと、既存の写像行に意味の無いフィールドが1つ増える
+      // ので、値の無いキーは出さないという §9.2 の規律どおり省く（ヘッダには必ず付く）。
+      rotatorReason: classified || undefined,
     },
   };
 }
@@ -811,6 +853,8 @@ export function buildBridgeLogMeta(parsed, extra = {}) {
   for (const key of [
     'gptPoolState', 'gptModelState', 'claudePoolState',
     'mappedFrom', 'mappedFromType', 'mappedTo', 'retryAfter', 'mapReason', 'mapPath',
+    // R-S9b: 追記は必ず末尾へ（§9.2）。値を持たない既存の写像行は1文字も変わらない。
+    'rotatorReason',
   ]) put(key, extra?.[key]);
   return meta;
 }

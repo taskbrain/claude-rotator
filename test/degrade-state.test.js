@@ -609,6 +609,100 @@ describe('mapClaudeExhaustion', () => {
     assert.equal(output.degradeLog.mapReason, 'all_claude_accounts_exhausted');
     assert.equal(output.degradeLog.resetAt, undefined, '529 は回復時刻を持たない（§9.2）');
   });
+
+  // -------------------------------------------------------------------------
+  // R-S9b（母艦裁定 D-197。語彙は D-199 で分割した）: 写像後の応答へ「なぜ止まって
+  // いるのか」を1本のヘッダ（x-claude-rotator-reason）で残す。語彙は既存の分類を写した
+  // 3値だけで、新しい分類は作らない: quota_exhausted / credential_cooldown（待てば回復
+  // する）/ credential_login_required（人が再ログインするまで回復しない）。既定は
+  // quota_exhausted（写像するのは 429 だけなので）。
+  // -------------------------------------------------------------------------
+
+  it('stamps x-claude-rotator-reason=quota_exhausted by default (既定は枠の枯渇)', () => {
+    const output = mapClaudeExhaustion(candidate429(), {
+      enabled: true, claudeAllUnusable: true, gptPoolState: 'unknown', mapPath: 'a',
+    });
+    assert.equal(output.headers['x-claude-rotator-reason'], 'quota_exhausted');
+    assert.equal(
+      output.degradeLog.rotatorReason,
+      undefined,
+      '既定の分類はログ行のフィールドを増やさない（値の無いキーは出さない＝§9.2）',
+    );
+  });
+
+  it('stamps credential_login_required and records it in the trace when the caller classifies the path (P-d)', () => {
+    const output = mapClaudeExhaustion(candidate429(), {
+      enabled: true,
+      claudeAllUnusable: true,
+      gptPoolState: 'unknown',
+      mapPath: 'd',
+      reason: 'credential_login_required',
+    });
+    assert.equal(output.headers['x-claude-rotator-reason'], 'credential_login_required');
+    assert.equal(output.degradeLog.rotatorReason, 'credential_login_required');
+    assert.equal(output.statusCode, 529);
+  });
+
+  // D-199: 資格情報起因を「待てばよい（cooldown）」と「人を呼ぶ（再ログイン）」へ分ける。
+  it('stamps credential_cooldown for the half that recovers on its own (待てば回復する側)', () => {
+    const output = mapClaudeExhaustion(candidate429(), {
+      enabled: true,
+      claudeAllUnusable: true,
+      gptPoolState: 'unknown',
+      mapPath: 'd',
+      reason: 'credential_cooldown',
+    });
+    assert.equal(output.headers['x-claude-rotator-reason'], 'credential_cooldown');
+    assert.equal(output.degradeLog.rotatorReason, 'credential_cooldown');
+    assert.equal(output.statusCode, 529);
+  });
+
+  it('stamps the reason on the 403 as well (ヘッダ組み立ての共通箇所に1本だけ置く)', () => {
+    const output = mapClaudeExhaustion(candidate429(), {
+      enabled: true,
+      claudeAllUnusable: true,
+      commonFamilyAllUnusable: true,
+      gptPoolState: 'unusable',
+      mapPath: 'd',
+      reason: 'credential_login_required',
+    });
+    assert.equal(output.statusCode, 403);
+    assert.equal(output.headers['x-claude-rotator-reason'], 'credential_login_required');
+  });
+
+  it('falls back to quota_exhausted outside the 3-value vocabulary (語彙は作らない)', () => {
+    // `credential_failure` は D-199 で語彙から外した包括値。P-d の述語
+    // `isCredentialUnavailable` が cooldown と再ログイン必要の2述語の**和そのもの**
+    // （src/proxy-server.js の同名関数）なので第3の資格情報起因は構造上あり得ず、
+    // 包括値を受け取ったら未知値として既定へ落とす。
+    for (const reason of [
+      'credential_failure', 'CREDENTIAL_COOLDOWN', 'credential cooldown', 'whatever', 42, null,
+    ]) {
+      const output = mapClaudeExhaustion(candidate429(), {
+        enabled: true, claudeAllUnusable: true, gptPoolState: 'unknown', mapPath: 'a', reason,
+      });
+      assert.equal(output.headers['x-claude-rotator-reason'], 'quota_exhausted', String(reason));
+      assert.equal(output.degradeLog.rotatorReason, undefined, String(reason));
+    }
+  });
+
+  it('never touches a response it does not map (写像しないときはヘッダも痕跡も足さない)', () => {
+    const output = mapClaudeExhaustion(candidate429(), {
+      enabled: true, claudeAllUnusable: false, gptPoolState: 'unknown', mapPath: 'a', reason: 'credential_login_required',
+    });
+    assert.equal(output.statusCode, 429);
+    assert.equal('x-claude-rotator-reason' in output.headers, false);
+    assert.equal(output.degradeLog.rotatorReason, undefined);
+  });
+
+  it('adds no header at all while degradeMapping is disabled (§14.4)', () => {
+    const input = candidate429();
+    const output = mapClaudeExhaustion(input, {
+      enabled: false, claudeAllUnusable: true, gptPoolState: 'unknown', mapPath: 'd', reason: 'credential_login_required',
+    });
+    assert.equal(output, input);
+    assert.equal('x-claude-rotator-reason' in output.headers, false);
+  });
 });
 
 // ---------------------------------------------------------------------------

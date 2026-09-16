@@ -510,7 +510,13 @@ claude-rotator status
       }
     }
     ```
-- ログの `outcome` は `forwarded` / `forwarded-mapped`（529 を 403 へ、または認証失効の 403 を 529 へ書き換えた）/ `bridge-unreachable` / `bridge-connect-timeout` / `bridge-idle-timeout` / `bridge-stream-error` に分かれ、`degradeReason` `upstreamStatus` `gptPoolState` `claudePoolState` `mappedFrom` / `mappedTo` などを、値があるときだけ行末へ追記します（値が1つも無ければ行は従来と同一です）。
+- **写像した応答には理由ヘッダ `x-claude-rotator-reason` を1本だけ付けます。** 値は次の3つだけで、529 でも 403 でも同じ1本が付きます。写像しなかった応答と `degradeMapping` を書いていない構成には付きません。
+    - `quota_exhausted` — 共通枠・系列枠の枯渇です。**待てば回復します。**
+    - `credential_cooldown` — 資格情報の更新が待機中（cooldown）です。**待てば回復します。**
+    - `credential_login_required` — 認証が失効しています。**人が `claude-rotator login` を実行するまで回復しません。**
+- 理由は「いま選ばれているアカウント1つ」ではなく**登録済みの全アカウント**を見て決めます。1つでも再ログインが必要なら `credential_login_required`、そうでなく1つでも cooldown 中なら `credential_cooldown`、どのアカウントにも資格情報の問題が無ければ `quota_exhausted` です。受け取った側が「待てばよいのか、人を呼ぶ必要があるのか」だけで分岐できるようにするためです。
+- 全アカウントが使えずに終端した要求（内部経路 `mapPath=d`）も、写像したときだけ proxy ログ行を1行残し、行末に `mapPath=d` と `rotatorReason=<上記の3値>` を付けます（写像しなければ従来どおり行は増えません）。
+- ログの `outcome` は `forwarded` / `forwarded-mapped`（529 を 403 へ、または認証失効の 403 を 529 へ書き換えた）/ `bridge-unreachable` / `bridge-connect-timeout` / `bridge-idle-timeout` / `bridge-stream-error` / `unavailable-accounts-local`（全アカウントが使えずに終端した要求を写像したときの行）に分かれ、`degradeReason` `upstreamStatus` `gptPoolState` `claudePoolState` `mappedFrom` / `mappedTo` などを、値があるときだけ行末へ追記します（値が1つも無ければ行は従来と同一です）。
 - 529 を書き換えた行（`forwarded-mapped`。403 へも 429 へも）には `resetAt` の直後に `effectiveResetAt` が並びます。`resetAt` は bridge が送ってきた `x-ombr-reset-at` の生値（Codex 側の週次）、`effectiveResetAt` は応答本文の `Earliest recovery` に実際に載った値（GPT 側・契約ヘッダ・Claude 側のうち最も早いもの）です。両者は食い違うことがあるため、復旧の見込み時刻は `effectiveResetAt` を読んでください。書き換えていない行と、回復見込み時刻を本文に持たない書き換え（認証失効以外の一時障害による 403 → 529／429）には出ません。
 
 注意:
@@ -1345,7 +1351,13 @@ How it behaves:
   - **Recovery needs no restart or reload.** A single successful response proving the bridge reached its upstream returns the learned "GPT side is unusable" to unknown (never straight to available). Cached denials (`x-ombr-cached: yes`) neither create nor extend that state.
   - **Expired GPT credentials (`codex_needs_login` / `codex_credentials_unavailable`) are excluded from waiting** and keep degrading with 529, because they never recover until a human runs `codex login`.
   - Log lines gain `cached=` (whether the bridge answered from its cache; `none` when the header is absent) and `retryAfter=`.
-- Log `outcome` values split into `forwarded` / `forwarded-mapped` (a 529 rewritten to 403, or an auth-expired 403 rewritten to 529) / `bridge-unreachable` / `bridge-connect-timeout` / `bridge-idle-timeout` / `bridge-stream-error`, and fields such as `degradeReason`, `upstreamStatus`, `gptPoolState`, `claudePoolState`, `mappedFrom` / `mappedTo` are appended at the end of the line only when they have a value (with no values, the line is identical to the current one).
+- **A mapped response carries exactly one reason header, `x-claude-rotator-reason`.** Its vocabulary is just these three values, and the same single header is set on both the 529 and the 403. Responses that were not mapped, and setups without `degradeMapping`, never carry it.
+    - `quota_exhausted` — a common or family quota window is used up. **It recovers on its own if you wait.**
+    - `credential_cooldown` — a credential refresh is waiting out a cooldown. **It recovers on its own if you wait.**
+    - `credential_login_required` — a login has expired. **It does not recover until a human runs `claude-rotator login`.**
+- The value is decided by scanning **every registered account**, not just the one currently selected: if any account needs a re-login the header says `credential_login_required`; otherwise, if any account is in a refresh cooldown it says `credential_cooldown`; otherwise `quota_exhausted`. That way the reader can branch on "wait it out" versus "call a human" alone.
+- A request that terminates because no account is usable at all (internal path `mapPath=d`) now also writes one proxy log line, but only when it was mapped; the line ends with `mapPath=d` and `rotatorReason=<one of the three values>` (without a mapping, no line is added, exactly as before).
+- Log `outcome` values split into `forwarded` / `forwarded-mapped` (a 529 rewritten to 403, or an auth-expired 403 rewritten to 529) / `bridge-unreachable` / `bridge-connect-timeout` / `bridge-idle-timeout` / `bridge-stream-error` / `unavailable-accounts-local` (the line written when a request that found no usable account was mapped), and fields such as `degradeReason`, `upstreamStatus`, `gptPoolState`, `claudePoolState`, `mappedFrom` / `mappedTo` are appended at the end of the line only when they have a value (with no values, the line is identical to the current one).
 - A line that rewrote a 529 (`forwarded-mapped`, to either 403 or 429) carries `effectiveResetAt` right after `resetAt`. `resetAt` is the raw `x-ombr-reset-at` the bridge sent (the Codex weekly window), while `effectiveResetAt` is the value that actually went into the `Earliest recovery` sentence of the response body (the earliest of the GPT side, the contract header and the Claude side). The two can differ, so read `effectiveResetAt` for the expected recovery time. It is absent on lines that were not rewritten, and on rewrites whose body carries no recovery time (a transient 403 mapped to 529/429).
 
 Caveats:
