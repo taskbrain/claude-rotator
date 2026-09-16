@@ -289,6 +289,27 @@ export class SessionAffinity {
   }
 
   /**
+   * 猶予の待機に入ったことを1行残す（§4.3.1・§7.2 の `affinity_defer`・D-60-2）。
+   *
+   * **表は1バイトも変えない。** この行は「バインドが変わらなかった」ことの記録であり、
+   * 全損（§7.4 の遷移回数）には数えない。書き込み口を `note()` と分けているのは、
+   * 猶予が結び付け先を動かさないことをこのクラスの側でも構造で示すためである。
+   *
+   * @param {unknown} key セッション鍵。
+   * @param {{account:string, waitMs:number, now?:number}} options
+   * @returns {{sid:string, account:string, waitMs:number}|null} 出した行の内容。
+   *   鍵が使えない・口座が空・待機が正でないなら `null`（1行も出さない）。
+   */
+  noteDefer(key, { account, waitMs, now = this.now() } = {}) {
+    const hash = sidHash(key);
+    if (!hash) return null;
+    if (typeof account !== 'string' || account.length === 0) return null;
+    if (!Number.isFinite(waitMs) || waitMs <= 0) return null;
+    this.write(now, `affinity_defer sid=${hash} account=${account} reason=quota_grace waitMs=${waitMs}`);
+    return { sid: hash, account, waitMs };
+  }
+
+  /**
    * TTL 切れ・容量超過・台帳から消えた口座を表から落とす（§3・§8.1）。
    *
    * @param {{now?:number, knownAccountIds?:Iterable<string>|null}|number} [options]

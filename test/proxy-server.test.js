@@ -11972,3 +11972,262 @@ describe('全滅時の終端応答を写像入口へ揃える (R-S9 / 統合㉔ 
     assertNoCredential503(response);
   });
 });
+
+// ---------------------------------------------------------------------------
+// R-S10: 再バインドの猶予（設計書 §4.3.1・D-60-2・D-62-2・D-63 C4）。
+//
+// 押さえるのは2点である。
+//   ⑰ 回復見込みが `rebindGraceMs` 以内の共通枠枯渇では再バインドしない——選択の直後・
+//      資格情報の解決の前に有界待機を挟み、**同じ口座へ1回だけ**送る。回復見込みが
+//      取得できない／`rebindGraceMs` より先／`rebindGraceMs:0` のときは待たずに即再バインド。
+//   ⑲ 待機中にクライアントが切断したら待たずに抜け、上流へ1回も送らない。
+//
+// どちらも「待機中に `res` へ1バイトも書かれていない」ことを直接固定する——猶予は上流へ
+// 送る前の待機なので、「応答が始まった後に送り直さない」は位置によって構造的に守られる。
+// `attemptedAccountIds` に同じ口座が2回入らないことは、上流が受け取った要求の本数
+// （猶予の周は1本だけ）と、重複ガードの終端（429/529）ではなく 200 が返ることで見る。
+// ---------------------------------------------------------------------------
+describe('session affinity rebind grace (R-S10)', () => {
+  function eventLines(logLines, kind) {
+    return logLines.filter(line => line.includes(` ${kind} `));
+  }
+
+  async function waitFor(predicate, timeoutMs = 2000) {
+    const startedAt = Date.now();
+    while (!predicate() && Date.now() - startedAt < timeoutMs) await sleep(5);
+    return predicate();
+  }
+
+  function resetAfter(ms) {
+    return new Date(Date.now() + ms).toISOString();
+  }
+
+  // 共通枠（unified 5h）を閾値まで埋める。`resetsAt` が null なら回復見込みは取得不能。
+  function exhaustCommonQuota(accountManager, accountId, resetsAt) {
+    accountManager.applyUsage(accountId, {
+      five_hour: { utilization: 1, resets_at: resetsAt },
+    });
+  }
+
+  /**
+   * proxy が応答へ書いた量を要求ごとに数える（`x-test-round` ヘッダで分ける）。
+   *
+   * `createProxyServer` が返す `http.Server` へ2本目の 'request' 監視を足すだけで、
+   * 本体のハンドラは1行も変わらない。ハンドラは非同期で、最初の `await` で必ず制御を
+   * 返すため、この監視は最初の書き込みより先に `res` を包める。
+   */
+  function watchResponseBytes(server) {
+    const bytes = new Map();
+    const size = chunk => (
+      typeof chunk === 'string' || Buffer.isBuffer(chunk) ? Buffer.byteLength(chunk) : 0
+    );
+    server.on('request', (req, res) => {
+      const round = req.headers['x-test-round'] || '-';
+      if (!bytes.has(round)) bytes.set(round, 0);
+      const add = value => bytes.set(round, bytes.get(round) + value);
+      const original = { writeHead: res.writeHead, write: res.write, end: res.end };
+      // ヘッダだけでも「応答が始まった」ので 1 と数える（本文 0 バイトの終端も同じ）。
+      res.writeHead = (...args) => { add(1); return original.writeHead.apply(res, args); };
+      res.write = (chunk, ...rest) => {
+        add(size(chunk));
+        return original.write.call(res, chunk, ...rest);
+      };
+      res.end = (chunk, ...rest) => {
+        add(Math.max(1, size(chunk)));
+        return original.end.call(res, chunk, ...rest);
+      };
+    });
+    return round => bytes.get(round) || 0;
+  }
+
+  async function startGrace({
+    accounts = ['acct_a', 'acct_b'],
+    sessionAffinity = { mode: 'on' },
+    upstream: upstreamHandler = null,
+  } = {}) {
+    const logLines = [];
+    const seen = [];
+    const rounds = [];
+    const upstream = await listen(http.createServer((req, res) => {
+      seen.push(req.headers.authorization);
+      rounds.push(req.headers['x-test-round'] || '-');
+      if (upstreamHandler && upstreamHandler({ req, res, seen, rounds }) === true) return;
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ ok: true }));
+    }));
+    const secretStore = new MemorySecretStore();
+    for (const id of accounts) {
+      await secretStore.set(id, {
+        accessToken: `token-${id}`,
+        refreshToken: `refresh-${id}`,
+        expiresAt: Date.now() + 3_600_000,
+      });
+    }
+    const logger = line => logLines.push(line);
+    const accountManager = new AccountManager({
+      accounts: accounts.map(id => ({ id, type: 'oauth' })),
+      logger,
+    });
+    const server = createProxyServer({
+      accountManager,
+      secretStore,
+      logger,
+      config: {
+        upstream: upstream.url,
+        usagePolling: { enabled: false },
+        ...(sessionAffinity ? { sessionAffinity } : {}),
+      },
+    });
+    const bytesFor = watchResponseBytes(server);
+    const proxy = await listen(server);
+    cleanupAfterTest(async () => { await close(proxy.server); await close(upstream.server); });
+
+    const ask = ({ sid = null, round = '-', model = 'sonnet' } = {}) => requestJson(
+      `${proxy.url}/v1/messages`,
+      {
+        method: 'POST',
+        body: JSON.stringify({ model }),
+        headers: {
+          ...(sid ? { 'x-claude-code-session-id': sid } : {}),
+          'x-test-round': round,
+        },
+      },
+    );
+    return {
+      proxy, upstream, seen, rounds, secretStore, accountManager, logLines, logger, ask, bytesFor,
+    };
+  }
+
+  it('⑰: waits out a recovery inside the grace and sends once to the same account', async () => {
+    let bytesAtUpstream = null;
+    let bytesFor = null;
+    const started = await startGrace({
+      sessionAffinity: { mode: 'on', rebindGraceMs: 5_000 },
+      upstream: ({ req }) => {
+        if (req.headers['x-test-round'] === '2') bytesAtUpstream = bytesFor('2');
+        return false;
+      },
+    });
+    const { ask, seen, rounds, logLines, accountManager } = started;
+    bytesFor = started.bytesFor;
+
+    assert.equal((await ask({ sid: 'session-one', round: '1' })).status, 200);
+    // 結び付け先の共通枠が枯れるが、回復見込みは猶予（5,000ms）の内側にある。
+    exhaustCommonQuota(accountManager, 'acct_a', resetAfter(250));
+
+    const startedAt = Date.now();
+    const response = await ask({ sid: 'session-one', round: '2' });
+    const elapsedMs = Date.now() - startedAt;
+
+    assert.equal(response.status, 200, '猶予の後に同じ口座で完走する');
+    assert.deepEqual(seen, ['Bearer token-acct_a', 'Bearer token-acct_a'], '再バインドしない');
+    assert.deepEqual(
+      rounds.filter(round => round === '2'),
+      ['2'],
+      '同じ口座へ送るのは1回だけ（attemptedAccountIds に2回入らない）',
+    );
+    assert.deepEqual(eventLines(logLines, 'affinity_switch'), [], 'affinity_switch は0行');
+
+    const defers = eventLines(logLines, 'affinity_defer');
+    assert.equal(defers.length, 1, 'affinity_defer は1行');
+    assert.match(
+      defers[0],
+      new RegExp(` affinity_defer sid=${sidHash('session-one')} account=acct_a reason=quota_grace waitMs=(\\d+)$`),
+    );
+    const waitMs = Number(/ waitMs=(\d+)$/.exec(defers[0])[1]);
+    assert.ok(waitMs > 0 && waitMs <= 5_000, `unexpected waitMs: ${waitMs}`);
+    assert.ok(elapsedMs >= 50, `待たずに送っている: ${elapsedMs}ms`);
+    assert.equal(bytesAtUpstream, 0, '待機中に res へ1バイトも書かれていない');
+  });
+
+  it('⑰: rebinds at once when the recovery estimate cannot be read', async () => {
+    const { ask, seen, logLines, accountManager } = await startGrace({
+      sessionAffinity: { mode: 'on', rebindGraceMs: 5_000 },
+    });
+
+    assert.equal((await ask({ sid: 'session-one', round: '1' })).status, 200);
+    exhaustCommonQuota(accountManager, 'acct_a', null);
+
+    const startedAt = Date.now();
+    assert.equal((await ask({ sid: 'session-one', round: '2' })).status, 200);
+    const elapsedMs = Date.now() - startedAt;
+
+    assert.equal(seen.at(-1), 'Bearer token-acct_b', '待たずに付け替える');
+    assert.deepEqual(eventLines(logLines, 'affinity_defer'), [], '猶予の経路へ入らない');
+    const switches = eventLines(logLines, 'affinity_switch');
+    assert.equal(switches.length, 1);
+    assert.match(switches[0], / from=acct_a to=acct_b reason=common_exhausted family=other switches=1$/);
+    assert.ok(elapsedMs < 250, `待ってしまっている: ${elapsedMs}ms`);
+  });
+
+  it('⑰: rebinds at once when the recovery estimate is beyond the grace', async () => {
+    const { ask, seen, logLines, accountManager } = await startGrace({
+      sessionAffinity: { mode: 'on', rebindGraceMs: 60_000 },
+    });
+
+    assert.equal((await ask({ sid: 'session-one', round: '1' })).status, 200);
+    exhaustCommonQuota(accountManager, 'acct_a', resetAfter(3_600_000));
+
+    assert.equal((await ask({ sid: 'session-one', round: '2' })).status, 200);
+
+    assert.equal(seen.at(-1), 'Bearer token-acct_b', '猶予より先の回復は待たない');
+    assert.deepEqual(eventLines(logLines, 'affinity_defer'), [], '猶予の経路へ入らない');
+    assert.equal(eventLines(logLines, 'affinity_switch').length, 1);
+  });
+
+  it('⑰: rebindGraceMs:0 never enters the grace path', async () => {
+    const { ask, seen, logLines, accountManager } = await startGrace({
+      sessionAffinity: { mode: 'on', rebindGraceMs: 0 },
+    });
+
+    assert.equal((await ask({ sid: 'session-one', round: '1' })).status, 200);
+    // 既定（60,000ms）の猶予なら確実に待つ回復見込みでも、0 なら1度も待たない。
+    exhaustCommonQuota(accountManager, 'acct_a', resetAfter(250));
+
+    const startedAt = Date.now();
+    assert.equal((await ask({ sid: 'session-one', round: '2' })).status, 200);
+    const elapsedMs = Date.now() - startedAt;
+
+    assert.equal(seen.at(-1), 'Bearer token-acct_b', 'v1.1 と同じ挙動へ戻る');
+    assert.deepEqual(eventLines(logLines, 'affinity_defer'), [], '猶予の経路へ入らない');
+    assert.equal(eventLines(logLines, 'affinity_switch').length, 1);
+    assert.ok(elapsedMs < 250, `待ってしまっている: ${elapsedMs}ms`);
+  });
+
+  it('⑲: a client disconnect during the grace wait sends nothing upstream', async () => {
+    const { proxy, ask, seen, logLines, accountManager, bytesFor } = await startGrace({
+      sessionAffinity: { mode: 'on', rebindGraceMs: 5_000 },
+    });
+
+    assert.equal((await ask({ sid: 'session-one', round: '1' })).status, 200);
+    exhaustCommonQuota(accountManager, 'acct_a', resetAfter(400));
+
+    const target = new URL(proxy.url);
+    const pending = http.request({
+      hostname: target.hostname,
+      port: target.port,
+      path: '/v1/messages',
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        'x-claude-code-session-id': 'session-one',
+        'x-test-round': '2',
+      },
+    });
+    pending.on('error', () => {});
+    cleanupAfterTest(async () => pending.destroy());
+    pending.end(JSON.stringify({ model: 'sonnet' }));
+
+    assert.ok(
+      await waitFor(() => eventLines(logLines, 'affinity_defer').length === 1),
+      '猶予の待機に入る',
+    );
+    assert.equal(seen.length, 1, '待機中はまだ上流へ送っていない');
+    pending.destroy();
+
+    // 切断で待機を抜けたら、そのまま要求を終える（回復見込みの時刻を過ぎても送らない）。
+    assert.equal(await waitFor(() => seen.length > 1, 600), false, '上流へ1回も送らない');
+    assert.equal(bytesFor('2'), 0, '待機中に res へ1バイトも書かれていない');
+    assert.deepEqual(eventLines(logLines, 'affinity_switch'), [], 'バインドも変えない');
+  });
+});

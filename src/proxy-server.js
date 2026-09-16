@@ -1457,6 +1457,7 @@ function createSessionAffinityRequest({
     select: () => null,
     confirm: () => {},
     noteUpstreamQuota: () => {},
+    beginQuotaGrace: () => 0,
   };
   if (!state.pinned) return state;
 
@@ -1476,6 +1477,9 @@ function createSessionAffinityRequest({
   let binding = null;
   let sendTo = null;
   let reason = null;
+  // 猶予（§4.3.1・D-63 C4）。0 なら待機は1度も起きない。
+  let graceMs = 0;
+  let graceAccountId = null;
   if (!entry) {
     binding = assign(null);
     sendTo = binding;
@@ -1493,11 +1497,23 @@ function createSessionAffinityRequest({
     sendTo = binding;
     reason = binding ? 'family_exhausted' : null;
   } else if (isCommonQuotaExhausted(bound, threshold)) {
-    // 共通枠が枯れた: 使えなかった結び付け先だけを付け替える（D-56-4・D-63 C2）。
-    // 猶予（D-60-2・§4.3.1）は R-S10 の範囲なのでここでは待たない。
-    binding = assign([bound.id]);
-    sendTo = binding;
-    reason = binding ? 'common_exhausted' : null;
+    // 共通枠が枯れた。回復見込みが `rebindGraceMs` 以内なら**再バインドしない**——
+    // 結び付け先を選んだまま、選択の直後・資格情報の解決の前に有界待機を挟み、待機の
+    // 後に同じ口座へ1回だけ送る（D-60-2・D-63 C4・§4.3.1）。60秒待てば同じ口座で
+    // 続けられる事象で付け替えるのは、1ターン分を全損させるだけで何も得ないためである。
+    // 回復見込みが猶予より先・取得不能・`rebindGraceMs:0` なら待たずに付け替える
+    // （無期限の待機を作らないための安全側の既定）。
+    // 付け替えるのは使えなかった結び付け先だけである（D-56-4・D-63 C2）。
+    graceMs = quotaGraceWaitMs(bound, settings.rebindGraceMs, accountManager.now());
+    if (graceMs > 0) {
+      binding = bound;
+      sendTo = bound;
+      graceAccountId = bound.id;
+    } else {
+      binding = assign([bound.id]);
+      sendTo = binding;
+      reason = binding ? 'common_exhausted' : null;
+    }
   } else {
     // 認証失敗・throttled・資格情報 cooldown・短期レート制限: バインドは変えず、
     // この要求だけ別の口座で完走させる（D-56-3・D-63 C3・§4.3 の表）。
@@ -1518,6 +1534,16 @@ function createSessionAffinityRequest({
     }
   }
 
+  // 待機は1要求につき1回まで（§4.3.1）。待機の連鎖を作らないよう、読み出した時点で
+  // 猶予を使い切る。予約済みの結び付け先へ送るときだけ効き、再バインド後の周では
+  // 0 を返す（2周目以降は付け替えが済んでいるので待つ理由が無い）。
+  state.beginQuotaGrace = account => {
+    if (graceMs <= 0 || !account || account.id !== graceAccountId) return 0;
+    const waitMs = graceMs;
+    graceMs = 0;
+    affinity.noteDefer(key, { account: account.id, waitMs });
+    return waitMs;
+  };
   let pending = sendTo;
   let firstSelect = true;
   state.select = attemptedAccountIds => {
@@ -1584,6 +1610,84 @@ function quotaRebindReason(account, threshold, modelFamily, now) {
   if (familyQuotaExhaustedOnly(account, threshold, modelFamily, now)) return 'family_exhausted';
   if (isCommonQuotaExhausted(account, threshold)) return 'common_exhausted';
   return null;
+}
+
+/**
+ * 共通枠の回復見込み（設計書 §4.3.1(b)・D-62-2）。
+ *
+ * 読むのは口座が**既に持っている** `quota.unified5hReset` / `unified7dReset` のうち
+ * `now` より後の直近だけである。**新しいヘッダ解析も本文解析も1つも増やさない**——
+ * `parseRateLimitHeaders` / `unifiedQuotaHeaderEvidence` / `retryAfterSeconds` は触らない。
+ * 共通枠の 429 を受けると `updateQuota` がヘッダの reset 値をここへ書き込むので、
+ * 「429 本文の `resets_at`」が指していた情報は次の要求の選択時にこの値として読める。
+ *
+ * `retry-after` と短期レート制限の reset（`quota.resetsAt`）は取得元に入れない。
+ * どちらも token / request の短期レート制限のもので、共通枠（unified 5h / 7d）の
+ * 回復見込みではなく、§4.3 の表で「バインド不変」と決めた側に属する。
+ *
+ * @returns {number|null} 回復見込みの時刻（ms）。取得できなければ `null`。
+ */
+function commonQuotaRecoveryAt(account, now) {
+  const quota = account?.quota || {};
+  let earliest = null;
+  for (const resetAt of [quota.unified5hReset, quota.unified7dReset]) {
+    if (!Number.isFinite(resetAt) || resetAt <= now) continue;
+    if (earliest === null || resetAt < earliest) earliest = resetAt;
+  }
+  return earliest;
+}
+
+/**
+ * 猶予の待機時間（設計書 §4.3.1・D-60-2・D-63 C4）。
+ *
+ * 回復見込みが `rebindGraceMs` 以内のときだけ正の値を返す。取得できないときに待たない
+ * のは、無期限の待機を作らないための安全側の既定である（§4.3.1 の表）。
+ * **`rebindGraceMs: 0` では常に 0 を返し、猶予の経路は1度も実行されない**（v1.1 と同じ挙動）。
+ *
+ * @returns {number} 待つミリ秒。待たないなら 0。
+ */
+function quotaGraceWaitMs(account, rebindGraceMs, now) {
+  if (!Number.isFinite(rebindGraceMs) || rebindGraceMs <= 0) return 0;
+  const recoveryAt = commonQuotaRecoveryAt(account, now);
+  if (recoveryAt === null) return 0;
+  const waitMs = recoveryAt - now;
+  return waitMs > 0 && waitMs <= rebindGraceMs ? waitMs : 0;
+}
+
+/**
+ * 猶予の有界待機（設計書 §4.3.1(a)・D-63 C4）。
+ *
+ * 待つのは**上流へ送る前**なので、待機中に `res` へは1バイトも書かれない——「応答が
+ * 始まった後に送り直さない」は、この位置によって構造的に守られる。待機の後に送るのは
+ * 同じ口座への1回だけなので、`attemptedAccountIds` にも `attempt` にも触れない
+ * （429 を受けた後に同じ口座へ送り直す経路は作らない）。
+ *
+ * クライアントの切断・要求の中断では待たずに抜ける（統合⑲）。`req` の 'close' は
+ * 本文を読み終えた時点で既に出ているので見張らない。見るのは `res` の 'close' だけである。
+ *
+ * @returns {Promise<boolean>} 送信を続けてよければ `true`、切断で抜けたなら `false`。
+ */
+function awaitQuotaGrace(req, res, waitMs) {
+  if (!(waitMs > 0)) return Promise.resolve(true);
+  if (req.aborted || res.destroyed) return Promise.resolve(false);
+  return new Promise(resolve => {
+    let timer = null;
+    let settled = false;
+    const finish = proceed => {
+      if (settled) return;
+      settled = true;
+      if (timer) clearTimeout(timer);
+      res.off('close', onClose);
+      resolve(proceed);
+    };
+    function onClose() {
+      finish(false);
+    }
+    timer = setTimeout(() => finish(true), waitMs);
+    // 待機が唯一の理由でプロセスを生かし続けない（要求の socket が生存を担う）。
+    timer.unref?.();
+    res.once('close', onClose);
+  });
 }
 
 function routingModelFamily(body) {
@@ -2268,6 +2372,17 @@ async function forwardWithRotation({
       })) return;
       sendUnavailableAccounts(res, accountManager, mapExhaustion);
       return;
+    }
+
+    // 設計書 §4.3.1(a)・D-63 C4: 猶予は「選択の直後・資格情報の解決の前」に置く。
+    // 予約（§4.4 ①）は `createSessionAffinityRequest` の同期区間で済んでいるので、
+    // 待っている間に来た同一 sid の要求は予約済みの同じ口座を読む（別口座へ割れない）。
+    // 待機の後に送るのは同じ口座への1回だけで、`attemptedAccountIds` も `attempt` も
+    // 動かさない。台帳から口座が消えていれば、この下の既存の `includes` 検査が拾う。
+    const quotaGraceMs = affinityRequest ? affinityRequest.beginQuotaGrace(account) : 0;
+    if (quotaGraceMs > 0) {
+      if (!(await awaitQuotaGrace(req, res, quotaGraceMs))) return;
+      if (req.aborted || res.destroyed) return;
     }
 
     if (
