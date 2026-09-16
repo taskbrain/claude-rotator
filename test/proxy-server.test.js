@@ -9656,7 +9656,12 @@ describe('Claude 全枯渇 429 の 529 写像を7系統へ結線する (R4-2/R4-
     );
   });
 
-  it('4-d: leaves the 503 credential branch of P-d untouched', async () => {
+  // 【R-S9】この経路の期待値は 503 → 529 へ変わった（設計書 §5.3(d)・§14.2 案イ・
+  // 坂根氏の判断⑤(e)）。全滅台帳の終端が口座の個別 state で 503 に化けると、529 を
+  // fallbackModel の発火条件にしている bridge 側で退避が働かないためである（I-6・
+  // D-67-2）。503 は「写像しないと決まったとき」だけ残る（同 describe の 5-b 群と、
+  // 「全滅時の終端応答を写像入口へ揃える (R-S9 …)」describe が押さえる）。
+  it('4-d: routes the credential branch of P-d through the mapper as well (R-S9 / I-6)', async () => {
     const { upstream } = await startUnusedUpstream();
     const accountManager = new AccountManager({
       accounts: [{ id: 'acct_1', type: 'oauth' }],
@@ -9668,9 +9673,14 @@ describe('Claude 全枯渇 429 の 529 写像を7系統へ結線する (R4-2/R4-
 
     const response = await ask(proxy);
 
-    assert.equal(response.status, 503, '認証の問題は 529 で逃がさない（契約 §C10.4 補足②）');
-    assert.equal(response.body.error.type, 'api_error');
-    assert.deepEqual(mapLines(logLines), [], '写像そのものが起きない');
+    assert.equal(response.status, 529, '認証失敗でも全滅時の終端は写像入口を通す（I-6）');
+    assert.equal(response.body.error.type, 'overloaded_error');
+    // P-d は proxy ログ行を持たない経路なので、写像しても痕跡は残らない（4-d 上段と同じ）。
+    assert.deepEqual(
+      logLines.filter(line => / proxy account=/.test(line)),
+      [],
+      'P-d はログ行を持たない（写像の痕跡も残らない＝R4-5 の残課題）',
+    );
   });
 
   it('5-b: keeps the P-a response at 429 while degradeMapping is unset (§14.4)', async () => {
@@ -11696,5 +11706,269 @@ describe('session affinity rebind and terminal (R-S8)', () => {
     assert.equal((await ask({ sid: 'session-one' })).status, 200);
     assert.equal(seen.at(-1), 'Bearer token-acct_b');
     assert.equal(accountManager.getCurrentAccount().id, 'acct_a', '稼働口座は据え置き');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// R-S9: 全滅時の終端応答を写像入口へ揃える（統合テスト㉔ / 設計書 §5.3(d)・§14.2 案イ /
+// 不変条件 I-6・実装で守る点 P-6）。
+//
+// 現行は `sendUnavailableAccounts` の資格情報分岐が写像器を呼ばずに 503 を書いて
+// return するため、同じ「全滅」台帳でも固定先（= `getCurrentAccount()` が返す口座）が
+// 認証失敗・資格情報 cooldown のときだけ 529 が 503 に化ける。bridge は 529 を
+// Claude Code の fallbackModel の発火条件として前提にしているので、503 では退避が
+// 働かない（D-67-2）。sticky ではセッションが1口座へ張り付くぶん、この化けが
+// そのセッションの全滅時応答に居座り続ける。
+//
+// 述語 `isCredentialUnavailable` は status 画面（`src/monitor.js` の
+// `login expired` / `needs login`）と `futureAvailabilityForModelFamily` と共有して
+// いるので触らない。変更するのは分岐側だけで、「503 の意味（認証情報が使えない）を
+// 運用者へ伝える役割は status 画面が担う」という整理は §14.2（D-72）のまま変えない。
+// ---------------------------------------------------------------------------
+describe('全滅時の終端応答を写像入口へ揃える (R-S9 / 統合㉔ / I-6・P-6)', () => {
+  const ENABLED_MAPPING = { enabled: true };
+
+  const exhaustedBridgeBody = '{"type":"error","error":{"type":"overloaded_error"}}';
+
+  // (pool)=unusable を学習させるための偽 bridge（契約 §C10.3 T3）。
+  async function startUnusableBridge() {
+    const bridge = await listen(http.createServer((req, res) => {
+      req.resume();
+      res.writeHead(529, {
+        'Content-Type': 'application/json',
+        'content-length': String(Buffer.byteLength(exhaustedBridgeBody)),
+        'x-ombr-contract': '1',
+        'x-ombr-degrade-reason': 'codex_pool_exhausted',
+        'x-ombr-degrade-scope': 'pool',
+        'x-ombr-pool-state': 'exhausted',
+        'x-ombr-upstream-status': '429',
+        'x-ombr-reset-at': '2099-01-01T00:00:00Z',
+      });
+      res.end(exhaustedBridgeBody);
+    }));
+    cleanupAfterTest(async () => close(bridge.server));
+    return bridge;
+  }
+
+  async function startTerminal({
+    accounts = ['acct_a'],
+    sessionAffinity = { mode: 'on' },
+    degradeMapping = ENABLED_MAPPING,
+    bridgeUrl = null,
+    tokenRefresher = null,
+    usageFetcher = null,
+  } = {}) {
+    const logLines = [];
+    const seen = [];
+    const upstream = await listen(http.createServer((req, res) => {
+      seen.push(req.headers.authorization);
+      req.resume();
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ ok: true }));
+    }));
+    const secretStore = new MemorySecretStore();
+    for (const id of accounts) {
+      await secretStore.set(id, {
+        accessToken: `token-${id}`,
+        refreshToken: `refresh-${id}`,
+        expiresAt: Date.now() + 3_600_000,
+      });
+    }
+    const logger = line => logLines.push(line);
+    const accountManager = new AccountManager({
+      accounts: accounts.map(id => ({ id, name: `${id}@example.com`, type: 'oauth' })),
+      logger,
+    });
+    const bridge = bridgeUrl
+      ? {
+        enabled: true,
+        url: bridgeUrl,
+        modelPattern: '^gpt-',
+        connectTimeoutMs: 1000,
+        idleTimeoutMs: 1000,
+        connectRetries: 0,
+      }
+      : { enabled: false };
+    const proxy = await listen(createProxyServer({
+      accountManager,
+      secretStore,
+      logger,
+      allowLiveClaudeCodeCredentials: false,
+      currentCredentialReader: async () => null,
+      ...(tokenRefresher ? { tokenRefresher } : {}),
+      ...(usageFetcher ? { usageFetcher } : {}),
+      config: {
+        upstream: upstream.url,
+        usagePolling: { enabled: false },
+        openaiBridge: { ...bridge, ...(degradeMapping ? { degradeMapping } : {}) },
+        ...(sessionAffinity ? { sessionAffinity } : {}),
+      },
+    }));
+    cleanupAfterTest(async () => {
+      await close(proxy.server);
+      await close(upstream.server);
+    });
+
+    const ask = ({ sid = 'session-one', model = 'sonnet' } = {}) => requestJson(
+      `${proxy.url}/v1/messages`,
+      {
+        method: 'POST',
+        body: JSON.stringify({ model }),
+        headers: {
+          'content-type': 'application/json',
+          ...(sid ? { 'x-claude-code-session-id': sid } : {}),
+        },
+        timeoutMs: 3_000,
+      },
+    );
+    return { proxy, accountManager, secretStore, logLines, seen, ask };
+  }
+
+  function exhaustCommonQuota(accountManager, id, offsetMs = 3_600_000) {
+    accountManager.updateQuota(id, {
+      'anthropic-ratelimit-unified-5h-utilization': '1',
+      'anthropic-ratelimit-unified-5h-reset': String(Math.ceil((Date.now() + offsetMs) / 1000)),
+    });
+  }
+
+  function assertNoCredential503(response) {
+    assert.notEqual(response.status, 503, '固定先の個別 state で 503 に化けない（I-6）');
+    assert.ok(
+      !response.bodyText.includes('No usable OAuth credential'),
+      '資格情報分岐の 503 本文が漏れない',
+    );
+  }
+
+  it('㉔(i): keeps the pinned terminal at 529 when every account is quota-exhausted', async () => {
+    const { ask, accountManager } = await startTerminal({ accounts: ['acct_a', 'acct_b'] });
+    assert.equal((await ask()).status, 200);
+
+    exhaustCommonQuota(accountManager, 'acct_a', 7_200_000);
+    exhaustCommonQuota(accountManager, 'acct_b', 1_800_000);
+    const response = await ask();
+
+    assert.equal(response.status, 529, '全口座枯渇は現行どおり写像入口を通る（非回帰）');
+    assert.equal(response.body.error.type, 'overloaded_error');
+    assertNoCredential503(response);
+  });
+
+  it('㉔(ii): ends a pinned session at 529 when its bound account is rejected (authentication_error)', async () => {
+    const { ask, accountManager, seen } = await startTerminal();
+    assert.equal((await ask()).status, 200);
+
+    accountManager.markError('acct_a', 'authentication_error', 'OAuth token rejected');
+    const response = await ask();
+
+    assert.equal(response.status, 529, '固定先が認証失敗でも退避が働く 529 を返す');
+    assert.equal(response.body.error.type, 'overloaded_error');
+    assert.equal(response.body.error.message, 'All Claude accounts are exhausted.');
+    assertNoCredential503(response);
+    assert.equal(seen.length, 1, '終端の判定で上流へ送り直さない');
+  });
+
+  it('㉔(ii): ends a pinned session at 529 when the stored refresh credential expired (NATIVE_REFRESH_REAUTH_REQUIRED)', async () => {
+    const { ask, proxy, secretStore } = await startTerminal({
+      tokenRefresher: async () => {
+        throw Object.assign(
+          new Error('The stored OAuth refresh credential has expired and must be linked again'),
+          { code: 'NATIVE_REFRESH_REAUTH_REQUIRED' },
+        );
+      },
+      usageFetcher: async () => assert.fail('usage fetch must not run after the refresh fails'),
+    });
+    assert.equal((await ask()).status, 200);
+
+    // 46e7d9c（J-1）で「保存済み refresh 資格情報の期限切れ」が認証失効へ分類される
+    // ようになった経路をそのまま通す（§0）。この入口は v1.0 起点のテストには無い。
+    await secretStore.set('acct_a', {
+      accessToken: 'token-acct_a',
+      refreshToken: 'refresh-acct_a',
+      expiresAt: 1,
+    });
+    const refresh = await requestJson(`${proxy.url}/internal/refresh-usage`, { method: 'POST' });
+    assert.equal(refresh.status, 200);
+    assert.equal(
+      refresh.body.status.accounts[0].unavailableReason?.type,
+      'oauth_refresh_failed',
+      '前提: 46e7d9c の分類で認証失効になっている',
+    );
+
+    const response = await ask();
+
+    assert.equal(response.status, 529);
+    assert.equal(response.body.error.type, 'overloaded_error');
+    assertNoCredential503(response);
+
+    // 503 の意味（認証情報が使えない）は status 画面が担う。文言は1文字も変えない
+    // （D-72・§14.2 の整理）。
+    const status = await requestJson(`${proxy.url}/internal/status`);
+    const output = renderStatus(status.body, { columns: 200 });
+    assert.match(output, /reason: login expired .* - run: claude-rotator login --id acct_a/);
+    assert.match(output, /needs login/);
+    assert.doesNotMatch(output, /oauth_refresh_failed|OAuth token refresh failed/);
+  });
+
+  it('㉔(iii): ends a pinned session at 529 while its bound account sits in the credential refresh cooldown', async () => {
+    const { ask, accountManager } = await startTerminal();
+    assert.equal((await ask()).status, 200);
+
+    accountManager.markCredentialRefreshRateLimited('acct_a', 120);
+    const response = await ask();
+
+    assert.equal(response.status, 529);
+    assert.equal(response.body.error.type, 'overloaded_error');
+    assertNoCredential503(response);
+    assert.equal(
+      response.headers['retry-after'],
+      undefined,
+      '写像した終端は他の6系統と同じ形（Retry-After を新たに足さない）',
+    );
+  });
+
+  it('㉔: escalates the credential terminal to 403 once the GPT pool is known unusable too', async () => {
+    const bridge = await startUnusableBridge();
+    const { ask, accountManager, proxy } = await startTerminal({ bridgeUrl: bridge.url });
+    assert.equal((await ask()).status, 200);
+    const warm = await requestJson(`${proxy.url}/v1/messages`, {
+      method: 'POST',
+      body: JSON.stringify({ model: 'gpt-6-astra' }),
+      headers: { 'content-type': 'application/json' },
+      timeoutMs: 3_000,
+    });
+    assert.equal(warm.status, 529, '前提: bridge の 529 は素通しされ (pool) が学習される');
+
+    accountManager.markError('acct_a', 'authentication_error', 'OAuth token rejected');
+    const response = await ask();
+
+    assert.equal(response.status, 403, '両プール枯渇なら 403（I-6）');
+    assert.equal(response.body.error.type, 'permission_error');
+    assert.match(response.body.error.message, /^All Claude accounts and the Codex pool are unavailable\./);
+    assertNoCredential503(response);
+  });
+
+  it('㉔: keeps the 503 and its Retry-After when nothing maps the terminal (§14.4・案イ)', async () => {
+    const { ask, accountManager } = await startTerminal({ degradeMapping: null });
+    assert.equal((await ask()).status, 200);
+
+    accountManager.markCredentialRefreshRateLimited('acct_a', 120);
+    const response = await ask();
+
+    assert.equal(response.status, 503, '写像しないと決まったときだけ 503 を返す');
+    assert.equal(response.body.error.type, 'api_error');
+    assert.equal(response.body.error.message, 'No usable OAuth credential is currently available.');
+    const retryAfter = Number.parseInt(response.headers['retry-after'], 10);
+    assert.ok(retryAfter >= 1 && retryAfter <= 120, `unexpected Retry-After: ${retryAfter}`);
+  });
+
+  it('㉔: takes the same terminal for a keyless request (sessionAffinity 未記載)', async () => {
+    const { ask, accountManager } = await startTerminal({ sessionAffinity: null });
+    assert.equal((await ask({ sid: null })).status, 200);
+
+    accountManager.markError('acct_a', 'authentication_error', 'OAuth token rejected');
+    const response = await ask({ sid: null });
+
+    assert.equal(response.status, 529, '終端は1本にする（鍵の有無で分けない）');
+    assert.equal(response.body.error.type, 'overloaded_error');
+    assertNoCredential503(response);
   });
 });

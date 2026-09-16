@@ -3882,6 +3882,28 @@ function sendJson(res, status, body) {
 function sendUnavailableAccounts(res, accountManager = null, exhaustionMapper = null) {
   const current = accountManager?.getCurrentAccount();
   const reason = current ? accountManager.unavailableReason(current) : null;
+  const body = {
+    type: 'error',
+    error: { type: 'rate_limit_error', message: 'All configured accounts are unavailable.' },
+  };
+  // P-d の写像入口。I-6・P-6（設計書 §5.3(d)・§14.2 案イ）: 全滅時の終端は、稼働口座
+  // ／固定先の個別 state（枯渇・認証失敗・資格情報 cooldown）に依らず必ずここを通す。
+  // 資格情報分岐を先に置いていた頃は、同じ全滅台帳でも `getCurrentAccount()` が返す
+  // 口座が認証失敗なら写像器を呼ばずに 503 を書いて return していたため、529 を
+  // fallbackModel の発火条件にしている bridge 側で退避が働かなかった（D-67-2）。
+  // 分岐の順序だけを入れ替え、資格情報分岐は「写像へ渡す候補を作る」側へ寄せる。
+  // 写像しないと決まったとき（台帳が全枯渇でない・degradeMapping 無効）は、下の 503 を
+  // 現行のまま返す。述語 `isCredentialUnavailable` は status 画面（monitor.js の
+  // `login expired` / `needs login`）と共有しているので触らない（§5.3(d) の実装位置）。
+  const mapped = exhaustionMapper?.({
+    statusCode: 429,
+    headers: { 'Content-Type': 'application/json' },
+    body: Buffer.from(JSON.stringify(body)),
+  }, { mapPath: 'd', headersSent: res.headersSent });
+  if (mapped && mapped.statusCode !== 429) {
+    sendBufferedResponse(res, mapped);
+    return;
+  }
   if (isCredentialUnavailable(reason)) {
     const headers = { 'Content-Type': 'application/json' };
     const now = Date.now();
@@ -3902,21 +3924,6 @@ function sendUnavailableAccounts(res, accountManager = null, exhaustionMapper = 
         message: 'No usable OAuth credential is currently available.',
       },
     }));
-    return;
-  }
-  // P-d の 429 分岐。503 分岐（認証情報が使えない）は上で return 済みなので
-  // 自動的に写像対象外になる（契約 §C10.4 補足②。個別の除外条件を書かない）。
-  const body = {
-    type: 'error',
-    error: { type: 'rate_limit_error', message: 'All configured accounts are unavailable.' },
-  };
-  const mapped = exhaustionMapper?.({
-    statusCode: 429,
-    headers: { 'Content-Type': 'application/json' },
-    body: Buffer.from(JSON.stringify(body)),
-  }, { mapPath: 'd', headersSent: res.headersSent });
-  if (mapped && mapped.statusCode !== 429) {
-    sendBufferedResponse(res, mapped);
     return;
   }
   sendJson(res, 429, body);
