@@ -3,14 +3,19 @@
 // 方針: ClaudeRotator は OSS として単体でも使われるため、codex-rotator が無くても
 // 動作すること（codex-rotator との連携は明示的に有効化したときだけ働く）。
 //
-// このファイルが固定するのは次の5点であり、いずれも「codex-rotator が無い環境でも
-// ClaudeRotator が壊れない」という受入条件の実体である（設計書 §14.4 の一覧）。
+// このファイルが固定するのは次の8点である。1〜5 は「codex-rotator が無い環境でも
+// ClaudeRotator が壊れない」という受入条件の実体（設計書 §14.4 の一覧）であり、
+// 6〜8 は sticky affinity（セッション単位の口座固定）の不変性3件
+// （sticky 設計書 v1.5 §10「不変性」／実装計画 v1.2 R-S13）である。
 //
 //   1. never-reads-codex-credentials-in-claude-process
 //   2. health-does-not-wait-for-codex-or-refresh
 //   3. unset-config-is-byte-identical
 //   4. codex-rotator-absent-is-harmless
 //   5. no-identifier-in-degrade-logs
+//   6. session-affinity-unset-is-byte-identical
+//   7. does-not-touch-gpt-path
+//   8. no-raw-session-id-in-logs
 //
 // 実装方針:
 //   - すべて実 TCP（port 0 で listen する）ので、他のテストファイルと並行実行しても
@@ -36,8 +41,11 @@ import { AccountManager } from '../src/account-manager.js';
 import { createGptPoolState, parseBridgeContract } from '../src/degrade-state.js';
 import { runCli } from '../src/cli.js';
 import { LOCAL_GATEWAY_AUTH_TOKEN } from '../src/config.js';
+import { writeJsonFileDurable } from '../src/json-file.js';
+import { renderStatus } from '../src/monitor.js';
 import { createProxyServer } from '../src/proxy-server.js';
 import { MemorySecretStore } from '../src/secret-store.js';
+import { normalizeSessionAffinity, sidHash } from '../src/session-affinity.js';
 import { startFakeBridge } from './helpers/fake-bridge.js';
 
 const cleanupCallbacks = [];
@@ -577,6 +585,322 @@ describe('no-identifier-in-degrade-logs (設計書 §13.1 CR-I)', () => {
 });
 
 // ---------------------------------------------------------------------------
+// 6. session-affinity-unset-is-byte-identical
+//    （設計書 §10「不変性」1件目・§14.1・§7.3・§8・D-56-6 ／ 実装計画 v1.2 R-S13）
+//
+// 固定するのは「`sessionAffinity` を1文字も書いていない構成は、`mode:"off"` を明示した
+// 構成とまったく同じ意味である」こと。比較は4点で、いずれも**実物**を突き合わせる。
+//
+//   (a) proxy のログ行     … 追記フィールド `sid=` / `aff=` / `fam=` が1つも生えない
+//   (b) /internal/status   … JSON に `sessionAffinity` キーが出ない
+//   (c) `claude-rotator status` … monitor.renderStatus の結果に Session Affinity 節が無い
+//   (d) runtime-state.json … **実ファイルのバイト列**。`sessionAffinity` も `events` も
+//                            書かれない（D-56-6 の要点。v1.0 にあった「保存ファイルの
+//                            差分は許容する」という緩和は §7.3 で撤回済み）
+//
+// さらに**再起動をまたぐ経路**を検査する——保存されたファイルだけを入力に、新しい
+// プロセス相当（新しい AccountManager ＋ restoreState ＋ 新しい createProxyServer）を
+// 立ち上げ直し、復元直後の (b)(c) と、要求を通したあとの (a)〜(d) をもう一度突き合わせる。
+// §7.3 が要求する「復元直後も Events 節が空のまま」はここで押さえる（`mode:"off"` では
+// events を保存も復元もしないため）。
+//
+// ■ 比較の対象外（明示除外。R-S13 の通過条件）
+//
+//   1. **R-S2 由来の既知例外2点**（設計書 §14.1・坂根氏の判断⑤(c)＝案A で承認済み）:
+//        ① サブキャップ由来の 429 で `currentIndex` が動かなくなる
+//        ② `switchToCandidate` を呼ばなくなるぶん `status='active'` の付け替えが消え、
+//           `/internal/status` と `claude-rotator status` の `active` の付き方が変わる
+//      この2点は **`sessionAffinity` の mode に連動しない常時適用の是正**であり、未記載
+//      構成でも `mode:"off"` 構成でも同じように起きる。したがって本テストが比べている
+//      2つの構成の**あいだには差が出ない**。「是正を入れる前との差」は本テストの対象では
+//      なく、段 P の本番実地確認（実装計画 v1.2 §3 段 P ③）が受け持つ。
+//
+//   2. **R-S1 の `account_switch` 行**: これは**新設の行**であって、既存 proxy 行の形の
+//      変更ではない（設計書 §7.2・実装計画 v1.2 §5「R7 の破れ」）。(a) が固定するのは
+//      「既存の proxy 行に追記フィールドが生えないこと」なので、新設行は (a) の対象外で
+//      ある。こちらも mode に連動しないため、2構成の比較には現れない。
+// ---------------------------------------------------------------------------
+
+describe('session-affinity-unset-is-byte-identical (設計書 §10・§14.1・§7.3・§8)', () => {
+  it('produces the same log lines, status JSON, status screen and runtime-state.json with and without an explicit sessionAffinity', async () => {
+    const upstream = await startAnthropicUpstream();
+    cleanupAfterTest(async () => upstream.close());
+
+    // 同じ偽上流に対し、同じ順序で同じ4要求を通す（片方は節そのものが無い構成）。
+    // R-S2 の既知例外2点（currentIndex を動かさない／`active` の付け替えが消える）は
+    // mode に連動しない常時適用の是正なので、この2つの構成の**どちらにも同じように**
+    // 効いている。R-S1 の `account_switch` は新設行で既存 proxy 行の形を変えない。
+    // よってどちらも「未記載 ⇔ 明示 off」の差にはならず、本比較の対象外である。
+    const unset = await exerciseAffinity({ upstream, sessionAffinity: undefined });
+    const explicitlyOff = await exerciseAffinity({ upstream, sessionAffinity: { mode: 'off' } });
+
+    for (const [phase, left, right] of [
+      ['初回起動', unset.first, explicitlyOff.first],
+      ['再起動後', unset.restarted, explicitlyOff.restarted],
+    ]) {
+      assert.deepEqual(left.logLines, right.logLines, `${phase}: (a) proxy のログ行が一致する`);
+      assert.equal(left.statusJson, right.statusJson, `${phase}: (b) /internal/status の JSON が一致する`);
+      assert.equal(left.screen, right.screen, `${phase}: (c) status 画面が一致する`);
+      assert.equal(left.stateFile, right.stateFile, `${phase}: (d) runtime-state.json のバイト列が一致する`);
+      assert.equal(left.restoredStatusJson, right.restoredStatusJson, `${phase}: 起動直後の status JSON が一致する`);
+      assert.equal(left.restoredScreen, right.restoredScreen, `${phase}: 起動直後の status 画面が一致する`);
+      assert.equal(left.writeCount, right.writeCount, `${phase}: 保存の回数まで一致する`);
+    }
+
+    assertNoAffinityArtifacts(unset.first, '未記載構成・初回起動');
+    assertNoAffinityArtifacts(unset.restarted, '未記載構成・再起動後');
+    assertNoAffinityArtifacts(explicitlyOff.first, 'mode:"off" 構成・初回起動');
+    assertNoAffinityArtifacts(explicitlyOff.restarted, 'mode:"off" 構成・再起動後');
+
+    // 再起動をまたぐ経路の本題（§7.3）: 復元した直後の Events 節が空のままであること。
+    // `events` を保存しないので、復元しても描くものが無い＝現行と同じ画面になる。
+    for (const [label, observation] of [
+      ['未記載構成', unset.restarted],
+      ['mode:"off" 構成', explicitlyOff.restarted],
+    ]) {
+      assert.deepEqual(
+        JSON.parse(observation.restoredStatusJson).events,
+        [],
+        `${label}: 復元直後の events が空（保存も復元もしていない・D-56-6）`,
+      );
+      assert.ok(
+        observation.restoredScreen.endsWith('Events\n'),
+        `${label}: 復元直後の Events 節に1行も描かれない`,
+      );
+    }
+
+    // 空振り防止: 4点の観測がすべて成立していること（空どうしの一致で緑になっていない）。
+    assert.equal(
+      unset.first.logLines.filter(line => / proxy account=/.test(line)).length,
+      STICKY_REQUESTS.length,
+      '比較対象の proxy 行が要求の数だけ出ていること',
+    );
+    assert.match(unset.first.statusJson, /"accounts":/);
+    assert.match(unset.first.screen, /Claude Rotator/);
+    assert.match(unset.first.stateFile, /"version": 1/);
+    assert.ok(unset.first.writeCount > 0, 'runtime-state.json が実際に書かれていること');
+  });
+
+  it('detects a difference in all four places once the mode is actually on (positive control)', async () => {
+    // このテストが無いと、4つの比較子を壊しても「差が無い」で緑になってしまう。
+    const upstream = await startAnthropicUpstream();
+    cleanupAfterTest(async () => upstream.close());
+
+    const unset = await exerciseAffinity({ upstream, sessionAffinity: undefined });
+    const on = await exerciseAffinity({ upstream, sessionAffinity: { mode: 'on' } });
+
+    assert.notDeepEqual(unset.first.logLines, on.first.logLines, '(a) の比較子が差を検出できる');
+    assert.notEqual(unset.first.statusJson, on.first.statusJson, '(b) の比較子が差を検出できる');
+    assert.notEqual(unset.first.screen, on.first.screen, '(c) の比較子が差を検出できる');
+    assert.notEqual(unset.first.stateFile, on.first.stateFile, '(d) の比較子が差を検出できる');
+    assert.notEqual(
+      unset.restarted.restoredScreen,
+      on.restarted.restoredScreen,
+      '再起動経路の比較子が差を検出できる（mode:"on" では events が復元される）',
+    );
+
+    // 差が「affinity のせい」であることまで押さえる（別の揺らぎで差が出ていない）。
+    assert.ok(
+      on.first.logLines.some(line => / sid=[0-9a-f]{12} aff=(bound|new|switch|none) fam=(fable|other)$/.test(line)),
+      'mode:"on" の proxy 行には sid=/aff=/fam= が付く（§7.1）',
+    );
+    assert.ok(JSON.parse(on.first.statusJson).sessionAffinity, 'mode:"on" の status JSON には節が出る（§7.3）');
+    assert.match(on.first.screen, /Session Affinity/, 'mode:"on" の status 画面には節が出る（D-185）');
+    assert.match(on.first.stateFile, /"sessionAffinity":/, 'mode:"on" の保存ファイルには表が載る（§8）');
+    assert.match(on.restarted.stateFile, /"events":/, 'mode:"on" の保存ファイルには events が載る（D-56-6）');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// 7. does-not-touch-gpt-path
+//    （設計書 §10「不変性」2件目・§1・§7.1 末尾・R9・D-63 C6 ／ 計画 v1.2 R-S13・I-4）
+//
+// gpt-* 宛の要求は sticky のコード経路へ**入らない**（設計書 §1）。`mode:"on"` にしても
+//   ① bridge へ送るヘッダ・パス・本文
+//   ② `openai-bridge` のログ行
+//   ③ ルーティング判定（bridge へ分岐すること）
+// が `mode:"off"` と不変であり、さらに gpt-* の要求は sid 付与率の**分母**
+// （status の `requests.proxied`）にも**セッション表**にも入らないことを固定する。
+// ---------------------------------------------------------------------------
+
+describe('does-not-touch-gpt-path (設計書 §10・§1・R9)', () => {
+  it('keeps the bridge-bound headers, the openai-bridge log lines and the routing decision unchanged while the mode is on', async () => {
+    const bridge = await startRecordingBridge();
+    cleanupAfterTest(async () => bridge.close());
+    const upstream = await startAnthropicUpstream();
+    cleanupAfterTest(async () => upstream.close());
+
+    // 同じ偽 bridge・同じ偽 Anthropic 上流に対し、同じ順序で同じ要求を通す。
+    const off = await exerciseGptPath({ bridge, upstream, sessionAffinity: undefined });
+    const on = await exerciseGptPath({ bridge, upstream, sessionAffinity: { mode: 'on' } });
+
+    assert.deepEqual(on.bridgeRequests, off.bridgeRequests, '① bridge が受け取るヘッダ・パス・本文が不変');
+    assert.deepEqual(on.bridgeLogLines, off.bridgeLogLines, '② openai-bridge のログ行が不変');
+    assert.deepEqual(on.gptObservations, off.gptObservations, 'gpt-* の応答（status・ヘッダ・本文）が不変');
+    assert.equal(on.bridgeRequests.length, off.bridgeRequests.length, '③ bridge へ分岐した件数が不変');
+
+    // 空振り防止＋positive control: `mode:"on"` が本当に効いている状態での比較であること。
+    assert.equal(on.bridgeRequests.length, 2, 'gpt-* が2件とも bridge へ分岐している');
+    assert.ok(on.bridgeLogLines.length > 0, '比較対象の openai-bridge 行が1行も無いなら空振り');
+    assert.equal(
+      on.affinityProxyLines.length,
+      1,
+      'claude-* の proxy 行にだけ sid=/aff=/fam= が付く＝mode:"on" が効いている',
+    );
+    assert.equal(off.affinityProxyLines.length, 0, 'mode:"off" では1行も付かない');
+    assert.deepEqual(
+      on.bridgeRequests.map(request => request.headers['x-claude-code-session-id']),
+      [STICKY_SESSION_ID, STICKY_SESSION_ID],
+      'セッションヘッダは rotator が触らずそのまま bridge へ届く（素通し）',
+    );
+    assert.deepEqual(
+      on.bridgeLogLines.filter(line => /\s(?:sid|aff|fam)=/.test(line)),
+      [],
+      'openai-bridge の行に affinity の追記フィールドが混ざらない（§7.1 末尾）',
+    );
+  });
+
+  it('counts no gpt-* request in the sid coverage denominator and binds no session for it', async () => {
+    const bridge = await startRecordingBridge();
+    cleanupAfterTest(async () => bridge.close());
+    const upstream = await startAnthropicUpstream();
+    cleanupAfterTest(async () => upstream.close());
+
+    const { proxy } = await startStickyProxy({
+      upstream,
+      sessionAffinity: { mode: 'on' },
+      openaiBridge: bridgeConfig(bridge.url),
+    });
+
+    // gpt-* だけを2件（いずれもセッションヘッダ付き）。
+    for (let i = 0; i < 2; i += 1) {
+      const response = await askSession(proxy, { sid: STICKY_SESSION_ID, model: 'gpt-6-astra' });
+      assert.equal(response.status, 200, 'gpt-* は bridge が 200 を返す');
+    }
+    const beforeClaude = await affinityStatusSection(proxy);
+    assert.deepEqual(beforeClaude.requests, { proxied: 0, keyed: 0 }, 'gpt-* は sid 付与率の分母に入らない');
+    assert.equal(beforeClaude.sidRate, null, '分母が0なので付与率は null（§7.3）');
+    assert.equal(beforeClaude.sessions, 0, 'gpt-* ではセッション表に1件も入らない');
+    assert.deepEqual(beforeClaude.sessionsByAccount, {}, '口座別の集計にも入らない');
+
+    // 同じセッション鍵の claude-* を1件だけ通す（positive control）。
+    assert.equal((await askSession(proxy, { sid: STICKY_SESSION_ID, model: 'claude-sonnet-4' })).status, 200);
+    const afterClaude = await affinityStatusSection(proxy);
+    assert.deepEqual(afterClaude.requests, { proxied: 1, keyed: 1 }, '数えるのは claude-* の要求だけ');
+    assert.equal(afterClaude.sidRate, 1, '1/1 なので付与率は 1');
+    assert.equal(afterClaude.sessions, 1, 'claude-* で初めて表に載る');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// 8. no-raw-session-id-in-logs
+//    （設計書 §10「不変性」3件目・§2.3・§7.1・§8・§9.1・R7・D-54-1 ／ FU-98）
+//
+// ログへ出てよいのは12桁ハッシュだけである。既知の合成セッション UUID と、受信した
+// `x-api-key` / `authorization` の値が全ログ行に1回も現れないことを固定する。
+// **FU-98**: 同じ検査を `runtime-state.json` の**実ファイルのバイト列**へも行う
+// （表を持った `mode:"on"` で保存し、UUID・トークン・メールアドレス・`gen` が無いこと）。
+// ---------------------------------------------------------------------------
+
+describe('no-raw-session-id-in-logs (設計書 §10・§9.1・R7・FU-98)', () => {
+  it('uses a scanner that actually catches a leaked raw value (positive control)', () => {
+    // このテストが無いと、走査の対象や比較を壊しても「一致0件」で緑になってしまう。
+    for (const [label, value] of STICKY_RAW_VALUES) {
+      assert.notDeepEqual(
+        findRawValueHits([`<ts> affinity_bind sid=${value} account=acct_a reason=new_session sessions=1`], label),
+        [],
+        `生値の見本を検出できていない: ${label}`,
+      );
+    }
+  });
+
+  it('writes only the 12-digit hash into the logs while the mode is on', async () => {
+    const bridge = await startRecordingBridge();
+    cleanupAfterTest(async () => bridge.close());
+    const upstream = await startAnthropicUpstream();
+    cleanupAfterTest(async () => upstream.close());
+
+    const { proxy, logLines } = await startStickyProxy({
+      upstream,
+      // 上限1件にして、2つ目のセッションで退避（affinity_evict）まで出す。
+      sessionAffinity: { mode: 'on', maxSessions: 1 },
+      openaiBridge: bridgeConfig(bridge.url),
+    });
+
+    const clientHeaders = {
+      'x-api-key': STICKY_CLIENT_API_KEY,
+      authorization: STICKY_CLIENT_AUTHORIZATION,
+    };
+    assert.equal((await askSession(proxy, { sid: STICKY_SESSION_ID, model: 'claude-sonnet-4', headers: clientHeaders })).status, 200);
+    assert.equal((await askSession(proxy, { sid: STICKY_OTHER_SESSION_ID, model: 'claude-sonnet-4', headers: clientHeaders })).status, 200);
+    assert.equal((await askSession(proxy, { sid: STICKY_SESSION_ID, model: 'gpt-6-astra', headers: clientHeaders })).status, 200);
+    await requestJson(`${proxy.url}/internal/status`);
+
+    // 空振り防止: 生値を含みうる行が実際に出ていること。
+    assert.ok(logLines.some(line => /\saffinity_bind\s/.test(line)), 'affinity_bind が出ていること');
+    assert.ok(logLines.some(line => /\saffinity_evict\s/.test(line)), 'affinity_evict が出ていること（上限1件）');
+    assert.ok(logLines.some(line => / openai-bridge /.test(line)), 'openai-bridge の行が出ていること');
+    assert.ok(
+      logLines.some(line => line.includes(` sid=${sidHash(STICKY_SESSION_ID)}`)),
+      'そのセッションの12桁ハッシュが実際にログへ出ていること（出るのはこれだけ）',
+    );
+
+    for (const [label] of STICKY_RAW_VALUES) {
+      assert.deepEqual(
+        findRawValueHits(logLines, label),
+        [],
+        `ログに生値が出ている: ${label}`,
+      );
+    }
+  });
+
+  it('keeps the raw session id, the credentials, the mail addresses and gen out of runtime-state.json (FU-98)', async () => {
+    const upstream = await startAnthropicUpstream();
+    cleanupAfterTest(async () => upstream.close());
+
+    const dir = await mkdtemp(join(tmpdir(), 'rotator-affinity-state-'));
+    cleanupAfterTest(async () => rm(dir, { recursive: true, force: true }));
+    const statePath = join(dir, 'runtime-state.json');
+
+    const { proxy, writes } = await startStickyProxy({
+      upstream,
+      sessionAffinity: { mode: 'on' },
+      statePath,
+    });
+    assert.equal((await askSession(proxy, { sid: STICKY_SESSION_ID, model: 'claude-sonnet-4' })).status, 200);
+    assert.equal((await askSession(proxy, { sid: STICKY_OTHER_SESSION_ID, model: 'claude-sonnet-4' })).status, 200);
+    assert.ok(await waitForCount(writes, 2), `保存が2回に達しない（実測 ${writes.length} 回）`);
+
+    const stateFile = await readFile(statePath, 'utf8');
+    const saved = JSON.parse(stateFile);
+
+    // 空振り防止: 表が実際に保存されていること（空のファイルを走査して緑にならない）。
+    assert.equal(saved.sessionAffinity.version, 1);
+    assert.equal(saved.sessionAffinity.entries.length, 2, '2セッションぶんの行が保存されていること');
+    for (const entry of saved.sessionAffinity.entries) {
+      assert.match(entry.k, /^[0-9a-f]{12}$/, '鍵は12桁ハッシュだけ（§8）');
+    }
+    assert.ok(
+      stateFile.includes(sidHash(STICKY_SESSION_ID)),
+      'そのセッションの12桁ハッシュが実ファイルに入っていること',
+    );
+
+    for (const [label] of STICKY_RAW_VALUES) {
+      assert.deepEqual(
+        findRawValueHits([stateFile], label),
+        [],
+        `runtime-state.json に生値が入っている: ${label}`,
+      );
+    }
+    assert.equal(
+      /"gen"\s*:/.test(stateFile),
+      false,
+      '世代番号は保存しない（D-60-1・§8）',
+    );
+  });
+});
+
+// ---------------------------------------------------------------------------
 // 共通ヘルパ（すべて port 0 で listen する）
 // ---------------------------------------------------------------------------
 
@@ -783,4 +1107,312 @@ async function requestJson(url, options = {}) {
     if (options.body) req.write(options.body);
     req.end();
   });
+}
+
+// ---------------------------------------------------------------------------
+// 共通ヘルパ（sticky affinity・R-S13）。ここでも固定ポートは1つも使わない。
+// ---------------------------------------------------------------------------
+
+// 台帳の時計は固定する。runtime-state.json の `savedAt` も status に出る各時刻もこの値
+// から決まるので、**実ファイルのバイト列**をそのまま比較できる（正規化を挟まない）。
+const STICKY_CLOCK_MS = 1_757_000_000_000;
+const STICKY_ACCOUNT_IDS = Object.freeze(['acct_a', 'acct_b']);
+// 合成の UUID。実在のセッション id ではなく、本ファイルで生成した目印である。
+const STICKY_SESSION_ID = 'b1d5f0c2-8a44-4e19-9f7c-2a6d3e5b01f8';
+const STICKY_OTHER_SESSION_ID = '7c9e2a10-4b3d-42f6-8e05-1d9a7f2c6b34';
+// 合成の受信資格情報（形だけを真似た目印文字列で、実在の鍵ではない）。
+const STICKY_CLIENT_API_KEY = 'synthetic-client-api-key-4d1f0a';
+const STICKY_CLIENT_BEARER = 'synthetic-client-bearer-7b2e93';
+const STICKY_CLIENT_AUTHORIZATION = `Bearer ${STICKY_CLIENT_BEARER}`;
+
+// ログと runtime-state.json のどちらにも1回も現れてはいけない生値（R7・§9.1・FU-98）。
+const STICKY_RAW_VALUES = Object.freeze([
+  ['セッションの生 UUID', STICKY_SESSION_ID],
+  ['別セッションの生 UUID', STICKY_OTHER_SESSION_ID],
+  ['受信した x-api-key', STICKY_CLIENT_API_KEY],
+  ['受信した authorization', STICKY_CLIENT_AUTHORIZATION],
+  ['受信した authorization のトークン部', STICKY_CLIENT_BEARER],
+  ['口座のアクセストークン', `token-${STICKY_ACCOUNT_IDS[0]}`],
+  ['口座のリフレッシュトークン', `refresh-${STICKY_ACCOUNT_IDS[0]}`],
+  ['口座のメールアドレス', `${STICKY_ACCOUNT_IDS[0]}@example.com`],
+]);
+
+// (a)〜(d) を作るための固定の要求列。鍵つき2件（同一セッション・別系統）＋別セッション
+// 1件（Fable 系統＝`fam=fable` の経路）＋鍵なし1件。
+const STICKY_REQUESTS = Object.freeze([
+  [STICKY_SESSION_ID, 'claude-sonnet-4'],
+  [STICKY_SESSION_ID, 'claude-3-5-haiku-20241022'],
+  [STICKY_OTHER_SESSION_ID, 'claude-fable-5-1'],
+  [null, 'claude-sonnet-4'],
+]);
+
+// proxy 行の追記フィールドと affinity_* 行。`mode:"off"` ではこの正規表現に当たる行が
+// 1本も出ない（§7.1・§7.2）。
+const AFFINITY_LOG_MARKERS = /\s(?:sid|aff|fam)=|\saffinity_/;
+
+const SSE_MESSAGE_START = 'event: message_start\ndata: {"type":"message_start"}\n\n';
+const SSE_MESSAGE_STOP = 'event: message_stop\ndata: {"type":"message_stop"}\n\n';
+
+/** 指定した生値を含む行を、行番号つきで返す（走査が働いていることを示せる形）。 */
+function findRawValueHits(lines, label) {
+  const found = STICKY_RAW_VALUES.find(([name]) => name === label);
+  if (!found) throw new Error(`unknown raw value label: ${label}`);
+  const [, value] = found;
+  const hits = [];
+  lines.forEach((line, index) => {
+    if (line.includes(value)) hits.push(`${index + 1} [${label}]`);
+  });
+  return hits;
+}
+
+function askSession(proxy, { sid = null, model = 'claude-sonnet-4', headers = {} } = {}) {
+  return requestJson(`${proxy.url}/v1/messages`, {
+    method: 'POST',
+    body: JSON.stringify({ model }),
+    headers: {
+      'content-type': 'application/json',
+      ...(sid ? { 'x-claude-code-session-id': sid } : {}),
+      ...headers,
+    },
+  });
+}
+
+// 保存は応答の送出より後に走る（`persistState()` は要求ハンドラの末尾で await される）。
+// 実ファイルを読む前に、期待する回数ぶん書き終わったことを待つ。
+async function waitForCount(list, target, timeoutMs = 3000) {
+  const startedAt = Date.now();
+  while (list.length < target && Date.now() - startedAt < timeoutMs) {
+    await new Promise(done => setTimeout(done, 5));
+  }
+  return list.length >= target;
+}
+
+async function startStickyProxy({
+  upstream,
+  sessionAffinity = undefined,
+  openaiBridge = undefined,
+  statePath = null,
+  savedState = null,
+  clockMs = STICKY_CLOCK_MS,
+} = {}) {
+  const logLines = [];
+  const writes = [];
+  const logger = line => logLines.push(line);
+  const secretStore = new MemorySecretStore();
+  for (const id of STICKY_ACCOUNT_IDS) {
+    await secretStore.set(id, {
+      accessToken: `token-${id}`,
+      refreshToken: `refresh-${id}`,
+      // 期限だけは実時刻で置く（更新経路へ入れないため）。保存 JSON には載らない値である。
+      expiresAt: Date.now() + 3_600_000,
+    });
+  }
+  const accountManager = new AccountManager({
+    accounts: STICKY_ACCOUNT_IDS.map(id => ({ id, name: `${id}@example.com`, type: 'oauth' })),
+    now: () => clockMs,
+    logger,
+    // src/cli.js の runServer と同じ決め方（§5.2(b)・D-56-6）。復元より前に決めないと効かない。
+    eventHistory: normalizeSessionAffinity(sessionAffinity).mode !== 'off',
+  });
+  // 台帳を先に復元し、その戻り値を createProxyServer へ渡す並び（§8.1）をそのまま再現する。
+  const credentialChangedAccountIds = savedState ? accountManager.restoreState(savedState) : null;
+  const proxy = await listen(createProxyServer({
+    accountManager,
+    secretStore,
+    logger,
+    savedState,
+    credentialChangedAccountIds,
+    ...(statePath
+      ? {
+        stateWriter: async state => {
+          await writeJsonFileDurable(statePath, state);
+          writes.push(state);
+        },
+      }
+      : {}),
+    config: {
+      upstream: upstream.url,
+      usagePolling: { enabled: false },
+      // 未記載構成では `sessionAffinity` というキー自体を置かない。
+      ...(sessionAffinity === undefined ? {} : { sessionAffinity }),
+      ...(openaiBridge ? { openaiBridge } : {}),
+    },
+  }));
+  cleanupAfterTest(async () => close(proxy.server));
+  return { proxy, accountManager, secretStore, logLines, writes };
+}
+
+// status の JSON と画面には、要求ごとの実測値 `durationMs` が `proxy-request` の
+// events として載る。これは本質的に揺らぐ値なので、proxy ログ行の `durationMs=<n>`
+// （normalizeLogLines）と同じように伏せてから比較する——既存のテスト3 が `date` ヘッダを
+// 落としているのと同じ扱いである。置き換え後も JSON として読めるよう文字列にしておく。
+function normalizeStatusText(text) {
+  return text
+    .replace(/"durationMs":\s*\d+/g, '"durationMs":"<n>"')
+    .replace(/ \d+ms outcome=/g, ' <n>ms outcome=');
+}
+
+async function observeStatus(proxy) {
+  const response = await requestJson(`${proxy.url}/internal/status`);
+  assert.equal(response.status, 200);
+  const body = JSON.parse(response.bodyText);
+  return {
+    json: normalizeStatusText(response.bodyText),
+    // `claude-rotator status` が描く画面（src/monitor.js の renderStatus）。端末幅と時計
+    // を固定して、比較が実行環境に依存しないようにする。
+    screen: normalizeStatusText(renderStatus(body, { now: STICKY_CLOCK_MS, columns: 100 })),
+  };
+}
+
+// 1プロセスぶんの観測。起動 →（復元直後の status）→ events を1件作る → 固定の要求列 →
+// 保存の完了待ち →（要求のあとの status）→ 実ファイルの読み出し。
+async function runAffinityProcess({ upstream, sessionAffinity, statePath, savedState }) {
+  const { proxy, accountManager, logLines, writes } = await startStickyProxy({
+    upstream,
+    sessionAffinity,
+    statePath,
+    savedState,
+  });
+
+  const restored = await observeStatus(proxy);
+
+  // 保存され得る `events` を1件作る。`mode:"off"` では保存も復元もしないので、再起動後の
+  // Events 節は空のままになる（§7.3・D-56-6）。
+  accountManager.markRateLimited(STICKY_ACCOUNT_IDS[1], 60);
+
+  for (const [sid, model] of STICKY_REQUESTS) {
+    const response = await askSession(proxy, { sid, model });
+    assert.equal(response.status, 200, `${model} の要求が偽上流まで通ること`);
+  }
+  assert.ok(
+    await waitForCount(writes, STICKY_REQUESTS.length),
+    `runtime-state.json の書き込みが ${STICKY_REQUESTS.length} 回に達しない（実測 ${writes.length} 回）`,
+  );
+
+  const final = await observeStatus(proxy);
+  return {
+    restoredStatusJson: restored.json,
+    restoredScreen: restored.screen,
+    statusJson: final.json,
+    screen: final.screen,
+    logLines: normalizeLogLines(logLines),
+    stateFile: await readFile(statePath, 'utf8'),
+    writeCount: writes.length,
+  };
+}
+
+// 1構成ぶん＝「初回起動」と「保存ファイルだけを引き継いだ新しいプロセス相当」の2本。
+async function exerciseAffinity({ upstream, sessionAffinity }) {
+  const dir = await mkdtemp(join(tmpdir(), 'rotator-affinity-invariance-'));
+  cleanupAfterTest(async () => rm(dir, { recursive: true, force: true }));
+  const statePath = join(dir, 'runtime-state.json');
+
+  const first = await runAffinityProcess({ upstream, sessionAffinity, statePath, savedState: null });
+  // 新しいプロセス相当: 保存されたファイルだけを入力に、台帳も表も作り直す（§8.1）。
+  const savedState = JSON.parse(await readFile(statePath, 'utf8'));
+  const restarted = await runAffinityProcess({ upstream, sessionAffinity, statePath, savedState });
+  return { first, restarted };
+}
+
+function assertNoAffinityArtifacts(observation, label) {
+  assert.deepEqual(
+    observation.logLines.filter(line => AFFINITY_LOG_MARKERS.test(line)),
+    [],
+    `${label}: (a) proxy 行の sid=/aff=/fam= も affinity_* 行も1つも出ない`,
+  );
+  for (const [phase, json] of [
+    ['起動直後', observation.restoredStatusJson],
+    ['要求のあと', observation.statusJson],
+  ]) {
+    assert.equal(
+      'sessionAffinity' in JSON.parse(json),
+      false,
+      `${label}/${phase}: (b) status の JSON に sessionAffinity キーが無い`,
+    );
+  }
+  for (const [phase, screen] of [
+    ['起動直後', observation.restoredScreen],
+    ['要求のあと', observation.screen],
+  ]) {
+    assert.equal(
+      screen.includes('Session Affinity'),
+      false,
+      `${label}/${phase}: (c) status 画面に Session Affinity 節が無い（D-185）`,
+    );
+  }
+  const saved = JSON.parse(observation.stateFile);
+  assert.equal(
+    'sessionAffinity' in saved,
+    false,
+    `${label}: (d) runtime-state.json に sessionAffinity キーが無い`,
+  );
+  assert.equal(
+    'events' in saved,
+    false,
+    `${label}: (d) runtime-state.json に events キーが無い（D-56-6）`,
+  );
+}
+
+// 受け取った要求をそのまま記録する偽 bridge。契約ヘッダの検査までは行わない——ここで
+// 見たいのは「rotator が bridge へ渡すものが mode で変わらないこと」だけである。
+async function startRecordingBridge() {
+  const received = [];
+  const bridge = await listen(http.createServer((req, res) => {
+    const chunks = [];
+    req.on('data', chunk => chunks.push(chunk));
+    req.on('end', () => {
+      received.push({
+        method: req.method,
+        url: req.url,
+        headers: { ...req.headers },
+        bodyText: Buffer.concat(chunks).toString('utf8'),
+      });
+      res.writeHead(200, { 'content-type': 'text/event-stream', 'cache-control': 'no-cache' });
+      res.write(SSE_MESSAGE_START);
+      res.end(SSE_MESSAGE_STOP);
+    });
+  }));
+  return {
+    url: bridge.url,
+    // 直前に記録したぶんだけを取り出す（2つの構成を同じ bridge で走らせるため）。
+    take: () => received.splice(0),
+    close: async () => close(bridge.server),
+  };
+}
+
+async function exerciseGptPath({ bridge, upstream, sessionAffinity }) {
+  bridge.take();
+  const { proxy, logLines } = await startStickyProxy({
+    upstream,
+    sessionAffinity,
+    openaiBridge: bridgeConfig(bridge.url),
+  });
+
+  const gptObservations = [];
+  for (let index = 0; index < 2; index += 1) {
+    gptObservations.push(summarize(
+      `gpt-${index}`,
+      await askSession(proxy, { sid: STICKY_SESSION_ID, model: 'gpt-6-astra' }),
+    ));
+  }
+  // 同じ鍵の claude-* も1件通す（`mode:"on"` が実際に効いていることの positive control）。
+  assert.equal((await askSession(proxy, { sid: STICKY_SESSION_ID, model: 'claude-sonnet-4' })).status, 200);
+
+  const normalized = normalizeLogLines(logLines);
+  return {
+    bridgeRequests: bridge.take(),
+    bridgeLogLines: normalized.filter(line => / openai-bridge /.test(line)),
+    gptObservations,
+    affinityProxyLines: normalized.filter(
+      line => / proxy account=/.test(line) && /\s(?:sid|aff|fam)=/.test(line),
+    ),
+  };
+}
+
+async function affinityStatusSection(proxy) {
+  const response = await requestJson(`${proxy.url}/internal/status`);
+  assert.equal(response.status, 200);
+  const section = JSON.parse(response.bodyText).sessionAffinity;
+  assert.ok(section, 'status の JSON に sessionAffinity 節があること');
+  return section;
 }
