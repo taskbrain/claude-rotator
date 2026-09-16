@@ -1059,7 +1059,7 @@ describe('logSessionAffinityStartupNotice (R-S6 / U17)', () => {
         { switchThreshold: 0.8, logger: line => lines.push(line), now: START_MS },
       );
       assert.deepEqual(returned, lines, '返り値は実際に出した行の配列');
-      assert.deepEqual(lines, [`${isoAt(START_MS)} affinity config mode=${mode} switchThreshold=0.8`]);
+      assert.deepEqual(lines, [`${isoAt(START_MS)} affinity_config mode=${mode} switchThreshold=0.8`]);
     }
   });
 
@@ -1081,7 +1081,7 @@ describe('logSessionAffinityStartupNotice (R-S6 / U17)', () => {
       normalizeSessionAffinity({ mode: 'on' }),
       { switchThreshold: undefined, logger: line => lines.push(line), now: START_MS },
     );
-    assert.deepEqual(lines, [`${isoAt(START_MS)} affinity config mode=on switchThreshold=unknown`]);
+    assert.deepEqual(lines, [`${isoAt(START_MS)} affinity_config mode=on switchThreshold=unknown`]);
   });
 });
 
@@ -1201,5 +1201,46 @@ describe('SessionAffinity mode memory and change notice (R-S11 / FU-69)', () => 
     affinity.applySettings({ mode: 'off' });
 
     assert.equal(changes.length, afterBind + 1);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// 復元したあとの LRU 順（R-S12 / FU-54）
+//
+// 表の順序は Map の挿入順＝recency（古い順）であり、`trimToCapacity` は「先頭が最も古い」
+// という前提で退避先を選ぶ。空の表へ読み戻す起動時はそれで正しいが、すでに行のある表へ
+// 読み戻すと、いま触られたばかりの行が先頭に残ったまま古い復元分が後ろへ並ぶ。その状態で
+// 容量を超えると、生きているセッションのほうが先に落ちる。restore の直後に `lastSeen`
+// 昇順で並べ直して、この取り違えを防ぐ。
+// ---------------------------------------------------------------------------
+
+describe('SessionAffinity restore ordering (R-S12 / FU-54)', () => {
+  it('re-orders the table by last seen so a restore into a live table still evicts the oldest first', () => {
+    const { affinity, clock } = createAffinity({ maxSessions: 3 });
+    // いま触ったばかりのセッション。挿入順ではこれが先頭にいる。
+    reserve(affinity, 'live-session', 'acct-a');
+
+    const result = affinity.restore({
+      version: 1,
+      savedAt: isoAt(clock.ms),
+      entries: [
+        { k: sidHash('older'), a: 'acct-a', t: START_MS - 120_000, s: 0 },
+        { k: sidHash('oldest'), a: 'acct-a', t: START_MS - 300_000, s: 0 },
+      ],
+    }, { accountManager: ledger(['acct-a']) });
+
+    assert.equal(result.restored, 2);
+    assert.equal(affinity.size, 3);
+
+    // 4件目で容量を超える。落ちるのは最も長く触られていない復元分であって、
+    // いま触ったばかりの行ではない。
+    clock.ms += 1_000;
+    reserve(affinity, 'new-session', 'acct-a');
+
+    assert.equal(affinity.size, 3);
+    assert.equal(affinity.get('oldest'), null, '最も古い行が落ちる');
+    assert.equal(affinity.get('live-session')?.home, 'acct-a', '生きている行は残る');
+    assert.equal(affinity.get('older')?.home, 'acct-a');
+    assert.equal(affinity.get('new-session')?.home, 'acct-a');
   });
 });

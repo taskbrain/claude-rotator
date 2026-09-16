@@ -46,6 +46,11 @@ export function renderStatus(status, options = {}) {
   // data; without it nothing is appended and the output stays byte-identical.
   lines.push(...renderCodexSection(options.codex, now));
 
+  // Session affinity section (sticky design 7.3). Drawn only when the status JSON
+  // carries the section, which /internal/status omits entirely while the mode is
+  // "off" - so the default configuration prints exactly what it prints today.
+  lines.push(...renderAffinitySection(status.sessionAffinity));
+
   lines.push('Events');
   for (const event of (status.events || []).slice(0, 8)) {
     lines.push(renderEvent(event));
@@ -425,4 +430,67 @@ function codexText(value, fallback) {
   if (typeof value !== 'string') return fallback;
   const cleaned = value.replace(CODEX_UNSAFE_CHARACTERS, '');
   return cleaned || fallback;
+}
+
+// ---------------------------------------------------------------------------
+// Session affinity section of `claude-rotator status` (sticky design 7.3).
+//
+// `status.sessionAffinity` is written by src/proxy-server.js and is absent while
+// the mode is "off"; nothing is drawn then, so the screen stays byte-identical to
+// the one operators see today (R7). Same shape as the Codex section above: a
+// header line in the `current:` column, indented detail rows, one trailing blank
+// line. Every field is optional as far as this renderer is concerned - a status
+// JSON from an older or newer proxy can only cost this section detail, never the
+// Claude side of the screen.
+// ---------------------------------------------------------------------------
+
+const AFFINITY_SECTION_LABEL = 'Session Affinity';
+// Same column as the `current:` field of the Claude Rotator header line.
+const AFFINITY_HEADER_WIDTH = 39;
+
+function renderAffinitySection(affinity) {
+  if (!affinity || typeof affinity !== 'object' || Array.isArray(affinity)) return [];
+  const lines = [
+    `${terminalPadEnd(AFFINITY_SECTION_LABEL, AFFINITY_HEADER_WIDTH)}${affinityHeadline(affinity)}`,
+  ];
+  for (const [label, counts] of [
+    ['by account', affinity.sessionsByAccount],
+    ['switches', affinity.switchesByReason],
+    ['evictions', affinity.evictionsByReason],
+  ]) {
+    const rendered = affinityCounts(counts);
+    if (rendered) lines.push(`  ${label}: ${rendered}`);
+  }
+  lines.push('');
+  return lines;
+}
+
+function affinityHeadline(affinity) {
+  const mode = typeof affinity.mode === 'string' && affinity.mode ? affinity.mode : 'unknown';
+  const sessions = affinityNumber(affinity.sessions) ?? 0;
+  const capacity = affinityNumber(affinity.capacity);
+  const of = capacity == null ? '' : `/${capacity}`;
+  return `mode: ${mode}  sessions: ${sessions}${of}  sid: ${affinitySidCoverage(affinity)}`;
+}
+
+// The share of forwarded requests that carried a session key (design 7.3). It is
+// counted per request, so it cannot be derived from the session counts above.
+function affinitySidCoverage(affinity) {
+  const proxied = affinityNumber(affinity.requests?.proxied) ?? 0;
+  const keyed = affinityNumber(affinity.requests?.keyed) ?? 0;
+  if (proxied <= 0) return 'no requests';
+  const rate = affinityNumber(affinity.sidRate) ?? keyed / proxied;
+  return `${Math.round(rate * 100)}% (${keyed}/${proxied})`;
+}
+
+function affinityCounts(counts) {
+  if (!counts || typeof counts !== 'object' || Array.isArray(counts)) return '';
+  return Object.entries(counts)
+    .filter(([, value]) => affinityNumber(value) != null)
+    .map(([key, value]) => `${key} ${value}`)
+    .join(', ');
+}
+
+function affinityNumber(value) {
+  return typeof value === 'number' && Number.isFinite(value) ? value : null;
 }

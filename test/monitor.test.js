@@ -657,3 +657,102 @@ describe('サブキャップ 429 で稼働口座が動かないときの表示 (
     assert.match(renderStatus(common, { now: NOW, columns: 100 }), /b@example\.com\s+active/);
   });
 });
+
+// ---------------------------------------------------------------------------
+// セッション固定の節（R-S12 / 設計書 §7.3）
+//
+// 描くのは status JSON が `sessionAffinity` を持っているときだけである。`mode:"off"` では
+// `/internal/status` がキー自体を出さないので、この節は1行も描かれず `claude-rotator status`
+// の出力は現行とバイト同一になる（R7）。Codex 節（`renderCodexSection`）と同型で、
+// `renderStatus` からの呼び出しは1箇所だけである。
+// ---------------------------------------------------------------------------
+
+describe('session affinity section (R-S12 / 設計書 §7.3)', () => {
+  const NOW = Date.parse('2026-09-16T09:00:00.000Z');
+
+  function baseStatus() {
+    return {
+      currentAccount: 'acct_1',
+      currentAccountName: 'a@example.com',
+      switchThreshold: 1,
+      routingAvailability: { fable: [], other: [] },
+      accounts: [],
+      events: [],
+    };
+  }
+
+  const SECTION = {
+    mode: 'on',
+    sessions: 2,
+    capacity: 10000,
+    sessionsByAccount: { acct_1: 2, acct_2: 1 },
+    switchesByReason: { common_exhausted: 1 },
+    evictionsByReason: { ttl: 3 },
+    requests: { proxied: 3, keyed: 2 },
+    sidRate: 0.6667,
+  };
+
+  function render(status) {
+    return renderStatus(status, { now: NOW, columns: 100 });
+  }
+
+  it('draws nothing at all when the status carries no sessionAffinity section', () => {
+    const output = render(baseStatus());
+
+    assert.equal(output.includes('Session Affinity'), false);
+    assert.equal(output.includes('sid:'), false);
+  });
+
+  it('appends the section without changing one byte of the rest of the screen', () => {
+    const before = render(baseStatus());
+
+    const after = render({ ...baseStatus(), sessionAffinity: SECTION });
+
+    const lines = after.split('\n');
+    const start = lines.findIndex(line => line.startsWith('Session Affinity'));
+    assert.ok(start >= 0, '節が描かれていない');
+    const end = lines.indexOf('', start);
+    assert.ok(end > start, '節は空行で終わる（Codex 節と同型）');
+    assert.equal([...lines.slice(0, start), ...lines.slice(end + 1)].join('\n'), before);
+  });
+
+  it('renders the mode, the session counts, the sid coverage and the reason breakdowns', () => {
+    const output = render({ ...baseStatus(), sessionAffinity: SECTION });
+
+    assert.match(output, /Session Affinity\s+mode: on {2}sessions: 2\/10000 {2}sid: 67% \(2\/3\)/);
+    assert.match(output, /\n {2}by account: acct_1 2, acct_2 1\n/);
+    assert.match(output, /\n {2}switches: common_exhausted 1\n/);
+    assert.match(output, /\n {2}evictions: ttl 3\n/);
+  });
+
+  it('omits the empty breakdowns and says so when no request has been forwarded yet', () => {
+    const output = render({
+      ...baseStatus(),
+      sessionAffinity: {
+        mode: 'observe',
+        sessions: 0,
+        capacity: 500,
+        sessionsByAccount: {},
+        switchesByReason: {},
+        evictionsByReason: {},
+        requests: { proxied: 0, keyed: 0 },
+        sidRate: null,
+      },
+    });
+
+    assert.match(output, /Session Affinity\s+mode: observe {2}sessions: 0\/500 {2}sid: no requests/);
+    assert.equal(output.includes('by account:'), false);
+    assert.equal(output.includes('switches:'), false);
+    assert.equal(output.includes('evictions:'), false);
+  });
+
+  it('keeps drawing the screen when the section is malformed', () => {
+    const output = render({
+      ...baseStatus(),
+      sessionAffinity: { mode: 42, sessions: 'many', sessionsByAccount: 'nope' },
+    });
+
+    assert.match(output, /Session Affinity\s+mode: unknown {2}sessions: 0 {2}sid: no requests/);
+    assert.match(output, /Events/);
+  });
+});

@@ -209,6 +209,10 @@ export function createProxyServer({
   // 立ち、`lastSeen` の更新では立たない。persistState が走れば下ろす。
   let affinityDirty = false;
   let affinityPersistTimer = null;
+  // sid 付与率の母数（§7.3）。要求単位で数える——鍵を抽出できた要求 ÷ この proxy が
+  // 転送した要求である。表の `summary()` はセッション単位の集計しか持たないので
+  // （FU-55）、要求の数はここで数える。表を作り直すたびに 0 から数え直す。
+  let affinityRequestCounts = createAffinityRequestCounts();
   function affinityPersistEnabled() {
     // `mode:"off"` と `persist:false` では節そのものを作らない（未記載構成の
     // runtime-state.json を現行とバイト同一に保つ・§8・D-56-6）。
@@ -318,6 +322,7 @@ export function createProxyServer({
   // ので、応答もログも現行とバイト単位で同一になる。起動時の1行（U17）も出ない。
   function createSessionAffinityFor(settings) {
     if (settings.mode === 'off') return null;
+    affinityRequestCounts = createAffinityRequestCounts();
     return new SessionAffinity({
       mode: settings.mode,
       idleTtlMs: settings.idleTtlMs,
@@ -329,6 +334,9 @@ export function createProxyServer({
     });
   }
   sessionAffinitySettings = normalizeSessionAffinity(config.sessionAffinity);
+  // 台帳へ渡すのは真偽値1つだけ（D-182・§5.2(b)）。`mode:"off"` では現行のまま
+  // ——`events` は保存も復元もされず、メモリ上限も効かない。
+  accountManager.setEventHistoryEnabled(sessionAffinitySettings.mode !== 'off');
   logSessionAffinityStartupNotice(sessionAffinitySettings, {
     switchThreshold: accountManager.switchThreshold,
     logger,
@@ -343,6 +351,31 @@ export function createProxyServer({
       accountManager,
       credentialChangedAccountIds,
     });
+  }
+
+  // status JSON へ足す `sessionAffinity` 節（設計書 §7.3）。組み立てはこの1箇所だけで行い、
+  // 台帳の `getStatus()` を返すすべての経路が `statusJson()` を通る。**`mode:"off"` では
+  // キー自体を出さない**ので、未記載構成の JSON は現行とバイト同一である（R7・D-56-6）。
+  function sessionAffinityStatusSection() {
+    if (!sessionAffinity || sessionAffinitySettings?.mode === 'off') return null;
+    const summary = sessionAffinity.summary();
+    const { proxied, keyed } = affinityRequestCounts;
+    return {
+      mode: sessionAffinitySettings.mode,
+      sessions: summary.sessions,
+      capacity: summary.capacity,
+      // 口座別の合計はセッション総数と一致しない（系統別副バインドで1セッションが
+      // 複数の口座に数えられるため・§7.3）。
+      sessionsByAccount: summary.sessionsByAccount,
+      switchesByReason: summary.switchesByReason,
+      evictionsByReason: summary.evictionsByReason,
+      requests: { proxied, keyed },
+      sidRate: proxied > 0 ? Math.round((keyed / proxied) * 10_000) / 10_000 : null,
+    };
+  }
+  function statusJson(status = accountManager.getStatus()) {
+    const section = sessionAffinityStatusSection();
+    return section ? { ...status, sessionAffinity: section } : status;
   }
 
   // GPT プール状態（設計書 §11.1 R3-4・契約 §C10.2）。プロセス内メモリだけで持ち、
@@ -459,7 +492,7 @@ export function createProxyServer({
         ) {
           await usageScheduler.refreshNow();
         }
-        sendJson(res, 200, accountManager.getStatus());
+        sendJson(res, 200, statusJson());
         return;
       }
 
@@ -467,12 +500,17 @@ export function createProxyServer({
         const body = JSON.parse((await readBody(req)).toString('utf8') || '{}');
         accountManager.switchTo(body.account);
         await persistState();
-        sendJson(res, 200, accountManager.getStatus());
+        sendJson(res, 200, statusJson());
         return;
       }
 
       if (req.method === 'POST' && req.url === '/internal/reload') {
         invalidateLiveClaudeCodeCache();
+        // FU-97・設計書 §8.1 末尾: この reload が表を変えたか。口座の入れ替えによる退避
+        // （evictAccounts / prune）だけでなく、**設定だけを変えた reload**（`on→off` で
+        // 表を捨てた・`maxSessions` を縮めて退避した）も対象である。真なら末尾で
+        // `persistState()` を1回だけ呼ぶ。
+        let affinityTableChanged = false;
         if (reloadAccounts) {
           const reloadResult = normalizeReloadAccountsResult(
             await reloadAccounts(),
@@ -520,8 +558,10 @@ export function createProxyServer({
             duplicateRefreshAccounts,
             ownedDuplicateIds,
           }) || duplicateStateChanged;
-          // 表が変わったときも既存の `duplicateStateChanged` と同じ扱いで1回保存する。
-          if (duplicateStateChanged || affinityEvicted.length > 0) await persistState();
+          affinityTableChanged = affinityTableChanged || affinityEvicted.length > 0;
+          // 表の保存は末尾の1回にまとめる（FU-97）。ここで保存すると、この後の
+          // 設定再読込が表をさらに変えたときに2回書くことになる。
+          if (duplicateStateChanged) await persistState();
         }
         // 既存の口座再読込に続けて openaiBridge を再読込する（仕様書 4.2.6 節）。
         // 口座再読込のロジックには一切触れない。
@@ -555,7 +595,11 @@ export function createProxyServer({
           if (sessionAffinity) {
             // 直前のモードはインスタンスが覚えている（FU-69・D-175）。渡し忘れで
             // 「有効→off」の `affinity_disabled` が消えることがない。
-            sessionAffinity.applySettings(sessionAffinitySettings);
+            const applied = sessionAffinity.applySettings(sessionAffinitySettings);
+            // 表を捨てた（`on→off`）・容量縮小で退避した、のどちらも「変わった」である。
+            affinityTableChanged = affinityTableChanged
+              || applied.cleared > 0
+              || applied.evicted.length > 0;
             if (sessionAffinitySettings.mode === 'off') {
               sessionAffinity = null;
               cancelAffinityPersistTimer();
@@ -564,6 +608,8 @@ export function createProxyServer({
           } else {
             sessionAffinity = createSessionAffinityFor(sessionAffinitySettings);
           }
+          // 台帳の events の扱いも mode に合わせて切り替える（D-56-6・§5.2(b)）。
+          accountManager.setEventHistoryEnabled(sessionAffinitySettings.mode !== 'off');
           // U17 の通知は degradeMapping と同じ位置・同じ関数で（`mode:"off"` では1行も出ない）。
           logSessionAffinityStartupNotice(sessionAffinitySettings, {
             switchThreshold: accountManager.switchThreshold,
@@ -582,7 +628,10 @@ export function createProxyServer({
         if (usagePollingEnabled(config)) {
           await usageScheduler.refreshNow({ afterCurrent: true });
         }
-        sendJson(res, 200, accountManager.getStatus());
+        // FU-97: 表が変わった reload はここで1回だけ保存する。`on→off` では節を落とした
+        // 状態で書き直すので、保存ファイルに古い表が残らない。
+        if (affinityTableChanged) await persistState();
+        sendJson(res, 200, statusJson());
         return;
       }
 
@@ -591,7 +640,8 @@ export function createProxyServer({
           sendCredentialOwnershipRestartRequired(res, 503);
           return;
         }
-        sendJson(res, 200, await usageScheduler.refreshNow());
+        const refreshed = await usageScheduler.refreshNow();
+        sendJson(res, 200, { ...refreshed, status: statusJson(refreshed.status) });
         return;
       }
 
@@ -606,7 +656,7 @@ export function createProxyServer({
         await persistState();
         sendJson(res, 200, {
           ...result,
-          status: accountManager.getStatus(),
+          status: statusJson(),
         });
         return;
       }
@@ -698,7 +748,9 @@ export function createProxyServer({
           ? { exhaustionMapper: applyClaudeExhaustionMapping }
           : {}),
         // mode:"off" では渡さない（現行と完全に同一の経路）。
-        ...(sessionAffinity ? { sessionAffinity, sessionAffinitySettings } : {}),
+        ...(sessionAffinity
+          ? { sessionAffinity, sessionAffinitySettings, sessionAffinityCounts: affinityRequestCounts }
+          : {}),
       });
       await persistState();
     } catch (error) {
@@ -1528,6 +1580,14 @@ function isFableRoutingModelId(value) {
 }
 
 /**
+ * sid 付与率の母数（設計書 §7.3・FU-55）。表の `summary()` はセッション単位の集計しか
+ * 持たないので、要求単位の2つの数だけをここで持つ。
+ */
+function createAffinityRequestCounts() {
+  return { proxied: 0, keyed: 0 };
+}
+
+/**
  * 1要求分の sticky affinity（設計書 §4.1・§4.4・§7.1）。
  *
  * 返すのは ①proxy 行へ足す `sid` / `aff` / `fam` ②`select()`＝§4.1 の選択
@@ -2352,6 +2412,7 @@ async function forwardWithRotation({
   exhaustionMapper = null,
   sessionAffinity = null,
   sessionAffinitySettings = null,
+  sessionAffinityCounts = null,
 }) {
   const attemptedAccountIds = new Set();
   let lastRetryableResponse = null;
@@ -2379,6 +2440,12 @@ async function forwardWithRotation({
     affinity: sessionAffinity,
     settings: sessionAffinitySettings,
   });
+  // sid 付与率の母数（§7.3・FU-55）。ここを通る要求だけを数えるので、gpt-* 宛の要求
+  // （openai-bridge へ分岐して本関数へ来ない）は分母にも分子にも入らない。
+  if (affinityRequest && sessionAffinityCounts) {
+    sessionAffinityCounts.proxied += 1;
+    if (affinityRequest.sid) sessionAffinityCounts.keyed += 1;
+  }
   // 設計書 §5.3(a): 試行ループの上限は固定セッションと鍵の無い要求で別々に持つ。
   // 鍵の無い要求は現行どおり口座総数、固定セッションは「バインド先 1 ＋ 再バインド候補数」である。
   // 再バインドは周の先頭（重複ガードより手前）で済むので、この本数で結び付け先と

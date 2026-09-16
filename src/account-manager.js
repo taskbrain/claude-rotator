@@ -32,6 +32,9 @@ const MAX_DATE_TIMESTAMP_MS = 8_640_000_000_000_000;
 const DEFAULT_ASSIGN_STOP_UTILIZATION = 0.9;
 const ASSIGN_BAND_WIDTH = 0.05;
 const ASSIGN_BAND_EPSILON = 1e-9;
+// `getStatus()` has always returned the newest 50 events; the same number bounds
+// the array in memory and in the saved state once the history is enabled.
+const EVENT_HISTORY_LIMIT = 50;
 const ACCOUNT_SWITCH_TRIGGERS = new Set([
   'usage-refresh',
   '429',
@@ -49,11 +52,21 @@ export class AccountManager {
     now = () => Date.now(),
     rotationPolicy = null,
     logger = null,
+    // Keep `events` as a bounded, persisted history (design 5.2(b), D-56-6).
+    // The ledger is told nothing about session affinity - not the instance, not
+    // the mode string (D-182): the caller that knows the mode passes this one
+    // boolean. While it is false the array behaves exactly as it does today -
+    // unbounded, never exported, never restored - so the default configuration
+    // keeps runtime-state.json, /internal/status and `claude-rotator status`
+    // byte-identical (R7). The unbounded growth that leaves behind is a separate
+    // follow-up (U14), deliberately not fixed here.
+    eventHistory = false,
   } = {}) {
     this.now = now;
     this.logger = typeof logger === 'function' ? logger : null;
     this.switchThreshold = normalizeSwitchThreshold(switchThreshold);
     this.rotationPolicy = normalizeRotationPolicy(rotationPolicy);
+    this.eventHistoryEnabled = eventHistory === true;
     this.events = [];
     this.accounts = accounts.map((account, index) => this.createAccount(account, index));
     const configuredIndex = currentAccountId
@@ -128,7 +141,7 @@ export class AccountManager {
     }
     this.currentIndex = index;
     this.accounts[index].status = 'active';
-    this.events.unshift({
+    this.recordEvent({
       at: new Date(this.now()).toISOString(),
       type: 'manual-switch',
       account: this.accounts[index].id,
@@ -226,7 +239,7 @@ export class AccountManager {
     account.rateLimitedUntil = Math.min(MAX_DATE_TIMESTAMP_MS - 1, this.now() + retryAfterMs);
     account.temporaryUnavailableReason = { ...reason };
     account.status = 'throttled';
-    this.events.unshift({
+    this.recordEvent({
       at: new Date(this.now()).toISOString(),
       type: event.eventType || 'upstream-error',
       account: account.id,
@@ -260,7 +273,7 @@ export class AccountManager {
     if (cause) account.errorReason.cause = cause;
     account.errorReason.at = normalizeDetectedAt(details?.at)
       || new Date(this.now()).toISOString();
-    this.events.unshift({
+    this.recordEvent({
       at: new Date(this.now()).toISOString(),
       type: 'account-error',
       account: account.id,
@@ -292,7 +305,7 @@ export class AccountManager {
     if (meta.statusCode != null) event.statusCode = meta.statusCode;
     if (meta.requestId) event.requestId = meta.requestId;
     if (meta.errorType) event.errorType = meta.errorType;
-    this.events.unshift(event);
+    this.recordEvent(event);
     return event;
   }
 
@@ -344,7 +357,7 @@ export class AccountManager {
     });
     if (this.currentIndex >= this.accounts.length) this.currentIndex = 0;
     if (this.accounts.length > 0 && !this.accounts[this.currentIndex]) this.currentIndex = 0;
-    this.events.unshift({
+    this.recordEvent({
       at: new Date(this.now()).toISOString(),
       type: 'reload',
       accounts: this.accounts.length,
@@ -356,6 +369,27 @@ export class AccountManager {
       trigger: 'reload',
     });
     return credentialChangedIds;
+  }
+
+  /**
+   * Turn the bounded, persisted event history on or off (design 5.2(b)).
+   * Called by the wiring that owns the session-affinity mode - at startup and
+   * again on POST /internal/reload, so a mode change takes effect immediately.
+   *
+   * @param {boolean} enabled
+   */
+  setEventHistoryEnabled(enabled) {
+    this.eventHistoryEnabled = enabled === true;
+  }
+
+  // The single write port for `events`. The cap is applied only while the
+  // history is enabled; with it off the array keeps growing exactly as today.
+  recordEvent(event) {
+    this.events.unshift(event);
+    if (this.eventHistoryEnabled && this.events.length > EVENT_HISTORY_LIMIT) {
+      this.events.length = EVENT_HISTORY_LIMIT;
+    }
+    return event;
   }
 
   getStatus() {
@@ -384,7 +418,7 @@ export class AccountManager {
           unavailableReason: this.unavailableReason(account),
         };
       }),
-      events: this.events.slice(0, 50),
+      events: this.events.slice(0, EVENT_HISTORY_LIMIT),
     };
   }
 
@@ -439,6 +473,11 @@ export class AccountManager {
       version: 1,
       savedAt: new Date(this.now()).toISOString(),
       currentAccount: active?.id || null,
+      // The key itself is absent while the history is off, so the saved file of
+      // a default configuration stays byte-identical (design 5.2(b), D-56-6).
+      ...(this.eventHistoryEnabled
+        ? { events: this.events.slice(0, EVENT_HISTORY_LIMIT) }
+        : {}),
       accounts: this.accounts.map(account => ({
         id: account.id,
         accountUuid: account.accountUuid,
@@ -471,7 +510,14 @@ export class AccountManager {
     const credentialChangedIds = [];
     for (const account of this.accounts) {
       const saved = savedById.get(account.id);
-      if (!saved) continue;
+      if (!saved) {
+        // FU-64 / D-183: 保存側に使える行が無い口座（行が壊れていて id で引けない、
+        // または保存より後に足された）は、資格情報が同じである証拠が無いので
+        // 「変わった」側へ倒す。表にバインドが無ければ evictAccounts は何も落とさない
+        // ので、安全側へ倒しても副作用は無い。
+        credentialChangedIds.push(account.id);
+        continue;
+      }
       const savedCredentialRevision = normalizeCredentialRevision(saved.credentialRevision);
       const credentialRevisionChanged = savedCredentialRevision != null
         && account.credentialRevision != null
@@ -502,6 +548,14 @@ export class AccountManager {
     if (state.currentAccount) {
       const index = this.accounts.findIndex(account => account.id === state.currentAccount);
       if (index >= 0) this.currentIndex = index;
+    }
+
+    // A saved state written before this key existed (or with a broken value) is
+    // not an error: the history simply starts empty (design 5.2(b)).
+    if (this.eventHistoryEnabled) {
+      this.events = (Array.isArray(state.events) ? state.events : [])
+        .filter(event => event && typeof event === 'object' && !Array.isArray(event))
+        .slice(0, EVENT_HISTORY_LIMIT);
     }
 
     return credentialChangedIds;
@@ -620,7 +674,7 @@ export class AccountManager {
     }
     this.currentIndex = selected.index;
     selected.account.status = 'active';
-    this.events.unshift({
+    this.recordEvent({
       at: new Date(this.now()).toISOString(),
       type: 'auto-switch',
       from: previous?.id || null,
@@ -657,7 +711,7 @@ export class AccountManager {
       const previous = this.accounts[this.currentIndex];
       if (previous) previous.status = this.displayStatus(previous);
       this.currentIndex = selected.index;
-      this.events.unshift({
+      this.recordEvent({
         at: new Date(this.now()).toISOString(),
         type: 'fallback-switch',
         from: previous?.id || null,
@@ -837,7 +891,7 @@ export class AccountManager {
     const key = `${reason.type}:${reason.window || ''}:${reason.resetAt || ''}`;
     if (account.quotaExhaustionEventKey === key) return;
     account.quotaExhaustionEventKey = key;
-    this.events.unshift({
+    this.recordEvent({
       at: new Date(this.now()).toISOString(),
       type: 'quota-exhausted',
       account: account.id,

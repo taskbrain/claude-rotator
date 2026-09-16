@@ -179,6 +179,9 @@ export function normalizeSessionAffinity(raw) {
 /**
  * 起動時に1行だけ残す記録（U17・§5.2 末尾）。
  *
+ * 行のキーは `affinity_config` である（FU-70・D-184）。`affinity_bind` / `affinity_evict` /
+ * `affinity_disabled` と同じ系統の1語にしておくと、ログの抽出が空白ではなくキー名1つで済む。
+ *
  * `switchThreshold` は sticky の前提ではない（v1.0 の「`mode:"on"` かつ 1 未満なら affinity を
  * off へ倒す」は D-56-7 で撤回した）が、1 未満だと既存の可用性判定と全滅判定がその分だけ
  * 手前で止まるため、後から読めるように値を残す。**`mode:"off"` では1行も出さない**——
@@ -197,7 +200,7 @@ export function logSessionAffinityStartupNotice(settings, {
   if (mode === 'off') return [];
   const threshold = Number.isFinite(switchThreshold) ? switchThreshold : 'unknown';
   const lines = [
-    `${new Date(now).toISOString()} affinity config mode=${mode} switchThreshold=${threshold}`,
+    `${new Date(now).toISOString()} affinity_config mode=${mode} switchThreshold=${threshold}`,
   ];
   for (const line of lines) logger?.(line);
   return lines;
@@ -583,6 +586,10 @@ export class SessionAffinity {
     }
     // 表の順序は recency（古い順）で保つので、古いほうから入れ直す。
     for (const { hash, entry } of usable.reverse()) this.entries.set(hash, entry);
+    // 非空の表へ読み戻すと、すでに入っている行（多くはいま触られたばかり）が挿入順の
+    // 先頭に残り、そこへ古い復元分が後ろから並ぶ。`trimToCapacity` は先頭を最も古い行と
+    // みなすので、そのままでは生きているセッションのほうが先に落ちる（FU-54）。
+    this.sortByRecency();
 
     return { restored: usable.length, skipped: null, dropped };
   }
@@ -688,6 +695,13 @@ export class SessionAffinity {
     // Map の挿入順を recency として使う（LRU の退避が O(1) で済む）。
     this.entries.delete(hash);
     this.entries.set(hash, entry);
+  }
+
+  // 挿入順＝recency（古い順）を組み直す。`touch` は1行ずつ順序を保つが、`restore` は
+  // 複数行をまとめて入れるのでここで一度だけ整える（FU-54）。
+  sortByRecency() {
+    const ordered = [...this.entries].sort((left, right) => left[1].lastSeen - right[1].lastSeen);
+    this.entries = new Map(ordered);
   }
 
   trimToCapacity(now, protectedHash = null) {

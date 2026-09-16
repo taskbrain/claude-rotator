@@ -2917,6 +2917,9 @@ describe('credential identity の戻り値 (D-60-3 / 設計書 §8.1)', () => {
       accounts: [
         savedEntry('acct_1', { accountUuid: 'uuid-1', credentialRevision: 'revision-1' }),
         savedEntry('acct_2', { accountUuid: 'uuid-2', credentialRevision: 'revision-1' }),
+        // FU-64 以降、保存側に行が無い口座は「変わったかもしれない」側へ倒れる。
+        // 「1件も変わっていない」を見るこのケースは台帳の3口座すべてを保存側にも置く。
+        savedEntry('acct_3', { accountUuid: 'uuid-3', credentialRevision: 'revision-1' }),
       ],
     });
 
@@ -2937,5 +2940,182 @@ describe('credential identity の戻り値 (D-60-3 / 設計書 §8.1)', () => {
     }
 
     assert.deepEqual(manager.accounts.map(account => account.id), ['acct_1', 'acct_2', 'acct_3']);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// 保存側に対応する行が無い口座（R-S12 / FU-64・D-183）
+//
+// `restoreState` は「保存時と資格情報が別物になった口座」の一覧を返し、sticky の表は
+// その口座へのバインドを捨てる（F3）。保存側の行が壊れている（id が文字列でない）
+// ときや、そもそも行が無いとき、旧実装は「変化なし」として黙って読み飛ばしていた。
+// 資格情報が同じである証拠がどこにも無いので、これらは安全側＝変わった側へ倒す。
+// バインドが無ければ evictAccounts は1行も落とさないので、実害は無い。
+// ---------------------------------------------------------------------------
+
+describe('保存側に対応エントリが無い口座 (R-S12 / FU-64・D-183)', () => {
+  const LEDGER = [
+    { id: 'acct_1', name: 'a@example.com', type: 'oauth', accountUuid: 'uuid-1', credentialRevision: 'revision-1' },
+    { id: 'acct_2', name: 'b@example.com', type: 'oauth', accountUuid: 'uuid-2', credentialRevision: 'revision-1' },
+  ];
+
+  function makeManager() {
+    return new AccountManager({ accounts: LEDGER, switchThreshold: 1, now: () => 1000 });
+  }
+
+  function savedEntry(id) {
+    return {
+      id,
+      accountUuid: id === 'acct_1' ? 'uuid-1' : 'uuid-2',
+      credentialRevision: 'revision-1',
+      status: 'ready',
+      quota: {},
+      usage: {},
+      rateLimitedUntil: null,
+      temporaryUnavailableReason: null,
+      errorReason: null,
+    };
+  }
+
+  it('reports an account whose saved entry has a non-string id as credential changed', () => {
+    const manager = makeManager();
+
+    const changed = manager.restoreState({
+      version: 1,
+      accounts: [
+        savedEntry('acct_1'),
+        // 壊れた行。id で引けないので acct_2 の保存分は存在しないのと同じである。
+        { ...savedEntry('acct_2'), id: 42 },
+      ],
+    });
+
+    assert.deepEqual(changed, ['acct_2']);
+  });
+
+  it('reports an account the saved state does not know at all', () => {
+    const manager = makeManager();
+
+    // 保存より後に足された口座。バインドは存在しえないので実害は無いが、
+    // 「資格情報が同じ」と断じる根拠も無いので変わった側へ入れる。
+    const changed = manager.restoreState({ version: 1, accounts: [savedEntry('acct_1')] });
+
+    assert.deepEqual(changed, ['acct_2']);
+  });
+
+  it('keeps returning an empty array when every account has a usable saved entry', () => {
+    const manager = makeManager();
+
+    const changed = manager.restoreState({
+      version: 1,
+      accounts: [savedEntry('acct_1'), savedEntry('acct_2')],
+    });
+
+    assert.deepEqual(changed, []);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// events の条件付き永続化とメモリ上限（R-S12 / D-56-6・設計書 §5.2(b)・§7.3）
+//
+// `getStatus()` は `events` の先頭50件を返し、`src/monitor.js` はその先頭8件を描く。
+// 復元すれば再起動直後の status JSON と CLI 出力は「復元しない現行」と必ず変わるので、
+// 保存・復元もメモリ上限50件も **sticky が有効なときだけ** 行う。既定（`mode:"off"`）は
+// 1点も変えない——`runtime-state.json`・`/internal/status`・`claude-rotator status` の
+// すべてが現行とバイト同一である（上限を持たない現行の問題は U14 の別件として残す）。
+//
+// 台帳は sticky の表も mode 文字列も知らない（D-182）。受け取るのは「履歴として扱うか」の
+// 真偽値1つだけで、その値を決めるのは結線側（proxy-server / cli）である。
+// ---------------------------------------------------------------------------
+
+describe('events の条件付き永続化とメモリ上限 (R-S12 / D-56-6)', () => {
+  function makeManager(options = {}) {
+    return new AccountManager({
+      accounts: [
+        { id: 'acct_1', name: 'a@example.com', type: 'oauth' },
+        { id: 'acct_2', name: 'b@example.com', type: 'oauth' },
+      ],
+      switchThreshold: 1,
+      now: () => 1000,
+      ...options,
+    });
+  }
+
+  function fill(manager, count) {
+    for (let index = 0; index < count; index += 1) {
+      manager.recordProxyRequest({
+        account: 'acct_1',
+        method: 'POST',
+        path: '/v1/messages',
+        outcome: 'ok',
+        durationMs: index,
+      });
+    }
+  }
+
+  it('keeps the unbounded current behaviour and writes no events key while the history is off', () => {
+    const manager = makeManager();
+
+    fill(manager, 60);
+
+    assert.equal(manager.events.length, 60, 'off では上限を適用しない（現行のまま）');
+    const saved = manager.exportState();
+    assert.equal('events' in saved, false, 'off では保存しない');
+
+    const restarted = makeManager();
+    restarted.restoreState({
+      ...saved,
+      events: [{ at: '2026-09-16T09:00:00.000Z', type: 'reload', accounts: 2 }],
+    });
+    assert.deepEqual(restarted.events, [], 'off では保存側に events があっても読み戻さない');
+    assert.deepEqual(restarted.getStatus().events, []);
+  });
+
+  it('applies the 50-entry cap and carries the history across a restart while it is on', () => {
+    const manager = makeManager({ eventHistory: true });
+
+    fill(manager, 60);
+
+    assert.equal(manager.events.length, 50);
+    const saved = manager.exportState();
+    assert.equal(saved.events.length, 50);
+
+    const restarted = makeManager({ eventHistory: true });
+    restarted.restoreState(saved);
+
+    assert.deepEqual(restarted.events, saved.events);
+    assert.deepEqual(restarted.getStatus().events, saved.events);
+  });
+
+  it('starts from an empty history when the saved state carries no usable events', () => {
+    for (const saved of [
+      { version: 1, accounts: [] },
+      { version: 1, accounts: [], events: 'nope' },
+      { version: 1, accounts: [], events: [null, 'nope', { at: 'x', type: 'reload' }] },
+    ]) {
+      const manager = makeManager({ eventHistory: true });
+      manager.restoreState(saved);
+      assert.deepEqual(
+        manager.events,
+        Array.isArray(saved.events) ? saved.events.filter(event => event && typeof event === 'object') : [],
+        JSON.stringify(saved),
+      );
+    }
+  });
+
+  it('turns the history on and off after construction (the reload path)', () => {
+    const manager = makeManager();
+
+    fill(manager, 60);
+    assert.equal(manager.events.length, 60);
+
+    manager.setEventHistoryEnabled(true);
+    fill(manager, 1);
+    assert.equal(manager.events.length, 50, '有効化した後の1件で上限まで切り詰まる');
+    assert.equal(manager.exportState().events.length, 50);
+
+    manager.setEventHistoryEnabled(false);
+    fill(manager, 5);
+    assert.equal(manager.events.length, 55, '無効化したら上限は効かない');
+    assert.equal('events' in manager.exportState(), false);
   });
 });

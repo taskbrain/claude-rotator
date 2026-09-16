@@ -72,6 +72,7 @@ import {
   xdgConfigHome,
 } from './paths.js';
 import { readJsonFile, writeJsonFileDurable } from './json-file.js';
+import { normalizeSessionAffinity } from './session-affinity.js';
 
 const execFileAsync = promisify(execFile);
 const CURRENT_ACCOUNT_ID = 'current';
@@ -370,6 +371,11 @@ async function runServer({ write }) {
     currentAccountId: config.activeAccount,
     rotationPolicy: config.rotationPolicy,
     logger,
+    // 切替履歴（`events`）を保存・復元し上限50件を適用するかどうか（設計書 §5.2(b)・
+    // D-56-6）。**復元は下の `restoreRuntimeState` で起きるので、その前に決めておく
+    // 必要がある**——createProxyServer が同じ値を入れ直すのは reload のためである。
+    // 台帳へ渡すのは真偽値1つだけで、mode 文字列も表も渡さない（D-182）。
+    eventHistory: normalizeSessionAffinity(config.sessionAffinity).mode !== 'off',
   });
   const statePath = runtimeStatePath();
   // 台帳を先に復元し、その戻り値（資格情報が別物になった口座 ID）を createProxyServer へ

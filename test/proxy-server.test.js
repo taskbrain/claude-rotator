@@ -12749,15 +12749,15 @@ describe('session affinity persistence and reload (R-S11)', () => {
 
   it('D-155 ③: a reload records the U17 config line again', async () => {
     const { reload, holder, logLines } = await startPersisting({ reloadable: true });
-    const atStartup = eventLines(logLines, 'affinity').filter(line => line.includes(' affinity config '));
+    const atStartup = eventLines(logLines, 'affinity_config');
     assert.equal(atStartup.length, 1);
 
     holder.sessionAffinity = { mode: 'observe' };
     assert.equal((await reload()).status, 200);
 
-    const after = logLines.filter(line => line.includes(' affinity config '));
+    const after = logLines.filter(line => line.includes(' affinity_config '));
     assert.equal(after.length, 2);
-    assert.match(after[1], / affinity config mode=observe switchThreshold=\S+$/);
+    assert.match(after[1], / affinity_config mode=observe switchThreshold=\S+$/);
   });
 
   it('FU-69: a reload to off logs affinity_disabled once and returns the proxy line to its current shape', async () => {
@@ -12796,7 +12796,7 @@ describe('session affinity persistence and reload (R-S11)', () => {
     assert.deepEqual(seen.slice(1), ['Bearer token-acct_a', 'Bearer token-acct_a']);
     assert.equal(persisted.at(-1).sessionAffinity.entries.length, 1);
     assert.equal(
-      logLines.filter(line => line.includes(' affinity config ')).length,
+      logLines.filter(line => line.includes(' affinity_config ')).length,
       1,
       '起動時は off なので1行も出ず、reload で初めて出る',
     );
@@ -12814,5 +12814,262 @@ describe('session affinity persistence and reload (R-S11)', () => {
 
     assert.ok(persisted.length > beforeReload, 'reload で表が変わったら保存する');
     assert.equal(persisted.at(-1).sessionAffinity.entries.length, 1);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// status 出力への sessionAffinity 節と events の条件付き永続化（R-S12・設計書 §7.3）
+//
+// 節は **`mode:"off"` ではキー自体を出さない**。off の `/internal/status` の JSON は
+// 現行とバイト同一であり、`claude-rotator status` の出力も変わらない（R7）。
+// 組み立ては結線側の1箇所（`sessionAffinityStatusSection`）だけで行い、status JSON を返す
+// すべての経路が同じ節を返す。口座台帳（AccountManager）は sticky の表を知らない（D-182）
+// ——台帳が受け取るのは「events を履歴として扱うか」の真偽値1つだけである。
+//
+// sid 付与率は要求単位（鍵を抽出できた要求 ÷ この proxy が転送した要求）で数える。
+// 表の `summary()` には要求の数が無いので（FU-55）、結線側で数える。
+// ---------------------------------------------------------------------------
+
+describe('session affinity status section and event history (R-S12)', () => {
+  const RAW_SESSION_ID = 'a41f77c2-0b93-4e58-9d17-5c3e8a1b2049';
+  const OTHER_SESSION_ID = 'b52a88d3-1ca4-4f69-8e28-6d4f9b2c3150';
+  const CLOCK_START_MS = Date.parse('2026-09-16T09:00:00.000Z');
+
+  function futureReset() {
+    return new Date(Date.now() + 7 * 24 * 60 * 60 * 1000).toISOString();
+  }
+
+  async function startStatus({
+    accounts = ['acct_a', 'acct_b'],
+    sessionAffinity = { mode: 'on' },
+    reloadable = false,
+  } = {}) {
+    const logLines = [];
+    const persisted = [];
+    const clock = { ms: CLOCK_START_MS };
+    const upstream = await listen(http.createServer((req, res) => {
+      req.resume();
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ ok: true }));
+    }));
+    const secretStore = new MemorySecretStore();
+    for (const id of accounts) {
+      await secretStore.set(id, {
+        accessToken: `token-${id}`,
+        refreshToken: `refresh-${id}`,
+        expiresAt: Date.now() + 3_600_000,
+      });
+    }
+    const accountManager = new AccountManager({
+      accounts: accounts.map(id => ({ id, name: `${id}@example.com`, type: 'oauth' })),
+      logger: line => logLines.push(line),
+      now: () => clock.ms,
+      // 結線側が渡す真偽値。off では偽なので現行と同一（D-56-6）。
+      eventHistory: (sessionAffinity?.mode ?? 'off') !== 'off',
+    });
+    const holder = {
+      accounts: accounts.map(id => ({ id, name: `${id}@example.com`, type: 'oauth' })),
+      sessionAffinity,
+    };
+    const proxy = await listen(createProxyServer({
+      accountManager,
+      secretStore,
+      logger: line => logLines.push(line),
+      // usage の取得は外へ出ない偽物に差し替える（/internal/refresh-usage の経路用）。
+      usageFetcher: async () => ({}),
+      ...(reloadable
+        ? {
+          reloadAccounts: async () => holder.accounts,
+          reloadSessionAffinity: async () => holder.sessionAffinity,
+        }
+        : {}),
+      stateWriter: async state => { persisted.push(state); },
+      config: {
+        upstream: upstream.url,
+        usagePolling: { enabled: false },
+        ...(sessionAffinity ? { sessionAffinity } : {}),
+      },
+    }));
+    cleanupAfterTest(async () => { await close(proxy.server); await close(upstream.server); });
+
+    const ask = ({ sid = null, model = 'sonnet' } = {}) => requestJson(
+      `${proxy.url}/v1/messages`,
+      {
+        method: 'POST',
+        body: JSON.stringify({ model }),
+        headers: { ...(sid ? { 'x-claude-code-session-id': sid } : {}) },
+      },
+    );
+    const status = () => requestJson(`${proxy.url}/internal/status`);
+    const reload = () => requestJson(`${proxy.url}/internal/reload`, { method: 'POST' });
+    return {
+      proxy, accountManager, secretStore, logLines, persisted, clock, holder, ask, status, reload,
+    };
+  }
+
+  it('writes no sessionAffinity key into the status JSON while the mode is off', async () => {
+    const { ask, status, accountManager } = await startStatus({ sessionAffinity: null });
+
+    await ask({ sid: RAW_SESSION_ID });
+    const response = await status();
+
+    assert.equal(response.status, 200);
+    assert.equal('sessionAffinity' in response.body, false);
+    // 時計を固定しているので台帳の出力とバイト単位で比べられる。
+    assert.equal(response.bodyText, JSON.stringify(accountManager.getStatus()));
+  });
+
+  it('reports the mode, the session counts, the capacity and the reason breakdowns', async () => {
+    const { ask, status, accountManager } = await startStatus();
+
+    await ask({ sid: RAW_SESSION_ID });
+    // acct_a の Fable 枠だけを枯らして、同じセッションに Fable 専用の副バインドを作らせる。
+    accountManager.applyUsage('acct_a', {
+      scoped_weekly: [{ key: 'fable', label: 'Fable', utilization: 1, resets_at: futureReset() }],
+    });
+    await ask({ sid: RAW_SESSION_ID, model: 'claude-fable-5' });
+    await ask({ sid: OTHER_SESSION_ID });
+
+    const section = (await status()).body.sessionAffinity;
+
+    assert.equal(section.mode, 'on');
+    assert.equal(section.sessions, 2);
+    assert.equal(section.capacity, 10_000);
+    assert.deepEqual(section.sessionsByAccount, { acct_a: 2, acct_b: 1 });
+    // 口座別の合計は総数と一致しない（系統別副バインドで1セッションが2口座に数えられる）。
+    const perAccountTotal = Object.values(section.sessionsByAccount)
+      .reduce((sum, count) => sum + count, 0);
+    assert.equal(perAccountTotal, 3);
+    assert.notEqual(perAccountTotal, section.sessions);
+    assert.deepEqual(section.switchesByReason, { family_exhausted: 1 });
+    assert.deepEqual(section.evictionsByReason, {});
+  });
+
+  it('counts the sid coverage per request instead of per session', async () => {
+    const { ask, status } = await startStatus();
+
+    await ask({ sid: RAW_SESSION_ID });
+    await ask({ sid: RAW_SESSION_ID });
+    await ask();
+
+    const section = (await status()).body.sessionAffinity;
+
+    assert.deepEqual(section.requests, { proxied: 3, keyed: 2 });
+    assert.equal(section.sidRate, 0.6667);
+    assert.equal(section.sessions, 1, '鍵の無い要求は表に載らない');
+  });
+
+  it('returns the same section from every path that answers with the status JSON', async () => {
+    const { ask, status, reload, proxy } = await startStatus({ reloadable: true });
+
+    await ask({ sid: RAW_SESSION_ID });
+
+    const fromStatus = (await status()).body.sessionAffinity;
+    const fromSwitch = (await requestJson(`${proxy.url}/internal/switch`, {
+      method: 'POST',
+      body: JSON.stringify({ account: 'acct_a' }),
+    })).body.sessionAffinity;
+    const fromReload = (await reload()).body.sessionAffinity;
+    const fromPrepareResume = (await requestJson(`${proxy.url}/internal/prepare-resume`, {
+      method: 'POST',
+      body: JSON.stringify({}),
+    })).body.status.sessionAffinity;
+    const fromRefreshUsage = (await requestJson(`${proxy.url}/internal/refresh-usage`, {
+      method: 'POST',
+    })).body.status.sessionAffinity;
+
+    for (const [label, section] of [
+      ['switch', fromSwitch],
+      ['reload', fromReload],
+      ['prepare-resume', fromPrepareResume],
+      ['refresh-usage', fromRefreshUsage],
+    ]) {
+      assert.deepEqual(section, fromStatus, `${label} の節が /internal/status と違う`);
+    }
+    assert.equal(fromStatus.sessions, 1);
+  });
+
+  it('drops the section from every path once a reload turns the mode off', async () => {
+    const { ask, status, reload, holder, proxy } = await startStatus({ reloadable: true });
+
+    await ask({ sid: RAW_SESSION_ID });
+    holder.sessionAffinity = undefined;
+
+    const fromReload = (await reload()).body;
+    const fromStatus = (await status()).body;
+    const fromSwitch = (await requestJson(`${proxy.url}/internal/switch`, {
+      method: 'POST',
+      body: JSON.stringify({ account: 'acct_a' }),
+    })).body;
+
+    for (const [label, body] of [
+      ['reload', fromReload],
+      ['status', fromStatus],
+      ['switch', fromSwitch],
+    ]) {
+      assert.equal('sessionAffinity' in body, false, `${label} が off なのに節を返した`);
+    }
+  });
+
+  it('FU-97: persists the table when a reload only changes the settings', async () => {
+    const { ask, reload, holder, persisted } = await startStatus({ reloadable: true });
+
+    await ask({ sid: RAW_SESSION_ID });
+    await ask({ sid: OTHER_SESSION_ID });
+    const beforeShrink = persisted.length;
+    // 口座は1つも変わらない。容量だけを 1 へ縮めるので、表から1件退避する。
+    holder.sessionAffinity = { mode: 'on', maxSessions: 1 };
+
+    assert.equal((await reload()).status, 200);
+
+    assert.equal(persisted.length - beforeShrink, 1, '容量縮小で表が変わったら1回だけ保存する');
+    assert.equal(persisted.at(-1).sessionAffinity.entries.length, 1);
+
+    const beforeOff = persisted.length;
+    holder.sessionAffinity = { mode: 'off' };
+
+    assert.equal((await reload()).status, 200);
+
+    assert.equal(persisted.length - beforeOff, 1, 'on→off で表を捨てたことを1回だけ保存する');
+    assert.equal('sessionAffinity' in persisted.at(-1), false);
+  });
+
+  it('FU-97: a reload that changes neither the accounts nor the table persists nothing extra', async () => {
+    const { ask, reload, persisted } = await startStatus({ reloadable: true });
+
+    await ask({ sid: RAW_SESSION_ID });
+    const before = persisted.length;
+
+    assert.equal((await reload()).status, 200);
+
+    assert.equal(persisted.length, before, '変化が無ければ保存を増やさない');
+  });
+
+  it('persists the events only while the mode is not off', async () => {
+    const enabled = await startStatus();
+    await enabled.ask({ sid: RAW_SESSION_ID });
+    const savedWhileOn = enabled.persisted.at(-1);
+    assert.ok(Array.isArray(savedWhileOn.events), 'observe/on では events を保存する');
+    assert.ok(savedWhileOn.events.length > 0);
+
+    const disabled = await startStatus({ sessionAffinity: null });
+    await disabled.ask({ sid: RAW_SESSION_ID });
+    assert.equal('events' in disabled.persisted.at(-1), false, 'off では events を保存しない');
+  });
+
+  it('starts persisting the events when a reload turns the mode on', async () => {
+    const { ask, reload, holder, persisted } = await startStatus({
+      reloadable: true,
+      sessionAffinity: null,
+    });
+
+    await ask({ sid: RAW_SESSION_ID });
+    assert.equal('events' in persisted.at(-1), false);
+    holder.sessionAffinity = { mode: 'observe' };
+
+    assert.equal((await reload()).status, 200);
+    await ask({ sid: RAW_SESSION_ID });
+
+    assert.ok(Array.isArray(persisted.at(-1).events));
   });
 });
