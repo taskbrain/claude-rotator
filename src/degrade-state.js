@@ -678,14 +678,18 @@ export function decideRecoveryWaitResponse(parsed, ctx = {}) {
   };
   if (status === 529) {
     if (!waits) return { rewrite: false, reason: 'claude-has-room' };
+    // D-150: 本文と同じ配列からログ用の effectiveResetAt を導く（上の
+    // decideBridgeResponse と同じ理由・同じ作り方）。resetAt= は生値のまま残す。
+    const resetAts = [ctx.gptResetAt, parsed.resetAt, ctx.claudeResetAt];
     return {
       rewrite: true,
       status: 429,
       retryAfterSeconds: RECOVERY_WAIT_RETRY_AFTER_SECONDS,
       stripRateLimitHeaders: true,
-      body: buildDegradeBody(429, { resetAts: [ctx.gptResetAt, parsed.resetAt, ctx.claudeResetAt] }),
+      body: buildDegradeBody(429, { resetAts }),
       meta: {
         ...shared,
+        effectiveResetAt: earliestResetAt(resetAts),
         mappedFrom: 529,
         mappedFromType: 'overloaded_error',
         mappedTo: 429,
@@ -697,6 +701,8 @@ export function decideRecoveryWaitResponse(parsed, ctx = {}) {
   if (status === 403 && TRANSIENT_DEGRADE_REASONS.has(parsed.reason)) {
     // Claude 側に空きがあるなら 529 にして退避させる（3 回で fallbackModel へ移る）。
     // 空きが無い／判定できないなら、要求した GPT 側で待つ。
+    // この枝の本文（buildTransientDegradeBody）は回復見込み時刻を**持たない**ので、
+    // effectiveResetAt も出さない（D-150 の別名は「本文へ実際に載った値」を指す）。
     const mapped = waits ? 429 : 529;
     return {
       rewrite: true,
@@ -741,13 +747,24 @@ export function decideBridgeResponse(parsed, ctx = {}) {
   if (parsed?.rawScope !== 'pool') return { rewrite: false, reason: 'scope-not-explicit-pool' };
   if (ctx.claudeAllUnusable !== true) return { rewrite: false, reason: 'claude-not-exhausted' };
   if (ctx.gptPoolState !== 'unusable') return { rewrite: false, reason: 'gpt-pool-not-unusable' };
+  // 母艦裁定 D-150: ログの resetAt= は契約ヘッダ x-ombr-reset-at の**生値**（Codex 側の
+  // 週次）であり、本文へ載る値（GPT 週次・契約ヘッダ・Claude 5h の3候補の最小）とは
+  // 別物である。同じ名前で意味が違うため復旧見込みを取り違える読み方を招いた。
+  // そこで本文と**同じ配列**から effectiveResetAt を導いてログへ並べて出す。
+  // 既存の resetAt= は残す（上書きしない）。判定・ステータス・本文は1バイトも変えない。
+  // ctx.claudeResetAt は呼び出し側（openai-bridge.js）が1回だけ評価した値であり、
+  // ここでは配列を1つ作って本文とログの両方に使うので、二重評価も食い違いも起きない。
+  const resetAts = [ctx.gptResetAt, parsed.resetAt, ctx.claudeResetAt];
   return {
     rewrite: true,
     status: 403,
-    body: buildDegradeBody(403, { resetAts: [ctx.gptResetAt, parsed.resetAt, ctx.claudeResetAt] }),
+    body: buildDegradeBody(403, { resetAts }),
     meta: {
       gptPoolState: 'unusable',
       claudePoolState: 'all-exhausted',
+      // 3候補がすべて無効なら null。buildBridgeLogMeta が null を出さないので、
+      // その場合のログ行は現行とバイト単位で同一になる。
+      effectiveResetAt: earliestResetAt(resetAts),
       mappedFrom: 529,
       mappedFromType: 'overloaded_error',
       mappedTo: 403,
@@ -780,6 +797,11 @@ export function buildBridgeLogMeta(parsed, extra = {}) {
   put('bridgeCached', parsed?.cached);
   put('accountLabel', parsed?.accountLabel);
   put('resetAt', parsed?.resetAt);
+  // effectiveResetAt は resetAt（契約ヘッダの生値）の直後に置く。2つが隣同士で読めることが
+  // D-150 の目的（生値と本文へ実際に載った値の取り違え防止）。下の extra ループに入れると、
+  // 間に primaryUsedPercent／secondaryUsedPercent／cached が挟まって隣接しない。
+  // 写像しない行では extra が空なので、この行は何も足さずログはバイト単位で現行と同一。
+  put('effectiveResetAt', extra?.effectiveResetAt);
   put('primaryUsedPercent', parsed?.primaryUsedPercent);
   put('secondaryUsedPercent', parsed?.secondaryUsedPercent);
   // cached は recoveryWait 有効時だけ呼び出し側が渡す（ヘッダが無いときは 'none'）。

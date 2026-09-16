@@ -509,6 +509,7 @@ claude-rotator status
     }
     ```
 - ログの `outcome` は `forwarded` / `forwarded-mapped`（529 を 403 へ、または認証失効の 403 を 529 へ書き換えた）/ `bridge-unreachable` / `bridge-connect-timeout` / `bridge-idle-timeout` / `bridge-stream-error` に分かれ、`degradeReason` `upstreamStatus` `gptPoolState` `claudePoolState` `mappedFrom` / `mappedTo` などを、値があるときだけ行末へ追記します（値が1つも無ければ行は従来と同一です）。
+- 529 を書き換えた行（`forwarded-mapped`。403 へも 429 へも）には `resetAt` の直後に `effectiveResetAt` が並びます。`resetAt` は bridge が送ってきた `x-ombr-reset-at` の生値（Codex 側の週次）、`effectiveResetAt` は応答本文の `Earliest recovery` に実際に載った値（GPT 側・契約ヘッダ・Claude 側のうち最も早いもの）です。両者は食い違うことがあるため、復旧の見込み時刻は `effectiveResetAt` を読んでください。書き換えていない行と、回復見込み時刻を本文に持たない書き換え（認証失効以外の一時障害による 403 → 529／429）には出ません。
 
 注意:
 
@@ -1281,6 +1282,7 @@ How it behaves:
   - **Expired GPT credentials (`codex_needs_login` / `codex_credentials_unavailable`) are excluded from waiting** and keep degrading with 529, because they never recover until a human runs `codex login`.
   - Log lines gain `cached=` (whether the bridge answered from its cache; `none` when the header is absent) and `retryAfter=`.
 - Log `outcome` values split into `forwarded` / `forwarded-mapped` (a 529 rewritten to 403, or an auth-expired 403 rewritten to 529) / `bridge-unreachable` / `bridge-connect-timeout` / `bridge-idle-timeout` / `bridge-stream-error`, and fields such as `degradeReason`, `upstreamStatus`, `gptPoolState`, `claudePoolState`, `mappedFrom` / `mappedTo` are appended at the end of the line only when they have a value (with no values, the line is identical to the current one).
+- A line that rewrote a 529 (`forwarded-mapped`, to either 403 or 429) carries `effectiveResetAt` right after `resetAt`. `resetAt` is the raw `x-ombr-reset-at` the bridge sent (the Codex weekly window), while `effectiveResetAt` is the value that actually went into the `Earliest recovery` sentence of the response body (the earliest of the GPT side, the contract header and the Claude side). The two can differ, so read `effectiveResetAt` for the expected recovery time. It is absent on lines that were not rewritten, and on rewrites whose body carries no recovery time (a transient 403 mapped to 529/429).
 
 Caveats:
 

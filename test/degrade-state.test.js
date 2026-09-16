@@ -1903,3 +1903,191 @@ describe('buildBridgeLogMeta > cached と retryAfter (統合設計 v2.1 §4.2 �
     assert.equal(meta.retryAfter, '30');
   });
 });
+
+// ---------------------------------------------------------------------------
+// 母艦裁定 D-150: ログの resetAt= と effectiveResetAt= を別名で並べる
+//
+// bridge 経路（529→403・529→429）のログ `resetAt=` は契約ヘッダ x-ombr-reset-at の
+// **生値**（Codex 側の週次）である。一方で本文の "Earliest recovery" は
+// [GPT の (pool) resetAt, 契約ヘッダ, Claude 側 5h] の**最小**を使う。同じ名前で
+// 意味が違うため、週次の生値を「復旧見込み」と読み違える事故が起きた。
+//
+// ここで固定するのは次の4点だけである（判定・ステータス・本文は1バイトも変えない）。
+//   (a) bridge 経路で Claude 側 5h が週次より早ければ effectiveResetAt は 5h 側になり、
+//       resetAt は生値（週次）のまま残る
+//   (b) decideRecoveryWaitResponse の 529→429 でも同じ
+//   (c) 候補がすべて無ければ effectiveResetAt は null で、ログにも出ない
+//   (d) 写像しなかった行のログ文字列は現行と1文字も変わらない
+// ---------------------------------------------------------------------------
+describe('effectiveResetAt > 本文へ実際に載る最早回復時刻をログの別名で出す (D-150)', () => {
+  // 契約ヘッダ（Codex 週次）は遅く、Claude 側の 5h 枠は早い、という本番で起きた形。
+  const weeklyHeaders = () => headers({ 'x-ombr-reset-at': LATER_RESET_AT });
+
+  it('(a) bridge 経路: Claude 5h が早ければ effectiveResetAt は 5h 側・resetAt は生値のまま', () => {
+    const parsed = parseBridgeContract(weeklyHeaders());
+    const decision = decideBridgeResponse(parsed, {
+      enabled: true,
+      upstreamStatus: 529,
+      claudeAllUnusable: true,
+      gptPoolState: 'unusable',
+      gptResetAt: null,
+      claudeResetAt: RESET_AT,
+    });
+
+    assert.equal(decision.status, 403, '判定もステータスも変えない');
+    assert.equal(decision.meta.effectiveResetAt, RESET_AT, '3候補の最小＝Claude 側 5h');
+    assert.match(
+      JSON.parse(decision.body).error.message,
+      new RegExp(`Earliest recovery: ${RESET_AT}\\.`),
+      '本文と同じ値であること（本文と食い違えばログの意味が無い）',
+    );
+
+    const meta = buildBridgeLogMeta(parsed, decision.meta);
+    assert.equal(meta.resetAt, LATER_RESET_AT, '既存の resetAt= は契約ヘッダの生値のまま残す');
+    assert.equal(meta.effectiveResetAt, RESET_AT);
+    assert.match(
+      formatLogMeta(meta),
+      new RegExp(`resetAt=${LATER_RESET_AT} effectiveResetAt=${RESET_AT} `),
+      '2つを隣同士で読めるように並べる（取り違え防止が目的）',
+    );
+  });
+
+  // (a) の fixture は使用率ヘッダも cached も持たないため、effectiveResetAt を extra ループの
+  // 先頭へ置いただけでも「隣接して見えて」しまう（resetAt との間に挟まりうるキーが1つも
+  // 値を持たないため）。本番の 529→429 経路では x-ombr-primary-used-percent などが載り、
+  // cached は recoveryWait 有効時に必ず入る（openai-bridge.js の呼び出し側が
+  // `parsed?.cached || 'none'` を足す）。この3キーは buildBridgeLogMeta では resetAt の
+  // **後ろ**・extra ループの**前**に置かれるので、effectiveResetAt を extra 側に置くと
+  // 本番ログでは必ず非隣接になる。ここでは本番と同じ形の fixture で行全体をリテラル固定する。
+  it('(a2) 使用率ヘッダと cached が載る本番形でも resetAt の直後に並ぶ', () => {
+    const parsed = parseBridgeContract(headers({
+      'x-ombr-reset-at': LATER_RESET_AT,
+      'x-ombr-cached': 'no',
+      'x-ombr-account': 'pro-b',
+      'x-ombr-primary-used-percent': '97.0',
+      'x-ombr-secondary-used-percent': '12.5',
+    }));
+    const decision = decideRecoveryWaitResponse(parsed, {
+      enabled: true,
+      upstreamStatus: 529,
+      claudeQuotaState: 'none',
+      gptPoolState: 'unusable',
+      gptResetAt: null,
+      claudeResetAt: RESET_AT,
+    });
+    assert.equal(decision.status, 429);
+
+    // 第3引数は openai-bridge.js の呼び出し側と同じ形に組む（recoveryWait 有効時の cached）。
+    const line = formatLogMeta(buildBridgeLogMeta(parsed, {
+      cached: parsed.cached || 'none',
+      ...decision.meta,
+    }));
+
+    assert.match(
+      line,
+      new RegExp(` resetAt=${LATER_RESET_AT} effectiveResetAt=${RESET_AT} primaryUsedPercent=`),
+      'resetAt と effectiveResetAt の間に使用率や cached が挟まってはいけない',
+    );
+    assert.equal(
+      line,
+      ' bridgeContract=1 degradeReason=codex_pool_exhausted poolState=exhausted degradeScope=pool'
+      + ' upstreamStatus=429 upstreamSent=yes bridgeCached=no accountLabel=pro-b'
+      + ` resetAt=${LATER_RESET_AT} effectiveResetAt=${RESET_AT}`
+      + ' primaryUsedPercent=97 secondaryUsedPercent=12.5 cached=no'
+      + ' gptPoolState=unusable claudePoolState=all-exhausted'
+      + ' mappedFrom=529 mappedFromType=overloaded_error mappedTo=429 retryAfter=30'
+      + ' mapReason=both_pools_unusable',
+      '行全体をリテラルで固定する（順序の回帰をここで止める）',
+    );
+  });
+
+  it('(b) decideRecoveryWaitResponse の 529→429 でも同じ値が出る', () => {
+    const parsed = parseBridgeContract(weeklyHeaders());
+    const decision = decideRecoveryWaitResponse(parsed, {
+      enabled: true,
+      upstreamStatus: 529,
+      claudeQuotaState: 'none',
+      gptPoolState: 'unusable',
+      gptResetAt: null,
+      claudeResetAt: RESET_AT,
+    });
+
+    assert.equal(decision.status, 429);
+    assert.equal(decision.retryAfterSeconds, 30, '待機の指示そのものは変えない');
+    assert.equal(decision.meta.effectiveResetAt, RESET_AT);
+    assert.match(
+      JSON.parse(decision.body).error.message,
+      new RegExp(`Earliest recovery: ${RESET_AT}\\.`),
+    );
+    assert.equal(buildBridgeLogMeta(parsed, decision.meta).resetAt, LATER_RESET_AT);
+  });
+
+  it('(b2) GPT 側の (pool) resetAt が最も早ければそれを採る（3候補すべてを見ている）', () => {
+    const parsed = parseBridgeContract(weeklyHeaders());
+    const decision = decideBridgeResponse(parsed, {
+      enabled: true,
+      upstreamStatus: 529,
+      claudeAllUnusable: true,
+      gptPoolState: 'unusable',
+      gptResetAt: RESET_AT,
+      claudeResetAt: LATER_RESET_AT,
+    });
+    assert.equal(decision.meta.effectiveResetAt, RESET_AT);
+  });
+
+  it('(c) 候補が1つも無ければ null になり、ログ行にも現れない', () => {
+    const parsed = parseBridgeContract(headers({ 'x-ombr-reset-at': undefined }));
+    const decision = decideBridgeResponse(parsed, {
+      enabled: true,
+      upstreamStatus: 529,
+      claudeAllUnusable: true,
+      gptPoolState: 'unusable',
+      gptResetAt: null,
+      claudeResetAt: null,
+    });
+
+    assert.equal(decision.meta.effectiveResetAt, null);
+    const line = formatLogMeta(buildBridgeLogMeta(parsed, decision.meta));
+    assert.equal(/effectiveResetAt/.test(line), false, '値が無いキーは出さない（§9.3 の既存規律）');
+    assert.equal(
+      line,
+      ' bridgeContract=1 degradeReason=codex_pool_exhausted poolState=exhausted degradeScope=pool'
+      + ' upstreamStatus=429 upstreamSent=yes'
+      + ' gptPoolState=unusable claudePoolState=all-exhausted'
+      + ' mappedFrom=529 mappedFromType=overloaded_error mappedTo=403 mapReason=both_pools_unusable',
+    );
+  });
+
+  it('(d) 写像しなかった行のログ文字列は1文字も変わらない', () => {
+    // 素通し（forwarded）の行は extra が空なので、契約ヘッダ由来のキーだけが並ぶ。
+    const parsed = parseBridgeContract(headers({ 'x-ombr-cached': 'no', 'x-ombr-account': 'pro-b' }));
+    assert.equal(
+      formatLogMeta(buildBridgeLogMeta(parsed, {})),
+      ' bridgeContract=1 degradeReason=codex_pool_exhausted poolState=exhausted degradeScope=pool'
+      + ' upstreamStatus=429 upstreamSent=yes bridgeCached=no accountLabel=pro-b'
+      + ` resetAt=${RESET_AT}`,
+      '素通しの行に effectiveResetAt は増えない',
+    );
+    // 書き換えない判定は meta そのものを持たない（現行どおり）。
+    const kept = decideBridgeResponse(parsed, {
+      enabled: true, upstreamStatus: 529, claudeAllUnusable: false, gptPoolState: 'unusable',
+    });
+    assert.equal(kept.rewrite, false);
+    assert.equal(kept.meta, undefined);
+  });
+
+  it('(d2) 一時障害の 403→429|529 は本文が回復時刻を持たないので effectiveResetAt も出さない', () => {
+    const parsed = parseBridgeContract({
+      'x-ombr-contract': '1',
+      'x-ombr-degrade-reason': 'codex_upstream_timeout',
+      'x-ombr-degrade-scope': 'pool',
+      'x-ombr-reset-at': LATER_RESET_AT,
+    });
+    const decision = decideRecoveryWaitResponse(parsed, {
+      enabled: true, upstreamStatus: 403, claudeQuotaState: 'none', claudeResetAt: RESET_AT,
+    });
+    assert.equal(decision.status, 429, 'この枝の挙動は変えない');
+    assert.equal('effectiveResetAt' in decision.meta, false);
+    assert.equal(/effectiveResetAt/.test(formatLogMeta(buildBridgeLogMeta(parsed, decision.meta))), false);
+  });
+});

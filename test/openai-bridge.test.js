@@ -2313,6 +2313,9 @@ describe('forwardToOpenAiBridge > 529 → 403 の書換 (R4-1 / 設計書 §8.7)
       metaTail(bridgeLine, 'forwarded-mapped'),
       ' bridgeContract=1 degradeReason=codex_pool_exhausted poolState=exhausted degradeScope=pool'
       + ` upstreamStatus=429 upstreamSent=yes accountLabel=acct-a resetAt=${FAR_FUTURE_RESET_AT}`
+      // D-150: 写像した行にだけ effectiveResetAt=（本文へ実際に載った最早回復時刻）が
+      // 並ぶ。resetAt= は契約ヘッダの生値のまま残す（この事例では両者が同じ値になる）。
+      + ` effectiveResetAt=${FAR_FUTURE_RESET_AT}`
       + ' gptPoolState=unusable gptModelState=unknown claudePoolState=all-exhausted'
       + ' mappedFrom=529 mappedFromType=overloaded_error mappedTo=403 mapReason=both_pools_unusable',
       '実際の上流ステータス（529・429）を必ず同じ行に残す（§9.1・受入条件7）',
