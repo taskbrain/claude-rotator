@@ -1907,7 +1907,7 @@ describe('codex status section (CLI)', () => {
       assert.deepEqual(paths, ['/healthz']);
       assert.match(io.output(), /Codex Rotator\s+pool: available \(1\/1 available\)/);
       assert.match(io.output(), /pro-a\s+█░░░░░░░░░\s+12%\s+available/);
-      assert.match(io.output(), /note: CLI-driven usage is not included in these numbers/);
+      assert.match(io.output(), /note: the CLI's own share cannot be separated out/);
       assert.match(io.output(), /a@example\.com\s+active/);
     } finally {
       await closeCodexServer(server);
