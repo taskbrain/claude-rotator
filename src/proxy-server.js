@@ -52,6 +52,7 @@ import {
   DEGRADE_REASON_QUOTA_EXHAUSTED,
   formatLogMeta,
   mapClaudeExhaustion,
+  mapUpstreamOverloaded,
 } from './degrade-state.js';
 import {
   DEFAULT_OPENAI_BRIDGE,
@@ -493,6 +494,22 @@ export function createProxyServer({
     return mapped;
   };
 
+  // 坂根氏 2026-09-18: Claude 上流（Anthropic）が返した 529 overloaded を 429 ＋
+  // Retry-After へ写像する。写像しないときは null を返し、呼び出し側が上流応答を
+  // そのまま送る。ここでもスイッチを読み直すのは、POST /internal/reload で無効化した
+  // 直後の進行中要求が古い判定へ落ちないようにするためである（上の写像と同じ理由）。
+  //
+  // 口座台帳へは一切書き込まない。529 overloaded はモデル全体の混雑であって口座固有
+  // ではないので、quota 枯渇・throttled・ローテーションのいずれにも波及させない。
+  const applyUpstreamOverloadMapping = candidate => {
+    const mapping = openaiBridgeSettings.degradeMapping;
+    if (mapping?.upstreamOverloadTo429 !== true) return null;
+    return mapUpstreamOverloaded(candidate, {
+      enabled: true,
+      retryAfterSeconds: mapping.upstreamOverloadRetryAfterSeconds,
+    });
+  };
+
   const server = http.createServer(async (req, res) => {
     try {
       if (!isTrustedLocalHttpRequest(req)) {
@@ -789,6 +806,11 @@ export function createProxyServer({
         // 設計書 §14.4「exhaustionMapper を渡さない forwardOnce が現行と同一に振る舞う」）。
         ...(openaiBridgeSettings.degradeMapping?.enabled === true
           ? { exhaustionMapper: applyClaudeExhaustionMapping }
+          : {}),
+        // 同じ規律: upstreamOverloadTo429 が真のときだけ渡す。渡さない構成では
+        // forwardOnce に分岐が1つも増えず、応答もログも現行とバイト単位で同一になる。
+        ...(openaiBridgeSettings.degradeMapping?.upstreamOverloadTo429 === true
+          ? { upstreamOverloadMapper: applyUpstreamOverloadMapping }
           : {}),
         // mode:"off" では渡さない（現行と完全に同一の経路）。
         ...(sessionAffinity
@@ -2510,6 +2532,7 @@ async function forwardWithRotation({
   upstreamConnectRetries,
   upstreamConnectRetryDelayMs,
   exhaustionMapper = null,
+  upstreamOverloadMapper = null,
   sessionAffinity = null,
   sessionAffinitySettings = null,
   sessionAffinityCounts = null,
@@ -2638,6 +2661,7 @@ async function forwardWithRotation({
         upstreamConnectRetryDelayMs,
         modelFamily,
         exhaustionMapper: mapExhaustion,
+        upstreamOverloadMapper,
         affinityLog: affinityRequest,
         observability,
       })) return;
@@ -2837,6 +2861,7 @@ async function forwardWithRotation({
       upstreamConnectRetries,
       upstreamConnectRetryDelayMs,
       exhaustionMapper: mapExhaustion,
+      upstreamOverloadMapper,
       affinityLog: affinityRequest,
       observability,
     });
@@ -2888,6 +2913,7 @@ async function forwardWithRotation({
         upstreamConnectRetries,
         upstreamConnectRetryDelayMs,
         exhaustionMapper: mapExhaustion,
+        upstreamOverloadMapper,
         affinityLog: affinityRequest,
         observability,
       });
@@ -2971,6 +2997,7 @@ async function forwardWithRotation({
       upstreamConnectRetryDelayMs,
       modelFamily,
       exhaustionMapper: mapExhaustion,
+      upstreamOverloadMapper,
       affinityLog: affinityRequest,
       observability,
     })) return;
@@ -2996,6 +3023,7 @@ async function forwardCurrentUnavailableAccount({
   upstreamConnectRetryDelayMs,
   modelFamily = null,
   exhaustionMapper = null,
+  upstreamOverloadMapper = null,
   affinityLog = null,
   observability = DEFAULT_OBSERVABILITY,
 }) {
@@ -3074,6 +3102,7 @@ async function forwardCurrentUnavailableAccount({
     upstreamConnectRetries,
     upstreamConnectRetryDelayMs,
     exhaustionMapper,
+    upstreamOverloadMapper,
     affinityLog,
     observability,
   });
@@ -3418,6 +3447,7 @@ async function forwardOnce({
   upstreamConnectRetries,
   upstreamConnectRetryDelayMs,
   exhaustionMapper = null,
+  upstreamOverloadMapper = null,
   observability = DEFAULT_OBSERVABILITY,
 }) {
   const target = configuredUpstreamTarget(req.url, upstream);
@@ -3425,6 +3455,9 @@ async function forwardOnce({
   const startedAt = Date.now();
   let outcome = 'ok';
   let bufferedPassthrough = false;
+  // 上流 529 は本文を見るまで overloaded_error か判別できない（ヘッダに型情報が無い）。
+  // ヘッダ受領の時点では何も書かずにバッファへ倒し、本文が揃ってから応答を決める。
+  let upstreamOverloadPending = false;
   let reactiveQuotaRetry = false;
   let reactiveQuotaSource = null;
   let reactiveReplayTargets = null;
@@ -3454,6 +3487,14 @@ async function forwardOnce({
     return true;
   };
 
+  // 上流 529 をバッファへ倒すかの単一の判定。`true` を返した呼び出し元は onResponse から
+  // `false` を返し、requestUpstream に本文を溜め切らせる（P-f と同じ型）。
+  const holdUpstreamOverload = upstreamRes => {
+    if (!upstreamOverloadMapper || upstreamRes.statusCode !== 529) return false;
+    upstreamOverloadPending = true;
+    return true;
+  };
+
   let upstreamResponse;
   try {
     upstreamResponse = await requestUpstreamWithConnectRetries({
@@ -3472,6 +3513,9 @@ async function forwardOnce({
       },
       onResponse(upstreamRes) {
         if (!accountManager.accounts.includes(account)) {
+          // reload と同時に 529 が届いた場合も写像する。ここを落とすと「reload と重なった
+          // 529 だけ写像されない」という再現困難な穴になる。
+          if (holdUpstreamOverload(upstreamRes)) return false;
           // P-g1: 応答ヘッダが届いた時点で口座が台帳から消えていた（reload）。
           // ここを結線しないと、この 429 は写像されないまま素通しされる（設計書 §4.2 v1.3 訂正）。
           return writeMappedOrHead(upstreamRes, 'g');
@@ -3484,6 +3528,12 @@ async function forwardOnce({
         accountManager.updateQuota(account.id, upstreamRes.headers, {
           atomicUnifiedWindows: upstreamRes.statusCode === 429,
         });
+
+        // updateQuota の**後**に置く: off の構成と口座台帳の扱いを1分岐も変えないため。
+        // 429 分岐（markRateLimited）・401 分岐（markError）の**前**に置く: 口座状態の
+        // 学習より前に抜けることを字義どおり満たすため（529 はどちらの条件にも当たらない
+        // ので二重の安全になる）。混雑はモデル全体の事象で、口座固有ではない。
+        if (holdUpstreamOverload(upstreamRes)) return false;
 
         if (!passthroughErrors && upstreamRes.statusCode === 429) {
           const unavailableReason = accountManager.unavailableReason(account);
@@ -3563,8 +3613,22 @@ async function forwardOnce({
     throw error;
   }
 
+  // 上流 529 の写像はここで確定させる。**この位置より後ろへ動かさないこと**——直後の
+  // finishStaleAccountResponse は 429 専用の exhaustionMapper しか通さないため、口座が
+  // reload で消えた要求だけ未写像のまま出てしまう。
+  const overloadMapped = upstreamOverloadPending
+    ? upstreamOverloadMapper(upstreamResponse)
+    : null;
+  if (overloadMapped?.degradeLog?.mapReason) degradeLog = overloadMapped.degradeLog;
+
   if (!accountManager.accounts.includes(account)) {
-    finishStaleAccountResponse(res, upstreamResponse, exhaustionMapper);
+    // 写像済みの応答へ exhaustionMapper を重ねない。重ねると台帳が全枯渇のとき、
+    // いま 429 にしたばかりの応答がふたたび 529 へ戻されて写像の意味が消える。
+    finishStaleAccountResponse(
+      res,
+      overloadMapped || upstreamResponse,
+      overloadMapped ? null : exhaustionMapper,
+    );
     return { retryNextAccount: false, passthroughResponse: upstreamResponse };
   }
 
@@ -3652,6 +3716,24 @@ async function forwardOnce({
       reactiveReplayTargets,
       reactiveReplayAuthorization,
     };
+  }
+
+  if (upstreamOverloadPending) {
+    // 上流 529 の終端。写像したときは 429 を、overloaded_error でなかったときは上流応答を
+    // そのまま返す（本文検査のためにバッファしたので content-length 付きで送り直す）。
+    // 口座台帳へは何も書かず、必ず retryNextAccount:false で終える（別口座を試さない）。
+    //
+    // rebase 時の是正: 旧 `extractUsage()` は観測整備（PR #42）で
+    // `parseUsageObservation()` ＋ `applyUsageObservation()` に置き換わったので、この経路も
+    // 上で1回だけ解析した `observation` を写す（本文を二度解析しない）。写像したときは
+    // 応答本文を差し替えているので足さない。`await` をまたいだので台帳の在籍を再確認する。
+    if (!overloadMapped && accountManager.accounts.includes(account)) {
+      applyUsageObservation(accountManager, account.id, observation);
+    }
+    if (!req.aborted && !res.destroyed) {
+      sendBufferedResponse(res, overloadMapped || upstreamResponse);
+    }
+    return { retryNextAccount: false };
   }
 
   if (bufferedPassthrough) {

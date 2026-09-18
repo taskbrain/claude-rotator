@@ -451,6 +451,64 @@ describe('unset-config-is-byte-identical (設計書 §14.1・§7.3-3)', () => {
     assert.equal(off.read().pool.state, 'unusable');
   });
 
+  it('(d) upstreamOverloadTo429 off keeps an upstream 529 overloaded byte-identical', async () => {
+    // 上流 529 の 429 写像もスイッチ配下に置く。未指定・false・非真偽値の3構成が、
+    // 未指定と応答（status・ヘッダ集合・本文）でもログ行でも完全に一致すること。
+    const bridge = await startFakeBridge({ port: 0, mode: 'legacy' });
+    cleanupAfterTest(async () => bridge.close());
+    const upstream = await startAnthropicUpstream({
+      status: 529,
+      body: '{"type":"error","error":{"type":"overloaded_error","message":"Overloaded"}}',
+      extraHeaders: {
+        'retry-after': '900',
+        'anthropic-ratelimit-unified-reset': '1789000000',
+        'request-id': 'req_invariance_529',
+      },
+    });
+    cleanupAfterTest(async () => upstream.close());
+
+    // 既存の degradeMapping.enabled は gpt-* 側のログ行を変えるので、比較は
+    // 「enabled が同じ構成どうし」で取る（新キー単独の影響だけを見るため）。
+    const unset = await exerciseProxy({ bridge, upstream, degradeMapping: undefined });
+    for (const degradeMapping of [
+      { enabled: false },
+      { upstreamOverloadTo429: false },
+      { upstreamOverloadTo429: 'true' },
+    ]) {
+      const other = await exerciseProxy({ bridge, upstream, degradeMapping });
+      const label = JSON.stringify(degradeMapping);
+      assert.deepEqual(unset.observations, other.observations, `${label}: 応答が一致する`);
+      assert.deepEqual(unset.logLines, other.logLines, `${label}: ログ行も一致する`);
+    }
+
+    // degradeMapping.enabled が真の構成でも、新キーが偽なら1バイトも変わらない。
+    const enabledOnly = await exerciseProxy({ bridge, upstream, degradeMapping: { enabled: true } });
+    for (const degradeMapping of [
+      { enabled: true, upstreamOverloadTo429: false },
+      { enabled: true, upstreamOverloadTo429: 'true' },
+    ]) {
+      const other = await exerciseProxy({ bridge, upstream, degradeMapping });
+      const label = JSON.stringify(degradeMapping);
+      assert.deepEqual(enabledOnly.observations, other.observations, `${label}: 応答が一致する`);
+      assert.deepEqual(enabledOnly.logLines, other.logLines, `${label}: ログ行も一致する`);
+    }
+
+    // 空振り防止: claude 宛の要求が実際に 529 のまま素通しされ、上流の待機ヘッダも
+    // 残っている（＝比較対象が「写像されうる応答」であること）。
+    assert.deepEqual(
+      unset.observations.map(observation => `${observation.name}:${observation.status}`),
+      ['health:200', 'status:200', 'gpt:429', 'claude:529'],
+    );
+    const claude = unset.observations.find(observation => observation.name === 'claude');
+    assert.ok(claude.headers.includes('retry-after: 900'), 'off では上流のヘッダをそのまま返す');
+    assert.equal(
+      unset.logLines.filter(line => /mapReason=|retryAfter=/.test(line)).length,
+      0,
+      'off では写像由来の追記フィールドが1つも出ない',
+    );
+    assert.ok(unset.logLines.length > 0, '比較対象のログ行が1行も無いなら比較が空振りしている');
+  });
+
   async function exerciseProxy({ bridge, upstream, degradeMapping }) {
     const logLines = [];
     const proxy = await startProxy({
@@ -1060,13 +1118,18 @@ async function startProxy({
   return proxy;
 }
 
-async function startAnthropicUpstream() {
+// status / 本文 / 追加ヘッダを差し替えられる偽 Anthropic 上流。既定は現行どおりの 200。
+async function startAnthropicUpstream({
+  status = 200,
+  body = JSON.stringify({ ok: true, usage: { input_tokens: 10, output_tokens: 20 } }),
+  extraHeaders = {},
+} = {}) {
   const upstream = await listen(http.createServer((req, res) => {
     req.resume();
-    const body = JSON.stringify({ ok: true, usage: { input_tokens: 10, output_tokens: 20 } });
-    res.writeHead(200, {
+    res.writeHead(status, {
       'content-type': 'application/json',
       'content-length': Buffer.byteLength(body),
+      ...extraHeaders,
     });
     res.end(body);
   }));

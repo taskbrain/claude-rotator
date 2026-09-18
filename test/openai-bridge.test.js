@@ -1077,6 +1077,8 @@ describe('normalizeDegradeMapping (R3-2 / 設計書 §7.3)', () => {
         enabled: true,
         bothUnusableStatus: 529,
         recoveryWaitEnabled: false,
+        upstreamOverloadTo429: false,
+        upstreamOverloadRetryAfterSeconds: 30,
         gptPoolUnusableTtlMs: 30000,
         codexStatusUrl: 'http://127.0.0.1:18765/healthz',
         codexStatusTimeoutMs: 800,
@@ -1092,6 +1094,8 @@ describe('normalizeDegradeMapping (R3-2 / 設計書 §7.3)', () => {
       enabled: true,
       bothUnusableStatus: 403,
       recoveryWaitEnabled: false,
+      upstreamOverloadTo429: false,
+      upstreamOverloadRetryAfterSeconds: 30,
       gptPoolUnusableTtlMs: 60000,
       codexStatusUrl: null,
       codexStatusTimeoutMs: 1500,
@@ -1120,6 +1124,31 @@ describe('normalizeDegradeMapping (R3-2 / 設計書 §7.3)', () => {
       );
     }
     assert.equal(normalizeDegradeMapping({ enabled: true, recoveryWaitEnabled: true }).recoveryWaitEnabled, true);
+    // (f) upstreamOverloadTo429 も真偽値の true だけ。判定式を1つに保つ（既存2キーと同じ規律）。
+    for (const value of ['true', 1, 'yes', {}, [], null, undefined, 0, false]) {
+      assert.equal(
+        normalizeDegradeMapping({ enabled: true, upstreamOverloadTo429: value }).upstreamOverloadTo429,
+        false,
+        `upstreamOverloadTo429:${JSON.stringify(value)}`,
+      );
+    }
+    assert.equal(normalizeDegradeMapping({ upstreamOverloadTo429: true }).upstreamOverloadTo429, true,
+      'degradeMapping.enabled に依存せず単独で有効にできる');
+    // (f) Retry-After 秒は 1..3600 の整数のみ。範囲外・非整数・非数値はすべて既定 30 へ倒す。
+    for (const value of [0, -1, 3601, 30.5, Number.NaN, Number.POSITIVE_INFINITY, '30', null, {}, undefined, true]) {
+      assert.equal(
+        normalizeDegradeMapping({ upstreamOverloadRetryAfterSeconds: value }).upstreamOverloadRetryAfterSeconds,
+        30,
+        `upstreamOverloadRetryAfterSeconds:${JSON.stringify(value) ?? String(value)}`,
+      );
+    }
+    for (const value of [1, 30, 60, 3600]) {
+      assert.equal(
+        normalizeDegradeMapping({ upstreamOverloadRetryAfterSeconds: value }).upstreamOverloadRetryAfterSeconds,
+        value,
+        `境界を含む整数は通す:${value}`,
+      );
+    }
     // ミリ秒は有限の正数のみ。0・負・NaN・Infinity・文字列はすべて既定へ戻す。
     for (const value of [0, -1, Number.NaN, Number.POSITIVE_INFINITY, '60000', null, {}]) {
       assert.equal(normalizeDegradeMapping({ gptPoolUnusableTtlMs: value }).gptPoolUnusableTtlMs, 60000);
@@ -1213,6 +1242,8 @@ describe('resolveOpenAiBridgeSettings degradeMapping (R3-2 / 設計書 §7.3-2)'
       enabled: true,
       bothUnusableStatus: 529,
       recoveryWaitEnabled: false,
+      upstreamOverloadTo429: false,
+      upstreamOverloadRetryAfterSeconds: 30,
       gptPoolUnusableTtlMs: 60000,
       codexStatusUrl: null,
       codexStatusTimeoutMs: 1500,
@@ -1335,6 +1366,33 @@ describe('degradeMapping の config-notice (設計書 §7.3-4)', () => {
     assert.match(lines[1], /degradeMapping\.codexStatusUrl must be loopback/);
   });
 
+  it('(g) announces the upstream 529 -> 429 mapping at startup and reload only when it is on', () => {
+    // 設定を読んだ人が「bridge 用の節だから bridge を使わなければ関係ない」と取り違え
+    // ないよう、有効化したときだけ1行残す。未設定・false では1行も出ない。
+    const on = resolveOpenAiBridgeSettings({
+      openaiBridge: { enabled: false, degradeMapping: { upstreamOverloadTo429: true } },
+    });
+    const lines = [];
+    assert.deepEqual(logDegradeMappingConfigNotice(on, line => lines.push(line)), lines);
+    assert.equal(lines.length, 1, 'bridge が無効でも、写像を有効にしたことだけを1行出す');
+    assert.match(
+      lines[0],
+      /^\d{4}-\d{2}-\d{2}T[\d:.]+Z openai-bridge config-notice degradeMapping\.upstreamOverloadTo429 answers a Claude upstream 529 overloaded_error with 429 \+ Retry-After$/,
+    );
+    for (const degradeMapping of [
+      { upstreamOverloadTo429: false },
+      { upstreamOverloadTo429: 'true' },
+      { enabled: true, upstreamOverloadTo429: false },
+    ]) {
+      const settings = resolveOpenAiBridgeSettings(enabledBridgeConfig({ degradeMapping }));
+      assert.deepEqual(
+        logDegradeMappingConfigNotice(settings, () => assert.fail('must not log')),
+        [],
+        JSON.stringify(degradeMapping),
+      );
+    }
+  });
+
   it('logs nothing for a loopback IPv6 codexStatusUrl', () => {
     // 修正前は [::1] が黙って捨てられていた。いまは値が残り通知も出ない。
     const settings = resolveOpenAiBridgeSettings(enabledBridgeConfig({
@@ -1403,6 +1461,30 @@ describe('POST /internal/reload と degradeMapping', () => {
     // 制約3（可逆性）: プロセスを止めずに1分以内で現行挙動へ戻せること。
     const reverted = applyReload(config, { ...config.openaiBridge, degradeMapping: { enabled: false } });
     assert.equal(reverted.degradeMapping.enabled, false, 'reload で即座に無効へ戻せる');
+  });
+
+  it('(g) toggles upstreamOverloadTo429 off -> on -> off across reloads', () => {
+    // 上流 529 の写像キーも degradeMapping の下にあるので、cli / reload の配線には
+    // 1行も足さずにプロセス再起動なしで反映される（要件①）。
+    const config = { openaiBridge: { ...createDefaultConfig().openaiBridge, enabled: true } };
+    const start = resolveOpenAiBridgeSettings(config);
+    assert.equal(start.degradeMapping.upstreamOverloadTo429, false, '起動時は無効');
+    assert.equal(start.degradeMapping.upstreamOverloadRetryAfterSeconds, 30);
+
+    const on = applyReload(config, {
+      ...config.openaiBridge,
+      degradeMapping: { upstreamOverloadTo429: true, upstreamOverloadRetryAfterSeconds: 45 },
+    });
+    assert.equal(on.degradeMapping.upstreamOverloadTo429, true, 'reload で有効になる');
+    assert.equal(on.degradeMapping.upstreamOverloadRetryAfterSeconds, 45);
+    assert.equal(on.degradeMapping.enabled, false, 'degradeMapping.enabled とは独立して効く');
+
+    const off = applyReload(config, {
+      ...config.openaiBridge,
+      degradeMapping: { upstreamOverloadTo429: false },
+    });
+    assert.equal(off.degradeMapping.upstreamOverloadTo429, false, 'reload で即座に切り戻せる');
+    assert.equal(off.degradeMapping.upstreamOverloadRetryAfterSeconds, 30, '秒数も既定へ戻る');
   });
 
   it('reverts to the disabled degradeMapping once the openaiBridge section disappears', () => {
@@ -2320,6 +2402,43 @@ describe('forwardToOpenAiBridge > 529 → 403 の書換 (R4-1 / 設計書 §8.7)
       + ' mappedFrom=529 mappedFromType=overloaded_error mappedTo=403 mapReason=both_pools_unusable',
       '実際の上流ステータス（529・429）を必ず同じ行に残す（§9.1・受入条件7）',
     );
+  });
+
+  it('(c) keeps the bridge 529 handling identical when upstreamOverloadTo429 is on', async () => {
+    // 上流 529 の 429 写像は Claude 上流（Anthropic）専用で、bridge 応答の 529 は
+    // 1バイトも通らない。新キーを true にしても既存の 529→403 は同じ答えを返す。
+    const base = await callWithLedger({ mode: 'exhausted', claudeAllUnusable: allClaudeExhausted });
+    const withKey = await callWithLedger({
+      mode: 'exhausted',
+      claudeAllUnusable: allClaudeExhausted,
+      degradeMapping: { enabled: true, upstreamOverloadTo429: true, upstreamOverloadRetryAfterSeconds: 5 },
+    });
+
+    assert.equal(withKey.response.status, base.response.status);
+    assert.equal(withKey.response.status, 403);
+    assert.equal(withKey.text, base.text);
+    assert.equal(withKey.response.headers.get('retry-after'), null, '429 の待機ヘッダを足さない');
+    assert.equal(
+      metaTail(withKey.bridgeLine, 'forwarded-mapped'),
+      metaTail(base.bridgeLine, 'forwarded-mapped'),
+      'ログの追記フィールドも同一',
+    );
+    assert.equal(/claude_upstream_overloaded/.test(withKey.bridgeLine), false);
+  });
+
+  it('(c) keeps a passed-through bridge 529 identical when upstreamOverloadTo429 is on', async () => {
+    // bridge が返す 529 の本文は overloaded_error だが、それを 429 へ写像しないこと。
+    const base = await callWithLedger({ mode: 'exhausted', claudeAllUnusable: someClaudeAvailable });
+    const withKey = await callWithLedger({
+      mode: 'exhausted',
+      claudeAllUnusable: someClaudeAvailable,
+      degradeMapping: { enabled: true, upstreamOverloadTo429: true },
+    });
+
+    assert.equal(withKey.response.status, 529, 'bridge 経由の 529 は対象外（既存経路を変えない）');
+    assert.equal(withKey.text, base.text);
+    assert.equal(withKey.response.headers.get('retry-after'), null);
+    assert.equal(/mapped(From|To)=/.test(withKey.bridgeLine), false);
   });
 
   it('(b) forwards the exhausted 529 untouched while any Claude account is still usable', async () => {

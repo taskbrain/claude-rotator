@@ -59,6 +59,12 @@ export const DISABLED_DEGRADE_MAPPING = Object.freeze({
   // 平坦キーにしてあるのは、既存4キーがすべて平坦であること、Object.freeze が浅いこと、
   // ネストの型検査を1段増やさないことによる（同 §3.1）。
   recoveryWaitEnabled: false,
+  // 坂根氏 2026-09-18: Claude 上流（Anthropic）が返す 529 overloaded を 429 ＋ Retry-After
+  // へ写像し、Claude Code を同じモデルのまま待たせて再試行させる。**未指定・false は
+  // 現行とバイト互換**であり、このキー1つで切り戻せる。degradeMapping.enabled とは
+  // 独立に効く（Claude 専用の機能であり、bridge の有無と関係がないため）。
+  upstreamOverloadTo429: false,
+  upstreamOverloadRetryAfterSeconds: 30,
   gptPoolUnusableTtlMs: 60000,
   codexStatusUrl: null,
   codexStatusTimeoutMs: 1500,
@@ -90,6 +96,13 @@ const RECOVERY_WAIT_PRECEDENCE_NOTICE =
   'degradeMapping.recoveryWaitEnabled takes precedence over bothUnusableStatus; '
   + 'both-pool exhaustion answers 429 with Retry-After';
 
+// 坂根氏 2026-09-18: Claude 上流の 529 を 429 にする機能は bridge とは無関係に効くので、
+// 設定を読んだ人が「bridge 用の節だから bridge がなければ関係ない」と取り違えないよう、
+// 起動時と reload 時だけ1行残す（要求ごとには出さない）。未設定なら1行も出ない。
+const UPSTREAM_OVERLOAD_NOTICE =
+  'degradeMapping.upstreamOverloadTo429 answers a Claude upstream 529 overloaded_error '
+  + 'with 429 + Retry-After';
+
 const CODEX_STATUS_URL_NOT_LOOPBACK_NOTICE =
   'degradeMapping.codexStatusUrl must be loopback; codex status section disabled';
 const CODEX_STATUS_URL_INVALID_NOTICE =
@@ -101,6 +114,13 @@ const CODEX_STATUS_URL_SCHEME_NOTICE =
 
 function positiveNumber(value, fallback) {
   return typeof value === 'number' && Number.isFinite(value) && value > 0 ? value : fallback;
+}
+
+// 範囲つきの整数。非数値・非整数・範囲外はすべて既定へ倒す（normalizeConnectRetries と同型）。
+function boundedInteger(value, fallback, min, max) {
+  return typeof value === 'number' && Number.isInteger(value) && value >= min && value <= max
+    ? value
+    : fallback;
 }
 
 // 転送要求から落とす契約ヘッダの判定。req.headers のキーは Node が小文字化するが、
@@ -165,6 +185,15 @@ export function normalizeDegradeMapping(raw) {
       : DISABLED_DEGRADE_MAPPING.bothUnusableStatus,
     // 真偽値の true だけを受け付ける（'true' や 1 は無効＝判定式を1つに保つ）。
     recoveryWaitEnabled: raw.recoveryWaitEnabled === true,
+    // 上流 529 の写像も同じ規律。各キーは独立に正規化するので enabled には依存しない。
+    upstreamOverloadTo429: raw.upstreamOverloadTo429 === true,
+    // 秒は 1..3600 の整数のみ。0 以下は待機の意味を失い、長すぎる値は再開を遅らせる。
+    upstreamOverloadRetryAfterSeconds: boundedInteger(
+      raw.upstreamOverloadRetryAfterSeconds,
+      DISABLED_DEGRADE_MAPPING.upstreamOverloadRetryAfterSeconds,
+      1,
+      3600,
+    ),
     gptPoolUnusableTtlMs: positiveNumber(raw.gptPoolUnusableTtlMs, DISABLED_DEGRADE_MAPPING.gptPoolUnusableTtlMs),
     codexStatusUrl: codexStatusUrl.value,
     codexStatusTimeoutMs: positiveNumber(raw.codexStatusTimeoutMs, DISABLED_DEGRADE_MAPPING.codexStatusTimeoutMs),
@@ -192,6 +221,10 @@ export function logDegradeMappingConfigNotice(settings, logger) {
   // (2) recoveryWait が bothUnusableStatus より優先することの明示（03 §4.1）。
   if (settings.enabled && degradeMapping.enabled === true && degradeMapping.recoveryWaitEnabled === true) {
     reasons.push(RECOVERY_WAIT_PRECEDENCE_NOTICE);
+  }
+  // (2b) 上流 529 → 429 写像（Claude 専用。degradeMapping.enabled・bridge の有無に依存しない）。
+  if (degradeMapping.upstreamOverloadTo429 === true) {
+    reasons.push(UPSTREAM_OVERLOAD_NOTICE);
   }
   // (3) 正規化で捨てた設定（非ループバック等の codexStatusUrl。設計書 §7.2）。
   // fail-safe 3経路では degradeMapping ごと DISABLED_DEGRADE_MAPPING に倒れており
