@@ -13,8 +13,8 @@ const MAX_DATE_TIMESTAMP_MS = 8_640_000_000_000_000;
  * `DEFAULT_ASSIGN_STOP_UTILIZATION` stops NEW assignments at 90% - it is not an
  * eviction line: a session already bound to a 90% account stays there until the
  * account actually runs out (R2). `ASSIGN_BAND_WIDTH` is the 5-point band below
- * the best headroom inside which the weekly-reset priority is allowed to decide;
- * the width itself is an authoring judgement that has not been measured (U15).
+ * the best headroom inside which the load keys are allowed to decide; the width
+ * itself is an authoring judgement that has not been measured (U15).
  * `ASSIGN_BAND_EPSILON` only absorbs binary floating point error. It is NOT the
  * subtraction of the width that needs it - `0.9 - 0.05` is exactly `0.85`. The
  * error is in the residuals themselves, which are read back as `1 - utilization`
@@ -978,12 +978,19 @@ export class AccountManager {
    * pick the account with the most headroom (design 4.2 (a)-(c)). Requests
    * without a session key keep going through the existing comparator.
    *
-   * Ranking, after the assign-stop gate and the missing-window split:
-   *   K1 weekly reset priority (only inside the band)
-   *   K2 earliest weekly reset (only between two priority accounts)
-   *   K3 fewest sessions already bound (R4 - this key is reachable here,
-   *      unlike in the existing comparator)
+   * Ranking inside the band, after the assign-stop gate and the missing-window
+   * split (design v1.7 P-a, 2026-09-18 judgement 6 (a)). The band, the gate, the
+   * split and the R1 gate release are unchanged from v1.6; only the ORDER inside
+   * the band moved:
+   *   K1 smallest real 5h load (`load5h`, an unreadable window sorts last)
+   *   K2 fewest WARM sessions already bound (R4)
+   *   K3 weekly reset priority, then the earliest weekly reset - both were K1/K2
+   *      in v1.6 and are now tie-breakers: spreading the load across accounts
+   *      beats draining an account whose weekly window is about to reset
    *   K4 largest headroom, then account priority, then ledger order
+   *
+   * Everything here is O(accounts) and reads only numbers the ledger already
+   * holds. No model call, no I/O.
    *
    * Side effect: the availability filter calls `isAvailable`, which refreshes
    * the quota state of every account it looks at. That is wanted - an expired
@@ -999,8 +1006,13 @@ export class AccountManager {
    * @param {number} assignStopUtilization Utilization at which an account stops
    *   accepting NEW sessions. The gate is dropped entirely when it would leave
    *   no candidate at all (R1).
-   * @param {Map<string,number>|Record<string,number>|null} sessionCounts Sessions
-   *   already bound per account id (`SessionAffinity.summary().sessionsByAccount`).
+   * @param {Map<string,number>|Record<string,number>|null} sessionCounts WARM
+   *   sessions already bound per account id - `SessionAffinity.warmSessionCounts()`
+   *   (design v1.7 P-c). A session that has gone cold no longer holds a cache on
+   *   its account, so counting it here would keep steering new sessions away from
+   *   an account that is in fact free. The caller used to pass the total
+   *   (`summary().sessionsByAccount`); a total still works, it is just a coarser
+   *   signal.
    * @returns {object|null} The chosen account, or null when nothing is usable -
    *   the caller then falls through to the existing exhausted-response path (R1).
    */
@@ -1041,6 +1053,25 @@ export class AccountManager {
     return band[0].account;
   }
 
+  /**
+   * The headroom `selectForNewAssignment` would give this account (design v1.7
+   * P-b). The reservation stage needs the SAME reading to decide whether a bound
+   * account is utilised enough to drain a cold session off it; re-deriving it from
+   * `quota` in the proxy would let the two drift apart the first time a window is
+   * added. `1 - min` is the utilisation; a `min` of null means it could not be
+   * read, and the caller must NOT read that as "idle".
+   *
+   * Pure: it does not refresh the quota state and does not touch the ledger.
+   *
+   * @param {object|null} account
+   * @param {string|null} modelFamily
+   * @returns {{min:number|null, complete:boolean}}
+   */
+  assignmentHeadroomFor(account, modelFamily = null) {
+    if (!account) return { min: null, complete: false };
+    return assignmentHeadroom(account.quota || {}, modelFamily);
+  }
+
   /** One ranking row for `selectForNewAssignment`. Reads the ledger, never writes it. */
   newAssignmentCandidate(account, index, modelFamily, now, sessionCounts) {
     const quota = account.quota || {};
@@ -1055,11 +1086,17 @@ export class AccountManager {
       account,
       index,
       headroom: assignmentHeadroom(quota, modelFamily),
+      // K1 (design v1.7 P-a): how much of the 5h window this account has actually
+      // burned, not how much is left on its tightest window. `headroom.min` can be
+      // dominated by the WEEKLY window, so an account that has barely touched its
+      // 5h window can lose to one that is halfway through it.
+      load5h: fiveHourLoad(quota, now),
+      // K2: only the WARM bindings (design v1.7 P-c).
+      warm: sessionCountFor(sessionCounts, account.id),
       weeklyResetPriority,
-      // K2 only separates two priority accounts, so everything else shares the
-      // same sentinel and falls through to K3.
+      // The reset instant only separates two priority accounts, so everything else
+      // shares the same sentinel and falls through to the next key.
       weeklyResetAt: weeklyResetPriority ? weeklyResetAt : Number.MAX_SAFE_INTEGER,
-      sessions: sessionCountFor(sessionCounts, account.id),
       priority: account.priority ?? Number.MAX_SAFE_INTEGER,
     };
   }
@@ -1481,15 +1518,50 @@ function assignmentHeadroom(quota, modelFamily) {
   };
 }
 
+/**
+ * The real 5h load of an account (design v1.7 P-a, K1).
+ *
+ * A 5h window whose reset instant has already passed is zero load, not a missing
+ * reading - the window has simply started over. (`refreshQuotaState` normally
+ * clears both fields before a candidate is ever built, so this branch is the
+ * belt-and-braces one; it matters for any caller that scores an account without
+ * going through the availability filter first.)
+ *
+ * A window that could NOT be read stays `null` and the comparator sorts it last.
+ * Reading it as 0 would make an account nobody has measured look like the idlest
+ * account there is, which is the same trap `assignmentHeadroom` avoids for the
+ * residuals (D-60-4).
+ */
+function fiveHourLoad(quota, now) {
+  const resetAt = finiteNumberOrNull(quota?.unified5hReset);
+  if (resetAt != null && resetAt < now) return 0;
+  return finiteNumberOrNull(quota?.unified5h);
+}
+
+/**
+ * The band comparator (design v1.7 P-a). Used for BOTH a brand-new session and a
+ * rebind target, because both go through `selectForNewAssignment`.
+ *
+ * The v1.6 order led with the weekly-reset priority, so a single account that
+ * happened to be closest to its weekly reset collected every new session in the
+ * band until it ran out. Leading with the real 5h load spreads the sessions and
+ * leaves the weekly-reset preference as a tie-breaker.
+ */
 function compareNewAssignmentCandidates(left, right) {
+  if (left.load5h !== right.load5h) {
+    // 欠測は末尾。`!==` は両方 null のときに偽になるので、ここは片方だけが null。
+    if (left.load5h == null) return 1;
+    if (right.load5h == null) return -1;
+    return left.load5h - right.load5h;
+  }
+  if (left.warm !== right.warm) {
+    return left.warm - right.warm;
+  }
   if (left.weeklyResetPriority !== right.weeklyResetPriority) {
     return left.weeklyResetPriority ? -1 : 1;
   }
   if (left.weeklyResetAt !== right.weeklyResetAt) {
     return left.weeklyResetAt - right.weeklyResetAt;
-  }
-  if (left.sessions !== right.sessions) {
-    return left.sessions - right.sessions;
   }
   const leftHeadroom = left.headroom.min ?? -1;
   const rightHeadroom = right.headroom.min ?? -1;

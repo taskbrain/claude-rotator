@@ -13181,6 +13181,32 @@ describe('session affinity status section and event history (R-S12)', () => {
     assert.deepEqual(section.evictionsByReason, {});
   });
 
+  // 設計書 v1.7 §7.3 の確定形は `{ mode, sessions, capacity, warmTtlMs, sessionsByAccount,
+  // warmSessionsByAccount, switchesByReason, evictionsByReason, requests, sidRate }` である。
+  // v1.6 の形に足した2つを status 側で直接押さえる——`summary()` が返していても節へ載せ
+  // 忘れれば、README と設計書が約束した項目が欠ける（R-S18-FIX1 差戻し2）。
+  it('reports the warm window and the warm per-account counts in the status section (v1.7 §7.3)', async () => {
+    const { ask, status } = await startStatus();
+
+    await ask({ sid: RAW_SESSION_ID });
+    await ask({ sid: OTHER_SESSION_ID });
+
+    const section = (await status()).body.sessionAffinity;
+
+    assert.equal(section.warmTtlMs, 3_600_000, '既定の warm 窓（1時間）を節へ出す');
+    assert.deepEqual(
+      section.warmSessionsByAccount,
+      { acct_a: 1, acct_b: 1 },
+      'いま来たばかりの2セッションはどちらも温かい（2本目は別口座へ散る）',
+    );
+    // 冷えた行も表には残るので、総数側は別に読める（2つの差が冷えた本数・§7.3）。
+    assert.deepEqual(section.sessionsByAccount, { acct_a: 1, acct_b: 1 });
+    assert.deepEqual(Object.keys(section), [
+      'mode', 'sessions', 'capacity', 'warmTtlMs', 'sessionsByAccount',
+      'warmSessionsByAccount', 'switchesByReason', 'evictionsByReason', 'requests', 'sidRate',
+    ], '§7.3 の確定形どおりの並び');
+  });
+
   it('counts the sid coverage per request instead of per session', async () => {
     const { ask, status } = await startStatus();
 
@@ -13307,5 +13333,180 @@ describe('session affinity status section and event history (R-S12)', () => {
     await ask({ sid: RAW_SESSION_ID });
 
     assert.ok(Array.isArray(persisted.at(-1).events));
+  });
+});
+
+// ---------------------------------------------------------------------------
+// 冷えた固定の解放（R-S18 / 設計書 v1.7 §4.3・P-b）
+//
+// v1.6 は「口座が枯れるまで動かさない」だった。v1.7（2026-09-18 判断6 案(a)）は、
+// **キャッシュが失効したセッションだけ**を、利用率の高い口座から空いている口座へ
+// 動かしてよいことにする。移すキャッシュがもう無いので費用はゼロであり、温かい
+// セッションはこの線では1本も動かない。
+// ---------------------------------------------------------------------------
+
+describe('session affinity cold reassign (R-S18 / 設計書 v1.7 P-b)', () => {
+  function eventLines(logLines, kind) {
+    return logLines.filter(line => line.includes(` ${kind} `));
+  }
+
+  async function startCold({
+    accounts = ['acct_a', 'acct_b'],
+    sessionAffinity = { mode: 'on', warmTtlMs: 60_000 },
+  } = {}) {
+    const logLines = [];
+    const seen = [];
+    // 時計は台帳へ注入する。affinity は `() => accountManager.now()` を読むので、
+    // これ1つで warm TTL を決定的に動かせる（実時間を待たない）。
+    const clock = { ms: Date.now() };
+    const upstream = await listen(http.createServer((req, res) => {
+      seen.push(req.headers.authorization);
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ ok: true }));
+    }));
+    const secretStore = new MemorySecretStore();
+    for (const id of accounts) {
+      await secretStore.set(id, {
+        accessToken: `token-${id}`,
+        refreshToken: `refresh-${id}`,
+        expiresAt: Date.now() + 3_600_000,
+      });
+    }
+    const logger = line => logLines.push(line);
+    const accountManager = new AccountManager({
+      accounts: accounts.map(id => ({ id, type: 'oauth' })),
+      logger,
+      now: () => clock.ms,
+    });
+    const proxy = await listen(createProxyServer({
+      accountManager,
+      secretStore,
+      logger,
+      config: {
+        upstream: upstream.url,
+        usagePolling: { enabled: false },
+        sessionAffinity,
+      },
+    }));
+    cleanupAfterTest(async () => { await close(proxy.server); await close(upstream.server); });
+
+    const ask = ({ sid = null, model = 'sonnet' } = {}) => requestJson(
+      `${proxy.url}/v1/messages`,
+      {
+        method: 'POST',
+        body: JSON.stringify({ model }),
+        headers: { ...(sid ? { 'x-claude-code-session-id': sid } : {}) },
+      },
+    );
+    return { seen, accountManager, logLines, ask, clock };
+  }
+
+  /** 枯渇はさせずに利用率だけを上げる（switchThreshold の既定は 1）。 */
+  function setUtilization(accountManager, id, { fiveHour, weekly }) {
+    const now = accountManager.now();
+    accountManager.applyUsage(id, {
+      five_hour: { utilization: fiveHour, resets_at: new Date(now + 3_600_000).toISOString() },
+      seven_day: { utilization: weekly, resets_at: new Date(now + 86_400_000).toISOString() },
+    });
+  }
+
+  it('moves a cold session off a heavily used account and records reason=cold_reassign', async () => {
+    const { ask, seen, logLines, accountManager, clock } = await startCold();
+
+    assert.equal((await ask({ sid: 'session-one' })).status, 200);
+    assert.equal(seen.at(-1), 'Bearer token-acct_a');
+
+    // 結び付け先は 90% まで使われているが、まだ枯れてはいない（要求は通る）。
+    setUtilization(accountManager, 'acct_a', { fiveHour: 0.90, weekly: 0.10 });
+    assert.equal(accountManager.isAvailable(accountManager.find('acct_a')), true);
+    // キャッシュが失効するまで放置する。
+    clock.ms += 60_001;
+
+    assert.equal((await ask({ sid: 'session-one' })).status, 200);
+
+    assert.equal(seen.at(-1), 'Bearer token-acct_b', '空いている口座へ移る');
+    const switches = eventLines(logLines, 'affinity_switch');
+    assert.equal(switches.length, 1);
+    assert.match(
+      switches[0],
+      / from=acct_a to=acct_b reason=cold_reassign family=other switches=1$/,
+    );
+
+    // 移った先が新しい結び付け先になる（毎回さまよわない）。
+    assert.equal((await ask({ sid: 'session-one' })).status, 200);
+    assert.equal(seen.at(-1), 'Bearer token-acct_b');
+    assert.equal(eventLines(logLines, 'affinity_switch').length, 1);
+  });
+
+  it('never moves a warm session, however used the bound account is', async () => {
+    const { ask, seen, logLines, accountManager } = await startCold();
+
+    assert.equal((await ask({ sid: 'session-one' })).status, 200);
+    setUtilization(accountManager, 'acct_a', { fiveHour: 0.99, weekly: 0.10 });
+
+    assert.equal((await ask({ sid: 'session-one' })).status, 200);
+
+    assert.deepEqual(seen, ['Bearer token-acct_a', 'Bearer token-acct_a']);
+    assert.deepEqual(eventLines(logLines, 'affinity_switch'), [], '温かいセッションは動かさない');
+  });
+
+  it('keeps a cold session where it is while the account is still below drainStartUtilization', async () => {
+    const { ask, seen, logLines, accountManager, clock } = await startCold();
+
+    assert.equal((await ask({ sid: 'session-one' })).status, 200);
+    setUtilization(accountManager, 'acct_a', { fiveHour: 0.50, weekly: 0.10 });
+    clock.ms += 60_001;
+
+    assert.equal((await ask({ sid: 'session-one' })).status, 200);
+
+    assert.deepEqual(seen, ['Bearer token-acct_a', 'Bearer token-acct_a']);
+    assert.deepEqual(
+      eventLines(logLines, 'affinity_switch'),
+      [],
+      '冷えていても、口座が混んでいなければ動かす理由が無い',
+    );
+  });
+
+  it('turns the whole line off when drainStartUtilization is 1', async () => {
+    const { ask, seen, logLines, accountManager, clock } = await startCold({
+      sessionAffinity: { mode: 'on', warmTtlMs: 60_000, drainStartUtilization: 1 },
+    });
+
+    assert.equal((await ask({ sid: 'session-one' })).status, 200);
+    setUtilization(accountManager, 'acct_a', { fiveHour: 0.99, weekly: 0.10 });
+    clock.ms += 60_001;
+
+    assert.equal((await ask({ sid: 'session-one' })).status, 200);
+
+    assert.deepEqual(seen, ['Bearer token-acct_a', 'Bearer token-acct_a']);
+    assert.deepEqual(eventLines(logLines, 'affinity_switch'), []);
+  });
+
+  it('leaves a cold session alone when the utilisation of the bound account cannot be read', async () => {
+    const { ask, seen, logLines, clock } = await startCold();
+
+    assert.equal((await ask({ sid: 'session-one' })).status, 200);
+    // 使用量を一度も取得できていない口座。0% と読んでも 100% と読んでもいけない。
+    clock.ms += 60_001;
+
+    assert.equal((await ask({ sid: 'session-one' })).status, 200);
+
+    assert.deepEqual(seen, ['Bearer token-acct_a', 'Bearer token-acct_a']);
+    assert.deepEqual(eventLines(logLines, 'affinity_switch'), []);
+  });
+
+  it('keeps the cold session on its account when there is nowhere better to go', async () => {
+    const { ask, seen, logLines, accountManager, clock } = await startCold({
+      accounts: ['acct_a'],
+    });
+
+    assert.equal((await ask({ sid: 'session-one' })).status, 200);
+    setUtilization(accountManager, 'acct_a', { fiveHour: 0.95, weekly: 0.10 });
+    clock.ms += 60_001;
+
+    assert.equal((await ask({ sid: 'session-one' })).status, 200, '要求は必ず通す（R1）');
+
+    assert.deepEqual(seen, ['Bearer token-acct_a', 'Bearer token-acct_a']);
+    assert.deepEqual(eventLines(logLines, 'affinity_switch'), []);
   });
 });

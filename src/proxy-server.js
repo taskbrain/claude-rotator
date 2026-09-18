@@ -330,6 +330,7 @@ export function createProxyServer({
       mode: settings.mode,
       idleTtlMs: settings.idleTtlMs,
       maxSessions: settings.maxSessions,
+      warmTtlMs: settings.warmTtlMs,
       // 台帳と同じ時計を読む（試験クロックを注入した検証で TTL がずれない）。
       now: () => accountManager.now(),
       logger,
@@ -367,9 +368,16 @@ export function createProxyServer({
       mode: sessionAffinitySettings.mode,
       sessions: summary.sessions,
       capacity: summary.capacity,
+      // 「温かい」の境界そのもの（設計書 v1.7 §7.3）。下の2つの口座別の数をどう読めば
+      // よいかがこの値で決まるので、数だけを出して窓を出さない形にはしない。
+      warmTtlMs: summary.warmTtlMs,
       // 口座別の合計はセッション総数と一致しない（系統別副バインドで1セッションが
       // 複数の口座に数えられるため・§7.3）。
       sessionsByAccount: summary.sessionsByAccount,
+      // そのうち「最後に触れてから warmTtlMs 以内」＝上流のキャッシュがまだ生きている
+      // 見込みの本数（設計書 v1.7 §7.3・P-c）。冷えた固定の解放（P-b）が効いているかは、
+      // この2つの差を見れば分かる。
+      warmSessionsByAccount: summary.warmSessionsByAccount,
       switchesByReason: summary.switchesByReason,
       evictionsByReason: summary.evictionsByReason,
       requests: { proxied, keyed },
@@ -1631,19 +1639,33 @@ function createSessionAffinityRequest({
   };
   if (!state.pinned) return state;
 
+  // 温かい数の償却掃除（設計書 v1.7 P-c）。冷えることは事象を伴わないので、要求の流れに
+  // 乗せて 1,000 本に1回だけ掃除する。**新しいタイマーは作らない。**
+  affinity.sweepWarm();
+
   const threshold = accountManager.switchThreshold;
   // 除外集合は必ず口座 id（文字列）で渡す（FU-60）。`attemptedAccountIds` は id の Set。
+  //
+  // 渡すのは**温かいバインド数**である（設計書 v1.7 P-a・P-c）。v1.6 は要求ごとに
+  // `summary()` を呼んで表を全件走査していたが、①10,000 行を毎要求なぞるのは無駄で、
+  // ②冷えたセッションまで数えると「実際には空いている口座」を避け続けてしまう。
+  // `warmSessionCounts()` は増分保持した数の複製を返すだけで、表は走査しない。
   const assign = excludeAccountIds => accountManager.selectForNewAssignment({
     modelFamily,
     excludeAccountIds,
     assignStopUtilization: settings.assignStopUtilization,
-    sessionCounts: affinity.summary().sessionsByAccount,
+    sessionCounts: affinity.warmSessionCounts(),
   });
 
   // ① 予約（§4.4 ①）。表を引き、結び付け先が使えるならそれを、使えないなら §4.1 の
   //    条件で付け替え先を決めて、この同期区間で `Map.set` まで済ませる。
   const entry = affinity.get(key, { modelFamily });
   const bound = entry ? accountManager.findOrNull(entry.bound) : null;
+  // ① の前に1つだけ足した線（設計書 v1.7 §4.3・P-b）。`entry.lastSeen` は **`note()` が
+  // 触る前**の値なので、「前回の要求からどれだけ空いたか」をそのまま読める。
+  const coldTarget = coldReassignTarget({
+    entry, bound, accountManager, settings, modelFamily, assign,
+  });
   let binding = null;
   let sendTo = null;
   let reason = null;
@@ -1658,6 +1680,12 @@ function createSessionAffinityRequest({
     binding = assign(null);
     sendTo = binding;
     reason = binding ? 'account_removed' : null;
+  } else if (coldTarget) {
+    // キャッシュが失効した固定を、混んでいる口座から空いている口座へ移す（P-b）。
+    // 失うものが無いので費用はゼロ。行き先が無ければこの枝は立たず、下の枝へ落ちる。
+    binding = coldTarget;
+    sendTo = coldTarget;
+    reason = 'cold_reassign';
   } else if (accountManager.isAvailable(bound, modelFamily)) {
     binding = bound;
     sendTo = bound;
@@ -1755,6 +1783,42 @@ function createSessionAffinityRequest({
     state.pendingReason = quotaRebindReason(previous, threshold, modelFamily, accountManager.now());
   };
   return state;
+}
+
+/**
+ * 冷えた固定の解放先（設計書 v1.7 §4.3・P-b。2026-09-18 判断6 案(a)）。
+ *
+ * v1.6 の要件 R2 は「口座が枯れるまで動かさない」だった。枯れるまで動かさないと、
+ * 一度混んだ口座に集まったセッションは、そのセッションが二度と来なくなっても
+ * その口座の「重さ」として残り続ける。とはいえ温かいセッションを動かすのは、
+ * 上流のプロンプトキャッシュを捨てて作り直させるという実費の伴う操作である。
+ * そこで**キャッシュが失効したセッションだけ**を動かす:
+ *
+ *   ①表に行があり ②最後の要求から `warmTtlMs` 以上空いていて
+ *   ③結び付け先の利用率が `drainStartUtilization` 以上で ④別の行き先がある
+ *
+ * の4つが揃ったときだけ。①〜③のどれかが欠ければ `null` を返し、呼び出し側は v1.6 と
+ * 同じ枝へ落ちる。**温かいセッションはこの線では1本も動かない。**
+ *
+ * 利用率は台帳の `assignmentHeadroomFor` から読む——選択側（`selectForNewAssignment`）と
+ * 同じ読み方でなければ、窓が1つ増えた日に判定と選択がずれる。読めなかった窓を
+ * 「空いている」とは読まない（`min == null` なら動かさない・D-60-4 と同じ構え）。
+ *
+ * @returns {object|null} 移す先の口座。移さないときは `null`。
+ */
+function coldReassignTarget({ entry, bound, accountManager, settings, modelFamily, assign }) {
+  if (!entry || !bound) return null;
+  // 1 は「この線を切る」という意味である（設計書 §6 の値域）。
+  const drainStart = settings.drainStartUtilization;
+  if (!Number.isFinite(drainStart) || drainStart >= 1) return null;
+  if (Math.max(0, accountManager.now() - entry.lastSeen) <= settings.warmTtlMs) return null;
+
+  const headroom = accountManager.assignmentHeadroomFor(bound, modelFamily);
+  if (headroom.min == null) return null;
+  if (1 - headroom.min < drainStart) return null;
+
+  const target = assign([bound.id]);
+  return target && target.id !== bound.id ? target : null;
 }
 
 /**

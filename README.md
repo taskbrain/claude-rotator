@@ -542,6 +542,8 @@ claude-rotator status
 | `sessionAffinity.maxSessions` | `10000` | 表に保持するセッション数の上限。`1`〜`10000` に丸め、小数は切り捨てます。超えた分は、最後のリクエストが古いセッションから外します |
 | `sessionAffinity.assignStopUtilization` | `0.9` | 新しいセッションの割り当てを止める使用率。`0`〜`1` に丸めます（`1` はこのゲートを使わないのと同じです）。この条件で候補が1つも残らない場合はゲートを外し、必ず候補を選びます |
 | `sessionAffinity.rebindGraceMs` | `60000`（60秒） | 共通枠が枯渇したときに、別アカウントへ付け替える前に待つ時間の上限。`0`〜`600000` に丸めます。回復見込みがこの上限より先・回復見込みを取得できない・`0` を指定した場合は、待たずに付け替えます |
+| `sessionAffinity.warmTtlMs` | `3600000`（1時間） | 最後のリクエストからこの時間以内のセッションを「キャッシュがまだ生きている」とみなします。`60000`〜`21600000` に丸めます。この時間を過ぎたセッションは、アカウントの割り当てを決めるときの重みから外れ、`drainStartUtilization` の対象になります |
+| `sessionAffinity.drainStartUtilization` | `0.85` | キャッシュが失効したセッションを、空いているアカウントへ移し始める使用率。`0`〜`1` に丸めます（**`1` を指定するとこの動作を行いません**）。移すキャッシュがもう無いセッションだけが対象で、キャッシュが生きているセッションはこの設定では動きません |
 | `sessionAffinity.persist` | `true` | `false` にするとメモリ上だけで保持し、`runtime-state.json` へは書きません |
 
 数値キーは、数値でない値や有限でない値を書くと既定値に戻り、値域を外れた値は上限・下限へ丸めます（エラーにはなりません）。`persist` は真偽値の `false` だけを「無効」と読み、それ以外の型は既定の `true` になります。セクション自体が object でない場合も、すべて既定値として扱います。
@@ -550,7 +552,7 @@ claude-rotator status
 
 - **`off`（既定）** — 何も記録せず、この機能のコード経路にも入りません。現行とまったく同じ動作です。
 - **`observe`** — セッション鍵の抽出とログ・集計だけを行い、**アカウントの選び方は一切変えません。** 固定を有効にする前に、セッション鍵の付与率と切り替え回数の基準線を測るための段です。
-- **`on`** — 同じセッションを同じアカウントへ固定します。結び付け先を付け替えるのは**枠が枯渇したときだけ**です。認証失敗・throttle・一時的なエラー・上流 5xx・切断では、そのリクエストだけを別アカウントで完走させ、次のリクエストは元のアカウントへ戻します。Fable 固有枠だけが枯れた場合は Fable リクエスト用の副バインドを1つ作り、他のモデルは元のアカウントのまま使います。共通枠が枯れた場合でも、回復見込みが `rebindGraceMs` 以内なら付け替えずに待ちます。
+- **`on`** — 同じセッションを同じアカウントへ固定します。**キャッシュが生きている間**、結び付け先を付け替えるのは**枠が枯渇したときだけ**です。認証失敗・throttle・一時的なエラー・上流 5xx・切断では、そのリクエストだけを別アカウントで完走させ、次のリクエストは元のアカウントへ戻します。Fable 固有枠だけが枯れた場合は Fable リクエスト用の副バインドを1つ作り、他のモデルは元のアカウントのまま使います。共通枠が枯れた場合でも、回復見込みが `rebindGraceMs` 以内なら付け替えずに待ちます。最後のリクエストから `warmTtlMs`（既定1時間）を過ぎてキャッシュが失効したセッションは、結び付け先の使用率が `drainStartUtilization`（既定 0.85）以上なら、空いているアカウントへ移すことがあります（ログの `reason` は `cold_reassign`）。このとき失うキャッシュはもうありません。
 
 **基準線の計測は `off` の状態から立ち上げてください。** セッション鍵の付与率（`status` の `sidRate`）の母数は、表を作り直したときだけ 0 に戻ります。`off` → `observe`、`off` → `on` のように **`off` を経由した切り替えでは 0 から数え直しますが、`observe` → `on` のように表を保ったまま `mode` だけを変えた場合は、`observe` の間に数えたリクエストが母数に残ります。**
 
@@ -585,7 +587,7 @@ proxy request ログに出るのは `account`、`method`、`path`、`status`、`
 - proxy request ログの**行末**に `sid=`（セッション鍵の先頭12桁ハッシュ。鍵を取り出せなかったリクエストには付きません）、`aff=`（`new` / `bound` / `switch` / `none`）、`fam=`（`fable` / `other`）が付きます。追記は必ず行末なので、位置ではなくキー名で読んでください。`mode: "observe"` では固定を行わないため `aff` は常に `none` です。
 - `affinity_config` — 起動時と `POST /internal/reload` 時に1行。`mode` と `switchThreshold` の値を記録します。
 - `affinity_bind` — 新しいセッションをアカウントへ結び付けた。
-- `affinity_switch` — 結び付け先を付け替えた。`reason` は共通枠の枯渇（`common_exhausted`）、Fable 固有枠の枯渇（`family_exhausted`）、アカウントが台帳から消えた（`account_removed`）のいずれかです。
+- `affinity_switch` — 結び付け先を付け替えた。`reason` は共通枠の枯渇（`common_exhausted`）、Fable 固有枠の枯渇（`family_exhausted`）、アカウントが台帳から消えた（`account_removed`）、キャッシュが失効したセッションを空いているアカウントへ移した（`cold_reassign`）のいずれかです。
 - `affinity_defer` — 共通枠の回復が近いので、付け替えずに `waitMs` だけ待って同じアカウントへ送った。
 - `affinity_stale` — 並行するリクエストが先に新しい結び付け先を作っていたため、遅れて届いた確定を捨てた（結び付け先は変わりません）。
 - `affinity_evict` — セッションを表から外した。`reason` は TTL 超過（`ttl`）、上限超過（`capacity`）、認証情報が別物になった（`credential_changed`）、アカウントが消えた（`account_removed`）のいずれかです。
@@ -594,7 +596,7 @@ proxy request ログに出るのは `account`、`method`、`path`、`status`、`
 
 いずれの行にも、生のセッション ID・token・メールアドレスは出しません（`sid` は12桁ハッシュ、アカウントはラベルだけです）。
 
-`/internal/status` には `sessionAffinity` 節が増えます（**`mode: "off"` ではキー自体がありません**）。内訳は `mode`、`sessions`（保持しているセッション数）、`capacity`（`maxSessions`）、`sessionsByAccount`（アカウント別のセッション数。**Fable 用の副バインドで1つのセッションが2つのアカウントに数えられるため、合計はセッション総数と一致しません**）、`switchesByReason`、`evictionsByReason`、`requests`（`proxied` = 転送したリクエスト数、`keyed` = うちセッション鍵が付いていた数）、`sidRate`（`keyed / proxied` を小数第4位で丸めた値。転送が0件なら `null`）です。`claude-rotator status` / `monitor` では、同じ内容を `Session Affinity` の行として表示します。
+`/internal/status` には `sessionAffinity` 節が増えます（**`mode: "off"` ではキー自体がありません**）。内訳は `mode`、`sessions`（保持しているセッション数）、`capacity`（`maxSessions`）、`warmTtlMs`、`sessionsByAccount`（アカウント別のセッション数。**Fable 用の副バインドで1つのセッションが2つのアカウントに数えられるため、合計はセッション総数と一致しません**）、`warmSessionsByAccount`（そのうちキャッシュがまだ生きているとみなしているセッション数。`sessionsByAccount` との差が、冷えたまま表に残っているセッションです）、`switchesByReason`、`evictionsByReason`、`requests`（`proxied` = 転送したリクエスト数、`keyed` = うちセッション鍵が付いていた数）、`sidRate`（`keyed / proxied` を小数第4位で丸めた値。転送が0件なら `null`）です。`claude-rotator status` / `monitor` では、同じ内容を `Session Affinity` の行として表示します。
 
 `mode` が `off` 以外のときは、`status` / `monitor` の `Events`（直近の切り替え・リクエスト）も `runtime-state.json` へ保存され、再起動後も残ります。保持するのは最新50件です。`mode: "off"` では保存も復元もしないため、`runtime-state.json` の内容は現行と同一です。
 
@@ -1383,6 +1385,8 @@ Configuration keys (the whole section may be omitted):
 | `sessionAffinity.maxSessions` | `10000` | Maximum number of sessions kept in the table. Clamped to `1`–`10000` and truncated to an integer; anything above it is dropped least-recently-used first |
 | `sessionAffinity.assignStopUtilization` | `0.9` | The usage ratio at which an account stops accepting *new* sessions. Clamped to `0`–`1` (`1` is the same as not using the gate). If the gate would leave no candidate at all, it is dropped so a candidate is always chosen |
 | `sessionAffinity.rebindGraceMs` | `60000` (60 sec) | Upper bound on the wait before a session whose shared quota is exhausted is rebound to another account. Clamped to `0`–`600000`. If the expected recovery is further away than this, if no recovery time is available, or if you set `0`, the session is rebound without waiting |
+| `sessionAffinity.warmTtlMs` | `3600000` (1 hour) | A session whose last request is within this window is treated as still holding an upstream cache. Clamped to `60000`–`21600000`. Past it, the session stops counting towards the weight of its account when a new assignment is ranked, and becomes eligible for `drainStartUtilization` |
+| `sessionAffinity.drainStartUtilization` | `0.85` | The usage ratio at which a session whose cache has expired is moved to a freer account. Clamped to `0`–`1` (**`1` turns this off**). Only sessions with no cache left to lose are moved; a session that still holds a cache is never moved by this setting |
 | `sessionAffinity.persist` | `true` | With `false` the table is kept in memory only and never written to `runtime-state.json` |
 
 A numeric key that is not a finite number falls back to its default, and a value outside the range is clamped rather than rejected (neither is an error). `persist` reads only the boolean `false` as "off"; any other type leaves the default `true`. A section that is not an object falls back to every default as well.
@@ -1391,7 +1395,7 @@ The three values of `mode`:
 
 - **`off` (default)** — nothing is recorded and the feature's code path is never entered. Identical to today's behavior.
 - **`observe`** — the session key is extracted, logged, and counted, but **account selection is not changed at all.** Use this stage to measure the baseline — session-key coverage and switch counts — before pinning is enabled.
-- **`on`** — a session stays on one account. A binding moves **only when quota runs out.** An authentication failure, a throttle, a transient error, an upstream 5xx, or a disconnect sends only that request through another account and leaves the binding alone, so the next request returns to the original account. When only the Fable-specific allowance is exhausted, a single Fable-only sub-binding is created and the other models keep using the original account. When the shared quota is exhausted but recovery is expected within `rebindGraceMs`, the request waits instead of being rebound.
+- **`on`** — a session stays on one account. **While its cache is still warm**, a binding moves **only when quota runs out.** An authentication failure, a throttle, a transient error, an upstream 5xx, or a disconnect sends only that request through another account and leaves the binding alone, so the next request returns to the original account. When only the Fable-specific allowance is exhausted, a single Fable-only sub-binding is created and the other models keep using the original account. When the shared quota is exhausted but recovery is expected within `rebindGraceMs`, the request waits instead of being rebound. Once `warmTtlMs` (1 hour by default) has passed since the last request the cache has expired, and the session may be moved to a freer account if the bound one is at or above `drainStartUtilization` (0.85 by default) — logged with `reason=cold_reassign`. There is no cache left to lose at that point.
 
 **Start the measurement from `off`.** The denominator of the session-key coverage (`sidRate` in `status`) is reset only when the table itself is rebuilt. Going `off` → `observe` or `off` → `on` **restarts the count from zero, whereas changing only `mode` while the table is kept — `observe` → `on` — carries the requests counted during `observe` into the denominator.**
 
@@ -1426,7 +1430,7 @@ Enabling [Per-Session Account Pinning](#per-session-account-pinning-sessionaffin
 - `sid=` (the first 12 hex digits of the session key's hash; absent when no key could be extracted), `aff=` (`new` / `bound` / `switch` / `none`), and `fam=` (`fable` / `other`) are appended at the **end** of the proxy request log line. They are always at the end, so read them by key name rather than by position. With `mode: "observe"` nothing is pinned, so `aff` is always `none`.
 - `affinity_config` — one line at startup and on `POST /internal/reload`, recording the `mode` and the `switchThreshold` value.
 - `affinity_bind` — a new session was bound to an account.
-- `affinity_switch` — a binding moved. `reason` is an exhausted shared quota (`common_exhausted`), an exhausted Fable-specific allowance (`family_exhausted`), or an account that disappeared from the ledger (`account_removed`).
+- `affinity_switch` — a binding moved. `reason` is an exhausted shared quota (`common_exhausted`), an exhausted Fable-specific allowance (`family_exhausted`), an account that disappeared from the ledger (`account_removed`), or a session whose cache had expired being moved to a freer account (`cold_reassign`).
 - `affinity_defer` — the shared quota was about to recover, so the request waited `waitMs` and went to the same account instead of being rebound.
 - `affinity_stale` — a concurrent request had already created a newer binding, so this late confirmation was dropped (the binding does not change).
 - `affinity_evict` — a session was dropped from the table. `reason` is TTL expiry (`ttl`), the capacity limit (`capacity`), a credential that became a different one (`credential_changed`), or an account that disappeared (`account_removed`).
@@ -1435,7 +1439,7 @@ Enabling [Per-Session Account Pinning](#per-session-account-pinning-sessionaffin
 
 None of these lines contains a raw session id, a token, or an email address (`sid` is the 12-digit hash, and accounts are labels only).
 
-`/internal/status` gains a `sessionAffinity` section (**the key itself is absent while `mode` is `"off"`**) containing `mode`, `sessions` (how many sessions are held), `capacity` (`maxSessions`), `sessionsByAccount` (sessions per account — **a Fable sub-binding makes one session count towards two accounts, so this never sums to the session total**), `switchesByReason`, `evictionsByReason`, `requests` (`proxied` = requests forwarded, `keyed` = how many of them carried a session key), and `sidRate` (`keyed / proxied`, rounded to four decimal places; `null` when nothing has been forwarded). `claude-rotator status` / `monitor` shows the same values as a `Session Affinity` block.
+`/internal/status` gains a `sessionAffinity` section (**the key itself is absent while `mode` is `"off"`**) containing `mode`, `sessions` (how many sessions are held), `capacity` (`maxSessions`), `warmTtlMs`, `sessionsByAccount` (sessions per account — **a Fable sub-binding makes one session count towards two accounts, so this never sums to the session total**), `warmSessionsByAccount` (how many of those are still treated as holding a cache; the difference from `sessionsByAccount` is what has gone cold while staying in the table), `switchesByReason`, `evictionsByReason`, `requests` (`proxied` = requests forwarded, `keyed` = how many of them carried a session key), and `sidRate` (`keyed / proxied`, rounded to four decimal places; `null` when nothing has been forwarded). `claude-rotator status` / `monitor` shows the same values as a `Session Affinity` block.
 
 While `mode` is anything other than `off`, the `Events` of `status` / `monitor` (the recent switches and requests) are persisted to `runtime-state.json` too and survive a restart, capped at the newest 50. With `mode: "off"` they are neither saved nor restored, so the contents of `runtime-state.json` stay identical to today's.
 

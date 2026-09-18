@@ -18,8 +18,22 @@ export const SESSION_AFFINITY_STATE_VERSION = 1;
 export const DEFAULT_IDLE_TTL_MS = 21_600_000;
 /** 既定の表の上限（§3）。溢れは `lastSeen` の古い順に落とす。 */
 export const DEFAULT_MAX_SESSIONS = 10_000;
+/**
+ * 既定の warm TTL（1時間・設計書 v1.7 §3・P-c）。
+ * 「温かい」＝最後に触れてから この時間以内＝上流のプロンプトキャッシュがまだ生きている
+ * 見込みがある、という意味である。メイン会話のキャッシュ寿命（最終利用から1時間）に
+ * 合わせてある。`idleTtlMs`（表から落とすまでの 6 時間）とは別物で、冷えただけの行は
+ * 表に残る——残っていなければ「冷えた固定を解放する」判断そのものができない。
+ */
+export const DEFAULT_WARM_TTL_MS = 3_600_000;
 /** 鍵の最大長（§2.2）。これを超える値は鍵にしない。 */
 export const MAX_SESSION_KEY_LENGTH = 128;
+/**
+ * 温かい数の掃除を回す間隔（要求数・設計書 v1.7 P-c）。
+ * **新しいタイマーは作らない。** 冷えることは事象を伴わないので、要求の流れに乗せて
+ * 償却する。1,000 本に1回で、10,000 行の表でも1回あたりの走査は冷えた分だけで済む。
+ */
+export const WARM_SWEEP_REQUEST_INTERVAL = 1_000;
 
 /**
  * 設定セクション `sessionAffinity` の既定（設計書 §6・D-54-6）。
@@ -34,19 +48,28 @@ export const DEFAULT_SESSION_AFFINITY = Object.freeze({
   maxSessions: DEFAULT_MAX_SESSIONS,
   assignStopUtilization: 0.9,
   rebindGraceMs: 60_000,
+  // v1.7（判断6 案(a)）の2キー。`warmTtlMs` はキャッシュが生きている見込みの長さ、
+  // `drainStartUtilization` は「冷えた固定を動かし始める利用率」である。1 にすると
+  // 冷えた固定の解放は起きない（無効化）。
+  warmTtlMs: DEFAULT_WARM_TTL_MS,
+  drainStartUtilization: 0.85,
   persist: true,
 });
 
 // `off`＝コード経路にも入らず現行と同一 ／ `observe`＝鍵の抽出とログだけ ／ `on`＝固定。
 // 未知の値（大文字・真偽値・数値を含む）はすべて `off` へ倒す（§6）。
 const SESSION_AFFINITY_MODES = new Set(['off', 'observe', 'on']);
-// 4つの数値キーの値域（§6 の表）。`min` 側も既定へ戻さずクランプする——`rebindGraceMs:0` は
+// 6つの数値キーの値域（§6 の表）。`min` 側も既定へ戻さずクランプする——`rebindGraceMs:0` は
 // 「待機の無効化」、`assignStopUtilization:0` は「ゲートの最も厳しい側」であって未指定ではない。
 const SESSION_AFFINITY_RANGES = Object.freeze({
   idleTtlMs: { min: 60_000, max: 604_800_000 },
   maxSessions: { min: 1, max: DEFAULT_MAX_SESSIONS, integer: true },
   assignStopUtilization: { min: 0, max: 1 },
   rebindGraceMs: { min: 0, max: 600_000 },
+  // 上限は idleTtlMs の既定（6時間）と揃える。warm が idle を越えると「温かいのに表に
+  // 無い行」が生まれ、冷えた固定の解放が判断できなくなるためである。
+  warmTtlMs: { min: 60_000, max: 21_600_000 },
+  drainStartUtilization: { min: 0, max: 1 },
 });
 
 const SESSION_ID_HEADER = 'x-claude-code-session-id';
@@ -57,7 +80,11 @@ const SID_HASH_PATTERN = /^[0-9a-f]{12}$/;
 // 結び付け先を付け替えてよい理由（§4.3 の表・§7.2）。確定（§4.4 ②）でこの3つ以外の理由が
 // 来たときは表を書き換えない——認証失敗・throttled・error・上流 5xx・切断・timeout・短期
 // レート制限は、その要求だけ別の口座で完走させ、次の要求は元の口座へ戻す（D-63 C3）。
-const REBIND_REASONS = new Set(['common_exhausted', 'family_exhausted', 'account_removed']);
+// `cold_reassign` は v1.7（判断6 案(a)・P-b）で足した予約段だけの理由である。
+// キャッシュが失効（`warmTtlMs` 超過）したセッションを、利用率の高い口座から空いている
+// 口座へ動かす——**移すものが無いので費用はゼロ**であり、温かいセッションはこの線では
+// 1本も動かない。
+const REBIND_REASONS = new Set(['common_exhausted', 'family_exhausted', 'account_removed', 'cold_reassign']);
 // 確定（§4.4 ②）で付け替えてよい理由は枠の枯渇の2値だけである（D-142）。台帳から口座が
 // 消えたことは予約段（`affinity_switch`）と退避段（`affinity_evict`）の事象であって、
 // 送信直前にバインドを動かす理由にはならない。
@@ -171,6 +198,8 @@ export function normalizeSessionAffinity(raw) {
     maxSessions: clampSetting(raw.maxSessions, 'maxSessions'),
     assignStopUtilization: clampSetting(raw.assignStopUtilization, 'assignStopUtilization'),
     rebindGraceMs: clampSetting(raw.rebindGraceMs, 'rebindGraceMs'),
+    warmTtlMs: clampSetting(raw.warmTtlMs, 'warmTtlMs'),
+    drainStartUtilization: clampSetting(raw.drainStartUtilization, 'drainStartUtilization'),
     // 既定が真のキーなので、真偽値の `false` だけを「切った」と読む（型違いは既定へ）。
     persist: raw.persist !== false,
   });
@@ -233,6 +262,7 @@ export class SessionAffinity {
     mode = DEFAULT_SESSION_AFFINITY.mode,
     idleTtlMs = DEFAULT_IDLE_TTL_MS,
     maxSessions = DEFAULT_MAX_SESSIONS,
+    warmTtlMs = DEFAULT_WARM_TTL_MS,
     now = () => Date.now(),
     logger = null,
     onChange = null,
@@ -248,9 +278,15 @@ export class SessionAffinity {
     this.onChange = typeof onChange === 'function' ? onChange : null;
     this.idleTtlMs = positiveInteger(idleTtlMs, DEFAULT_IDLE_TTL_MS);
     this.maxSessions = positiveInteger(maxSessions, DEFAULT_MAX_SESSIONS);
+    this.warmTtlMs = positiveInteger(warmTtlMs, DEFAULT_WARM_TTL_MS);
     this.entries = new Map();
     this.switchCounts = new Map();
     this.evictCounts = new Map();
+    // 口座ごとの「温かいバインド数」（設計書 v1.7 P-c）。要求ごとの全件走査をやめ、
+    // バインドの増減と `lastSeen` の更新だけで保つ。数え方は `sessionsByAccount` と同じで、
+    // 1セッションは1口座につき1回だけ数える（副バインドがあれば2口座に1ずつ載る）。
+    this.warmCounts = new Map();
+    this.warmSweepCountdown = WARM_SWEEP_REQUEST_INTERVAL;
   }
 
   get size() {
@@ -348,7 +384,9 @@ export class SessionAffinity {
       }
       for (const [family, accountId] of Object.entries(entry.families)) {
         if (known.has(accountId)) continue;
+        this.removeWarm(entry);
         delete entry.families[family];
+        this.refreshWarm(entry, now);
         evicted.push(this.recordEvict(hash, entry, accountId, 'account_removed', now));
       }
     }
@@ -377,7 +415,9 @@ export class SessionAffinity {
       }
       for (const [family, accountId] of Object.entries(entry.families)) {
         if (!targets.has(accountId)) continue;
+        this.removeWarm(entry);
         delete entry.families[family];
+        this.refreshWarm(entry, now);
         evicted.push(this.recordEvict(hash, entry, accountId, reason, now));
       }
     }
@@ -410,13 +450,17 @@ export class SessionAffinity {
    * 設定の再正規化（§6 の reload）で上限が変わったときに、その場で表へ反映する。
    * `maxSessions` を縮めたときは即 LRU で切り詰める（§3）。
    *
-   * @param {{idleTtlMs?:number, maxSessions?:number}} [limits]
+   * @param {{idleTtlMs?:number, maxSessions?:number, warmTtlMs?:number}} [limits]
    * @param {{now?:number}} [options]
    */
-  configure({ idleTtlMs, maxSessions } = {}, { now = this.now() } = {}) {
+  configure({ idleTtlMs, maxSessions, warmTtlMs } = {}, { now = this.now() } = {}) {
     if (idleTtlMs !== undefined) this.idleTtlMs = positiveInteger(idleTtlMs, this.idleTtlMs);
     if (maxSessions !== undefined) this.maxSessions = positiveInteger(maxSessions, this.maxSessions);
-    return this.prune({ now });
+    if (warmTtlMs !== undefined) this.warmTtlMs = positiveInteger(warmTtlMs, this.warmTtlMs);
+    const evicted = this.prune({ now });
+    // reload は稀なので、窓が変わったときは増分更新ではなく全件で数え直す（P-c）。
+    this.resyncWarm(now);
+    return evicted;
   }
 
   /**
@@ -439,16 +483,20 @@ export class SessionAffinity {
     if (next.mode === 'off') {
       const cleared = this.entries.size;
       this.entries.clear();
+      this.warmCounts.clear();
       if (previous !== 'off') this.write(now, `affinity_disabled sessions=${cleared}`);
       if (cleared > 0) this.markChanged();
       return { mode: next.mode, previousMode: previous, cleared, evicted: [] };
     }
 
     const cleared = previous === 'off' ? this.entries.size : 0;
-    if (previous === 'off') this.entries.clear();
+    if (previous === 'off') {
+      this.entries.clear();
+      this.warmCounts.clear();
+    }
     if (cleared > 0) this.markChanged();
     const evicted = this.configure(
-      { idleTtlMs: next.idleTtlMs, maxSessions: next.maxSessions },
+      { idleTtlMs: next.idleTtlMs, maxSessions: next.maxSessions, warmTtlMs: next.warmTtlMs },
       { now },
     );
     return { mode: next.mode, previousMode: previous, cleared, evicted };
@@ -458,11 +506,19 @@ export class SessionAffinity {
    * status 出力用の集計（§7.3）。
    * `sessionsByAccount` は「その口座に結び付いているセッション数」であり、系統別副バインドで
    * 1セッションが2口座に数えられるため、**合計はセッション総数と一致しない**。
+   *
+   * `warmSessionsByAccount` はそのうち「最後に触れてから `warmTtlMs` 以内」のものだけを
+   * 数えた数である（設計書 v1.7 §3・P-c）。**総数側 `sessionsByAccount` は従来どおり全件を
+   * 数える**——冷えたセッションも表には残っており、status で「何本が表にいるか」と
+   * 「何本がまだキャッシュを持っていそうか」は別々に読めたほうがよい。
+   *
+   * この関数だけは全件走査のままにしてある。要求ごとに呼ぶのは `warmSessionCounts()` の
+   * ほうで、status は要求ごとには作られない。
    */
   summary() {
     const sessionsByAccount = {};
     for (const entry of this.entries.values()) {
-      for (const accountId of new Set([entry.home, ...Object.values(entry.families)])) {
+      for (const accountId of entryAccounts(entry)) {
         sessionsByAccount[accountId] = (sessionsByAccount[accountId] ?? 0) + 1;
       }
     }
@@ -470,10 +526,59 @@ export class SessionAffinity {
       sessions: this.entries.size,
       capacity: this.maxSessions,
       idleTtlMs: this.idleTtlMs,
+      warmTtlMs: this.warmTtlMs,
       sessionsByAccount,
+      warmSessionsByAccount: Object.fromEntries(this.warmCounts),
       switchesByReason: Object.fromEntries(this.switchCounts),
       evictionsByReason: Object.fromEntries(this.evictCounts),
     };
+  }
+
+  /**
+   * 選択側（`AccountManager.selectForNewAssignment`）が要求ごとに読む温かいバインド数
+   * （設計書 v1.7 P-a・P-c）。O(口座数) の複製を返すので、受け取った側が書き換えても
+   * 内部の数は壊れない。**表の全件走査はしない。**
+   *
+   * @returns {Map<string,number>}
+   */
+  warmSessionCounts() {
+    return new Map(this.warmCounts);
+  }
+
+  /**
+   * 冷えた行を温かい数から落とす（設計書 v1.7 P-c の遅延償却）。
+   *
+   * 「冷えた」は事象を伴わないので、増分更新だけでは数が減らない。表の順序は
+   * recency（古い順）なので、**先頭から見て最初に温かい行が来たらそこで止められる**
+   * ——落ちた分だけの O(k) で済み、新しいタイマーも要らない。結線側はこれを
+   * 1,000 要求ごとに1回呼ぶ。
+   *
+   * @param {number} [now]
+   * @returns {number} 温かい数から落とした行数。
+   */
+  /**
+   * 要求1本ぶんの償却（設計書 v1.7 P-c）。`WARM_SWEEP_REQUEST_INTERVAL` 本に1回だけ
+   * `pruneWarm()` を呼ぶ。結線側はこれを鍵のある要求ごとに1回呼ぶだけでよい。
+   *
+   * @param {number} [now]
+   * @returns {number} この呼び出しで温かい数から落とした行数（掃除しない回は 0）。
+   */
+  sweepWarm(now = this.now()) {
+    this.warmSweepCountdown -= 1;
+    if (this.warmSweepCountdown > 0) return 0;
+    this.warmSweepCountdown = WARM_SWEEP_REQUEST_INTERVAL;
+    return this.pruneWarm(now);
+  }
+
+  pruneWarm(now = this.now()) {
+    let dropped = 0;
+    for (const entry of this.entries.values()) {
+      if (!this.cold(entry, now)) break;
+      if (!entry.warm) continue;
+      this.removeWarm(entry);
+      dropped += 1;
+    }
+    return dropped;
   }
 
   /**
@@ -572,6 +677,8 @@ export class SessionAffinity {
           lastSeen,
           requests: 0,
           switches: Number.isFinite(record.s) ? record.s : 0,
+          // 温かいかどうかは復元し終えてから `resyncWarm` が一度に決める。
+          warm: false,
         },
       });
     }
@@ -590,6 +697,8 @@ export class SessionAffinity {
     // 先頭に残り、そこへ古い復元分が後ろから並ぶ。`trimToCapacity` は先頭を最も古い行と
     // みなすので、そのままでは生きているセッションのほうが先に落ちる（FU-54）。
     this.sortByRecency();
+    // 復元した行の `lastSeen` は過去なので、温かい数は入れ直した後に一度だけ数え直す（P-c）。
+    this.resyncWarm(now);
 
     return { restored: usable.length, skipped: null, dropped };
   }
@@ -613,6 +722,45 @@ export class SessionAffinity {
     return now - entry.lastSeen > this.idleTtlMs;
   }
 
+  // --- 温かいバインド数（設計書 v1.7 P-c）--------------------------------
+  //
+  // `entry.warm` は「この行がいま `warmCounts` に載っているか」を表す真偽値で、
+  // 数の増減は必ずこの旗を通る。旗を持たせているのは、口座が変わる編集
+  // （home の付け替え・副バインドの追加と削除）で、どの口座から引いてどの口座へ
+  // 足すかを取り違えないためである。編集の作法は必ず
+  // `removeWarm` → 書き換え → `refreshWarm` の順にする。
+
+  cold(entry, now) {
+    return Math.max(0, now - entry.lastSeen) > this.warmTtlMs;
+  }
+
+  addWarm(entry) {
+    if (entry.warm) return;
+    for (const accountId of entryAccounts(entry)) bump(this.warmCounts, accountId);
+    entry.warm = true;
+  }
+
+  removeWarm(entry) {
+    if (!entry.warm) return;
+    for (const accountId of entryAccounts(entry)) drop(this.warmCounts, accountId);
+    entry.warm = false;
+  }
+
+  refreshWarm(entry, now) {
+    if (this.cold(entry, now)) this.removeWarm(entry);
+    else this.addWarm(entry);
+  }
+
+  // 全件で数え直す。reload（`configure`）と復元（`restore`）だけが呼ぶ——どちらも
+  // 起動・設定変更の頻度でしか起きないので、要求経路の O(1) は保たれる。
+  resyncWarm(now) {
+    this.warmCounts.clear();
+    for (const entry of this.entries.values()) {
+      entry.warm = false;
+      this.refreshWarm(entry, now);
+    }
+  }
+
   reserve(hash, entry, { account, modelFamily, reason, now }) {
     if (!entry) {
       const created = {
@@ -623,8 +771,10 @@ export class SessionAffinity {
         lastSeen: now,
         requests: 1,
         switches: 0,
+        warm: false,
       };
       this.entries.set(hash, created);
+      this.addWarm(created);
       this.trimToCapacity(now, hash);
       this.write(now, `affinity_bind sid=${hash} account=${account} reason=new_session sessions=${this.entries.size}`);
       this.markChanged();
@@ -667,6 +817,8 @@ export class SessionAffinity {
   rebind(hash, entry, { account, modelFamily, reason, now, gen }) {
     const from = boundAccount(entry, modelFamily);
     const slot = rebindSlot(entry, modelFamily, reason);
+    // 口座の集合が変わるので、先に古い集合ぶんを引いてから書き換える（P-c）。
+    this.removeWarm(entry);
     if (slot === 'family') {
       entry.families[modelFamily] = account;
     } else {
@@ -678,6 +830,7 @@ export class SessionAffinity {
     }
     entry.gen = gen;
     entry.switches += 1;
+    this.refreshWarm(entry, now);
 
     const label = REBIND_REASONS.has(reason) ? reason : UNKNOWN_REASON;
     bump(this.switchCounts, label);
@@ -692,6 +845,8 @@ export class SessionAffinity {
 
   touch(hash, entry, now) {
     entry.lastSeen = now;
+    // 再訪で温まり直す。すでに温かければ何もしない（P-c）。
+    this.addWarm(entry);
     // Map の挿入順を recency として使う（LRU の退避が O(1) で済む）。
     this.entries.delete(hash);
     this.entries.set(hash, entry);
@@ -723,6 +878,7 @@ export class SessionAffinity {
 
   dropEntry(hash, entry, reason, now) {
     this.entries.delete(hash);
+    this.removeWarm(entry);
     return this.recordEvict(hash, entry, entry.home, reason, now);
   }
 
@@ -755,6 +911,13 @@ export class SessionAffinity {
 // F9 の保持数。復元・保存には現れない（`export` は項目を明示して組み立てる）。
 function held(entry) {
   return (entry.holds ?? 0) > 0;
+}
+
+// その行が結び付いている口座の集合（重複なし）。`sessionsByAccount` と
+// `warmSessionsByAccount` は必ずこれを通して数える——2箇所で数え方がずれると、
+// 片方だけ「1セッションが2回」になる（設計書 §7.3）。
+function entryAccounts(entry) {
+  return new Set([entry.home, ...Object.values(entry.families)]);
 }
 
 function snapshot(hash, entry, modelFamily) {
@@ -805,6 +968,14 @@ function accountIdsOf(accountManager) {
 
 function bump(counts, key) {
   counts.set(key, (counts.get(key) ?? 0) + 1);
+}
+
+// 0 になった鍵は消す。残しておくと status の口座別の表に「0 本」の行が増え続け、
+// 台帳から消えた口座の名前がいつまでも出る。
+function drop(counts, key) {
+  const next = (counts.get(key) ?? 0) - 1;
+  if (next > 0) counts.set(key, next);
+  else counts.delete(key);
 }
 
 function positiveInteger(value, fallback) {

@@ -37,6 +37,7 @@ function createAffinity(overrides = {}) {
   const affinity = new SessionAffinity({
     idleTtlMs: overrides.idleTtlMs ?? 21_600_000,
     maxSessions: overrides.maxSessions ?? 10_000,
+    warmTtlMs: overrides.warmTtlMs ?? 3_600_000,
     now: () => clock.ms,
     logger,
   });
@@ -783,6 +784,8 @@ const FULL_SECTION = {
   maxSessions: 500,
   assignStopUtilization: 0.75,
   rebindGraceMs: 30_000,
+  warmTtlMs: 1_800_000,
+  drainStartUtilization: 0.7,
   persist: false,
 };
 
@@ -852,6 +855,10 @@ describe('normalizeSessionAffinity (R-S6 / 設計書 §6)', () => {
       maxSessions: 10_000,
       assignStopUtilization: 0.9,
       rebindGraceMs: 60_000,
+      // v1.7（判断6 案(a)）で足した2つ。既定はメイン会話のキャッシュ寿命 1 時間と、
+      // 冷えた固定を動かし始める利用率 85%。
+      warmTtlMs: 3_600_000,
+      drainStartUtilization: 0.85,
       persist: true,
     });
     assert.deepEqual(normalizeSessionAffinity({}), DEFAULT_SESSION_AFFINITY);
@@ -891,13 +898,16 @@ describe('normalizeSessionAffinity (R-S6 / 設計書 §6)', () => {
     }
   });
 
-  it('clamps the four numeric keys into their documented range', () => {
+  it('clamps the six numeric keys into their documented range', () => {
     const clamps = [
       ['idleTtlMs', [[0, 60_000], [1, 60_000], [60_000, 60_000], [120_000, 120_000],
         [604_800_000, 604_800_000], [604_800_001, 604_800_000]]],
       ['maxSessions', [[0, 1], [-5, 1], [1, 1], [500, 500], [10_000, 10_000], [10_001, 10_000]]],
       ['assignStopUtilization', [[-1, 0], [0, 0], [0.75, 0.75], [1, 1], [1.5, 1]]],
       ['rebindGraceMs', [[-1, 0], [0, 0], [30_000, 30_000], [600_000, 600_000], [600_001, 600_000]]],
+      ['warmTtlMs', [[0, 60_000], [1, 60_000], [60_000, 60_000], [1_800_000, 1_800_000],
+        [21_600_000, 21_600_000], [21_600_001, 21_600_000]]],
+      ['drainStartUtilization', [[-1, 0], [0, 0], [0.7, 0.7], [1, 1], [1.5, 1]]],
     ];
     for (const [key, cases] of clamps) {
       for (const [written, expected] of cases) {
@@ -919,7 +929,8 @@ describe('normalizeSessionAffinity (R-S6 / 設計書 §6)', () => {
   it('falls back to the default for wrong types and non-finite numbers', () => {
     const wrong = [Number.NaN, Number.POSITIVE_INFINITY, Number.NEGATIVE_INFINITY,
       '60000', null, {}, [], true, false];
-    for (const key of ['idleTtlMs', 'maxSessions', 'assignStopUtilization', 'rebindGraceMs']) {
+    for (const key of ['idleTtlMs', 'maxSessions', 'assignStopUtilization', 'rebindGraceMs',
+      'warmTtlMs', 'drainStartUtilization']) {
       for (const value of wrong) {
         assert.equal(
           normalizeSessionAffinity({ [key]: value })[key],
@@ -1242,5 +1253,221 @@ describe('SessionAffinity restore ordering (R-S12 / FU-54)', () => {
     assert.equal(affinity.get('live-session')?.home, 'acct-a', '生きている行は残る');
     assert.equal(affinity.get('older')?.home, 'acct-a');
     assert.equal(affinity.get('new-session')?.home, 'acct-a');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// warm セッション数の増分保持（R-S16 / 設計書 v1.7 §3・P-c）
+//
+// 「温かい」＝最後に触れてから `warmTtlMs`（既定 1 時間）以内。要求ごとに表を全件
+// 走査して数え直すのをやめ、bind / rebind / evict と `lastSeen` の更新で増分更新する。
+// 冷えたことは事象を伴わないので、表の先頭（＝最も古い行）から冷えた分だけを落とす
+// `pruneWarm()` を 1,000 要求ごとに償却で回す（新しいタイマーは作らない）。
+// ---------------------------------------------------------------------------
+
+describe('SessionAffinity warm counts (R-S16 / 設計書 v1.7 P-c)', () => {
+  it('counts a binding as warm until warmTtlMs has passed and drops it on the amortised sweep', () => {
+    const { affinity, clock } = createAffinity({ warmTtlMs: 3_600_000 });
+    reserve(affinity, 'session-1', 'acct-a');
+    reserve(affinity, 'session-2', 'acct-b');
+
+    assert.deepEqual(affinity.summary().warmSessionsByAccount, { 'acct-a': 1, 'acct-b': 1 });
+
+    clock.ms += 3_600_001;
+    // 冷えるだけでは事象が起きないので、掃除を呼ぶまで数は動かない（償却の設計）。
+    assert.deepEqual(affinity.summary().warmSessionsByAccount, { 'acct-a': 1, 'acct-b': 1 });
+    assert.equal(affinity.pruneWarm(), 2);
+    assert.deepEqual(affinity.summary().warmSessionsByAccount, {});
+    assert.equal(affinity.pruneWarm(), 0, '二度目の掃除は何も落とさない');
+
+    // セッションそのものは idleTtlMs（6時間）まで残る——冷えただけでは退避しない。
+    assert.equal(affinity.summary().sessions, 2);
+    assert.deepEqual(affinity.summary().sessionsByAccount, { 'acct-a': 1, 'acct-b': 1 });
+  });
+
+  it('re-warms a cold session when it comes back', () => {
+    const { affinity, clock } = createAffinity({ warmTtlMs: 3_600_000 });
+    reserve(affinity, 'session-1', 'acct-a');
+
+    clock.ms += 3_600_001;
+    affinity.pruneWarm();
+    assert.deepEqual(affinity.summary().warmSessionsByAccount, {});
+
+    reserve(affinity, 'session-1', 'acct-a');
+    assert.deepEqual(affinity.summary().warmSessionsByAccount, { 'acct-a': 1 });
+    // `get()` は `lastSeen` を動かさないので温め直さない（表を読むだけ・§3）。
+    // 温め直すのは予約（`note()`）であり、要求は必ずそこを通る。
+    clock.ms += 3_600_001;
+    affinity.pruneWarm();
+    affinity.get('session-1');
+    assert.deepEqual(affinity.summary().warmSessionsByAccount, {});
+  });
+
+  it('moves the warm count with a rebind and with a family sub-binding', () => {
+    const { affinity } = createAffinity();
+    reserve(affinity, 'session-1', 'acct-a');
+    reserve(affinity, 'session-1', 'acct-d', { modelFamily: 'fable', reason: 'family_exhausted' });
+
+    assert.deepEqual(
+      affinity.summary().warmSessionsByAccount,
+      { 'acct-a': 1, 'acct-d': 1 },
+      '副バインドは sessionsByAccount と同じ数え方（口座ごとに1回）',
+    );
+
+    reserve(affinity, 'session-1', 'acct-c', { reason: 'common_exhausted' });
+
+    assert.deepEqual(
+      affinity.summary().warmSessionsByAccount,
+      { 'acct-c': 1 },
+      'home の付け替えで副バインドが消えるので、その口座の warm も消える',
+    );
+  });
+
+  it('removes the warm count when the row is evicted', () => {
+    const { affinity, clock } = createAffinity({ idleTtlMs: 60_000, warmTtlMs: 60_000 });
+    reserve(affinity, 'session-1', 'acct-a');
+    reserve(affinity, 'session-2', 'acct-b');
+
+    affinity.evictAccounts(['acct-b']);
+    assert.deepEqual(affinity.summary().warmSessionsByAccount, { 'acct-a': 1 });
+
+    clock.ms += 60_001;
+    affinity.prune();
+    assert.deepEqual(affinity.summary().warmSessionsByAccount, {}, 'TTL 退避でも数は残らない');
+    assert.equal(affinity.size, 0);
+  });
+
+  it('never goes negative and drops the key once the count reaches zero', () => {
+    const { affinity } = createAffinity({ maxSessions: 1 });
+    reserve(affinity, 'session-1', 'acct-a');
+    reserve(affinity, 'session-2', 'acct-a');
+
+    assert.deepEqual(affinity.summary().warmSessionsByAccount, { 'acct-a': 1 });
+    assert.deepEqual(
+      Object.keys(affinity.summary().warmSessionsByAccount).filter(id => id === 'acct-b'),
+      [],
+      '触れていない口座の鍵は生えない',
+    );
+  });
+
+  it('exposes the counts as a map the selector can read without a full scan', () => {
+    const { affinity } = createAffinity();
+    reserve(affinity, 'session-1', 'acct-a');
+
+    const counts = affinity.warmSessionCounts();
+
+    assert.equal(counts instanceof Map, true);
+    assert.equal(counts.get('acct-a'), 1);
+    counts.set('acct-a', 999);
+    assert.equal(affinity.summary().warmSessionsByAccount['acct-a'], 1, '戻り値は複製で内部を壊せない');
+  });
+
+  it('re-syncs the counts when warmTtlMs changes on reload', () => {
+    const { affinity, clock } = createAffinity({ warmTtlMs: 3_600_000 });
+    reserve(affinity, 'session-1', 'acct-a');
+    clock.ms += 1_800_000;
+    reserve(affinity, 'session-2', 'acct-b');
+
+    // `previousMode:'on'` は「有効なまま設定だけ変えた reload」。既定の 'off' からの
+    // 有効化だと表ごと捨てるので、数え直しの検証にならない（§6）。
+    affinity.applySettings({ mode: 'on', warmTtlMs: 60_000 }, { previousMode: 'on' });
+
+    assert.deepEqual(
+      affinity.summary().warmSessionsByAccount,
+      { 'acct-b': 1 },
+      '短くした窓で数え直す（session-1 は 30 分前なので冷える）',
+    );
+
+    affinity.applySettings({ mode: 'on', warmTtlMs: 21_600_000 }, { previousMode: 'on' });
+
+    assert.deepEqual(
+      affinity.summary().warmSessionsByAccount,
+      { 'acct-a': 1, 'acct-b': 1 },
+      '広げた窓でも数え直す',
+    );
+  });
+
+  it('seeds the counts from the restored last seen and clears them when the mode goes off', () => {
+    const { affinity, clock } = createAffinity({ warmTtlMs: 3_600_000 });
+
+    const result = affinity.restore({
+      version: 1,
+      savedAt: isoAt(clock.ms),
+      entries: [
+        { k: sidHash('warm-one'), a: 'acct-a', t: START_MS - 60_000, s: 0 },
+        { k: sidHash('cold-one'), a: 'acct-b', t: START_MS - 7_200_000, s: 0 },
+      ],
+    }, { accountManager: ledger(['acct-a', 'acct-b']) });
+
+    assert.equal(result.restored, 2, '6時間の idleTtl では冷えた行も復元される');
+    assert.deepEqual(
+      affinity.summary().warmSessionsByAccount,
+      { 'acct-a': 1 },
+      '復元直後から温かい行だけが数に入る',
+    );
+
+    affinity.applySettings({ mode: 'off' });
+    assert.deepEqual(affinity.summary().warmSessionsByAccount, {});
+  });
+});
+
+describe('SessionAffinity warm sweep (R-S17 / 設計書 v1.7 P-c の遅延償却)', () => {
+  it('sweeps once every 1,000 requests instead of on every request or on a timer', () => {
+    const { affinity, clock } = createAffinity({ warmTtlMs: 60_000 });
+    reserve(affinity, 'cold-session', 'acct-a');
+    clock.ms += 60_001;
+
+    for (let i = 1; i < 1_000; i += 1) {
+      assert.equal(affinity.sweepWarm(), 0, `${i} 本目では掃除しない`);
+    }
+    assert.deepEqual(affinity.summary().warmSessionsByAccount, { 'acct-a': 1 });
+
+    assert.equal(affinity.sweepWarm(), 1, '1,000 本目で1回だけ掃除する');
+    assert.deepEqual(affinity.summary().warmSessionsByAccount, {});
+
+    // 次の周期がまた 1,000 本ぶん続く。
+    assert.equal(affinity.sweepWarm(), 0);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// 冷えた固定の解放（R-S18 / 設計書 v1.7 §4.3・P-b）
+//
+// 予約段だけの理由である。キャッシュが失効したセッションを空いている口座へ動かすのは
+// 費用ゼロなので付け替えてよいが、**送信直前の確定（§4.4 ②）では付け替えない**
+// ——確定で動かしてよいのは枠の枯渇の2値だけという D-142 は v1.7 でも変えない。
+// ---------------------------------------------------------------------------
+
+describe('SessionAffinity cold_reassign (R-S18 / 設計書 v1.7 P-b)', () => {
+  it('counts and logs cold_reassign as a known switch reason at the reservation stage', () => {
+    const { affinity, logger } = createAffinity();
+    reserve(affinity, SESSION_ID, 'acct-a');
+
+    const switched = reserve(affinity, SESSION_ID, 'acct-b', { reason: 'cold_reassign' });
+
+    assert.equal(switched.disposition, 'switch');
+    assert.equal(switched.account, 'acct-b');
+    assert.equal(switched.reason, 'cold_reassign', 'unknown へ落とさない');
+    assert.deepEqual(affinity.summary().switchesByReason, { cold_reassign: 1 });
+    assert.match(
+      linesOf(logger, 'affinity_switch')[0],
+      / from=acct-a to=acct-b reason=cold_reassign family=other switches=1$/,
+    );
+  });
+
+  it('refuses to move the binding when cold_reassign arrives at the confirm stage (D-142)', () => {
+    const { affinity } = createAffinity();
+    const reserved = reserve(affinity, SESSION_ID, 'acct-a');
+
+    const confirmed = affinity.note(SESSION_ID, {
+      account: 'acct-b',
+      expectedGen: reserved.gen,
+      reason: 'cold_reassign',
+    });
+
+    assert.equal(confirmed.disposition, 'bound');
+    assert.equal(confirmed.account, 'acct-a', '確定では冷えた解放を理由に付け替えない');
+    assert.equal(affinity.get(SESSION_ID).home, 'acct-a');
+    assert.deepEqual(affinity.summary().switchesByReason, {});
   });
 });

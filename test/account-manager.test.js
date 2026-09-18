@@ -2627,7 +2627,7 @@ describe('selectForNewAssignment (D-56-1 / D-60-4 / 設計書 §4.2)', () => {
     );
   });
 
-  it('§4.2 例③: breaks an exact tie by the number of sessions already bound', () => {
+  it('§4.2 例③: breaks an exact tie by the number of warm sessions already bound', () => {
     const manager = makeManager(['cand1', 'cand2']);
     setWindows(manager, 'cand1', { fiveHour: 0.80, weekly: 0.70 });
     setWindows(manager, 'cand2', { fiveHour: 0.80, weekly: 0.70 });
@@ -2643,7 +2643,7 @@ describe('selectForNewAssignment (D-56-1 / D-60-4 / 設計書 §4.2)', () => {
         sessionCounts: new Map([['cand1', 12], ['cand2', 1]]),
       })?.id,
       'cand2',
-      'K3（バインド済みセッション数）が台帳順より前にあるので必ず効く',
+      '5h 実消費が同点なので、温かいバインド数（第2キー）が台帳順より前で効く',
     );
     assert.equal(
       manager.selectForNewAssignment({
@@ -2651,7 +2651,7 @@ describe('selectForNewAssignment (D-56-1 / D-60-4 / 設計書 §4.2)', () => {
         sessionCounts: { cand1: 12, cand2: 1 },
       })?.id,
       'cand2',
-      'summary().sessionsByAccount のような素のオブジェクトでも同じ結果になる',
+      'summary().warmSessionsByAccount のような素のオブジェクトでも同じ結果になる',
     );
   });
 
@@ -2729,15 +2729,83 @@ describe('selectForNewAssignment (D-56-1 / D-60-4 / 設計書 §4.2)', () => {
     );
   });
 
-  it('lets the weekly-reset priority decide only inside the band', () => {
+  // v1.7（判断6 案(a)・P-a）で週次リセット優先は第3キーへ降格した。5h 実消費と温かい
+  // バインド数が並んで初めて効くので、この回帰は 5h 側を同点にしたうえで帯域の差を
+  // 7d 側で作る。差を 5h 側で作ると、降格した鍵まで到達せずに 5h の小さいほうが勝つ。
+  it('lets the weekly-reset priority decide only inside the band, and only after the load keys tie', () => {
     const manager = makeManager(['soon', 'late']);
     setWindows(manager, 'soon', { fiveHour: 0.80, weekly: 0.90, weeklyResetAt: SOON_WEEKLY });
-    setWindows(manager, 'late', { fiveHour: 0.82, weekly: 0.90, weeklyResetAt: LATE_WEEKLY });
+    setWindows(manager, 'late', { fiveHour: 0.80, weekly: 0.92, weeklyResetAt: LATE_WEEKLY });
 
     assert.equal(
       manager.selectForNewAssignment({ assignStopUtilization: 0.9 })?.id,
       'soon',
-      'best=0.82 の帯域（0.77 以上）に両方入るので K1 の週次リセット優先が効く',
+      'best=0.80 の帯域（0.75 以上）に両方入り、5h 実消費（0.20）も warm（0）も同点なので週次リセット優先が効く',
+    );
+  });
+
+  // --- v1.7（判断6 案(a)・P-a）で先頭へ置いた2つの鍵 ---------------------
+  //
+  // 帯域（best から 5 ポイント）・受入ゲート 0.90・欠測分離（D-60-4）・全滅時の
+  // ゲート解除（R1）は v1.6 のまま。**帯域の中の並べ替えだけ**を差し替える。
+
+  it('P-a: ranks the band by the real 5h load before the残枠 keys', () => {
+    const manager = makeManager(['tight7d', 'busy5h']);
+    // tight7d は 5h をほとんど使っていないが、週次が狭いので headroom.min は小さい。
+    setWindows(manager, 'tight7d', { fiveHour: 0.90, weekly: 0.76 });
+    // busy5h は残枠の最小値では勝つが、5h を 22% 使っている。
+    setWindows(manager, 'busy5h', { fiveHour: 0.78, weekly: 0.95 });
+
+    assert.equal(
+      manager.selectForNewAssignment({ assignStopUtilization: 0.9 })?.id,
+      'tight7d',
+      'best=0.78 の帯域（0.73 以上）に両方入り、第1キーの 5h 実消費（0.10 < 0.22）で決まる',
+    );
+  });
+
+  it('P-a: keeps the load key ahead of the warm count', () => {
+    const manager = makeManager(['lighter', 'idle']);
+    setWindows(manager, 'lighter', { fiveHour: 0.80, weekly: 0.95 });
+    setWindows(manager, 'idle', { fiveHour: 0.78, weekly: 0.95 });
+
+    assert.equal(
+      manager.selectForNewAssignment({
+        assignStopUtilization: 0.9,
+        sessionCounts: { lighter: 12, idle: 0 },
+      })?.id,
+      'lighter',
+      '温かいセッションが12本ぶら下がっていても、5h 実消費が小さいほうが先（第1キー）',
+    );
+  });
+
+  it('P-a: sorts an unreadable 5h window last instead of treating it as idle', () => {
+    const manager = makeManager(['noFiveHour', 'knownLoad']);
+    // どちらも窓が1つ欠けているので、D-60-4 の分離では同じ組に入る。
+    setWindows(manager, 'noFiveHour', { weekly: 0.90 });
+    setWindows(manager, 'knownLoad', { fiveHour: 0.86 });
+
+    assert.equal(
+      manager.selectForNewAssignment({ assignStopUtilization: 0.9 })?.id,
+      'knownLoad',
+      '5h が読めない口座を「使っていない」とは読まない（残枠では noFiveHour が勝つ）',
+    );
+  });
+
+  it('P-a: reads an expired 5h window as zero load', () => {
+    const manager = makeManager(['expired']);
+    setWindows(manager, 'expired', { fiveHour: 0.05, weekly: 0.90 });
+    const account = manager.find('expired');
+    const afterReset = Date.parse(FIVE_HOUR_RESET) + 1;
+
+    assert.equal(
+      manager.newAssignmentCandidate(account, 0, null, Date.parse(FIVE_HOUR_RESET) - 1, null).load5h,
+      0.95,
+      'リセット前は実消費をそのまま読む',
+    );
+    assert.equal(
+      manager.newAssignmentCandidate(account, 0, null, afterReset, null).load5h,
+      0,
+      'リセット時刻を過ぎた 5h の値は 0 として扱う（欠測ではない）',
     );
   });
 
@@ -2749,10 +2817,14 @@ describe('selectForNewAssignment (D-56-1 / D-60-4 / 設計書 §4.2)', () => {
   // 誤差なく戻るのに対し、0.30 は 0.30000000000000004 へずれるため、帯域の下端が
   // 0.25000000000000006 になって候補の 0.25 をわずかに上回る。
   // 値を落ちる組へ差し替えて、epsilon が無いと 'best' が選ばれることを固定する。
+  //
+  // v1.7（P-a）で並べ替えの第1キーが 5h 実消費になったため、残枠の差を 5h 側で作ると
+  // 帯域へ入る前に第1キーで決着して epsilon を踏まない。差は 7d 側で作り、5h は同点に
+  // 揃えて、帯域の中に残った 'edge' を週次リセット優先（第3キー）で選ばせる。
   it('keeps a candidate exactly five points below the best inside the band', () => {
     const manager = makeManager(['best', 'edge']);
-    setWindows(manager, 'best', { fiveHour: 0.30, weekly: 0.90, weeklyResetAt: LATE_WEEKLY });
-    setWindows(manager, 'edge', { fiveHour: 0.25, weekly: 0.90, weeklyResetAt: SOON_WEEKLY });
+    setWindows(manager, 'best', { fiveHour: 0.90, weekly: 0.30, weeklyResetAt: LATE_WEEKLY });
+    setWindows(manager, 'edge', { fiveHour: 0.90, weekly: 0.25, weeklyResetAt: SOON_WEEKLY });
 
     assert.equal(
       manager.selectForNewAssignment({ assignStopUtilization: 0.9 })?.id,
@@ -2805,6 +2877,31 @@ describe('selectForNewAssignment (D-56-1 / D-60-4 / 設計書 §4.2)', () => {
     setWindows(manager, 'cand2', { fiveHour: 0, weekly: 0.90 });
 
     assert.equal(manager.selectForNewAssignment({}), null);
+  });
+
+  // P-b（設計書 v1.7 §4.3）は「結び付け先の利用率が drainStartUtilization 以上か」を
+  // 予約段で判定する。その利用率は選択側と同じ残枠の読み方でなければならないので、
+  // 台帳が持つ読み方をそのまま外へ出す（proxy 側で 5h/7d/サブキャップを数え直さない）。
+  it('exposes the same headroom the selector uses so the reservation stage can read the utilisation', () => {
+    const manager = makeManager(['cand1']);
+    setWindows(manager, 'cand1', { fiveHour: 0.40, weekly: 0.70, fableSubCap: 0.05 });
+
+    assert.deepEqual(
+      manager.assignmentHeadroomFor(manager.find('cand1'), null),
+      { min: 0.4, complete: true },
+      '非 Fable の要求では 5h/7d の残枠の小さいほう＝利用率 60%',
+    );
+    const fable = manager.assignmentHeadroomFor(manager.find('cand1'), 'fable');
+    // 残率は `1 - (1 - 0.05)` の往復なので二進小数の誤差が乗る（FU-58 と同じ理由）。
+    assert.ok(
+      Math.abs(fable.min - 0.05) < 1e-9 && fable.complete === true,
+      `Fable の要求ではサブキャップも同列に数える＝利用率 95%: ${JSON.stringify(fable)}`,
+    );
+    assert.deepEqual(
+      manager.assignmentHeadroomFor(null, null),
+      { min: null, complete: false },
+      '口座が無いときは「読めなかった」として返す（利用率 0 と誤読させない）',
+    );
   });
 
   it('does not multiply quota-exhausted events when the selector evaluates the same account repeatedly', () => {
