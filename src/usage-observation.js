@@ -104,16 +104,38 @@ const zstdDecompress = typeof zlib.zstdDecompress === 'function'
   ? promisify(zlib.zstdDecompress)
   : null;
 
+/**
+ * 「大きすぎて読めなかった」を表すエラーコード。
+ *
+ * - `ERR_BUFFER_TOO_LARGE`: zlib の `maxOutputLength` 超過（RangeError）。gzip / deflate /
+ *   br / zstd のいずれも同じコードで投げる。
+ * - `ERR_STRING_TOO_LONG`: `Buffer#toString()` の上限（`buffer.constants.MAX_STRING_LENGTH`
+ *   ＝ 536,870,888）超過。
+ *
+ * どちらも本文が壊れているわけではないので `unparsable` ではなく `too-large` として数える
+ * （README の「`too-large`＝`maxBodyBytes` 超」と同じ意味）。
+ */
+const SIZE_ERROR_CODES = new Set(['ERR_BUFFER_TOO_LARGE', 'ERR_STRING_TOO_LONG']);
+
+function isSizeError(error) {
+  return SIZE_ERROR_CODES.has(error?.code);
+}
+
+// 各デコーダは第2引数に zlib のオプション（`maxOutputLength`）を受け取る。
+// **渡し忘れると上限が buffer.kMaxLength（約 4 GiB）になり、解凍爆弾が素通りする。**
 const DECODERS = new Map([
   ['gzip', gunzip],
   ['x-gzip', gunzip],
   // Content-Encoding: deflate には zlib 形式と raw 形式の両方が実在するので、
   // zlib 形式で失敗したら raw で読み直す。
-  ['deflate', async buffer => {
+  ['deflate', async (buffer, options) => {
     try {
-      return await inflate(buffer);
-    } catch {
-      return inflateRaw(buffer);
+      return await inflate(buffer, options);
+    } catch (error) {
+      // 上限超過は raw で読み直しても同じ結果にしかならない。ここで握ると理由が
+      // `unparsable` に化けるので、そのまま上げて `too-large` として数えさせる。
+      if (isSizeError(error)) throw error;
+      return inflateRaw(buffer, options);
     }
   }],
   ['br', brotliDecompress],
@@ -190,29 +212,40 @@ function emptyObservation(parse, encoding = null) {
 /**
  * 応答本文（の写し）から usage を読む。**本文は書き換えない。**
  *
+ * **この関数は例外を投げない。** 解凍・文字列化・解析のどこで失敗しても
+ * `parse` に理由の入った観測を返す。呼び出し側（`src/proxy-server.js`）は
+ * `await parseUsageObservation(...)` を try で囲んでおらず、ストリーム応答では
+ * 既に `res.headersSent` が真なので、例外が漏れると転送中の応答が破壊される。
+ *
  * @param {Buffer} body `Buffer.concat` 済みの応答本文。
- * @param {{contentEncoding?: unknown, maxBytes?: number}} options
+ * @param {{contentEncoding?: unknown, maxBytes?: number}} options `maxBytes` は
+ *   圧縮後の長さと**解凍後の長さの両方**に効く上限。
  * @returns {Promise<UsageObservation>}
  */
 export async function parseUsageObservation(body, { contentEncoding = null, maxBytes = DEFAULT_OBSERVABILITY.requestLog.maxBodyBytes } = {}) {
   const encoding = normalizeEncoding(contentEncoding);
   if (!Buffer.isBuffer(body) || body.length === 0) return emptyObservation('no-usage', encoding);
-  // 上限判定は解凍の前に行う（解凍爆弾でメモリを食わないため）。
+  // 上限は二段で効かせる。①受け取ったバイト数（圧縮後）をここで弾く。
+  // ②解凍後のバイト数は各デコーダへ渡す `maxOutputLength` で同じ値に抑える。
+  // ②が無いと zlib の既定上限が buffer.kMaxLength（約 4 GiB）になり、
+  // 小さな圧縮本文でメモリを食い尽くせてしまう（解凍爆弾）。
   if (body.length > maxBytes) return emptyObservation('too-large', encoding);
 
-  let raw = body;
+  let decoder = null;
   if (encoding !== null) {
-    const decoder = DECODERS.get(encoding);
+    decoder = DECODERS.get(encoding);
     // 知らない符号化、または知っているが解けない符号化（Node に API が無い zstd）。
     if (decoder == null) return emptyObservation('unsupported-encoding', encoding);
-    try {
-      raw = await decoder(body);
-    } catch {
-      return emptyObservation('unparsable', encoding);
-    }
   }
 
-  return readUsage(raw.toString('utf8'), encoding);
+  // 解凍だけでなく `toString` と `readUsage` も同じ try の中に入れる。`toString` は
+  // 解凍後が MAX_STRING_LENGTH を超えると投げるため、外に出すと上の欠陥が再発する。
+  try {
+    const raw = decoder === null ? body : await decoder(body, { maxOutputLength: maxBytes });
+    return readUsage(raw.toString('utf8'), encoding);
+  } catch (error) {
+    return emptyObservation(isSizeError(error) ? 'too-large' : 'unparsable', encoding);
+  }
 }
 
 function readUsage(text, encoding) {

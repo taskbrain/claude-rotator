@@ -219,6 +219,59 @@ describe('parseUsageObservation / 本文の読み方', () => {
     assert.equal(result.model, null);
   });
 
+  it('解凍後に上限を超える本文（解凍爆弾）は too-large になり、例外は漏れない', async () => {
+    // 圧縮後は maxBytes に収まり、解凍後だけが超える形。入口の長さ判定（圧縮後）は
+    // 素通りするので、デコーダへ渡す maxOutputLength が無いと 4 MiB を展開してしまう。
+    const maxBytes = 64 * 1024;
+    const bomb = Buffer.alloc(4 * 1024 * 1024, 0x61);
+    const cases = [
+      ['gzip', zlib.gzipSync(bomb)],
+      ['deflate', zlib.deflateSync(bomb)],
+      // raw 形式へのフォールバック側も上限を受け継ぐこと。
+      ['deflate', zlib.deflateRawSync(bomb)],
+      ['br', zlib.brotliCompressSync(bomb)],
+    ];
+    if (typeof zlib.zstdCompressSync === 'function') cases.push(['zstd', zlib.zstdCompressSync(bomb)]);
+
+    for (const [encoding, compressed] of cases) {
+      assert.ok(compressed.length <= maxBytes, `${encoding}: fixture が圧縮後の長さ判定で弾かれている`);
+      const result = await parseUsageObservation(compressed, { contentEncoding: encoding, maxBytes });
+      assert.equal(result.parse, 'too-large', `${encoding} は too-large のはず`);
+      assert.equal(result.encoding, encoding);
+      assert.equal(result.model, null);
+      assert.equal(result.inputTokens, 0);
+    }
+
+    // maxOutputLength を足しても正常系は壊れない（上限内なら従来どおり解ける）。
+    assertUsage(await parseUsageObservation(
+      zlib.gzipSync(Buffer.from(SSE, 'utf8')),
+      { contentEncoding: 'gzip', maxBytes },
+    ));
+  });
+
+  it('toString 段階の例外も観測値になり、呼び出し側へ漏れない', async () => {
+    // 解凍後が Node の文字列上限（buffer.constants.MAX_STRING_LENGTH ＝ 536,870,888）を
+    // 超えると Buffer#toString が ERR_STRING_TOO_LONG を投げる。512 MiB を実際に確保せず、
+    // その例外だけを Buffer に生やして再現する（Buffer.isBuffer は真のまま）。
+    const bufferThatThrows = (error) => {
+      const buffer = Buffer.from(SSE, 'utf8');
+      Object.defineProperty(buffer, 'toString', { value: () => { throw error; } });
+      assert.ok(Buffer.isBuffer(buffer));
+      return buffer;
+    };
+
+    const tooLong = new Error('Cannot create a string longer than 0x1fffffe8 characters');
+    tooLong.code = 'ERR_STRING_TOO_LONG';
+    const sized = await parseUsageObservation(bufferThatThrows(tooLong), {});
+    assert.equal(sized.parse, 'too-large');
+    assert.equal(sized.inputTokens, 0);
+
+    // サイズ以外の予期しない例外は unparsable。いずれにせよ外へは投げない。
+    const other = await parseUsageObservation(bufferThatThrows(new Error('synthetic')), {});
+    assert.equal(other.parse, 'unparsable');
+    assert.equal(other.inputTokens, 0);
+  });
+
   it('model は応答から採る（message_start.message.model / 非ストリームの model）', async () => {
     assert.equal((await parseUsageObservation(Buffer.from(SSE, 'utf8'), {})).model, 'claude-opus-5-1');
     const noModel = [
