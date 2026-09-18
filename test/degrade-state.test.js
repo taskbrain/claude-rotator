@@ -1,5 +1,6 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
+import { brotliCompressSync, deflateSync, gzipSync } from 'node:zlib';
 
 import {
   applyRecoveryWaitHeaders,
@@ -13,8 +14,10 @@ import {
   decideAuthDegradeRewrite,
   decideBridgeResponse,
   decideRecoveryWaitResponse,
+  decideUpstreamOverloadedWait,
   formatLogMeta,
   mapClaudeExhaustion,
+  mapUpstreamOverloaded,
   parseBridgeContract,
   quotaWaits,
   sanitizeAccountLabel,
@@ -1897,6 +1900,178 @@ describe('decideRecoveryWaitResponse (統合設計 v2.1 §3.2・§4.1 案A)', ()
       false,
     );
     assert.equal(decideBridgeResponse(parsed, { ...base, upstreamStatus: 403 }).rewrite, false);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// 上流 529 overloaded の 429 写像（要件 (a)(b)(f)）。
+//
+// 対象は **Anthropic 上流が返した 529**（本文 error.type = overloaded_error）だけで、
+// rotator が合成する 529 も bridge 経由の 529 も入力集合に入らない。mapClaudeExhaustion の
+// 入力は常に 429 なので、この写像とは入力が完全に排他である（順序で取り合わない）。
+// ---------------------------------------------------------------------------
+describe('decideUpstreamOverloadedWait / mapUpstreamOverloaded (上流 529 overloaded → 429)', () => {
+  const OVERLOADED = '{"type":"error","error":{"type":"overloaded_error","message":"Overloaded"}}';
+
+  const upstream529 = (overrides = {}) => ({
+    statusCode: 529,
+    headers: {
+      'content-type': 'application/json',
+      'content-length': String(Buffer.byteLength(OVERLOADED)),
+      'request-id': 'req_overloaded',
+      'Retry-After': '900',
+      'anthropic-ratelimit-unified-reset': '1789000000',
+      ...overrides.headers,
+    },
+    body: Buffer.from(overrides.body ?? OVERLOADED),
+    ...(overrides.statusCode ? { statusCode: overrides.statusCode } : {}),
+  });
+
+  const decide = (response, ctx = {}) =>
+    decideUpstreamOverloadedWait(response, { enabled: true, ...ctx });
+
+  it('(a) rewrites an upstream 529 overloaded_error to 429 rate_limit_error with Retry-After', () => {
+    const decision = decide(upstream529());
+    assert.equal(decision.rewrite, true);
+    assert.equal(decision.status, 429);
+    assert.equal(decision.retryAfterSeconds, 30, '既定は 30 秒');
+    assert.equal(decision.stripRateLimitHeaders, true);
+    assert.equal(JSON.parse(decision.body).error.type, 'rate_limit_error');
+    assert.equal(
+      /exhausted/.test(JSON.parse(decision.body).error.message),
+      false,
+      '口座は枯れていないので「枯渇」とは書かない',
+    );
+    assert.deepEqual(decision.meta, {
+      mappedFrom: 529,
+      mappedFromType: 'overloaded_error',
+      mappedTo: 429,
+      retryAfter: 30,
+      mapReason: 'claude_upstream_overloaded',
+    });
+  });
+
+  it('(a) honours a configured Retry-After', () => {
+    const decision = decide(upstream529(), { retryAfterSeconds: 5 });
+    assert.equal(decision.retryAfterSeconds, 5);
+    assert.equal(decision.meta.retryAfter, 5);
+  });
+
+  it('(a) mapUpstreamOverloaded drops the upstream Retry-After and every anthropic-ratelimit-*', () => {
+    const mapped = mapUpstreamOverloaded(upstream529(), { enabled: true });
+    assert.equal(mapped.statusCode, 429);
+    assert.deepEqual(
+      Object.keys(mapped.headers).filter(key => /retry-after|ratelimit/i.test(key)),
+      ['Retry-After'],
+      '上流の待機ヘッダを1本も残さない（残すと最大数時間の無音待機になる）',
+    );
+    assert.equal(mapped.headers['Retry-After'], '30');
+    assert.equal(mapped.headers['request-id'], 'req_overloaded', '診断用ヘッダは残す');
+    assert.equal(mapped.headers['content-type'], 'application/json');
+    assert.equal(mapped.headers['content-length'], String(mapped.body.length));
+    assert.equal(mapped.degradeLog.mapReason, 'claude_upstream_overloaded');
+    assert.equal(mapped.degradeLog.mappedFrom, 529);
+    assert.equal(mapped.degradeLog.mappedTo, 429);
+    assert.equal(mapped.degradeLog.retryAfter, 30);
+  });
+
+  it('(a) reads a gzip / deflate / brotli encoded overloaded body', () => {
+    // accept-encoding はそのまま上流へ転送されるので、529 の本文が圧縮されて返りうる。
+    // 展開せずに JSON.parse すると型判定が空振りし、機能が黙って効かなくなる。
+    for (const [encoding, compress] of [
+      ['gzip', gzipSync],
+      ['deflate', deflateSync],
+      ['br', brotliCompressSync],
+    ]) {
+      const response = {
+        statusCode: 529,
+        headers: { 'content-type': 'application/json', 'content-encoding': encoding },
+        body: compress(Buffer.from(OVERLOADED)),
+      };
+      assert.equal(decide(response).rewrite, true, encoding);
+      const mapped = mapUpstreamOverloaded(response, { enabled: true });
+      assert.equal(mapped.statusCode, 429, encoding);
+      assert.equal(
+        mapped.headers['content-encoding'],
+        undefined,
+        `${encoding}: 合成した非圧縮本文に上流の content-encoding を残さない`,
+      );
+    }
+  });
+
+  it('(a) caps how far a compressed body is expanded (zip bomb guard)', () => {
+    // 本文の符号化は上流が決めるので、展開後の大きさも上流が決められてしまう。上限が無いと
+    // イベントループ上の同期展開でメモリを持っていかれるため、1 MiB を超える展開は打ち切る。
+    const padded = size =>
+      `{"type":"error","error":{"type":"overloaded_error","message":"${'A'.repeat(size)}"}}`;
+    const oversized = {
+      statusCode: 529,
+      headers: { 'content-type': 'application/json', 'content-encoding': 'gzip' },
+      body: gzipSync(Buffer.from(padded(1024 * 1024))),
+    };
+    assert.deepEqual(
+      decide(oversized),
+      { rewrite: false, reason: 'body-not-overloaded' },
+      '上限超過は RangeError で catch に落ち、写像せず透過する（例外で落とさない）',
+    );
+    assert.equal(mapUpstreamOverloaded(oversized, { enabled: true }), null);
+
+    // 上限内なら従来どおり展開して写像する（上限を入れたせいで通常の本文まで落とさない）。
+    const withinLimit = {
+      statusCode: 529,
+      headers: { 'content-type': 'application/json', 'content-encoding': 'gzip' },
+      body: gzipSync(Buffer.from(padded(64 * 1024))),
+    };
+    assert.equal(decide(withinLimit).rewrite, true);
+    assert.equal(mapUpstreamOverloaded(withinLimit, { enabled: true }).statusCode, 429);
+  });
+
+  it('(b) leaves any other 529 body alone', () => {
+    for (const [body, label] of [
+      ['{"type":"error","error":{"type":"api_error","message":"temporary upstream failure"}}', 'api_error'],
+      ['', '空本文'],
+      ['{"type":"error",', '壊れた JSON'],
+      ['{"type":"error","error":{}}', 'error.type が無い'],
+    ]) {
+      assert.deepEqual(
+        decide(upstream529({ body })),
+        { rewrite: false, reason: 'body-not-overloaded' },
+        label,
+      );
+      assert.equal(mapUpstreamOverloaded(upstream529({ body }), { enabled: true }), null, label);
+    }
+    // 展開できない content-encoding も安全側（透過）へ倒す。
+    assert.deepEqual(
+      decide({ statusCode: 529, headers: { 'content-encoding': 'gzip' }, body: Buffer.from(OVERLOADED) }),
+      { rewrite: false, reason: 'body-not-overloaded' },
+      '展開に失敗したら透過する（例外で落とさない）',
+    );
+  });
+
+  it('(b)(c) never touches a status other than 529, and stays off unless enabled', () => {
+    for (const statusCode of [200, 403, 429, 500, 503]) {
+      assert.deepEqual(
+        decide({ statusCode, headers: {}, body: Buffer.from(OVERLOADED) }),
+        { rewrite: false, reason: 'status-not-529' },
+        String(statusCode),
+      );
+    }
+    assert.deepEqual(
+      decideUpstreamOverloadedWait(upstream529(), { enabled: false }),
+      { rewrite: false, reason: 'disabled' },
+    );
+    assert.deepEqual(decideUpstreamOverloadedWait(upstream529()), { rewrite: false, reason: 'disabled' });
+    assert.equal(mapUpstreamOverloaded(upstream529(), { enabled: false }), null);
+    assert.equal(mapUpstreamOverloaded(null, { enabled: true }), null);
+  });
+
+  it('(a) the log fields render in the documented order', () => {
+    const mapped = mapUpstreamOverloaded(upstream529(), { enabled: true });
+    assert.equal(
+      formatLogMeta(buildBridgeLogMeta({ upstreamStatus: mapped.degradeLog.mappedFrom }, mapped.degradeLog)),
+      ' upstreamStatus=529 mappedFrom=529 mappedFromType=overloaded_error mappedTo=429'
+      + ' retryAfter=30 mapReason=claude_upstream_overloaded',
+    );
   });
 });
 

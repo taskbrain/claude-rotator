@@ -9845,6 +9845,30 @@ describe('Claude 全枯渇 429 の 529 写像を7系統へ結線する (R4-2/R4-
     );
   });
 
+  it('4-b: leaves the replayed 529 (P-b) untouched when upstreamOverloadTo429 is on', async () => {
+    // 上流 529 の 429 写像は「Anthropic が返した 529」だけが対象。rotator が合成した
+    // 529（再生を含む）は入力集合に入らないので、新キーを真にしても答えは変わらない。
+    const base = await runReactiveReplayScenario();
+    const withKey = await runReactiveReplayScenario({
+      degradeMapping: { enabled: true, upstreamOverloadTo429: true, upstreamOverloadRetryAfterSeconds: 5 },
+    });
+
+    assert.equal(withKey.response.status, base.response.status);
+    assert.equal(withKey.response.status, 529);
+    assert.equal(withKey.response.bodyText, base.response.bodyText);
+    assert.equal(withKey.response.headers['retry-after'], undefined, '待機ヘッダを足さない');
+    assert.deepEqual(
+      withKey.logLines
+        .filter(line => / claude-exhaustion-replay /.test(line))
+        .map(line => line.replace(/^\S+ /, '')),
+      base.logLines
+        .filter(line => / claude-exhaustion-replay /.test(line))
+        .map(line => line.replace(/^\S+ /, '')),
+      '再生の写像ログも同一',
+    );
+    assert.equal(/claude_upstream_overloaded/.test(withKey.logLines.join('\n')), false);
+  });
+
   it('4-b: keeps the replayed upstream headers and only replaces the body', async () => {
     const { response } = await runReactiveReplayScenario();
 
@@ -10341,6 +10365,298 @@ describe('Claude 全枯渇 429 の 529 写像を7系統へ結線する (R4-2/R4-
     assert.equal(response.headers['x-path-test'], 'p-g2', '上流ヘッダが残るので経路を固定できる');
     // P-g1 と同じく、台帳から消えた口座の要求は proxy ログ行を持たない（R4-5 の残課題）。
     assert.deepEqual(logLines.filter(line => / proxy account=/.test(line)), []);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// 上流 529 overloaded を 429 ＋ Retry-After へ写像する（坂根氏 2026-09-18 の要件）。
+//
+// 「ハイデマンドで Fable 5.1 が使えない時は、リトライが走る 429 になるように」。
+// Claude Code は 529 を3回で fallbackModel へ退避させるが、429 なら同じモデルのまま
+// 待って再試行する。ここでは偽 Anthropic 上流を立て、実 TCP で写像を固定する。
+//
+// 対象は上流（Anthropic）が返した 529（本文 overloaded_error）だけ。rotator が合成する
+// 529 も bridge 経由の 529 も入力集合に入らない（(c)）。口座台帳は一切学習しない（(e)）。
+// ---------------------------------------------------------------------------
+describe('上流 529 overloaded の 429 写像 (upstreamOverloadTo429)', () => {
+  const OVERLOADED = '{"type":"error","error":{"type":"overloaded_error","message":"Overloaded"}}';
+  const ON = { upstreamOverloadTo429: true };
+
+  async function startProxy({
+    accountManager,
+    secretStore,
+    upstreamUrl,
+    logLines = [],
+    degradeMapping = ON,
+    reloadOpenAiBridge = null,
+  }) {
+    const proxy = await listen(createProxyServer({
+      accountManager,
+      secretStore,
+      config: {
+        upstream: upstreamUrl,
+        usagePolling: { enabled: false },
+        openaiBridge: { enabled: false, ...(degradeMapping ? { degradeMapping } : {}) },
+      },
+      currentCredentialReader: async () => null,
+      ...(reloadOpenAiBridge ? { reloadOpenAiBridge } : {}),
+      logger: line => logLines.push(line),
+    }));
+    cleanupAfterTest(async () => close(proxy.server));
+    return proxy;
+  }
+
+  // 本文と付随ヘッダを差し替えられる偽 Anthropic 上流。上流が実際に付けてくる
+  // 待機ヘッダ（残すと最大数時間の無音待機になる）を必ず載せる。
+  async function startOverloadedUpstream({ body = OVERLOADED, extraHeaders = {} } = {}) {
+    const seen = [];
+    const upstream = await listen(http.createServer((req, res) => {
+      seen.push(req.headers.authorization);
+      req.resume();
+      res.writeHead(529, {
+        'Content-Type': 'application/json',
+        'Content-Length': String(Buffer.byteLength(body)),
+        'request-id': 'req_upstream_529',
+        'Retry-After': '900',
+        'anthropic-ratelimit-unified-reset': '1789000000',
+        'anthropic-ratelimit-requests-remaining': '0',
+        ...extraHeaders,
+      });
+      res.end(body);
+    }));
+    cleanupAfterTest(async () => close(upstream.server));
+    return { upstream, seen };
+  }
+
+  async function readyAccountManager(ids = ['acct_1']) {
+    const secretStore = new MemorySecretStore();
+    for (const id of ids) await secretStore.set(id, { accessToken: `access-token-${id}` });
+    const accountManager = new AccountManager({
+      accounts: ids.map(id => ({ id, type: 'oauth' })),
+      now: () => 1000,
+    });
+    return { secretStore, accountManager };
+  }
+
+  const ask = proxy => requestJson(`${proxy.url}/v1/messages`, {
+    method: 'POST',
+    body: JSON.stringify({ model: 'claude-fable-5-1' }),
+    headers: { 'content-type': 'application/json' },
+    timeoutMs: 3_000,
+  });
+
+  // 壊れた JSON の透過も観測するので、本文を解析しない素の要求を使う。
+  const askRaw = proxy => new Promise((resolve, reject) => {
+    const target = new URL(`${proxy.url}/v1/messages`);
+    const request = http.request({
+      hostname: target.hostname,
+      port: target.port,
+      path: target.pathname,
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+    }, res => {
+      const chunks = [];
+      res.on('data', chunk => chunks.push(chunk));
+      res.on('end', () => resolve({
+        status: res.statusCode,
+        headers: res.headers,
+        bodyText: Buffer.concat(chunks).toString('utf8'),
+      }));
+      res.on('error', reject);
+    });
+    request.on('error', reject);
+    request.setTimeout(3_000, () => request.destroy(new Error('test client timeout')));
+    request.end(JSON.stringify({ model: 'claude-fable-5-1' }));
+  });
+
+  const proxyLines = logLines => logLines.filter(line => / proxy account=/.test(line));
+
+  it('(a) answers 429 rate_limit_error with Retry-After and logs mapReason on the same line', async () => {
+    const { upstream } = await startOverloadedUpstream();
+    const { secretStore, accountManager } = await readyAccountManager();
+    const logLines = [];
+    const proxy = await startProxy({
+      accountManager, secretStore, upstreamUrl: upstream.url, logLines,
+    });
+
+    const response = await ask(proxy);
+
+    assert.equal(response.status, 429, '529 だと Claude Code が fallbackModel へ退避してしまう');
+    assert.equal(response.body.error.type, 'rate_limit_error');
+    assert.equal(response.headers['retry-after'], '30');
+    assert.deepEqual(
+      Object.keys(response.headers).filter(key => key.startsWith('anthropic-ratelimit-')),
+      [],
+      '上流の枠ヘッダを残すと Claude Code がその時刻まで無音で眠る',
+    );
+    assert.equal(
+      response.headers['content-length'],
+      String(Buffer.byteLength(response.bodyText)),
+      'Content-Length は写像後の本文長へ入れ替える',
+    );
+    assert.equal(response.headers['request-id'], 'req_upstream_529', '診断用ヘッダは残す');
+
+    const lines = proxyLines(logLines);
+    assert.equal(lines.length, 1, '行は増やさない（既存の1行へ併記する）');
+    assert.match(
+      lines[0],
+      / status=429 durationMs=\d+ outcome=upstream-error-passthrough requestId=req_upstream_529/,
+      '返した status（429）を行の status にする',
+    );
+    assert.match(
+      lines[0],
+      / upstreamStatus=529 mappedFrom=529 mappedFromType=overloaded_error mappedTo=429 retryAfter=30 mapReason=claude_upstream_overloaded$/,
+      '実際の上流ステータスを必ず同じ行へ残す',
+    );
+  });
+
+  it('(a) uses the configured Retry-After seconds', async () => {
+    const { upstream } = await startOverloadedUpstream();
+    const { secretStore, accountManager } = await readyAccountManager();
+    const logLines = [];
+    const proxy = await startProxy({
+      accountManager,
+      secretStore,
+      upstreamUrl: upstream.url,
+      logLines,
+      degradeMapping: { upstreamOverloadTo429: true, upstreamOverloadRetryAfterSeconds: 7 },
+    });
+
+    const response = await ask(proxy);
+    assert.equal(response.headers['retry-after'], '7');
+    assert.match(proxyLines(logLines).at(-1), /retryAfter=7 mapReason=claude_upstream_overloaded$/);
+  });
+
+  it('(b) passes an upstream 529 through untouched when the body is not overloaded_error', async () => {
+    for (const [body, label] of [
+      ['{"type":"error","error":{"type":"api_error","message":"temporary upstream failure"}}', 'api_error'],
+      ['', '空本文'],
+      ['{"type":"error",', '壊れた JSON'],
+    ]) {
+      const { upstream } = await startOverloadedUpstream({ body });
+      const { secretStore, accountManager } = await readyAccountManager();
+      const logLines = [];
+      const proxy = await startProxy({
+        accountManager, secretStore, upstreamUrl: upstream.url, logLines,
+      });
+
+      const response = await askRaw(proxy);
+
+      assert.equal(response.status, 529, label);
+      assert.equal(response.bodyText, body, `${label}: 本文をそのまま返す`);
+      assert.equal(response.headers['request-id'], 'req_upstream_529', label);
+      assert.equal(response.headers['retry-after'], '900', `${label}: 上流のヘッダを書き換えない`);
+      assert.equal(
+        /mapReason=/.test(proxyLines(logLines).at(-1)),
+        false,
+        `${label}: 写像していないので痕跡も出ない`,
+      );
+    }
+  });
+
+  it('(e) never learns quota exhaustion or marks the account unusable', async () => {
+    // 台帳の扱いは「写像したときも off のときと1つも変わらない」ことで固定する。
+    // 上流 529 に枠ヘッダが付いていれば updateQuota はどちらでも同じように記録するので、
+    // 「不変」ではなく「off と同値」が正しい言明である（updateQuota は意図的に残す）。
+    const ledgerSnapshot = manager => ({
+      currentAccount: manager.getStatus().currentAccount,
+      status: manager.accounts[0].status,
+      quota: structuredClone(manager.accounts[0].quota ?? null),
+      rateLimitedUntil: manager.accounts[0].rateLimitedUntil ?? null,
+      errorReason: manager.accounts[0].errorReason ?? null,
+      eventTypes: manager.events.map(event => event.type),
+    });
+
+    // 同じ 529 を3回叩いても口座が落ちず、ローテーションも起きない（要件④）。
+    const run = async degradeMapping => {
+      const { upstream, seen } = await startOverloadedUpstream();
+      const { secretStore, accountManager } = await readyAccountManager();
+      const proxy = await startProxy({
+        accountManager, secretStore, upstreamUrl: upstream.url, degradeMapping,
+      });
+      const statuses = [];
+      for (let attempt = 0; attempt < 3; attempt += 1) statuses.push((await ask(proxy)).status);
+      return { statuses, seen, ledger: ledgerSnapshot(accountManager) };
+    };
+
+    const on = await run(ON);
+    const off = await run(null);
+
+    assert.deepEqual(on.statuses, [429, 429, 429], '前提: 3回とも写像されている');
+    assert.deepEqual(off.statuses, [529, 529, 529], '前提: off では素通しされている');
+    assert.deepEqual(on.ledger, off.ledger, 'スイッチの有無で口座台帳の扱いが1つも変わらない');
+
+    assert.equal(on.ledger.currentAccount, 'acct_1', '選択は動かない');
+    assert.equal(on.ledger.status, 'active', 'throttled / error にしない');
+    assert.equal(on.ledger.rateLimitedUntil, null, 'markRateLimited を呼ばない');
+    assert.equal(on.ledger.errorReason, null, 'markError を呼ばない');
+    assert.deepEqual(
+      on.ledger.eventTypes,
+      ['proxy-request', 'proxy-request', 'proxy-request'],
+      '529 overloaded で増えるのは proxy-request だけ（口座の状態遷移イベントは1件も出ない）',
+    );
+    assert.deepEqual(
+      on.seen,
+      ['Bearer access-token-acct_1', 'Bearer access-token-acct_1', 'Bearer access-token-acct_1'],
+      '別口座を試さない（毎回同じ Bearer で届く）',
+    );
+  });
+
+  it('(c) leaves the locally synthesised 529 (P-a) exactly as it is', async () => {
+    // rotator が自分で作る 529（all_claude_accounts_exhausted）は対象外。
+    const { upstream, seen } = await startOverloadedUpstream();
+    const { secretStore, accountManager } = await readyAccountManager();
+    accountManager.updateQuota('acct_1', {
+      'anthropic-ratelimit-unified-5h-utilization': '1',
+      'anthropic-ratelimit-unified-5h-reset': '10',
+    });
+    const logLines = [];
+    const proxy = await startProxy({
+      accountManager,
+      secretStore,
+      upstreamUrl: upstream.url,
+      logLines,
+      degradeMapping: { enabled: true, upstreamOverloadTo429: true },
+    });
+
+    const response = await ask(proxy);
+
+    assert.equal(response.status, 529, '合成 529 は退避させたままにする');
+    assert.equal(response.body.error.type, 'overloaded_error');
+    assert.equal(response.body.error.message, 'All Claude accounts are exhausted.');
+    assert.equal(response.headers['retry-after'], undefined);
+    assert.deepEqual(seen, [], '上流へは送っていない');
+    assert.match(proxyLines(logLines).at(-1), /mapReason=all_claude_accounts_exhausted mapPath=a$/);
+  });
+
+  it('(g) picks the mapping up and drops it again through POST /internal/reload', async () => {
+    const { upstream } = await startOverloadedUpstream();
+    const { secretStore, accountManager } = await readyAccountManager();
+    let nextBridge = { enabled: false };
+    const proxy = await startProxy({
+      accountManager,
+      secretStore,
+      upstreamUrl: upstream.url,
+      degradeMapping: null,
+      reloadOpenAiBridge: async () => nextBridge,
+    });
+    const reload = () => requestJson(`${proxy.url}/internal/reload`, {
+      method: 'POST',
+      headers: { authorization: `Bearer ${LOCAL_GATEWAY_AUTH_TOKEN}` },
+      timeoutMs: 5_000,
+    });
+
+    assert.equal((await ask(proxy)).status, 529, '既定 off では素通し');
+
+    nextBridge = { enabled: false, degradeMapping: { upstreamOverloadTo429: true } };
+    assert.equal((await reload()).status, 200);
+    const mapped = await ask(proxy);
+    assert.equal(mapped.status, 429, 'プロセス再起動なしで有効になる');
+    assert.equal(mapped.headers['retry-after'], '30');
+
+    nextBridge = { enabled: false, degradeMapping: { upstreamOverloadTo429: false } };
+    assert.equal((await reload()).status, 200);
+    assert.equal((await ask(proxy)).status, 529, 'キーを false にするだけで即座に切り戻せる');
   });
 });
 

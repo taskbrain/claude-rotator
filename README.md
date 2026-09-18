@@ -488,6 +488,8 @@ claude-rotator status
 | `degradeMapping.enabled` | `false` | 写像・学習・403 書き換えの総合スイッチ。`false` なら現行と完全に同一の挙動 |
 | `degradeMapping.bothUnusableStatus` | `403` | Claude も GPT も使えないときのステータス。`403` = 明示停止、`529` = 退避を試み続ける。それ以外の値は `403` として扱います。**`recoveryWaitEnabled` が `true` のときは、このキーより下記の待機（429）が優先します** |
 | `degradeMapping.recoveryWaitEnabled` | `false` | **上流が全滅・一時障害のときに Claude Code を止めず、待たせて自動継続させるスイッチ。** `true` のとき、403 の代わりに **429 `rate_limit_error` ＋ `Retry-After: 30`** を返します。真偽値の `true` だけを受け付け、それ以外（`"true"` や `1` を含む）はすべて `false` です。**`false`（既定）なら応答もログも現行と1バイト変わりません** |
+| `degradeMapping.upstreamOverloadTo429` | `false` | **Anthropic 上流が混雑しているとき（529 `overloaded_error`）に、429 `rate_limit_error` ＋ `Retry-After` へ書き換えて返すスイッチ。** Claude Code は 529 を3回受けると `fallbackModel` の次の要素へ移りますが、429 なら**同じモデルのまま待って再試行**します（「ハイデマンドで Fable 5.1 が使えないときに退避させたくない」場合に使います）。真偽値の `true` だけを受け付け、それ以外（`"true"` や `1` を含む）はすべて `false` です。**これは Claude 側だけの機能で、`degradeMapping.enabled` にも `openaiBridge.enabled` にも依存しません**（設定の置き場所が `degradeMapping` の下なのは、`POST /internal/reload` の既存の再読み込み経路にそのまま乗るためです）。**`false`（既定）なら応答もログも現行と1バイト変わりません** |
+| `degradeMapping.upstreamOverloadRetryAfterSeconds` | `30` | 上記で付け直す `Retry-After` の秒数。`1`〜`3600` の整数だけを受け付け、それ以外（小数・文字列・範囲外）はすべて `30` になります |
 | `degradeMapping.gptPoolUnusableTtlMs` | `60000`（60秒） | 「GPT 側は使えない」という学習を、状態不明へ戻すまでの時間。`recoveryWaitEnabled` が `false` のときは**回復見込み時刻を伴わない学習にだけ**効き、`true` のときは回復見込み時刻を伴う学習にも `min(回復見込み時刻, 学習時刻 + この値)` として効きます |
 | `degradeMapping.codexStatusUrl` | `null` | `status` にブリッジ側の枠状況を表示するための取得先（loopback のみ）。`null` なら表示しません |
 | `degradeMapping.codexStatusTimeoutMs` | `1500` | 上記取得のタイムアウト（必ず有限値） |
@@ -521,6 +523,30 @@ claude-rotator status
       }
     }
     ```
+- **`upstreamOverloadTo429: true` のときだけ変わること**（`false` の既定では何も変わりません）:
+  - **Anthropic 上流が 529 `overloaded_error` を返したとき**、claude-rotator がそれを **429 `rate_limit_error` ＋ `Retry-After: 30`**（秒数は `upstreamOverloadRetryAfterSeconds`）に書き換えて Claude Code へ返します。Claude Code は 529 を3回受けると `fallbackModel` の次の要素へ移りますが、429 なら**同じモデルのまま待って再試行**します。**画面にエラーは出ますが、モデルは切り替わりません。**
+  - 書き換えるのは **Anthropic 上流が返した 529 のうち、本文の `error.type` が `overloaded_error` のものだけ**です。同じ 529 でも `api_error` などの本文、空の本文、壊れた本文は**そのまま素通し**します（本文が `gzip` / `deflate` / `br` で圧縮されている場合は展開してから判定し、展開できなければ素通しします）。
+  - **claude-rotator 自身が作る 529**（全アカウント枠切れの `All Claude accounts are exhausted.`）と、**ブリッジ経由の 529** は対象外で、従来どおりの挙動のままです。
+  - 合成した 429 からは、上流の `Retry-After` と `anthropic-ratelimit-*`（`anthropic-ratelimit-unified-reset` を含む）を**すべて除去**し、`Retry-After` を1つだけ付けます。除去しないと、Claude Code がそのリセット時刻まで（最大6時間）無言で待つことがあります。`request-id` などの診断用ヘッダは残します。
+  - **アカウントの状態は一切変えません。** 上流の 529（過負荷）はモデル全体の混雑であってアカウント固有の事象ではないため、枠切れ・一時停止（throttle）として学習せず、アカウントの切り替えも行いません。同じ 529 が続いても、同じアカウントのまま返し続けます。
+  - proxy ログ行の末尾に `upstreamStatus=529 mappedFrom=529 mappedFromType=overloaded_error mappedTo=429 retryAfter=30 mapReason=claude_upstream_overloaded` が付きます（行は増えません。行の `status=` は実際に返した 429 になります）。
+  - 設定例（`config.json`。`openaiBridge.enabled` が `false` のままでも効きます）:
+
+    ```json
+    {
+      "openaiBridge": {
+        "degradeMapping": { "upstreamOverloadTo429": true }
+      }
+    }
+    ```
+
+  - **切り戻し手順（プロセスの再起動は不要）**: `config.json` の `upstreamOverloadTo429` を `false` にする（またはキーごと消す）→ `POST /internal/reload` を実行する。次の要求から上流の 529 はそのまま素通しに戻ります。逆に有効化するときも同じ手順です。
+
+    ```bash
+    curl -sS -X POST http://127.0.0.1:37891/internal/reload
+    ```
+
+  - **注意（長時間の混雑）**: 上流の混雑が長く続くと、429 ＋ `Retry-After` を返し続けるあいだ Claude Code は待ち続けます。「止まらない」ことと「いつか終わる」ことは別なので、混雑が長引く場合はこのキーを `false` に戻して退避（529）へ切り替えてください。打ち切り回数の上限は設けていません。
 - **写像した応答には理由ヘッダ `x-claude-rotator-reason` を1本だけ付けます。** 値は次の3つだけで、529 でも 403 でも同じ1本が付きます。写像しなかった応答と `degradeMapping` を書いていない構成には付きません。
     - `quota_exhausted` — 共通枠・系列枠の枯渇です。**待てば回復します。**
     - `credential_cooldown` — 資格情報の更新が待機中（cooldown）です。**待てば回復します。**
@@ -679,7 +705,7 @@ Claude Code からの正確なモデル ID `claude-fable-5` または `claude-fa
 
 切り替え可能なアカウントがなくローカルで 429 を返す場合も、Claude Code が 5時間枠は `session limit`、7日枠は `weekly limit` として扱える unified rate-limit ヘッダーを返します。rotator 独自の補足情報は JSON の `details.rotator_message` に入ります。
 
-retryable な上流 5xx / 529 / `x-should-retry` 付きレスポンス、または上流アイドルタイムアウトが起きた場合も、アカウント切り替えは行いません。上流の error body または proxy の timeout error を可能な限りそのまま返します。
+retryable な上流 5xx / 529 / `x-should-retry` 付きレスポンス、または上流アイドルタイムアウトが起きた場合も、アカウント切り替えは行いません。上流の error body または proxy の timeout error を可能な限りそのまま返します。ただし `openaiBridge.degradeMapping.upstreamOverloadTo429` を `true` にしたときだけ、上流の 529 `overloaded_error` は 429 ＋ `Retry-After` へ書き換えます（アカウント切り替えを行わない点は変わりません）。詳細は [設定ファイルと環境変数](#設定ファイルと環境変数) の「GPT モデルとの相互退避」を参照してください。
 
 Usage API の再取得は、デフォルトでは 15 分ごとの定期 polling と、100% 到達済みの枠がリセットされる時刻の直後に実行されます。間隔は [設定ファイルと環境変数](#設定ファイルと環境変数) の `usagePolling.intervalMs` で変更できます。Claude Code 側の早期リセットや一時的な状態変化を確認したい場合は、次の手動コマンドで全登録アカウントを即時再確認します。
 
@@ -1410,6 +1436,8 @@ Configuration keys (the whole section may be omitted):
 | `degradeMapping.enabled` | `false` | Master switch for the mapping, the learning, and the 403 rewrite. With `false` the behavior is identical to the current one |
 | `degradeMapping.bothUnusableStatus` | `403` | Status returned when neither Claude nor GPT is usable. `403` = stop explicitly, `529` = keep attempting to degrade. Any other value is treated as `403`. **When `recoveryWaitEnabled` is `true`, the wait below takes precedence over this key** |
 | `degradeMapping.recoveryWaitEnabled` | `false` | **Keeps Claude Code alive while every upstream is exhausted or temporarily broken.** When `true`, the proxy answers **429 `rate_limit_error` with `Retry-After: 30`** instead of 403. Only the boolean `true` is accepted (`"true"` and `1` are not). **With `false` (the default) both the responses and the log lines are byte-for-byte identical to the current behavior** |
+| `degradeMapping.upstreamOverloadTo429` | `false` | **Rewrites an overloaded Anthropic upstream (529 `overloaded_error`) into 429 `rate_limit_error` with `Retry-After`.** Claude Code moves to the next `fallbackModel` entry after three 529s, but on a 429 it **waits and retries on the same model** (use this when a high-demand period must not silently switch you off the model you asked for). Only the boolean `true` is accepted (`"true"` and `1` are not). **This is a Claude-side feature and depends on neither `degradeMapping.enabled` nor `openaiBridge.enabled`** — it lives under `degradeMapping` only so that it is picked up by the existing `POST /internal/reload` path. **With `false` (the default) both the responses and the log lines are byte-for-byte identical to the current behavior** |
+| `degradeMapping.upstreamOverloadRetryAfterSeconds` | `30` | Seconds put into that `Retry-After`. Only integers from `1` to `3600` are accepted; anything else (fractions, strings, out-of-range values) becomes `30` |
 | `degradeMapping.gptPoolUnusableTtlMs` | `60000` (60 sec) | How long a "GPT side is unusable" observation is kept before it reverts to unknown. With `recoveryWaitEnabled: false` it only applies to observations **without** a recovery time; with `true` it also caps observations that carry one, as `min(recovery time, learned at + this value)` |
 | `degradeMapping.codexStatusUrl` | `null` | Endpoint used to show the bridge's quota state in `status` (loopback only). `null` shows nothing |
 | `degradeMapping.codexStatusTimeoutMs` | `1500` | Timeout for that fetch (always finite) |
@@ -1432,6 +1460,30 @@ How it behaves:
   - **Recovery needs no restart or reload.** A single successful response proving the bridge reached its upstream returns the learned "GPT side is unusable" to unknown (never straight to available). Cached denials (`x-ombr-cached: yes`) neither create nor extend that state.
   - **Expired GPT credentials (`codex_needs_login` / `codex_credentials_unavailable`) are excluded from waiting** and keep degrading with 529, because they never recover until a human runs `codex login`.
   - Log lines gain `cached=` (whether the bridge answered from its cache; `none` when the header is absent) and `retryAfter=`.
+- **What changes only when `upstreamOverloadTo429: true`** (nothing changes with the default `false`):
+  - When the Anthropic upstream answers **529 `overloaded_error`**, claude-rotator rewrites it into **429 `rate_limit_error` with `Retry-After: 30`** (the seconds come from `upstreamOverloadRetryAfterSeconds`). Claude Code moves to the next `fallbackModel` entry after three 529s, but on a 429 it **waits and retries on the same model**. **An error is still shown, but the model does not change.**
+  - Only a 529 **from the Anthropic upstream whose body `error.type` is `overloaded_error`** is rewritten. A 529 carrying any other body (`api_error`, an empty body, a truncated body) is **forwarded unchanged**. A body compressed with `gzip` / `deflate` / `br` is decompressed before the check, and is forwarded unchanged if it cannot be decompressed.
+  - **A 529 synthesized by claude-rotator itself** (`All Claude accounts are exhausted.`) and **a 529 coming from the bridge** are out of scope and behave exactly as before.
+  - The synthesized 429 **drops every** upstream `Retry-After` and `anthropic-ratelimit-*` header (including `anthropic-ratelimit-unified-reset`) and carries exactly one `Retry-After`. Without that, Claude Code can sleep silently until the advertised reset (up to six hours). Diagnostic headers such as `request-id` are kept.
+  - **Account state is never touched.** An upstream overload is a model-wide condition rather than an account-specific one, so it is never learned as an exhausted quota or a throttle, and it never rotates accounts: repeated 529s keep being answered from the same account.
+  - The proxy log line gains `upstreamStatus=529 mappedFrom=529 mappedFromType=overloaded_error mappedTo=429 retryAfter=30 mapReason=claude_upstream_overloaded` at the end (no extra line is written, and the line's `status=` becomes the 429 actually returned).
+  - Example `config.json` (it works with `openaiBridge.enabled` left at `false`):
+
+    ```json
+    {
+      "openaiBridge": {
+        "degradeMapping": { "upstreamOverloadTo429": true }
+      }
+    }
+    ```
+
+  - **Rolling it back (no process restart):** set `upstreamOverloadTo429` to `false` in `config.json` (or delete the key), then `POST /internal/reload`. From the next request on, upstream 529s are forwarded unchanged again. Enabling it uses the same two steps.
+
+    ```bash
+    curl -sS -X POST http://127.0.0.1:37891/internal/reload
+    ```
+
+  - **Caveat (a long overload):** while the upstream stays overloaded, claude-rotator keeps answering 429 with `Retry-After` and Claude Code keeps waiting. "Never stops" is not the same as "eventually finishes", so if an overload drags on, set the key back to `false` to degrade (529) instead. There is no retry-count cutoff.
 - **A mapped response carries exactly one reason header, `x-claude-rotator-reason`.** Its vocabulary is just these three values, and the same single header is set on both the 529 and the 403. Responses that were not mapped, and setups without `degradeMapping`, never carry it.
     - `quota_exhausted` — a common or family quota window is used up. **It recovers on its own if you wait.**
     - `credential_cooldown` — a credential refresh is waiting out a cooldown. **It recovers on its own if you wait.**
@@ -1530,7 +1582,7 @@ The weekly-reset priority window defaults to within 36 hours of reset, and can b
 
 Even when no account is available to switch to and the proxy returns a local 429, Claude Code still receives the same unified rate-limit headers it understands, treating a 5-hour exhaustion as a `session limit` and a 7-day exhaustion as a `weekly limit`. Rotator-specific detail is added under the JSON's `details.rotator_message`.
 
-The proxy never switches accounts for a retryable upstream 5xx/529, a response carrying `x-should-retry`, or an upstream idle timeout. It passes the upstream error body, or the proxy's own timeout error, straight through wherever possible instead.
+The proxy never switches accounts for a retryable upstream 5xx/529, a response carrying `x-should-retry`, or an upstream idle timeout. It passes the upstream error body, or the proxy's own timeout error, straight through wherever possible instead. The one exception is `openaiBridge.degradeMapping.upstreamOverloadTo429: true`, which rewrites an upstream 529 `overloaded_error` into 429 with `Retry-After` (accounts are still never switched); see "Cross-Degradation with GPT Models" under Configuration.
 
 By default the Usage API is refetched on a 15-minute periodic poll, and again right after a window that had reached 100% is expected to reset. The interval can be changed with `usagePolling.intervalMs` in [Configuration and Environment Variables](#configuration-and-environment-variables). To force an immediate recheck of every registered account — for example, to confirm an early Claude Code-side reset or some other transient state change — run:
 

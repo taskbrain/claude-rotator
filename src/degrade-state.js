@@ -1,6 +1,10 @@
 // 縮退写像の純関数群（設計書 §11.1 R3-1）。
 // HTTP も fs も触らない。時刻は必ず呼び出し側から注入する（決定的にテストできる形にする）。
 // 出典: 設計書 §4.2 / §6.5 / §8.6 / §8.7 / §9.3、契約 v1.3 §C3・§C10。
+//
+// zlib の同期展開だけは例外的に使う。I/O ではなく入力だけで決まる変換であり、上流の
+// 応答本文が圧縮されていると error.type を読めないためである（下の decodedBodyErrorType）。
+import { brotliDecompressSync, gunzipSync, inflateSync } from 'node:zlib';
 
 // 設計書 §6.6 規律1: この形に合致しない値はログへ落とさない（メールアドレス混入の遮断）。
 const ACCOUNT_LABEL_PATTERN = /^[a-z0-9][a-z0-9_-]{0,31}$/;
@@ -765,6 +769,130 @@ export function decideRecoveryWaitResponse(parsed, ctx = {}) {
   // codex_no_account_for_model・request_invalid・413・一般 500 などは現行どおり素通しする
   // （設定の問題や要求そのものの誤りは、待っても退避しても解けない）。
   return { rewrite: false, reason: 'status-not-mappable' };
+}
+
+// ---------------------------------------------------------------------------
+// Claude 上流（Anthropic）が返す 529 overloaded の 429 写像（坂根氏 2026-09-18 の要件
+// 「ハイデマンドで Fable 5.1 が使えない時は、リトライが走る 429 になるように」）。
+//
+// Claude Code は 529 を 3 回で fallbackModel へ退避させるが、429 なら同じモデルのまま
+// 待って再試行する。混雑はモデル全体の事象で口座固有ではないので、**口座台帳には
+// 一切学習させない**（呼び出し側の拘束。ここは応答を作るだけの純関数）。
+//
+// 入力は常に 529 であり、mapClaudeExhaustion（入力は常に 429）とは入力集合が完全に
+// 排他なので、評価順で取り合わない。bridge 応答は openai-bridge.js の別経路であり、
+// ここには1バイトも来ない。
+// ---------------------------------------------------------------------------
+
+const UPSTREAM_OVERLOADED_BODY_TYPE = 'overloaded_error';
+// DEGRADE_REASONS（契約ヘッダの語彙）には足さない。あれは bridge との契約の列挙であり、
+// これは rotator のログに出すだけの名前なので、混ぜると契約の検証が緩む。
+const UPSTREAM_OVERLOAD_MAP_REASON = 'claude_upstream_overloaded';
+// 「枯渇」とは書かない——口座は枯れておらず、上流が混んでいるだけである。
+const UPSTREAM_OVERLOADED_WAIT_MESSAGE =
+  'The Claude upstream is overloaded. Retrying automatically.';
+
+/** 合成する 429 の本文（既存の合成 429 と同じ形＝rate_limit_error）。 */
+function buildUpstreamOverloadedBody() {
+  return JSON.stringify({
+    type: 'error',
+    error: { type: 'rate_limit_error', message: UPSTREAM_OVERLOADED_WAIT_MESSAGE },
+  });
+}
+
+// 上流が制御する本文をイベントループ上で無制限に展開しないための上限（1 MiB）。
+const MAX_DECODED_BODY_BYTES = 1048576;
+
+const BODY_DECODERS = new Map([
+  ['gzip', gunzipSync],
+  ['x-gzip', gunzipSync],
+  ['deflate', inflateSync],
+  ['br', brotliDecompressSync],
+]);
+
+function headerValueOf(headers, name) {
+  for (const [key, value] of Object.entries(headers || {})) {
+    if (key.toLowerCase() === name) return Array.isArray(value) ? value[0] : value;
+  }
+  return undefined;
+}
+
+/**
+ * 本文の error.type を読む。クライアントの accept-encoding はそのまま上流へ転送される
+ * ため、529 の本文が gzip / deflate / br で返ることが実際にある。展開せずに JSON.parse
+ * すると型判定が空振りし、機能が黙って効かなくなる。未知の符号化・展開失敗は
+ * undefined を返して安全側（＝写像せず透過）へ倒す。
+ */
+function decodedBodyErrorType(body, headers) {
+  const encoding = String(headerValueOf(headers, 'content-encoding') || '').trim().toLowerCase();
+  if (encoding === '' || encoding === 'identity') return bodyErrorType(body);
+  const decode = BODY_DECODERS.get(encoding);
+  if (!decode) return undefined;
+  try {
+    return bodyErrorType(decode(Buffer.from(body || ''), { maxOutputLength: MAX_DECODED_BODY_BYTES }));
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * 上流 529 を 429 待機へ書き換えるかを決める（他の decide* と同じ戻り値の形）。
+ * @param {{statusCode:number, headers:object, body:Buffer}|null} response 受信済みの上流応答。
+ *   本文でしか overloaded_error か判別できないので、呼び出し側は本文を溜め切ってから渡す。
+ * @param {{enabled?:boolean, retryAfterSeconds?:number}} ctx
+ */
+export function decideUpstreamOverloadedWait(response, ctx = {}) {
+  if (ctx.enabled !== true) return { rewrite: false, reason: 'disabled' };
+  if (!response || Number(response.statusCode) !== 529) {
+    return { rewrite: false, reason: 'status-not-529' };
+  }
+  if (decodedBodyErrorType(response.body, response.headers) !== UPSTREAM_OVERLOADED_BODY_TYPE) {
+    return { rewrite: false, reason: 'body-not-overloaded' };
+  }
+  const retryAfterSeconds = typeof ctx.retryAfterSeconds === 'number'
+    ? ctx.retryAfterSeconds
+    : RECOVERY_WAIT_RETRY_AFTER_SECONDS;
+  return {
+    rewrite: true,
+    status: 429,
+    retryAfterSeconds,
+    stripRateLimitHeaders: true,
+    body: buildUpstreamOverloadedBody(),
+    meta: {
+      mappedFrom: 529,
+      mappedFromType: UPSTREAM_OVERLOADED_BODY_TYPE,
+      mappedTo: 429,
+      retryAfter: retryAfterSeconds,
+      mapReason: UPSTREAM_OVERLOAD_MAP_REASON,
+    },
+  };
+}
+
+/**
+ * 決定を実際の応答へ適用する（mapClaudeExhaustion と同じ役割・同じ組み立て順）。
+ * 書き換えないときは null を返し、呼び出し側が上流応答をそのまま送れるようにする。
+ * @returns {{statusCode:number, headers:object, body:Buffer, degradeLog:object}|null}
+ */
+export function mapUpstreamOverloaded(response, ctx = {}) {
+  const decision = decideUpstreamOverloadedWait(response, ctx);
+  if (!decision.rewrite) return null;
+  const body = Buffer.from(decision.body);
+  // applyRecoveryWaitHeaders が上流の Retry-After と anthropic-ratelimit-*（unified-reset
+  // を含む）を大小文字問わず全部落とす。残すと Claude Code がそのリセット時刻まで
+  // 無音で眠るため、除去は整形ではなく必須要件である（§3.3 と同じ事故）。
+  const headers = applyRecoveryWaitHeaders(
+    withoutBodyHeaders(response.headers),
+    decision.retryAfterSeconds,
+  );
+  headers['content-type'] = 'application/json';
+  headers['content-length'] = String(body.length);
+  return {
+    ...response,
+    statusCode: decision.status,
+    headers,
+    body,
+    degradeLog: { ...decision.meta },
+  };
 }
 
 /**
