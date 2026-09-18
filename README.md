@@ -14,6 +14,7 @@ npm レジストリでは配布していません（`package.json` は `"private
 
 ## 目次
 
+- [v0.3.0 の主な更新](#v030-の主な更新)
 - [v0.2.2 の主な更新](#v022-の主な更新)
 - [v0.2.1 の主な更新](#v021-の主な更新)
 - [v0.2.0 の主な更新](#v020-の主な更新)
@@ -37,6 +38,12 @@ npm レジストリでは配布していません（`package.json` は `"private
 - [安全設計](#安全設計)
 - [開発](#開発)
 - [English](#english)
+
+## v0.3.0 の主な更新
+
+- **各リクエストのキャッシュ観測**（#42）: 既存の proxy ログ行の末尾へ `enc=`（上流応答の content-encoding）・`usageParse=`（usage を数えられなかったときだけ、その理由）・`sid=`（セッションIDの12桁ハッシュ）などを追記します。あわせて、圧縮された上流応答を解凍せずに読んでいたため全アカウントで 0 のままだった usage 集計を修正しました（解析用の写しだけを解凍し、転送するバイト列と応答ヘッダには触れません）。
+- **セッション単位のアカウント固定**（#43）: 同じセッションのリクエストを同じアカウントへ送り続け、会話の途中でアカウントが変わることによる prompt cache の喪失を抑えます。`sessionAffinity.mode` は `off` / `observe` / `on` の3値で、**既定は `off`**（書かなければ従来どおりの動作）です。
+- **全アカウント枯渇時の終端応答が 503 から 529 へ**（#43）: `degradeMapping.enabled: true` のとき、全アカウントが使えずに終端する要求は、現在アカウントの資格情報の状態に関わらず必ず写像経路を通るようになりました。従来は資格情報の分岐が先にあり 503 を返していたため、529 を退避の合図にしている `fallbackModel` が働きませんでした（`degradeMapping` が無効なときは従来どおり 503 です）。
 
 ## v0.2.2 の主な更新
 
@@ -490,6 +497,7 @@ claude-rotator status
 動作の要点:
 
 - 単一アカウントの一時的な 429 は退避させません。529 へ写像するのは、アカウント台帳上そのモデル系列で使えるアカウントが1つも無いときだけです（アカウント未登録のときも写像しません）。
+- **全アカウントが使えずに終端する要求は、現在アカウントの資格情報の状態（認証失効・更新 cooldown）に関わらず必ずこの写像経路を通ります**（v0.3.0 での変更。v0.2.2 までは資格情報の分岐が先にあり、その場合だけ写像器を呼ばずに **503** を返していたため、529 を合図にしている `fallbackModel` の退避が働きませんでした）。写像が成立したときの終端は **529**（`bothUnusableStatus` が `403` なら 403、`recoveryWaitEnabled: true` なら 429）で、写像しないと決まったとき（`degradeMapping` が無効・台帳が全枯渇ではない）は従来どおり 503 です。
 - **本機能が生成する** 403 は、Claude 側の全枯渇と GPT 側の利用不可が同時に成立したときだけです。応答本文には、両者のうち最も早い回復見込み時刻を添えます。なお、ブリッジへの接続拒否・接続タイムアウト・アイドルタイムアウトは本機能とは無関係に従来どおり 403 を返します（`outcome` の値で区別できます）。
 - **GPT 側の認証が切れたときは止めずに退避させます。** ブリッジが契約ヘッダ付きで 403 を返し、その理由が「ログイン切れ」（`codex_needs_login`）または「資格情報を読めない」（`codex_credentials_unavailable`）のときだけ、claude-rotator は **529 へ書き換えて**返し、Claude Code を `fallbackModel` の次の要素（Opus 等）へ退避させます。作業を止めないためです。両方とも使えないときの停止は従来どおり `bothUnusableStatus`（既定 `403`）が決めます。契約ヘッダの無い 403、およびモデル未割り当て（`codex_no_account_for_model`）の 403 は、従来どおりそのまま返します。
 - Claude 側のアカウントの認証が切れたときは、`status` の口座カードに `reason: login expired - run: claude-rotator login --id <id>` と表示し、Routing availability では `unknown` ではなく `needs login` と表示します。
@@ -899,6 +907,7 @@ This package is not published to the npm registry (`package.json` sets `"private
 
 ### Table of Contents
 
+- [What's New in v0.3.0](#whats-new-in-v030)
 - [What's New in v0.2.2](#whats-new-in-v022)
 - [What's New in v0.2.1](#whats-new-in-v021)
 - [What's New in v0.2.0](#whats-new-in-v020)
@@ -920,6 +929,12 @@ This package is not published to the npm registry (`package.json` sets `"private
 - [Troubleshooting](#troubleshooting)
 - [Security Design](#security-design)
 - [Development](#development)
+
+### What's New in v0.3.0
+
+- **Per-request cache observability** (#42): The existing proxy log lines gain `enc=` (the content-encoding of the upstream response), `usageParse=` (why usage could not be counted, present only when it could not), `sid=` (a 12-hex-digit hash of the session ID), and related fields. This release also fixes usage aggregation that stayed at 0 for every account because compressed upstream responses were read without being decompressed (only an analysis copy is decompressed; the forwarded bytes and response headers are untouched).
+- **Per-session account pinning** (#43): Requests from the same session keep going to the same account, which limits the prompt-cache loss caused by switching accounts mid-conversation. `sessionAffinity.mode` takes `off` / `observe` / `on`, and **defaults to `off`** (omit it and behavior is unchanged).
+- **The all-accounts-exhausted terminal response moved from 503 to 529** (#43): With `degradeMapping.enabled: true`, a request that terminates because no account is usable now always goes through the mapping path, regardless of the current account's credential state. Previously the credential branch came first and returned 503, so the `fallbackModel` degradation that keys on 529 never fired (with `degradeMapping` disabled it is still 503, as before).
 
 ### What's New in v0.2.2
 
@@ -1404,6 +1419,7 @@ Configuration keys (the whole section may be omitted):
 How it behaves:
 
 - A temporary 429 from a single account never triggers a fallback. The 529 mapping applies only when the account ledger has no usable account left for that model family (and never when no account is registered).
+- **A request that terminates because no account is usable always goes through this mapping path, regardless of the current account's credential state** (an expired login or a refresh cooldown) — changed in v0.3.0, because through v0.2.2 the credential branch came first and returned **503** without ever calling the mapper, so the `fallbackModel` degradation that keys on 529 never fired. When the mapping applies, the terminal status is **529** (403 when `bothUnusableStatus` is `403`, 429 when `recoveryWaitEnabled` is `true`); when it does not apply (`degradeMapping` disabled, or the ledger is not fully exhausted), it is still 503 as before.
 - The 403 **produced by this feature** is returned only when the Claude side is fully exhausted *and* the GPT side is known to be unusable at the same time. The response body carries the earliest expected recovery time of the two. Independently of this feature, a refused connection, a connect timeout, or an idle timeout against the bridge still returns 403 exactly as before (the `outcome` value tells them apart).
 - **An expired GPT-side login degrades instead of stopping.** When the bridge answers 403 with contract headers and the reason is a signed-out pool (`codex_needs_login`) or unreadable credentials (`codex_credentials_unavailable`), claude-rotator **rewrites it to 529** so Claude Code falls back to the next entry of `fallbackModel` (for example `opus`) and the session keeps working. Stopping when neither side is usable is still governed by `bothUnusableStatus` (default `403`). A 403 without contract headers, and a `codex_no_account_for_model` 403, are forwarded unchanged as before.
 - When a Claude account's own login expires, the `status` account card prints `reason: login expired - run: claude-rotator login --id <id>` and Routing availability shows `needs login` instead of `unknown`.
