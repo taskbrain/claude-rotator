@@ -236,6 +236,9 @@ describe('createProxyServer', () => {
     assert.deepEqual(newAccount.usage, {
       totalInputTokens: 0,
       totalOutputTokens: 0,
+      totalCacheReadTokens: 0,
+      totalCacheCreation1hTokens: 0,
+      totalCacheCreation5mTokens: 0,
       totalRequests: 0,
       lastUsed: null,
     });
@@ -10380,6 +10383,11 @@ describe('写像フィールドを既存の proxy ログ行へ併記する (R4-5
         upstream: upstreamUrl,
         usagePolling: { enabled: false },
         openaiBridge: { ...bridge, ...(degradeMapping ? { degradeMapping } : {}) },
+        // この describe が固定しているのは「degradeMapping が proxy 行を変えないこと」であって、
+        // キャッシュ観測の追記ではない。観測は既定 on（U-3）なので、明示的に切って
+        // degradeMapping だけを見る。観測を on にした行の形は
+        // describe('cache observability') と test/invariance.test.js が固定する。
+        observability: { requestLog: { enabled: false } },
       },
       currentCredentialReader: async () => null,
       logger: line => logLines.push(line),
@@ -11219,6 +11227,12 @@ describe('session affinity wiring (R-S7)', () => {
         upstream: upstream.url,
         usagePolling: { enabled: false },
         ...(sessionAffinity ? { sessionAffinity } : {}),
+        // この describe が固定しているのは sticky の追記（sid=/aff=/fam=）と `mode:"off"` で
+        // 行が現行のままであることで、キャッシュ観測の追記ではない。観測は既定 on（U-3）で
+        // 同じ行の**さらに末尾**へ足すので、ここは明示的に切って affinity だけを見る。
+        // 観測を on にした行の形は describe('cache observability') と
+        // test/invariance.test.js が固定する。
+        observability: { requestLog: { enabled: false } },
       },
     }));
     cleanupAfterTest(async () => { await close(proxy.server); await close(upstream.server); });
@@ -12570,6 +12584,10 @@ describe('session affinity persistence and reload (R-S11)', () => {
         upstream: upstream.url,
         usagePolling: { enabled: false },
         ...(sessionAffinity ? { sessionAffinity } : {}),
+        // reload で `mode:"off"` へ戻したとき proxy 行が現行の形へ帰ることを見る describe。
+        // キャッシュ観測（既定 on・U-3）は同じ行のさらに末尾へ足すので、ここは明示的に
+        // 切って affinity の追記だけを見る（観測側の形は describe('cache observability')）。
+        observability: { requestLog: { enabled: false } },
       },
     }));
     cleanupAfterTest(async () => { await close(proxy.server); await close(upstream.server); });
@@ -13508,5 +13526,340 @@ describe('session affinity cold reassign (R-S18 / 設計書 v1.7 P-b)', () => {
 
     assert.deepEqual(seen, ['Bearer token-acct_a', 'Bearer token-acct_a']);
     assert.deepEqual(eventLines(logLines, 'affinity_switch'), []);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// キャッシュ観測（計画書 Task 1 Step 6・Task 2）
+//
+// 偽上流はすべて listen(0, '127.0.0.1')。実サービス・実 API・稼働中 rotator へは
+// 到達しない（~/.claude/rules/02-verification.md §3）。
+// fixture のセッション id は本ファイルで作った合成値である。
+// ---------------------------------------------------------------------------
+
+const OBSERVED_SSE = [
+  'event: message_start',
+  'data: ' + JSON.stringify({
+    type: 'message_start',
+    message: {
+      model: 'claude-opus-5-1',
+      usage: {
+        input_tokens: 10,
+        cache_read_input_tokens: 99000,
+        cache_creation_input_tokens: 1500,
+        cache_creation: { ephemeral_1h_input_tokens: 1500, ephemeral_5m_input_tokens: 0 },
+      },
+    },
+  }),
+  '',
+  'event: message_delta',
+  'data: ' + JSON.stringify({ type: 'message_delta', usage: { output_tokens: 20 } }),
+  '',
+  '',
+].join('\n');
+
+const QUOTA_HEADERS = {
+  'anthropic-ratelimit-unified-5h-utilization': '0.76',
+  'anthropic-ratelimit-unified-7d-utilization': '0.33',
+  'anthropic-ratelimit-unified-5h-reset': '1789012345',
+  'anthropic-ratelimit-unified-7d-reset': '1789098765',
+};
+
+async function startObservabilityProxy({ upstreamHandler, observability, logLines = [] }) {
+  const upstreamSeen = [];
+  const upstream = await listen(http.createServer((req, res) => {
+    upstreamSeen.push({ acceptEncoding: req.headers['accept-encoding'] });
+    upstreamHandler(req, res);
+  }));
+  const secretStore = new MemorySecretStore();
+  await secretStore.set('acct_1', { accessToken: 'access-token-1' });
+  const accountManager = new AccountManager({
+    accounts: [{ id: 'acct_1', name: 'a@example.com', type: 'oauth' }],
+    now: () => 1000,
+  });
+  const proxy = await listen(createProxyServer({
+    accountManager,
+    secretStore,
+    config: { upstream: upstream.url, ...(observability === undefined ? {} : { observability }) },
+    logger: line => logLines.push(line),
+  }));
+  cleanupAfterTest(async () => {
+    await close(proxy.server);
+    await close(upstream.server);
+  });
+  return { proxy, accountManager, logLines, upstreamSeen };
+}
+
+function proxyLine(logLines) {
+  return logLines.find(line => line.includes(' proxy '));
+}
+
+// 圧縮された応答を受け取るので、本文を JSON として解釈しない生のクライアント。
+// listen(0, '127.0.0.1') の偽上流としか話さない。
+function requestRaw(url, { method = 'POST', body = null, headers = {} } = {}) {
+  return new Promise((resolve, reject) => {
+    const target = new URL(url);
+    const req = http.request({
+      hostname: target.hostname,
+      port: target.port,
+      path: target.pathname,
+      method,
+      headers: { 'content-type': 'application/json', ...headers },
+    }, res => {
+      const chunks = [];
+      res.on('data', chunk => chunks.push(chunk));
+      res.on('end', () => resolve({ status: res.statusCode, headers: res.headers, body: Buffer.concat(chunks) }));
+    });
+    req.on('error', reject);
+    if (body) req.write(body);
+    req.end();
+  });
+}
+
+describe('cache observability', () => {
+  it('gzip で圧縮された SSE からも usage を集計する（現行は 0 件で終わる欠陥）', async () => {
+    const zlib = await import('node:zlib');
+    const { proxy, accountManager } = await startObservabilityProxy({
+      upstreamHandler: (req, res) => {
+        res.writeHead(200, {
+          'Content-Type': 'text/event-stream',
+          'Content-Encoding': 'gzip',
+          ...QUOTA_HEADERS,
+        });
+        res.end(zlib.gzipSync(Buffer.from(OBSERVED_SSE, 'utf8')));
+      },
+    });
+
+    const response = await requestRaw(`${proxy.url}/v1/messages`, {
+      method: 'POST',
+      body: JSON.stringify({ model: 'claude-opus-5-1' }),
+    });
+    assert.equal(response.status, 200);
+
+    const { usage } = accountManager.getStatus().accounts[0];
+    assert.equal(usage.totalCacheReadTokens, 99000);
+    assert.equal(usage.totalCacheCreation1hTokens, 1500);
+    assert.equal(usage.totalCacheCreation5mTokens, 0);
+    assert.equal(usage.totalInputTokens, 10);
+    assert.equal(usage.totalOutputTokens, 20);
+  });
+
+  it('1要求で totalRequests が 1 だけ増える（旧実装はストリームで 2 増えた）', async () => {
+    const { proxy, accountManager } = await startObservabilityProxy({
+      upstreamHandler: (req, res) => {
+        res.writeHead(200, { 'Content-Type': 'text/event-stream' });
+        res.end(OBSERVED_SSE);
+      },
+    });
+
+    await requestRaw(`${proxy.url}/v1/messages`, {
+      method: 'POST', body: JSON.stringify({ model: 'claude-opus-5-1' }),
+    });
+    assert.equal(accountManager.getStatus().accounts[0].usage.totalRequests, 1);
+  });
+
+  it('usage が読めなかった要求は totalRequests に数えない', async () => {
+    const { proxy, accountManager, logLines } = await startObservabilityProxy({
+      upstreamHandler: (req, res) => {
+        // 解けない符号化。解析は unsupported-encoding で観測可能に落ちる。
+        res.writeHead(200, { 'Content-Type': 'text/event-stream', 'Content-Encoding': 'snappy' });
+        res.end(OBSERVED_SSE);
+      },
+    });
+
+    await requestRaw(`${proxy.url}/v1/messages`, {
+      method: 'POST', body: JSON.stringify({ model: 'claude-opus-5-1' }),
+    });
+    const { usage } = accountManager.getStatus().accounts[0];
+    assert.equal(usage.totalRequests, 0);
+    assert.equal(usage.totalCacheReadTokens, 0);
+    assert.match(proxyLine(logLines), / enc=snappy usageParse=unsupported-encoding$/);
+  });
+
+  it('proxy 行の末尾へ計画書の順序で観測を追記する', async () => {
+    const zlib = await import('node:zlib');
+    const { proxy, logLines } = await startObservabilityProxy({
+      upstreamHandler: (req, res) => {
+        res.writeHead(200, {
+          'Content-Type': 'text/event-stream',
+          'Content-Encoding': 'gzip',
+          ...QUOTA_HEADERS,
+        });
+        res.end(zlib.gzipSync(Buffer.from(OBSERVED_SSE, 'utf8')));
+      },
+    });
+
+    await requestRaw(`${proxy.url}/v1/messages`, {
+      method: 'POST',
+      body: JSON.stringify({ model: 'claude-opus-5-1' }),
+      headers: { 'x-claude-code-session-id': 'synthetic-session-0001' },
+    });
+
+    assert.match(
+      proxyLine(logLines),
+      / model=claude-opus-5-1 sid=[0-9a-f]{12} in=10 out=20 cr=99000 cc=1500 c1h=1500 c5m=0 u5h=0\.76 u5hReset=1789012345 u7d=0\.33 u7dReset=1789098765 enc=gzip$/,
+    );
+    // 生のセッション id はどこにも出さない。
+    assert.ok(!logLines.join('\n').includes('synthetic-session-0001'));
+  });
+
+  it('セッションヘッダの無い要求では sid=- になる（付与率の測定）', async () => {
+    const { proxy, logLines } = await startObservabilityProxy({
+      upstreamHandler: (req, res) => {
+        res.writeHead(200, { 'Content-Type': 'text/event-stream' });
+        res.end(OBSERVED_SSE);
+      },
+    });
+
+    await requestRaw(`${proxy.url}/v1/messages`, {
+      method: 'POST', body: JSON.stringify({ model: 'claude-opus-5-1' }),
+    });
+    assert.match(proxyLine(logLines), / sid=- /);
+  });
+
+  it('requestLog.enabled=false のとき proxy 行は現行と同じ形へ戻るが usage 集計は続く', async () => {
+    const zlib = await import('node:zlib');
+    const { proxy, accountManager, logLines } = await startObservabilityProxy({
+      observability: { requestLog: { enabled: false } },
+      upstreamHandler: (req, res) => {
+        res.writeHead(200, { 'Content-Type': 'text/event-stream', 'Content-Encoding': 'gzip', ...QUOTA_HEADERS });
+        res.end(zlib.gzipSync(Buffer.from(OBSERVED_SSE, 'utf8')));
+      },
+    });
+
+    await requestRaw(`${proxy.url}/v1/messages`, {
+      method: 'POST', body: JSON.stringify({ model: 'claude-opus-5-1' }),
+    });
+
+    const line = proxyLine(logLines);
+    assert.ok(!line.includes(' model='), line);
+    assert.ok(!line.includes(' sid='), line);
+    assert.ok(!line.includes(' enc='), line);
+    assert.match(line, /outcome=ok$/);
+    // 観測の無効化は集計まで止めない（欠陥修正そのものは設定に従属させない）。
+    assert.equal(accountManager.getStatus().accounts[0].usage.totalCacheReadTokens, 99000);
+  });
+
+  it('解けない符号化を上流向けの accept-encoding から落とす', async () => {
+    const { proxy, upstreamSeen } = await startObservabilityProxy({
+      upstreamHandler: (req, res) => {
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ usage: { input_tokens: 1, output_tokens: 1 } }));
+      },
+    });
+
+    await requestRaw(`${proxy.url}/v1/messages`, {
+      method: 'POST',
+      body: JSON.stringify({ model: 'claude-opus-5-1' }),
+      // Task 1 Step 0 で実測した Claude Code 2.1.275 の実際の値。
+      headers: { 'accept-encoding': 'gzip, deflate, br, zstd' },
+    });
+
+    const zstdDecodable = typeof (await import('node:zlib')).default.zstdDecompress === 'function';
+    assert.equal(upstreamSeen[0].acceptEncoding, zstdDecodable ? 'gzip, deflate, br, zstd' : 'gzip, deflate, br');
+  });
+
+  it('dropUndecodableAcceptEncoding=false なら accept-encoding を素通しする', async () => {
+    const { proxy, upstreamSeen } = await startObservabilityProxy({
+      observability: { upstream: { dropUndecodableAcceptEncoding: false } },
+      upstreamHandler: (req, res) => {
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ usage: { input_tokens: 1, output_tokens: 1 } }));
+      },
+    });
+
+    await requestRaw(`${proxy.url}/v1/messages`, {
+      method: 'POST',
+      body: JSON.stringify({ model: 'claude-opus-5-1' }),
+      headers: { 'accept-encoding': 'gzip, deflate, br, zstd' },
+    });
+    assert.equal(upstreamSeen[0].acceptEncoding, 'gzip, deflate, br, zstd');
+  });
+});
+
+describe('cache observability の reload', () => {
+  async function startReloadProxy({ observability, nextObservability }) {
+    const logLines = [];
+    const upstream = await listen(http.createServer((req, res) => {
+      res.writeHead(200, { 'Content-Type': 'application/json', ...QUOTA_HEADERS });
+      res.end(JSON.stringify({ model: 'claude-opus-5-1', usage: { input_tokens: 10, output_tokens: 20 } }));
+    }));
+    const secretStore = new MemorySecretStore();
+    await secretStore.set('acct_1', { accessToken: 'access-token-1' });
+    const accountManager = new AccountManager({
+      accounts: [{ id: 'acct_1', type: 'oauth' }],
+      now: () => 1000,
+    });
+    const proxy = await listen(createProxyServer({
+      accountManager,
+      secretStore,
+      config: { upstream: upstream.url, usagePolling: { enabled: false }, observability },
+      currentCredentialReader: async () => null,
+      reloadObservability: async () => nextObservability,
+      logger: line => logLines.push(line),
+    }));
+    cleanupAfterTest(async () => {
+      await close(proxy.server);
+      await close(upstream.server);
+    });
+    return { proxy, logLines };
+  }
+
+  const ask = proxy => requestRaw(`${proxy.url}/v1/messages`, {
+    method: 'POST', body: JSON.stringify({ model: 'claude-opus-5-1' }),
+  });
+  const proxyLinesOf = logLines => logLines.filter(line => line.includes(' proxy '));
+
+  it('reload で observability セクションを消すと既定（on）へ戻る', async () => {
+    const { proxy, logLines } = await startReloadProxy({
+      observability: { requestLog: { enabled: false } },
+      nextObservability: undefined,
+    });
+
+    await ask(proxy);
+    assert.ok(!proxyLinesOf(logLines).at(-1).includes(' model='), '起動時は無効');
+
+    assert.equal((await requestJson(`${proxy.url}/internal/reload`, { method: 'POST' })).status, 200);
+    await ask(proxy);
+    assert.match(proxyLinesOf(logLines).at(-1), / model=claude-opus-5-1 sid=- in=10 out=20 /);
+  });
+
+  it('reload で無効化すると行が現行の形へ戻る', async () => {
+    const { proxy, logLines } = await startReloadProxy({
+      observability: undefined,
+      nextObservability: { requestLog: { enabled: false } },
+    });
+
+    await ask(proxy);
+    assert.match(proxyLinesOf(logLines).at(-1), / model=claude-opus-5-1 /, '起動時は既定 on');
+
+    assert.equal((await requestJson(`${proxy.url}/internal/reload`, { method: 'POST' })).status, 200);
+    await ask(proxy);
+    assert.match(proxyLinesOf(logLines).at(-1), /outcome=ok$/);
+  });
+
+  it('reload の値にもクランプが効く（毎回 normalizeObservability を通し直す）', async () => {
+    const { proxy, logLines } = await startReloadProxy({
+      observability: undefined,
+      // maxBodyBytes を 1 にしても 1 MiB へクランプされるので too-large にはならない。
+      nextObservability: { requestLog: { maxBodyBytes: 1 } },
+    });
+
+    assert.equal((await requestJson(`${proxy.url}/internal/reload`, { method: 'POST' })).status, 200);
+    await ask(proxy);
+    const line = proxyLinesOf(logLines).at(-1);
+    assert.ok(!line.includes('usageParse=too-large'), line);
+    assert.match(line, / in=10 out=20 /);
+  });
+
+  it('reload を2回叩いても行は増えない', async () => {
+    const { proxy, logLines } = await startReloadProxy({
+      observability: undefined,
+      nextObservability: { requestLog: { enabled: true } },
+    });
+    await requestJson(`${proxy.url}/internal/reload`, { method: 'POST' });
+    const after = logLines.length;
+    await requestJson(`${proxy.url}/internal/reload`, { method: 'POST' });
+    assert.equal(logLines.length, after, 'reload 自体は observability の行を出さない');
   });
 });

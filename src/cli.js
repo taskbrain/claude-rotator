@@ -21,6 +21,7 @@ import {
 } from './config.js';
 import { createProxyServer, defaultTokenRefresher } from './proxy-server.js';
 import { createServerLogWriter } from './log-rotation.js';
+import { normalizeObservability } from './usage-observation.js';
 import {
   createSecretStore,
   duplicateRefreshTokenAccountIds,
@@ -315,6 +316,19 @@ function refreshUsageWarning(account) {
   return 'unknown refresh error';
 }
 
+/**
+ * server.log の writer へ渡す引数を作る。
+ *
+ * `logMaxBytes` は `POST /internal/reload` では効かない。`createServerLogWriter()` は
+ * 起動時に fd を開くので、変更には再起動が必要である（README に明記）。
+ *
+ * @param {object} config `loadOrCreateConfig()` の戻り値。
+ * @param {string} logPath server.log の絶対パス。
+ */
+export function serverLogWriterOptions(config, logPath) {
+  return { logPath, maxBytes: normalizeObservability(config?.observability).logMaxBytes };
+}
+
 export function helpText() {
   return `Usage:
   claude-rotator install [--no-start] [--force]
@@ -359,7 +373,7 @@ async function runServer({ write }) {
   // Built before the AccountManager so that every account switch — including
   // one that happens while the server is still coming up — reaches the log.
   const logPath = join(dirname(getConfigPath()), 'server.log');
-  const logWriter = process.stdout.isTTY ? null : createServerLogWriter({ logPath });
+  const logWriter = process.stdout.isTTY ? null : createServerLogWriter(serverLogWriterOptions(config, logPath));
   const logger = line => {
     if (logWriter) logWriter.write(line);
     else write(`${line}\n`);
@@ -400,6 +414,8 @@ async function runServer({ write }) {
     },
     reloadOpenAiBridge: () => loadConfig().then(nextConfig => nextConfig?.openaiBridge),
     reloadSessionAffinity: () => loadConfig().then(nextConfig => nextConfig?.sessionAffinity),
+    // logMaxBytes だけは reload では効かない（fd は起動時に開くため。README に明記）。
+    reloadObservability: () => loadConfig().then(nextConfig => nextConfig?.observability),
     logger,
     savedState,
     credentialChangedAccountIds,

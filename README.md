@@ -29,6 +29,7 @@ npm レジストリでは配布していません（`package.json` は `"private
 - [設定ファイルと環境変数](#設定ファイルと環境変数)
   - [セッション単位のアカウント固定（sessionAffinity）](#セッション単位のアカウント固定sessionaffinity)
 - [ログと切り替え診断](#ログと切り替え診断)
+  - [キャッシュ観測（`observability`）](#キャッシュ観測observability)
 - [主なコマンド](#主なコマンド)
 - [アップデート](#アップデート)
 - [アンインストール](#アンインストール)
@@ -413,6 +414,8 @@ claude-rotator status
 
 既定の `config.json` は次のとおりです（初回起動時に自動生成されます）。
 
+なお `observability` セクションは既定の `config.json` には書き出されません。未指定のときは既定値（キャッシュ観測 有効・`logMaxBytes` 32 MiB）で動きます。変更したい場合だけ手で足してください（→ [キャッシュ観測（`observability`）](#キャッシュ観測observability)）。
+
 ```json
 {
   "proxy": {
@@ -579,6 +582,66 @@ claude-rotator status
 ```
 
 常駐 server の file log の確認方法は [トラブルシュート](#トラブルシュート) を参照してください。
+
+### キャッシュ観測（`observability`）
+
+各 proxy request のトークン内訳・モデル・セッション指紋・枠の使用率を、**既存の `proxy` 行の末尾へ追記**します。新しい行種別は増えません。既定で有効です。
+
+```text
+… outcome=ok model=claude-opus-5-1 sid=ab12cd34ef56 in=10 out=20 cr=99000 cc=1500 c1h=1500 c5m=0 u5h=0.76 u5hReset=1789012345 u7d=0.33 u7dReset=1789098765 enc=gzip
+```
+
+| フィールド | 意味 |
+| --- | --- |
+| `model` | 上流の**応答**が名乗ったモデル ID。要求本文は読みません。 |
+| `sid` | セッション id の SHA-256 の先頭 12 桁。**生の id は出しません。** 鍵が無い要求は `sid=-`。 |
+| `in` / `out` | `input_tokens` / `output_tokens`。 |
+| `cr` | `cache_read_input_tokens`（キャッシュから読めたぶん）。 |
+| `cc` | `cache_creation_input_tokens`（キャッシュを作ったぶんの合計）。 |
+| `c1h` / `c5m` | `cache_creation.ephemeral_1h_input_tokens` / `ephemeral_5m_input_tokens`。 |
+| `u5h` / `u7d` | 5時間枠 / 7日枠の使用率（0〜1）。応答ヘッダ由来。 |
+| `u5hReset` / `u7dReset` | 各枠の reset 時刻（エポック秒）。 |
+| `enc` | 上流応答の `content-encoding`（`gzip` / `br` / `deflate` / 無圧縮は `-`）。 |
+| `usageParse` | **usage を数えられなかったときだけ**出ます。`ok` のときは出ません。 |
+
+`usageParse` の値は `unsupported-encoding`（この Node では解けない符号化）、`too-large`（`maxBodyBytes` 超）、`unparsable`（JSON でも SSE でもない）、`no-usage`（429 / 401 など usage を含まない応答）です。**黙って 0 件にせず、必ず理由が行に残ります。**
+
+値が無いところは `-` になります。`totalRequests` は **usage を読めた応答だけ**を 1 件として数えます（読めなかった件数は `usageParse=` の分布から数えてください）。
+
+#### 設定
+
+```json
+{
+  "observability": {
+    "requestLog": { "enabled": true, "sessionFromBody": false, "maxBodyBytes": 16777216 },
+    "upstream": { "dropUndecodableAcceptEncoding": true },
+    "logMaxBytes": 33554432
+  }
+}
+```
+
+- `requestLog.enabled`（既定 `true`）: 追記の有無。`false` にすると `proxy` 行は追記が1バイトも無い従来の形へ戻ります。**usage の集計そのものはこの設定に関係なく動きます。**
+- `requestLog.sessionFromBody`（既定 `false`）: `x-claude-code-session-id` ヘッダが無いときに、要求本文の `metadata.user_id` から session id を拾うかどうか。要求ごとに JSON 解析が1回増えるので、既定では行いません。
+- `requestLog.maxBodyBytes`（既定 16 MiB・1 MiB〜64 MiB）: 解析する応答本文の上限。超えた応答は `usageParse=too-large` になります。
+- `upstream.dropUndecodableAcceptEncoding`（既定 `true`）: 下の「圧縮応答の扱い」を参照。
+- `logMaxBytes`（既定 32 MiB・1 MiB〜256 MiB）: `server.log` のローテーション閾値。
+
+`requestLog` と `upstream` の各キーは `POST /internal/reload`（`claude-rotator` の reload 経路）で即座に反映されます。**`logMaxBytes` だけは reload では反映されません。** `server.log` の file descriptor は server 起動時に開くため、変更するには server の再起動が必要です。
+
+追記により `proxy` 行はおよそ 1.9 倍（約 182 バイト → 約 346 バイト）になります。既定の `logMaxBytes` 32 MiB は、これを見込んだ値です。2 世代（`server.log` と `server.log.1`）で約 64 MiB ＝ 実測 45,000 行/日 のとき**約 4.1 日**ぶんが残ります（10 MiB のままだと約 1.3 日へ縮みます）。
+
+#### 圧縮応答の扱い
+
+Claude Code は `accept-encoding: gzip, deflate, br, zstd` を送ります。上流が圧縮して返した応答は、**解析用の写しだけを解凍**して usage を読みます。クライアントへ転送するバイト列と応答ヘッダには一切手を触れません。
+
+`zstd` は Node 22.15 以降にしか解凍 API がありません。それ未満の Node で動かしている場合、`upstream.dropUndecodableAcceptEncoding` が `true` のあいだは、**上流へ送る `accept-encoding` から `zstd` だけを落として** `gzip, deflate, br` を送ります。これが要求ヘッダに手を加える唯一の箇所です。`false` にすると要求ヘッダは完全な素通しに戻りますが、上流が `zstd` で返した応答は `usageParse=unsupported-encoding` になり、その要求の usage は数えられません。
+
+#### 切り戻し
+
+1. `observability.requestLog.enabled` を `false` にして reload する。`proxy` 行が従来の形に戻ります。
+2. それでも戻したい場合は、旧バージョンの実体へ戻して server を再起動する。`logMaxBytes` の変更もこの再起動で元に戻ります。
+
+なお、アカウント切り替えの `account_switch` 行は別機能（session affinity 側）が出しています。ここでは扱いません。
 
 proxy request ログに出るのは `account`、`method`、`path`、`status`、`durationMs`、`outcome`、`requestId`、timeout/network error 時の `errorType` だけです。内部 proxy error は `proxy-error method=... path=... error=...` として短い原因を出します。token / Authorization header / API key / request body / response body は出しません。
 

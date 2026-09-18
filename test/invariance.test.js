@@ -533,6 +533,99 @@ describe('codex-rotator-absent-is-harmless (設計書 §14.2)', () => {
 });
 
 // ---------------------------------------------------------------------------
+// 6. observability-disabled-is-byte-identical / no-raw-session-id
+//
+// 計画書 Task 5。固定するのは次の3点である。
+//
+//   (a) `observability.requestLog.enabled:false` のとき、`proxy` 行が 6baf211 の形と
+//       完全に一致する（追記フィールドが1つも出ない）。
+//   (b) 既定（未指定＝on・U-3）のときは、行の**先頭部分が (a) とバイト単位で同一**で、
+//       観測は末尾に足されているだけである。本文も応答ヘッダも変わらない。
+//   (c) 生のセッション id が、ログ行にも `exportState()` の実バイト列にも現れない。
+//       検出力があることを positive control（わざと生値を流した文字列）で確かめる。
+//
+// **注意**: 「未指定なら行がバイト同一」ではない。U-3 の即決で既定を on にしたので、
+// 未指定の構成では行が伸びる。バイト同一が成り立つのは明示的に無効化したときである。
+// ---------------------------------------------------------------------------
+
+// 6baf211 時点の proxy 行の形。追記フィールドが1つも無いことを見ている。
+const LEGACY_PROXY_LINE_6BAF211 = /^\d{4}-\d{2}-\d{2}T[\d:.]+Z proxy account=\S+ method=\S+ path=\S+ status=\S+ durationMs=\d+ outcome=[a-z-]+(?: requestId=\S+)?(?: errorType=\S+)?$/;
+
+// 合成のセッション id。実在の値ではない。
+const SYNTHETIC_SESSION_ID = 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee';
+
+describe('observability-disabled-is-byte-identical (計画書 Task 5)', () => {
+  async function exercise(observability) {
+    const logLines = [];
+    const upstream = await startAnthropicUpstream();
+    cleanupAfterTest(async () => upstream.close());
+    const accountManager = new AccountManager({
+      accounts: [{ id: 'acct_1', name: 'user-a@example.com', type: 'oauth' }],
+      now: () => 1000,
+    });
+    const proxy = await startProxy({ accountManager, logLines, upstream: upstream.url, observability });
+    const response = await requestJson(`${proxy.url}/v1/messages`, {
+      method: 'POST',
+      body: JSON.stringify({ model: 'claude-opus-5-1' }),
+      headers: { 'x-claude-code-session-id': SYNTHETIC_SESSION_ID },
+    });
+    return {
+      response,
+      accountManager,
+      proxyLines: logLines.filter(line => line.includes(' proxy ')),
+      logLines,
+    };
+  }
+
+  it('enabled:false では proxy 行が 6baf211 の形と完全に一致する', async () => {
+    const disabled = await exercise({ requestLog: { enabled: false } });
+    assert.ok(disabled.proxyLines.length > 0, '比較対象の行が実際に出ている（空振り防止）');
+    for (const line of disabled.proxyLines) assert.match(line, LEGACY_PROXY_LINE_6BAF211);
+  });
+
+  it('既定（on）は同じ行の末尾へ足すだけで、前半はバイト単位で同一', async () => {
+    const disabled = await exercise({ requestLog: { enabled: false } });
+    const enabled = await exercise(undefined);
+
+    assert.equal(disabled.proxyLines.length, enabled.proxyLines.length);
+    // durationMs だけは実測値なので走ごとに変わる（時刻は now を固定してあるので動かない）。
+    // 桁数の違いで前半の長さがずれると比較が意味を失うため、既存の normalizeLogLines と
+    // 同じ規則でここだけ正規化してから突き合わせる。
+    const normalize = line => line.replace(/durationMs=\d+/, 'durationMs=<n>');
+    for (const [index, rawLine] of enabled.proxyLines.entries()) {
+      const legacy = normalize(disabled.proxyLines[index]);
+      const line = normalize(rawLine);
+      const appendix = line.slice(legacy.length);
+      assert.equal(
+        line.slice(0, legacy.length),
+        legacy,
+        '観測は末尾に足すだけで、既存フィールドを1バイトも書き換えない',
+      );
+      assert.match(appendix, /^ model=\S+ sid=[0-9a-f]{12} in=\d+ out=\d+ cr=\d+ cc=\d+ c1h=\d+ c5m=\d+ /);
+    }
+
+    // 応答そのものは両構成で完全に一致する（本文を書き換えていないこと）。
+    assert.equal(enabled.response.status, disabled.response.status);
+    assert.deepEqual(enabled.response.body, disabled.response.body);
+  });
+
+  it('生のセッション id をログにも runtime-state にも出さない', async () => {
+    const enabled = await exercise(undefined);
+
+    const logText = enabled.logLines.join('\n');
+    assert.ok(logText.includes(' sid='), 'sid= が実際に出ている（空振り防止）');
+    assert.ok(!logText.includes(SYNTHETIC_SESSION_ID), 'ログに生のセッション id を出さない');
+
+    const stateBytes = JSON.stringify(enabled.accountManager.exportState());
+    assert.ok(!stateBytes.includes(SYNTHETIC_SESSION_ID), '状態ファイルにも生の id を出さない');
+
+    // positive control: 同じ走査が、生値を含む文字列は必ず捕まえること。
+    const poisoned = `${logText}\n2026-09-18T00:00:00.000Z proxy sid=${SYNTHETIC_SESSION_ID}`;
+    assert.ok(poisoned.includes(SYNTHETIC_SESSION_ID), '走査に検出力があること');
+  });
+});
+
+// ---------------------------------------------------------------------------
 // 5. no-identifier-in-degrade-logs
 //
 // 設計書 §13.1 CR-I: 画面出力以外の経路（ログ行・ヘッダ）に個人を特定できる識別子を
@@ -945,6 +1038,7 @@ async function startProxy({
   logLines = null,
   upstream = 'http://127.0.0.1:1',
   openaiBridge = undefined,
+  observability = undefined,
 } = {}) {
   const store = secretStore || new MemorySecretStore();
   if (!secretStore) await store.set('acct_1', { accessToken: 'access-token-1' });
@@ -958,6 +1052,7 @@ async function startProxy({
       upstream,
       usagePolling: { enabled: false },
       ...(openaiBridge ? { openaiBridge } : {}),
+      ...(observability === undefined ? {} : { observability }),
     },
     logger: logLines ? line => logLines.push(line) : null,
   }));
@@ -1263,6 +1358,12 @@ async function startStickyProxy({
       // 未記載構成では `sessionAffinity` というキー自体を置かない。
       ...(sessionAffinity === undefined ? {} : { sessionAffinity }),
       ...(openaiBridge ? { openaiBridge } : {}),
+      // ここで固定したいのは `sessionAffinity` 由来の差だけである。キャッシュ観測は
+      // 既定 on（U-3）で proxy 行の末尾へ `model=`／`sid=`／`in=` … を足すので、
+      // 切らないと (a) の「追記が1つも無い」が観測側の `sid=` で破れる。観測を on に
+      // した行の形と、観測を切った行が 6baf211 と一致することは
+      // describe('observability-disabled-is-byte-identical') が別に固定している。
+      observability: { requestLog: { enabled: false } },
     },
   }));
   cleanupAfterTest(async () => close(proxy.server));
