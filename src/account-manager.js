@@ -160,11 +160,30 @@ export class AccountManager {
     this.refreshQuotaState(account);
   }
 
-  updateUsage(accountId, { inputTokens = 0, outputTokens = 0 } = {}) {
+  /**
+   * 1応答ぶんの usage を積む。
+   *
+   * `countRequest` は**usage を実際に読めたときだけ**真にすること（呼び出し側で
+   * `parseUsageObservation()` の `parse === 'ok'` を判定する）。旧実装はストリーム応答で
+   * `message_start` と `message_delta` の2回呼ばれ、1要求で `totalRequests` が 2 増えていた。
+   * 「1応答＝1件」に直すため、件数の計上を引数で明示的に受け取る形にした。
+   * 読めなかった要求の件数は `server.log` の `usageParse=` の分布から数える。
+   */
+  updateUsage(accountId, {
+    inputTokens = 0,
+    outputTokens = 0,
+    cacheReadTokens = 0,
+    cacheCreation1hTokens = 0,
+    cacheCreation5mTokens = 0,
+    countRequest = false,
+  } = {}) {
     const account = this.find(accountId);
     account.usage.totalInputTokens += inputTokens;
     account.usage.totalOutputTokens += outputTokens;
-    account.usage.totalRequests += 1;
+    account.usage.totalCacheReadTokens += cacheReadTokens;
+    account.usage.totalCacheCreation1hTokens += cacheCreation1hTokens;
+    account.usage.totalCacheCreation5mTokens += cacheCreation5mTokens;
+    if (countRequest) account.usage.totalRequests += 1;
     account.usage.lastUsed = new Date(this.now()).toISOString();
   }
 
@@ -899,6 +918,11 @@ function emptyAccountUsage() {
   return {
     totalInputTokens: 0,
     totalOutputTokens: 0,
+    // キャッシュ4分類のうち集計するのは3つ。`cache_creation_input_tokens`（合計）は
+    // 1h と 5m の和なので状態には持たず、要求単位の `cc=` だけをログへ出す。
+    totalCacheReadTokens: 0,
+    totalCacheCreation1hTokens: 0,
+    totalCacheCreation5mTokens: 0,
     totalRequests: 0,
     lastUsed: null,
   };
@@ -1309,6 +1333,10 @@ function restoreUsage(value) {
   return {
     totalInputTokens: restoreNumber(value?.totalInputTokens),
     totalOutputTokens: restoreNumber(value?.totalOutputTokens),
+    // 3キーを持たない旧い runtime-state.json でも restoreNumber が 0 を返すだけで壊れない。
+    totalCacheReadTokens: restoreNumber(value?.totalCacheReadTokens),
+    totalCacheCreation1hTokens: restoreNumber(value?.totalCacheCreation1hTokens),
+    totalCacheCreation5mTokens: restoreNumber(value?.totalCacheCreation5mTokens),
     totalRequests: restoreNumber(value?.totalRequests),
     lastUsed: typeof value?.lastUsed === 'string' ? value.lastUsed : null,
   };

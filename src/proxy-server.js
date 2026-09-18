@@ -26,6 +26,14 @@ import {
 import { createNativeClaudeRefresher } from './native-claude-refresher.js';
 import { isFableScopeIdentity, parseRateLimitHeaders } from './quota.js';
 import { duplicateRefreshTokenAccountIds } from './secret-store.js';
+import { sessionKeyFrom, sidHash } from './session-key.js';
+import {
+  DEFAULT_OBSERVABILITY,
+  normalizeObservability,
+  observationLogFields,
+  parseUsageObservation,
+  upstreamAcceptEncoding,
+} from './usage-observation.js';
 import {
   buildBridgeLogMeta,
   claudeAllUnusable,
@@ -78,6 +86,7 @@ export function createProxyServer({
   config,
   reloadAccounts = null,
   reloadOpenAiBridge = null,
+  reloadObservability = null,
   allowLiveClaudeCodeCredentials = true,
   tokenRefresher = null,
   currentCredentialReader = readCurrentClaudeCredentials,
@@ -250,6 +259,9 @@ export function createProxyServer({
   // openaiBridge の設定解決結果はここでキャッシュする（起動時に1回、以後は
   // POST /internal/reload のときだけ再計算する）。毎リクエスト resolveOpenAiBridgeSettings()
   // を呼び直すと正規表現の再コンパイルとログの洪水を招く。
+  // キャッシュ観測の設定。openaiBridge と同じく、起動時に1回だけ解決して
+  // POST /internal/reload のときだけ作り直す。
+  let observabilitySettings = normalizeObservability(config.observability);
   let openaiBridgeSettings = resolveOpenAiBridgeSettings(config);
   if (openaiBridgeSettings.warning) {
     logger?.(`${new Date().toISOString()} openai-bridge config-warning ${openaiBridgeSettings.warning}`);
@@ -442,6 +454,15 @@ export function createProxyServer({
           );
           logDegradeMappingConfigNotice(openaiBridgeSettings, logger);
         }
+        // キャッシュ観測の再読込。セクションが無い・config.json 自体が無い
+        // （reloadObservability が undefined を返す）ときは既定へ戻す。
+        // **毎回 normalizeObservability() を通し直すこと。** 起動時の1回きりの
+        // 正規化を使い回すと、reload で入ってきた値にクランプが効かない。
+        if (reloadObservability) {
+          const nextObservability = await reloadObservability();
+          config.observability = nextObservability;
+          observabilitySettings = normalizeObservability(nextObservability);
+        }
         // Reconcile in the background instead of awaiting it (or replacing
         // the shared operationalStateCheck gate other requests await): each
         // account's reconcile can block on that account's file lock for up
@@ -569,6 +590,7 @@ export function createProxyServer({
         ...(openaiBridgeSettings.degradeMapping?.enabled === true
           ? { exhaustionMapper: applyClaudeExhaustionMapping }
           : {}),
+        observability: observabilitySettings,
       });
       await persistState();
     } catch (error) {
@@ -1954,6 +1976,7 @@ async function forwardWithRotation({
   upstreamConnectRetries,
   upstreamConnectRetryDelayMs,
   exhaustionMapper = null,
+  observability = DEFAULT_OBSERVABILITY,
 }) {
   const maxAttempts = Math.max(1, accountManager.accounts.length);
   const attemptedAccountIds = new Set();
@@ -2046,6 +2069,7 @@ async function forwardWithRotation({
         upstreamConnectRetryDelayMs,
         modelFamily,
         exhaustionMapper: mapExhaustion,
+        observability,
       })) return;
       sendUnavailableAccounts(res, accountManager, mapExhaustion);
       return;
@@ -2221,6 +2245,7 @@ async function forwardWithRotation({
       upstreamConnectRetries,
       upstreamConnectRetryDelayMs,
       exhaustionMapper: mapExhaustion,
+      observability,
     });
     if (!accountManager.accounts.includes(account)) {
       finishStaleAccountResponse(res, result.passthroughResponse, mapExhaustion);
@@ -2270,6 +2295,7 @@ async function forwardWithRotation({
         upstreamConnectRetries,
         upstreamConnectRetryDelayMs,
         exhaustionMapper: mapExhaustion,
+        observability,
       });
       if (!accountManager.accounts.includes(account)) {
         finishStaleAccountResponse(res, retryResult.passthroughResponse, mapExhaustion);
@@ -2350,6 +2376,7 @@ async function forwardWithRotation({
       upstreamConnectRetryDelayMs,
       modelFamily,
       exhaustionMapper: mapExhaustion,
+      observability,
     })) return;
     sendUnavailableAccounts(res, accountManager, mapExhaustion);
   }
@@ -2373,6 +2400,7 @@ async function forwardCurrentUnavailableAccount({
   upstreamConnectRetryDelayMs,
   modelFamily = null,
   exhaustionMapper = null,
+  observability = DEFAULT_OBSERVABILITY,
 }) {
   if (sendCurrentQuotaUnavailableResponse({
     req,
@@ -2448,6 +2476,7 @@ async function forwardCurrentUnavailableAccount({
     upstreamConnectRetries,
     upstreamConnectRetryDelayMs,
     exhaustionMapper,
+    observability,
   });
   return true;
 }
@@ -2789,9 +2818,10 @@ async function forwardOnce({
   upstreamConnectRetries,
   upstreamConnectRetryDelayMs,
   exhaustionMapper = null,
+  observability = DEFAULT_OBSERVABILITY,
 }) {
   const target = configuredUpstreamTarget(req.url, upstream);
-  const headers = buildUpstreamHeaders(req.headers, account, secret);
+  const headers = buildUpstreamHeaders(req.headers, account, secret, observability);
   const startedAt = Date.now();
   let outcome = 'ok';
   let bufferedPassthrough = false;
@@ -2976,6 +3006,20 @@ async function forwardOnce({
     : null;
   if (bufferedReplay?.degradeLog?.mapReason) degradeLog = bufferedReplay.degradeLog;
 
+  // durationMs は観測の解凍を await する前に確定させる。解凍時間が混ざると、
+  // 配備前後で遅延の分位点を比べられなくなる（計画書 (d)・リスク R-5）。
+  const durationMs = Date.now() - startedAt;
+
+  // 応答本文の**写し**を読むだけで、クライアントへ流すバイト列には触れない。
+  // 解凍は非同期版を使う（同期版はイベントループを塞ぐ）。本文は既に onChunk で
+  // クライアントへ流れ切っており、遅れるのは終端だけである。
+  const observation = accountManager.accounts.includes(account) && upstreamResponse.body.length > 0
+    ? await parseUsageObservation(upstreamResponse.body, {
+      contentEncoding: headerValue(upstreamResponse.headers['content-encoding']),
+      maxBytes: observability.requestLog.maxBodyBytes,
+    })
+    : null;
+
   if (accountManager.accounts.includes(account)) {
     recordProxyRequest({
       accountManager,
@@ -2989,8 +3033,11 @@ async function forwardOnce({
       // outcome は上流で実際に起きたこと（rate-limit-passthrough 等）のままにする。
       // 何へ書き換えたかは同じ行の mappedTo / mapReason が持つ（§9.4 は bridge 経路の分岐）。
       outcome: outcomeForResponse(outcome, upstreamResponse.statusCode),
-      durationMs: Date.now() - startedAt,
+      durationMs,
       degradeLog,
+      observationLog: observability.requestLog.enabled
+        ? buildObservationLog({ req, body, observation, upstreamResponse, observability })
+        : null,
     });
   }
 
@@ -3019,8 +3066,9 @@ async function forwardOnce({
     return { retryAfterRefresh: true, passthroughResponse: upstreamResponse };
   }
 
-  if (accountManager.accounts.includes(account) && upstreamResponse.body.length > 0) {
-    extractUsage(upstreamResponse.body, account.id, accountManager);
+  // 解析は上の1回だけ。ここでは結果を集計へ写す（口座が台帳から消えていないか再確認する）。
+  if (accountManager.accounts.includes(account)) {
+    applyUsageObservation(accountManager, account.id, observation);
   }
 
   if (!res.writableEnded) res.end();
@@ -3102,13 +3150,19 @@ function isLoopbackHostname(hostname) {
   );
 }
 
-function buildUpstreamHeaders(inputHeaders, account, secret) {
+function buildUpstreamHeaders(inputHeaders, account, secret, observability = DEFAULT_OBSERVABILITY) {
   const headers = {};
   for (const [key, value] of Object.entries(inputHeaders)) {
     const lower = key.toLowerCase();
     if (HOP_HEADERS.has(lower)) continue;
     if (lower === 'x-api-key' || lower === 'authorization') continue;
-    headers[key] = value;
+    // 要求ヘッダを書き換える唯一の箇所。この実行環境が解けない符号化（Node 22.15 未満の
+    // zstd）だけを一覧から落とす。Claude Code は `gzip, deflate, br, zstd` を送るので、
+    // 落とさないと上流が zstd で返したときに usage を1件も数えられない（計画書 Task 1 Step 0）。
+    // 落とすものが無ければ受け取った文字列がそのまま返るので、ヘッダはバイト同一のままになる。
+    headers[key] = lower === 'accept-encoding' && observability.upstream.dropUndecodableAcceptEncoding
+      ? upstreamAcceptEncoding(value)
+      : value;
   }
 
   if (account.type === 'apikey') {
@@ -3354,6 +3408,11 @@ function recordProxyRequest({
   // R4-5: 写像した要求の痕跡（mapClaudeExhaustion の戻り値 degradeLog）。任意引数なので
   // 渡さなければ現行と完全に同一に振る舞う（設計書 §14.4）。
   degradeLog = null,
+  // sticky R-S7 の追記情報の予約席。起点 60da9aa には R-S7 がまだ無いので常に null だが、
+  // 引数の順序を先に確定させておき、sticky 合流時に番号を振り直さずに済ませる。
+  affinityLog = null,
+  // キャッシュ観測の追記情報。null なら行は現行とバイト単位で同一になる。
+  observationLog = null,
 }) {
   // 写像した要求では、クライアントへ実際に返した status（mappedTo）を記録する。
   // 写像前の実ステータスは同じ行の upstreamStatus / mappedFrom に必ず残るので、
@@ -3369,7 +3428,7 @@ function recordProxyRequest({
     durationMs,
     errorType,
   });
-  writeProxyLog(logger, event, degradeLog);
+  writeProxyLog(logger, event, degradeLog, affinityLog, observationLog);
 }
 
 /**
@@ -3386,7 +3445,15 @@ function degradeLogFields(degradeLog) {
   ));
 }
 
-function writeProxyLog(logger, event, degradeLog = null) {
+/**
+ * `proxy` 行を書く。
+ *
+ * 引数順は `(logger, event, degradeLog, affinityLog, observationLog)` に固定し、
+ * 連結順は `degradeLogFields` → `affinityLogFields`（sticky R-S7 が持ち込む。
+ * 起点 60da9aa にはまだ無い） → `observationLogFields` の固定とする。
+ * 追記は必ず末尾へ。値が1つも無ければ行は現行とバイト単位で同一になる。
+ */
+function writeProxyLog(logger, event, degradeLog = null, affinityLog = null, observationLog = null) {
   if (!logger) return;
   const fields = [
     `${event.at} proxy`,
@@ -3400,7 +3467,7 @@ function writeProxyLog(logger, event, degradeLog = null) {
   if (event.requestId) fields.push(`requestId=${event.requestId}`);
   if (event.errorType) fields.push(`errorType=${event.errorType}`);
   // 追記は必ず末尾へ（§9.2）。値が1つも無ければ行は現行とバイト単位で同一になる。
-  logger(`${fields.join(' ')}${degradeLogFields(degradeLog)}`);
+  logger(`${fields.join(' ')}${degradeLogFields(degradeLog)}${observationLogFields(observationLog, affinityLog)}`);
 }
 
 function syntheticUpstreamErrorResponse(error) {
@@ -3570,39 +3637,70 @@ function sendBufferedResponse(res, response) {
   res.end(response.body || Buffer.alloc(0));
 }
 
-function extractUsage(body, accountId, accountManager) {
-  const text = body.toString('utf8');
+/**
+ * 解析済みの観測を口座の集計へ足す。
+ *
+ * **読めた要求だけを数える。** `parse` が `ok` 以外（解けない符号化・大きすぎる本文・
+ * 解析不能・usage 無し）のときは口座の状態を一切動かさない。読めなかった件数は
+ * `server.log` の `usageParse=` の分布から数える。
+ *
+ * 旧 `extractUsage()` は `content-encoding` を見ずに圧縮されたバイト列を UTF-8 として
+ * 解釈していたため、例外も警告も出さないまま 0 件で終わっていた（本件の根本原因）。
+ */
+function applyUsageObservation(accountManager, accountId, observation) {
+  if (observation?.parse !== 'ok') return;
   try {
-    const json = JSON.parse(text);
-    if (json.usage) {
-      accountManager.updateUsage(accountId, {
-        inputTokens: json.usage.input_tokens || 0,
-        outputTokens: json.usage.output_tokens || 0,
-      });
-    }
-    return;
+    accountManager.updateUsage(accountId, {
+      inputTokens: observation.inputTokens,
+      outputTokens: observation.outputTokens,
+      cacheReadTokens: observation.cacheReadTokens,
+      cacheCreation1hTokens: observation.cacheCreation1hTokens,
+      cacheCreation5mTokens: observation.cacheCreation5mTokens,
+      // 1応答＝1件。旧実装はストリームで message_start と message_delta の2回数えていた。
+      countRequest: true,
+    });
   } catch {
-    // Continue with SSE parsing.
+    // 集計の失敗で応答を壊さない（旧実装の try/catch と同じ規律）。
   }
+}
 
-  for (const event of text.split('\n\n')) {
-    const dataLine = event.split('\n').find(line => line.startsWith('data: '));
-    if (!dataLine) continue;
-    try {
-      const data = JSON.parse(dataLine.slice(6));
-      if (data.type === 'message_start' && data.message?.usage) {
-        accountManager.updateUsage(accountId, {
-          inputTokens: data.message.usage.input_tokens || 0,
-        });
-      } else if (data.type === 'message_delta' && data.usage) {
-        accountManager.updateUsage(accountId, {
-          outputTokens: data.usage.output_tokens || 0,
-        });
-      }
-    } catch {
-      // Ignore non-JSON SSE payloads.
-    }
-  }
+/**
+ * `proxy` 行へ足す観測情報を組み立てる。
+ *
+ * 枠の使用率は `parseRateLimitHeaders()` をもう一度呼んで作る。`updateQuota()` が
+ * `onResponse` で同じ解析をしているが、そちらは口座台帳を更新する副作用つきなので、
+ * ログ用には副作用の無いこの関数を別に呼ぶ。reset はミリ秒で返るのでエポック秒へ直す。
+ */
+function buildObservationLog({ req, body, observation, upstreamResponse, observability }) {
+  const quota = parseRateLimitHeaders(upstreamResponse.headers);
+  // 既定では要求本文を読まない。本文は数百 KB〜数 MB あり、JSON.parse の追加1回が
+  // 要求ごとの実コストになる。まずヘッダ付与率を測ってから有効化を決める。
+  const sessionSource = observability.requestLog.sessionFromBody ? body : null;
+  return {
+    model: observation?.model ?? null,
+    // 生のセッション id は出さない。出すのは sha256 の先頭 12 桁だけ。
+    sid: sidHash(sessionKeyFrom(req, sessionSource)),
+    inputTokens: observation?.inputTokens ?? 0,
+    outputTokens: observation?.outputTokens ?? 0,
+    cacheReadTokens: observation?.cacheReadTokens ?? 0,
+    cacheCreationTokens: observation?.cacheCreationTokens ?? 0,
+    cacheCreation1hTokens: observation?.cacheCreation1hTokens ?? 0,
+    cacheCreation5mTokens: observation?.cacheCreation5mTokens ?? 0,
+    quota: {
+      unified5h: quota.unified5h,
+      unified5hReset: epochSeconds(quota.unified5hReset),
+      unified7d: quota.unified7d,
+      unified7dReset: epochSeconds(quota.unified7dReset),
+    },
+    encoding: observation?.encoding ?? null,
+    parse: observation?.parse ?? 'no-usage',
+  };
+}
+
+function epochSeconds(milliseconds) {
+  return typeof milliseconds === 'number' && Number.isFinite(milliseconds)
+    ? Math.floor(milliseconds / 1000)
+    : null;
 }
 
 async function readBody(req) {

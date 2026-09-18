@@ -293,3 +293,37 @@ describe('createServerLogWriter', () => {
     },
   );
 });
+
+// ---------------------------------------------------------------------------
+// createServerLogWriter の maxBytes（計画書 Task 4）
+// ---------------------------------------------------------------------------
+
+describe('createServerLogWriter の maxBytes', () => {
+  it('渡した閾値でローテーションする（既定の 10 MiB を待たない）', () => {
+    const dir = tempDir();
+    const logPath = join(dir, 'server.log');
+    const writer = createServerLogWriter({ logPath, maxBytes: 64 });
+    try {
+      writer.write('x'.repeat(40));
+      assert.equal(existsSync(`${logPath}.1`), false, '閾値以下では回さない');
+      writer.write('y'.repeat(40));
+      writer.write('z');
+      assert.equal(existsSync(`${logPath}.1`), true, '閾値超で .1 ができる');
+      assert.ok(readFileSync(`${logPath}.1`, 'utf8').includes('x'.repeat(40)));
+    } finally {
+      writer.close();
+    }
+  });
+
+  it('maxBytes を渡さなければ既定の LOG_MAX_BYTES を使う', () => {
+    const dir = tempDir();
+    const logPath = join(dir, 'server.log');
+    const writer = createServerLogWriter({ logPath });
+    try {
+      writer.write('x'.repeat(1024));
+      assert.equal(existsSync(`${logPath}.1`), false);
+    } finally {
+      writer.close();
+    }
+  });
+});

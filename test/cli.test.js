@@ -18,6 +18,7 @@ import {
   internalApiUrl,
   removeServiceFile,
   requestJson,
+  serverLogWriterOptions,
   runCli,
   runMacosCliActionWithLock,
   startService,
@@ -2220,3 +2221,25 @@ async function unusedCodexLoopbackPort() {
   await closeCodexServer(server);
   return port;
 }
+
+// ---------------------------------------------------------------------------
+// server.log のローテーション閾値の配線（計画書 Task 4）
+// ---------------------------------------------------------------------------
+
+describe('serverLogWriterOptions', () => {
+  it('config.observability.logMaxBytes を writer へ渡す', () => {
+    const options = serverLogWriterOptions({ observability: { logMaxBytes: 12 * 1024 * 1024 } }, '/tmp/x/server.log');
+    assert.equal(options.logPath, '/tmp/x/server.log');
+    assert.equal(options.maxBytes, 12 * 1024 * 1024);
+  });
+
+  it('observability セクションが無ければ既定の 32 MiB になる', () => {
+    assert.equal(serverLogWriterOptions({}, '/tmp/x/server.log').maxBytes, 32 * 1024 * 1024);
+    assert.equal(serverLogWriterOptions({ observability: {} }, '/tmp/x/server.log').maxBytes, 32 * 1024 * 1024);
+  });
+
+  it('不正な値はクランプまたは既定へ倒れる（server.log を壊さない）', () => {
+    assert.equal(serverLogWriterOptions({ observability: { logMaxBytes: 1 } }, 'p').maxBytes, 1024 * 1024);
+    assert.equal(serverLogWriterOptions({ observability: { logMaxBytes: 'big' } }, 'p').maxBytes, 32 * 1024 * 1024);
+  });
+});

@@ -681,6 +681,9 @@ describe('AccountManager', () => {
     assert.deepEqual(account.usage, {
       totalInputTokens: 0,
       totalOutputTokens: 0,
+      totalCacheReadTokens: 0,
+      totalCacheCreation1hTokens: 0,
+      totalCacheCreation5mTokens: 0,
       totalRequests: 0,
       lastUsed: null,
     });
@@ -717,6 +720,9 @@ describe('AccountManager', () => {
     assert.deepEqual(account.usage, {
       totalInputTokens: 0,
       totalOutputTokens: 0,
+      totalCacheReadTokens: 0,
+      totalCacheCreation1hTokens: 0,
+      totalCacheCreation5mTokens: 0,
       totalRequests: 0,
       lastUsed: null,
     });
@@ -938,6 +944,9 @@ describe('AccountManager', () => {
     assert.deepEqual(account.usage, {
       totalInputTokens: 0,
       totalOutputTokens: 0,
+      totalCacheReadTokens: 0,
+      totalCacheCreation1hTokens: 0,
+      totalCacheCreation5mTokens: 0,
       totalRequests: 0,
       lastUsed: null,
     });
@@ -978,6 +987,9 @@ describe('AccountManager', () => {
     assert.deepEqual(account.usage, {
       totalInputTokens: 0,
       totalOutputTokens: 0,
+      totalCacheReadTokens: 0,
+      totalCacheCreation1hTokens: 0,
+      totalCacheCreation5mTokens: 0,
       totalRequests: 0,
       lastUsed: null,
     });
@@ -1024,6 +1036,9 @@ describe('AccountManager', () => {
     assert.deepEqual(account.usage, {
       totalInputTokens: 0,
       totalOutputTokens: 0,
+      totalCacheReadTokens: 0,
+      totalCacheCreation1hTokens: 0,
+      totalCacheCreation5mTokens: 0,
       totalRequests: 0,
       lastUsed: null,
     });
@@ -2526,5 +2541,109 @@ describe('familyQuotaExhaustedOnly / isCommonQuotaExhausted (D-56-3 / 設計書 
       isCommonQuotaExhausted(manager.find('scoped'), manager.switchThreshold),
       isCommonQuotaExhausted(null, manager.switchThreshold),
     ], [true, true, true, false, false]);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// updateUsage のキャッシュ4分類と totalRequests の意味（計画書 Task 1 Step 4・(d)）
+// ---------------------------------------------------------------------------
+
+describe('updateUsage / キャッシュ4分類と countRequest', () => {
+  const makeUsageManager = () => new AccountManager({
+    accounts: [{ id: 'acct_1', type: 'oauth' }],
+    now: () => 1000,
+  });
+
+  it('キャッシュ4分類を積み上げる', () => {
+    const manager = makeUsageManager();
+    manager.updateUsage('acct_1', {
+      inputTokens: 10,
+      outputTokens: 20,
+      cacheReadTokens: 99000,
+      cacheCreation1hTokens: 1500,
+      cacheCreation5mTokens: 300,
+      countRequest: true,
+    });
+    manager.updateUsage('acct_1', {
+      inputTokens: 1,
+      outputTokens: 2,
+      cacheReadTokens: 1000,
+      cacheCreation1hTokens: 10,
+      cacheCreation5mTokens: 20,
+      countRequest: true,
+    });
+
+    const { usage } = manager.getStatus().accounts[0];
+    assert.equal(usage.totalInputTokens, 11);
+    assert.equal(usage.totalOutputTokens, 22);
+    assert.equal(usage.totalCacheReadTokens, 100000);
+    assert.equal(usage.totalCacheCreation1hTokens, 1510);
+    assert.equal(usage.totalCacheCreation5mTokens, 320);
+  });
+
+  it('countRequest が真のときだけ totalRequests が増える（1応答＝1件）', () => {
+    const manager = makeUsageManager();
+    manager.updateUsage('acct_1', { inputTokens: 1, cacheReadTokens: 2, countRequest: true });
+    manager.updateUsage('acct_1', { inputTokens: 1, cacheReadTokens: 2, countRequest: true });
+    assert.equal(manager.getStatus().accounts[0].usage.totalRequests, 2);
+  });
+
+  it('countRequest を落とした呼び出しでは totalRequests が増えない', () => {
+    const manager = makeUsageManager();
+    // usage が読めなかった要求（usageParse が ok 以外）はここを通る。
+    manager.updateUsage('acct_1', { inputTokens: 1 });
+    manager.updateUsage('acct_1', { inputTokens: 1, countRequest: false });
+    const { usage } = manager.getStatus().accounts[0];
+    assert.equal(usage.totalRequests, 0);
+    assert.equal(usage.totalInputTokens, 2, 'トークンは countRequest と無関係に積む');
+  });
+
+  it('lastUsed は countRequest の真偽にかかわらず更新する', () => {
+    const manager = makeUsageManager();
+    manager.updateUsage('acct_1', { inputTokens: 1 });
+    assert.equal(manager.getStatus().accounts[0].usage.lastUsed, new Date(1000).toISOString());
+  });
+
+  it('引数を省略しても壊れない（既存の呼び出し形と後方互換）', () => {
+    const manager = makeUsageManager();
+    manager.updateUsage('acct_1');
+    manager.updateUsage('acct_1', { inputTokens: 10, outputTokens: 20 });
+    const { usage } = manager.getStatus().accounts[0];
+    assert.equal(usage.totalInputTokens, 10);
+    assert.equal(usage.totalCacheReadTokens, 0);
+    assert.equal(usage.totalRequests, 0);
+  });
+
+  it('3キーを持たない旧い runtime-state.json を読んでも 0 で復元される', () => {
+    const manager = makeUsageManager();
+    manager.restoreState({
+      accounts: [{
+        id: 'acct_1',
+        usage: { totalInputTokens: 100, totalOutputTokens: 50, totalRequests: 7, lastUsed: null },
+      }],
+    });
+    const { usage } = manager.getStatus().accounts[0];
+    assert.equal(usage.totalInputTokens, 100);
+    assert.equal(usage.totalCacheReadTokens, 0);
+    assert.equal(usage.totalCacheCreation1hTokens, 0);
+    assert.equal(usage.totalCacheCreation5mTokens, 0);
+  });
+
+  it('新しい3キーを持つ状態は値ごと復元される', () => {
+    const original = makeUsageManager();
+    original.updateUsage('acct_1', {
+      inputTokens: 10,
+      cacheReadTokens: 99000,
+      cacheCreation1hTokens: 1500,
+      cacheCreation5mTokens: 300,
+      countRequest: true,
+    });
+    const restarted = makeUsageManager();
+    restarted.restoreState(original.exportState());
+    const { usage } = restarted.getStatus().accounts[0];
+    assert.equal(usage.totalCacheReadTokens, 99000);
+    assert.equal(usage.totalCacheCreation1hTokens, 1500);
+    assert.equal(usage.totalCacheCreation5mTokens, 300);
+    assert.equal(usage.totalRequests, 1);
   });
 });
