@@ -10503,9 +10503,12 @@ describe('上流 529 overloaded の 429 写像 (upstreamOverloadTo429)', () => {
       / status=429 durationMs=\d+ outcome=upstream-error-passthrough requestId=req_upstream_529/,
       '返した status（429）を行の status にする',
     );
+    // 行末で閉じない。観測整備（PR #42）の `model= sid= in= …` が同じ行のこの後ろへ
+    // 付くので、`$` で留めると写像とは無関係な理由で落ちる（§7.1「追記は末尾で、
+    // 順序に依存しない読み方をすること」）。写像フィールドが連続していることは見る。
     assert.match(
       lines[0],
-      / upstreamStatus=529 mappedFrom=529 mappedFromType=overloaded_error mappedTo=429 retryAfter=30 mapReason=claude_upstream_overloaded$/,
+      / upstreamStatus=529 mappedFrom=529 mappedFromType=overloaded_error mappedTo=429 retryAfter=30 mapReason=claude_upstream_overloaded/,
       '実際の上流ステータスを必ず同じ行へ残す',
     );
   });
@@ -10524,7 +10527,8 @@ describe('上流 529 overloaded の 429 写像 (upstreamOverloadTo429)', () => {
 
     const response = await ask(proxy);
     assert.equal(response.headers['retry-after'], '7');
-    assert.match(proxyLines(logLines).at(-1), /retryAfter=7 mapReason=claude_upstream_overloaded$/);
+    // 同じ理由で行末に留めない（この後ろに観測整備の追記が続く）。
+    assert.match(proxyLines(logLines).at(-1), /retryAfter=7 mapReason=claude_upstream_overloaded/);
   });
 
   it('(b) passes an upstream 529 through untouched when the body is not overloaded_error', async () => {
