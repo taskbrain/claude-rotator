@@ -562,6 +562,56 @@ claude-rotator status
 - `fallbackModel` の最終要素も同じ枯渇したプールに当たる構成では、Claude Code は指数バックオフ（約0.6秒→約74秒）で再試行を続けます。当リポジトリの実測では、150秒の観測窓内で終端せず、エラー表示も出ませんでした。`bothUnusableStatus` の既定を `403`（明示停止）にしているのはこのためで、`529` にすると同じ無言待ちが起こり得ます。`openaiBridge.enabled` が `false` のまま `degradeMapping.enabled` を `true` にする構成でも同じ限界があるため、起動時とリロード時に警告を1行出します（禁止はしません）。
 - ログにも `status` の表示にも、メールアドレスなどの識別子は出しません（アカウントはラベルだけを扱います）。
 
+#### `status` の Codex 節（`codexStatusUrl` を設定したとき）
+
+`degradeMapping.codexStatusUrl` を設定すると、`status` / `monitor` の末尾に転送先ブリッジ（Codex）側の枠状況が表示されます。Claude 側の表示は1行も変わらず、未設定なら節そのものが出ません。
+
+```text
+Codex Rotator                          sendable 0/2  (held 1, capped 1)
+  reading  usage GET, startup check passed   raw pool state: exhausted
+  primary  held      7d █████████░  98%  stop 75%   reset in 5d5h -> 09/21 20:59 JST
+    clears   not at that reset - needs 2 clean usage reads at 70% or less
+    read     09/16 15:32 JST usage GET, ordinary use allowed, stops when unread
+  pro2     capped    7d ██████████ 100%  stop 100%  reset in 3d1h -> 09/19 17:10 JST
+    clears   not at that reset - needs 2 clean usage reads at 99% or less
+    read     09/16 15:32 JST usage GET, ordinary use allowed, sends when unread
+  note: held = stopped at our own line, capped = the plan limit itself
+  note: held / capped read as "cooldown" in /healthz
+  note: second window on pro2 is stale - last read 0% on 09/16 06:23 JST
+  note: percentages cover the whole account - ChatGPT app, Codex CLI, and this bridge
+  note: the CLI's own share cannot be separated out
+  note: accounts are shown by label
+```
+
+**停止はリセット時刻では解けません。** 行末の `reset in ... -> ... JST` は使用率の窓が初期化される時刻であって、その口座が送れるようになる時刻ではありません。解除の条件は必ずその直下の `clears` 行に書かれています。
+
+状態語の意味:
+
+| 語 | 意味 | 何で解けるか |
+|---|---|---|
+| `ready` | 送れる | — |
+| `held` | 当方の停止線（`stop` 欄が100%未満）で止めた＝枠の温存 | 条件を満たす使用率の観測が2回 |
+| `capped` | 上流の枠そのものに到達した（`stop 100%`） | 同上 |
+| `stopped` | 個別の停止線を持たない口座が、全体の既定線で止まった | 条件を満たす観測が1回 |
+| `reserved` | 観測を失っており、読めるまで送らない設定の口座 | 完全な観測が1回 |
+| `unread` | 使用率の観測がまだ無い | 同上 |
+| `exhausted` | 429 を観測した | リセット後の再確認 |
+| `blocked` | 上流が通常利用を拒否している | 通常利用可と読める観測 |
+| `needs login` | ログインが切れている | 再ログイン |
+
+`held` と `capped` の解除条件には、使用率のほかに**上流が通常利用を許可していると読める観測であること**が含まれます。上流が拒否している間は使用率が下がっても解けないため、そのときは `clears` 行の直下に `refused` 行を出します。停止線（`stop` 欄）を緩めても、拒否が続くかぎりその口座は1本も送れません。
+
+読み方の補足:
+
+- `/healthz` の `state` と画面の状態語は1対1ではありません。停止ラッチの掛かった口座（`held` / `capped` / `stopped` / `blocked`）だけが `cooldown` と出て、ラッチを持たない `reserved` / `unread` は `ready` のまま出ます（送れないのは選択側の判断のため）。画面はこの対応を**そのときのペイロードから起こして** `note:` 行に出すので、`/healthz` と突き合わせるときはその行を見てください。
+- ラベル欄は画面に出る最長のラベルに合わせて広がります（契約の上限は32文字）。ラベルが20文字を超える構成では、行はその分だけ長くなります。ラベルを切り詰めると `/healthz` と突き合わせられなくなるため、切り詰めません。
+- `read` 行が観測の出所（`usage GET` など）を併記するのは、それがその読み取りのものだと確かめられるときだけです（ブリッジは口座ごとに1つの出所しか報告せず、それは主窓・副窓のうち最後に読んだ方のものです）。
+- 使用率は主窓（`7d` など）のものだけを表示します。副窓は観測が現在のものであるときだけ主窓の真下へ1行足し、鮮度が切れた副窓は `note` で開示します。
+- `*` は「最後に取れた値であり、現在の観測は途切れている」という印です。このときバーは `----------` になります。
+- 既に過ぎたリセット時刻は表示しません。
+- ブリッジが選択理由（`selectionEligible` など）を報告しない旧版のときは、推測せず従来の `pool: <状態> (N/M available)` 形式のまま表示します。
+- 表示される数字は ChatGPT アプリ・Codex CLI・本ブリッジを含む口座全体の消費であり、CLI 単独の取り分は切り出せません。
+
 ### セッション単位のアカウント固定（`sessionAffinity`）
 
 `sessionAffinity` は、同じ Claude Code セッションからのリクエストを同じアカウントへ送り続けるための任意のセクションです。upstream の prompt cache はアカウント（組織）ごとに別物なので、会話の途中でアカウントが変わると、そのセッションは1ターン分のキャッシュを失います。アカウントの切り替えそのものを減らす機能ではなく、切り替えが進行中の会話へ波及する範囲を小さくするための機能です。
@@ -1498,6 +1548,56 @@ Caveats:
 - A 529 travels the same path as a genuine Anthropic overload. To a user with no `fallbackModel`, it is indistinguishable from an ordinary overload error. Claude Code moves to the next entry after retrying a 529 three times, and that behavior applies only while `fallbackModel` still has a next entry.
 - If the last entry of `fallbackModel` lands in the same exhausted pool, Claude Code keeps retrying with exponential backoff (about 0.6 sec growing to about 74 sec). In our measurements it neither terminated nor surfaced an error within the 150-second observation window. That is why `bothUnusableStatus` defaults to `403` (explicit stop); setting `529` can reproduce the same silent wait. Leaving `openaiBridge.enabled` at `false` while turning `degradeMapping.enabled` on has the same limitation, so a single warning line is logged at startup and on reload (the combination is not forbidden).
 - Neither the logs nor the `status` output ever contain email addresses or similar identifiers; accounts are handled by label only.
+
+#### The Codex Block in `status` (when `codexStatusUrl` is set)
+
+Setting `degradeMapping.codexStatusUrl` appends the forwarding bridge's (Codex) quota state to `status` / `monitor`. Not one line of the Claude side changes, and without the setting the block is not drawn at all.
+
+```text
+Codex Rotator                          sendable 0/2  (held 1, capped 1)
+  reading  usage GET, startup check passed   raw pool state: exhausted
+  primary  held      7d █████████░  98%  stop 75%   reset in 5d5h -> 09/21 20:59 JST
+    clears   not at that reset - needs 2 clean usage reads at 70% or less
+    read     09/16 15:32 JST usage GET, ordinary use allowed, stops when unread
+  pro2     capped    7d ██████████ 100%  stop 100%  reset in 3d1h -> 09/19 17:10 JST
+    clears   not at that reset - needs 2 clean usage reads at 99% or less
+    read     09/16 15:32 JST usage GET, ordinary use allowed, sends when unread
+  note: held = stopped at our own line, capped = the plan limit itself
+  note: held / capped read as "cooldown" in /healthz
+  note: second window on pro2 is stale - last read 0% on 09/16 06:23 JST
+  note: percentages cover the whole account - ChatGPT app, Codex CLI, and this bridge
+  note: the CLI's own share cannot be separated out
+  note: accounts are shown by label
+```
+
+**A reset instant does not lift a stop.** The trailing `reset in ... -> ... JST` is when the usage window starts over, not when the account can send again. What actually clears the stop is always written on the `clears` line directly underneath it.
+
+What each state word means:
+
+| Word | Meaning | What clears it |
+|---|---|---|
+| `ready` | Can send | — |
+| `held` | Stopped at our own line (the `stop` column is below 100%), i.e. quota held back | 2 qualifying usage readings |
+| `capped` | The plan limit itself was reached (`stop 100%`) | Same |
+| `stopped` | An account with no per-account stop line hit the global default | 1 qualifying reading |
+| `reserved` | The reading was lost and this account is configured not to send while unread | 1 complete reading |
+| `unread` | No usage reading yet | Same |
+| `exhausted` | A 429 was observed | A recheck after that reset |
+| `blocked` | The upstream refuses ordinary use | A reading that says otherwise |
+| `needs login` | The login expired | Signing in again |
+
+Clearing `held` or `capped` takes more than the percentages: the same readings must also say the upstream allows ordinary use. While it refuses, no drop in usage will lift the stop, so a `refused` line is printed directly under `clears`. Relaxing the stop line (the `stop` column) changes nothing for as long as the refusal stands.
+
+Reading the rest of it:
+
+- The `state` in `/healthz` does not map one to one onto the words on this screen. Only an account a stop latch is holding (`held`, `capped`, `stopped`, `blocked`) reads as `cooldown` there; `reserved` and `unread`, which carry no latch and are withheld by the selection rules instead, read as `ready`. The screen derives this mapping **from the payload it was handed** and prints it on a `note:` line, so use that line when matching a row against `/healthz`.
+- The label column stretches to the longest label on screen (the contract allows 32 characters). With labels longer than 20 the rows grow by the difference; they are never truncated, because a truncated label can no longer be matched against `/healthz`.
+- The `read` line names the source of a reading (`usage GET` and the like) only when that source can be shown to be this reading's. The bridge reports one source per account, taken from whichever of the two windows was read last.
+- The percentage is the primary window's (`7d` and the like) only. A second window adds one row directly beneath the primary one while its own reading is current; a stale second window is disclosed in a `note` instead.
+- `*` marks a value that is the last one obtained while the current reading is interrupted. The bar is drawn as `----------` in that case.
+- A reset instant that has already passed is never drawn.
+- An older bridge that reports no selection fields (`selectionEligible` and friends) keeps the previous `pool: <state> (N/M available)` layout rather than having the details guessed at.
+- The percentages cover the whole account - the ChatGPT app, the Codex CLI, and this bridge - and the CLI's own share cannot be separated out.
 
 #### Per-Session Account Pinning (`sessionAffinity`)
 
