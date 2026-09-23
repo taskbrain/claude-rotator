@@ -10665,6 +10665,143 @@ describe('上流 529 overloaded の 429 写像 (upstreamOverloadTo429)', () => {
 });
 
 // ---------------------------------------------------------------------------
+// 段 2（母艦裁定 D-261・方式イ）: 全枯渇のとき合成 429 を 529 へ写像しない。
+//
+// 週次上限では「同じモデルのまま自動リトライ」させたい（`fallbackModel` は撤去済み）。
+// Claude Code は `anthropic-ratelimit-unified-*` の有無でプラン上限と一時スロットルを
+// 区別するので、rotator は答えを作り替えず**合成 429 をヘッダごと素通し**する。
+// 36 番設計の方式ア（429 ＋ Retry-After をクランプして合成する）は L1 で差し戻された。
+// 既定（キー未指定・true）では現行どおり 529 へ写像し、応答もログも1バイト変わらない。
+// ---------------------------------------------------------------------------
+describe('全枯渇の 529 写像を止める (claudeExhaustedTo529 / D-261)', () => {
+  const OFF = { enabled: true, claudeExhaustedTo529: false };
+
+  async function startProxy({
+    accountManager, secretStore, upstreamUrl, logLines = [], degradeMapping, reloadOpenAiBridge = null,
+  }) {
+    const proxy = await listen(createProxyServer({
+      accountManager,
+      secretStore,
+      config: {
+        upstream: upstreamUrl,
+        usagePolling: { enabled: false },
+        openaiBridge: { enabled: false, ...(degradeMapping ? { degradeMapping } : {}) },
+        observability: { requestLog: { enabled: false } },
+      },
+      currentCredentialReader: async () => null,
+      ...(reloadOpenAiBridge ? { reloadOpenAiBridge } : {}),
+      logger: line => logLines.push(line),
+    }));
+    cleanupAfterTest(async () => close(proxy.server));
+    return proxy;
+  }
+
+  // 週次枠を使い切った唯一の口座。上流へは一度も届かないので P-a（局所合成）だけを見る。
+  async function exhaustedProxy({ degradeMapping, logLines = [], reloadOpenAiBridge = null } = {}) {
+    const seen = [];
+    const upstream = await listen(http.createServer((req, res) => {
+      seen.push(req.headers.authorization);
+      req.resume();
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end('{}');
+    }));
+    cleanupAfterTest(async () => close(upstream.server));
+    const secretStore = new MemorySecretStore();
+    await secretStore.set('acct_1', { accessToken: 'access-token-1' });
+    const accountManager = new AccountManager({
+      accounts: [{ id: 'acct_1', type: 'oauth' }],
+      now: () => 1000,
+    });
+    accountManager.updateQuota('acct_1', {
+      'anthropic-ratelimit-unified-7d-utilization': '1',
+      'anthropic-ratelimit-unified-7d-reset': '4070908800',
+    });
+    const proxy = await startProxy({
+      accountManager, secretStore, upstreamUrl: upstream.url, logLines, degradeMapping, reloadOpenAiBridge,
+    });
+    return { proxy, seen, logLines };
+  }
+
+  const ask = proxy => requestJson(`${proxy.url}/v1/messages`, {
+    method: 'POST',
+    body: JSON.stringify({ model: 'claude-fable-5-1' }),
+    headers: { 'content-type': 'application/json' },
+    timeoutMs: 3_000,
+  });
+  const proxyLines = logLines => logLines.filter(line => / proxy account=/.test(line));
+
+  it('maps to 529 by default, exactly as it does today', async () => {
+    // 既定が現行のままであることを先に固定する（配備しても既定では何も変わらない）。
+    for (const degradeMapping of [{ enabled: true }, { enabled: true, claudeExhaustedTo529: true }]) {
+      const { proxy, seen } = await exhaustedProxy({ degradeMapping });
+      const response = await ask(proxy);
+      assert.equal(response.status, 529, JSON.stringify(degradeMapping));
+      assert.equal(response.body.error.type, 'overloaded_error');
+      assert.deepEqual(seen, [], '上流へは送っていない');
+    }
+  });
+
+  it('returns the synthetic 429 with every unified header when the flag is off', async () => {
+    const { proxy, seen, logLines } = await exhaustedProxy({ degradeMapping: OFF });
+
+    const response = await ask(proxy);
+
+    assert.equal(response.status, 429, '週次上限は 429 のまま返す（Claude Code が同じモデルで待つ）');
+    assert.equal(response.body.error.type, 'rate_limit_error');
+    // Claude Code が「プラン上限」と判別する根拠。1つでも欠けると一時スロットル扱いになる。
+    assert.equal(response.headers['anthropic-ratelimit-unified-status'], 'rejected');
+    assert.equal(response.headers['anthropic-ratelimit-unified-representative-claim'], 'seven_day');
+    assert.equal(response.headers['anthropic-ratelimit-unified-reset'], '4070908800');
+    assert.equal(response.headers['anthropic-ratelimit-unified-7d-utilization'], '1');
+    assert.equal(response.headers['anthropic-ratelimit-unified-7d-reset'], '4070908800');
+    // 方式ア（撤回）で合成しようとしていたものは1つも付けない。
+    assert.equal(response.headers['retry-after'], undefined, 'Retry-After は合成しない');
+    assert.equal(response.headers['x-claude-rotator-reason'], undefined, '写像専用ヘッダも付かない');
+    assert.deepEqual(seen, [], '素通しでも上流へは送らない（口座台帳の判定だけで決める）');
+  });
+
+  it('logs that it declined to map, on the same single proxy line', async () => {
+    const { proxy, logLines } = await exhaustedProxy({ degradeMapping: OFF });
+
+    await ask(proxy);
+
+    const lines = proxyLines(logLines);
+    assert.equal(lines.length, 1, 'P-a は行を増やさない（既存の1行へ併記する）');
+    assert.match(
+      lines[0],
+      / status=429 durationMs=\d+ outcome=quota-exhausted-local gptPoolState=unknown claudePoolState=all-exhausted mapReason=claude_exhausted_passthrough mapPath=a$/,
+      '返した status は 429 で、写像しなかったことが mapReason で読める（mapped* は載らない）',
+    );
+  });
+
+  it('picks the flag up and drops it again through POST /internal/reload', async () => {
+    // 切戻し手順（37 番 §6）の裏づけ: キー1つを戻して reload するだけで現行へ戻る。
+    let nextBridge = { enabled: false, degradeMapping: { enabled: true } };
+    const { proxy } = await exhaustedProxy({
+      degradeMapping: { enabled: true },
+      reloadOpenAiBridge: async () => nextBridge,
+    });
+    const reload = () => requestJson(`${proxy.url}/internal/reload`, {
+      method: 'POST',
+      headers: { authorization: `Bearer ${LOCAL_GATEWAY_AUTH_TOKEN}` },
+      timeoutMs: 5_000,
+    });
+
+    assert.equal((await ask(proxy)).status, 529, '既定では 529 へ写像する');
+
+    nextBridge = { enabled: false, degradeMapping: OFF };
+    assert.equal((await reload()).status, 200);
+    const off = await ask(proxy);
+    assert.equal(off.status, 429, 'プロセス再起動なしで素通しへ切り替わる');
+    assert.equal(off.headers['anthropic-ratelimit-unified-status'], 'rejected');
+
+    nextBridge = { enabled: false, degradeMapping: { enabled: true, claudeExhaustedTo529: true } };
+    assert.equal((await reload()).status, 200);
+    assert.equal((await ask(proxy)).status, 529, 'キーを true に戻すだけで即座に切り戻せる');
+  });
+});
+
+// ---------------------------------------------------------------------------
 // R4-5: 写像した要求の「既存の proxy ログ行」へ、写像フィールドを併記すること。
 //
 // 設計書 §9.1「529 と偽装する以上、実際の上流ステータスを必ず同じ行に残す」

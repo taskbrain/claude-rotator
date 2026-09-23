@@ -1079,6 +1079,8 @@ describe('normalizeDegradeMapping (R3-2 / 設計書 §7.3)', () => {
         recoveryWaitEnabled: false,
         upstreamOverloadTo429: false,
         upstreamOverloadRetryAfterSeconds: 30,
+        // D-261: 既定 true のキー（全枯渇の 529 写像は現行どおり続ける）。
+        claudeExhaustedTo529: true,
         gptPoolUnusableTtlMs: 30000,
         codexStatusUrl: 'http://127.0.0.1:18765/healthz',
         codexStatusTimeoutMs: 800,
@@ -1096,6 +1098,7 @@ describe('normalizeDegradeMapping (R3-2 / 設計書 §7.3)', () => {
       recoveryWaitEnabled: false,
       upstreamOverloadTo429: false,
       upstreamOverloadRetryAfterSeconds: 30,
+      claudeExhaustedTo529: true,
       gptPoolUnusableTtlMs: 60000,
       codexStatusUrl: null,
       codexStatusTimeoutMs: 1500,
@@ -1134,6 +1137,17 @@ describe('normalizeDegradeMapping (R3-2 / 設計書 §7.3)', () => {
     }
     assert.equal(normalizeDegradeMapping({ upstreamOverloadTo429: true }).upstreamOverloadTo429, true,
       'degradeMapping.enabled に依存せず単独で有効にできる');
+    // (h) D-261: claudeExhaustedTo529 は既定が true なので向きが逆になる。非 boolean を
+    // 受理せず既定（写像する＝現行）へ倒し、無効化は真偽値の false だけで成立させる。
+    for (const value of ['false', 0, 'no', {}, [], null, undefined, 1, true]) {
+      assert.equal(
+        normalizeDegradeMapping({ enabled: true, claudeExhaustedTo529: value }).claudeExhaustedTo529,
+        true,
+        `claudeExhaustedTo529:${JSON.stringify(value) ?? String(value)}`,
+      );
+    }
+    assert.equal(normalizeDegradeMapping({ claudeExhaustedTo529: false }).claudeExhaustedTo529, false,
+      '真偽値の false だけが写像を止める（degradeMapping.enabled には依存しない）');
     // (f) Retry-After 秒は 1..3600 の整数のみ。範囲外・非整数・非数値はすべて既定 30 へ倒す。
     for (const value of [0, -1, 3601, 30.5, Number.NaN, Number.POSITIVE_INFINITY, '30', null, {}, undefined, true]) {
       assert.equal(
@@ -1244,6 +1258,7 @@ describe('resolveOpenAiBridgeSettings degradeMapping (R3-2 / 設計書 §7.3-2)'
       recoveryWaitEnabled: false,
       upstreamOverloadTo429: false,
       upstreamOverloadRetryAfterSeconds: 30,
+      claudeExhaustedTo529: true,
       gptPoolUnusableTtlMs: 60000,
       codexStatusUrl: null,
       codexStatusTimeoutMs: 1500,
@@ -1393,6 +1408,34 @@ describe('degradeMapping の config-notice (設計書 §7.3-4)', () => {
     }
   });
 
+  it('(D-261) announces the exhaustion passthrough only when claudeExhaustedTo529 is turned off', () => {
+    // 既定（true）では1行も出ない。運用者が明示的に false を書いたときだけ、
+    // 「なぜ全枯渇で 529 が出なくなったのか」を起動ログと reload ログに残す。
+    const off = resolveOpenAiBridgeSettings({
+      openaiBridge: { enabled: false, degradeMapping: { claudeExhaustedTo529: false } },
+    });
+    const lines = [];
+    assert.deepEqual(logDegradeMappingConfigNotice(off, line => lines.push(line)), lines);
+    assert.equal(lines.length, 1, 'bridge が無効でも、写像を止めたことだけを1行出す');
+    assert.match(
+      lines[0],
+      /^\d{4}-\d{2}-\d{2}T[\d:.]+Z openai-bridge config-notice degradeMapping\.claudeExhaustedTo529 is off; an all-accounts-exhausted 429 is returned unchanged instead of being mapped to 529$/,
+    );
+    for (const degradeMapping of [
+      undefined,
+      { claudeExhaustedTo529: true },
+      { claudeExhaustedTo529: 'false' },
+      { enabled: true, claudeExhaustedTo529: true },
+    ]) {
+      const settings = resolveOpenAiBridgeSettings(enabledBridgeConfig({ degradeMapping }));
+      assert.deepEqual(
+        logDegradeMappingConfigNotice(settings, () => assert.fail('must not log')),
+        [],
+        JSON.stringify(degradeMapping) ?? String(degradeMapping),
+      );
+    }
+  });
+
   it('logs nothing for a loopback IPv6 codexStatusUrl', () => {
     // 修正前は [::1] が黙って捨てられていた。いまは値が残り通知も出ない。
     const settings = resolveOpenAiBridgeSettings(enabledBridgeConfig({
@@ -1485,6 +1528,30 @@ describe('POST /internal/reload と degradeMapping', () => {
     });
     assert.equal(off.degradeMapping.upstreamOverloadTo429, false, 'reload で即座に切り戻せる');
     assert.equal(off.degradeMapping.upstreamOverloadRetryAfterSeconds, 30, '秒数も既定へ戻る');
+  });
+
+  it('(D-261) toggles claudeExhaustedTo529 on -> off -> on across reloads', () => {
+    // 切戻し手順（37 番 §6）の裏づけ: config.json のキー1つを戻して reload するだけで、
+    // プロセスを止めずに現行（529 写像）へ戻る。
+    const config = { openaiBridge: { ...createDefaultConfig().openaiBridge, enabled: true } };
+    const start = resolveOpenAiBridgeSettings(config);
+    assert.equal(start.degradeMapping.claudeExhaustedTo529, true, '起動時は写像する（現行どおり）');
+
+    const off = applyReload(config, {
+      ...config.openaiBridge,
+      degradeMapping: { claudeExhaustedTo529: false },
+    });
+    assert.equal(off.degradeMapping.claudeExhaustedTo529, false, 'reload で写像を止められる');
+    assert.equal(off.degradeMapping.enabled, false, 'degradeMapping.enabled とは独立して効く');
+
+    const back = applyReload(config, {
+      ...config.openaiBridge,
+      degradeMapping: { claudeExhaustedTo529: true },
+    });
+    assert.equal(back.degradeMapping.claudeExhaustedTo529, true, 'reload で即座に切り戻せる');
+
+    const removed = applyReload(config, { ...config.openaiBridge, degradeMapping: {} });
+    assert.equal(removed.degradeMapping.claudeExhaustedTo529, true, 'キーごと消しても既定へ戻る');
   });
 
   it('reverts to the disabled degradeMapping once the openaiBridge section disappears', () => {

@@ -709,6 +709,117 @@ describe('mapClaudeExhaustion', () => {
 });
 
 // ---------------------------------------------------------------------------
+// mapClaudeExhaustion > 全枯渇の 529 写像を止める（母艦裁定 D-261・段 2 方式イ）
+// ---------------------------------------------------------------------------
+
+describe('mapClaudeExhaustion > claudeExhaustedTo529 の素通し (D-261)', () => {
+  // rotator が全枯渇時に合成する 429 の再現。Claude Code が「週次上限」を判別する根拠は
+  // この unified ヘッダ群なので、素通しでは1バイトも落としてはならない。
+  const synthetic429 = () => ({
+    statusCode: 429,
+    headers: {
+      'content-type': 'application/json',
+      'x-claude-rotator-account': 'acct-1',
+      'x-claude-rotator-quota-window': 'seven_day',
+      'anthropic-ratelimit-unified-status': 'rejected',
+      'anthropic-ratelimit-unified-representative-claim': 'seven_day',
+      'anthropic-ratelimit-unified-reset': '4070908800',
+      'anthropic-ratelimit-unified-seven-day-utilization': '1',
+      'anthropic-ratelimit-unified-seven-day-reset': '4070908800',
+    },
+    body: Buffer.from(JSON.stringify({
+      type: 'error',
+      error: { type: 'rate_limit_error', message: "You've hit your weekly limit · resets ..." },
+    })),
+  });
+  const exhausted = (overrides = {}) => ({
+    enabled: true, claudeAllUnusable: true, gptPoolState: 'unusable', mapPath: 'a', ...overrides,
+  });
+
+  it('returns the synthetic 429 with its status, headers and body untouched', () => {
+    const input = synthetic429();
+    const output = mapClaudeExhaustion(input, exhausted({ claudeExhaustedTo529: false }));
+    assert.equal(output.statusCode, 429, '写像しないのだからステータスは 429 のまま');
+    assert.equal(output.headers, input.headers, 'ヘッダは参照ごとそのまま（1つも足さない・落とさない）');
+    assert.equal(output.body, input.body, '本文も参照ごとそのまま');
+    // 参照同一だけでは読み手に伝わらないので、判別の根拠になるヘッダを明示的にも固定する。
+    assert.equal(output.headers['anthropic-ratelimit-unified-status'], 'rejected');
+    assert.equal(output.headers['anthropic-ratelimit-unified-reset'], '4070908800');
+    assert.equal(JSON.parse(output.body.toString('utf8')).error.type, 'rate_limit_error');
+    assert.equal('x-claude-rotator-reason' in output.headers, false, '写像専用のヘッダは付かない');
+  });
+
+  it('records that it declined to map, without any mapped* field', () => {
+    const output = mapClaudeExhaustion(synthetic429(), exhausted({ claudeExhaustedTo529: false }));
+    assert.equal(output.degradeLog.mapReason, 'claude_exhausted_passthrough');
+    assert.equal(output.degradeLog.claudePoolState, 'all-exhausted');
+    assert.equal(output.degradeLog.gptPoolState, 'unusable');
+    assert.equal(output.degradeLog.mapPath, 'a');
+    for (const key of ['mappedFrom', 'mappedTo', 'mappedFromType', 'retryAfter', 'resetAt', 'rotatorReason']) {
+      assert.equal(output.degradeLog[key], undefined, `写像していないので ${key} は載らない`);
+    }
+  });
+
+  it('still maps to 529 for the default and for every non-boolean value', () => {
+    // 既定が true のキーなので、無効化として効くのは真偽値の false だけ。未指定・
+    // 'false'・0・null を「止めろ」と解釈すると、設定ミスで無言のまま挙動が変わる。
+    for (const claudeExhaustedTo529 of [undefined, true, 'false', 0, null, {}, []]) {
+      const output = mapClaudeExhaustion(synthetic429(), exhausted({
+        claudeExhaustedTo529, gptPoolState: 'available',
+      }));
+      assert.equal(output.statusCode, 529, `claudeExhaustedTo529:${JSON.stringify(claudeExhaustedTo529) ?? String(claudeExhaustedTo529)}`);
+      assert.equal(output.degradeLog.mapReason, 'all_claude_accounts_exhausted');
+    }
+  });
+
+  it('takes precedence over the 403 and the recoveryWait 429 branches', () => {
+    // 両プール全滅（403 になる構成）でも、recoveryWait の 429 待機構成でも、素通しが勝つ。
+    // 段 2 の目的は「rotator が答えを作らず Claude Code に週次上限として扱わせる」こと
+    // なので、先に判定しないと本文とヘッダが作り替えられてしまう。
+    for (const overrides of [
+      { commonFamilyAllUnusable: true, bothUnusableStatus: 403, claudeResetAt: RESET_AT },
+      {
+        commonFamilyAllUnusable: true, recoveryWaitEnabled: true, commonFamilyQuotaState: 'none',
+        gptResetAt: RESET_AT, claudeResetAt: RESET_AT,
+      },
+    ]) {
+      const input = synthetic429();
+      const output = mapClaudeExhaustion(input, exhausted({ ...overrides, claudeExhaustedTo529: false }));
+      assert.equal(output.statusCode, 429, JSON.stringify(overrides));
+      assert.equal(output.headers, input.headers, JSON.stringify(overrides));
+      assert.equal(output.body, input.body, JSON.stringify(overrides));
+      assert.equal(output.degradeLog.mapReason, 'claude_exhausted_passthrough');
+      assert.equal(output.headers['Retry-After'], undefined, 'Retry-After を合成しない（方式ア の撤回）');
+    }
+  });
+
+  it('adds no mapReason to a request that was never a mapping candidate', () => {
+    // 全枯渇でない・429 でない・ヘッダ送出済みの3つは写像の候補ですらない。ここへ
+    // mapReason を足すと、写像と無関係な要求の proxy ログ行が1フィールド増える（§14.4）。
+    for (const ctx of [
+      { claudeAllUnusable: false },
+      { headersSent: true },
+    ]) {
+      const output = mapClaudeExhaustion(synthetic429(), exhausted({ ...ctx, claudeExhaustedTo529: false }));
+      assert.equal(output.statusCode, 429);
+      assert.equal(output.degradeLog.mapReason, undefined, JSON.stringify(ctx));
+    }
+    const notA429 = mapClaudeExhaustion({ ...synthetic429(), statusCode: 500 },
+      exhausted({ claudeExhaustedTo529: false }));
+    assert.equal(notA429.degradeLog.mapReason, undefined);
+  });
+
+  it('is still a no-op object identity when degradeMapping itself is disabled', () => {
+    const input = synthetic429();
+    assert.equal(
+      mapClaudeExhaustion(input, { enabled: false, claudeAllUnusable: true, claudeExhaustedTo529: false }),
+      input,
+      'enabled:false の早期 return は新キーより先に効く（degradeLog すら足さない）',
+    );
+  });
+});
+
+// ---------------------------------------------------------------------------
 // decideBridgeResponse（設計書 §8.7 の4条件）
 // ---------------------------------------------------------------------------
 

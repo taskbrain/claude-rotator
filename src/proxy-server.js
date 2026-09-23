@@ -476,6 +476,10 @@ export function createProxyServer({
       commonFamilyAllUnusable: commonAllUnusable,
       recoveryWaitEnabled,
       commonFamilyQuotaState: commonQuota,
+      // D-261（段 2・方式イ）: 全枯渇の合成 429 を 529 へ写像するか。**既定は写像する**
+      // （＝現行）。ここでも設定を読み直すのは上の enabled と同じ理由で、
+      // POST /internal/reload の直後に進行中の要求が古い判定へ落ちないようにするため。
+      claudeExhaustedTo529: mapping.claudeExhaustedTo529 !== false,
       gptPoolState: gptState,
       bothUnusableStatus: mapping.bothUnusableStatus,
       gptResetAt: pool?.resetAt || null,
