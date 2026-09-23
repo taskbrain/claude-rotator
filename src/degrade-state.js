@@ -538,6 +538,11 @@ function withoutBodyHeaders(headers) {
   return next;
 }
 
+// D-261（段 2・方式イ）: 写像条件は満たしたが、設定で写像を止めたことを表す mapReason。
+// DEGRADE_REASONS（bridge との契約の語彙）には足さない——これは rotator のログにだけ
+// 出る名前であり、UPSTREAM_OVERLOAD_MAP_REASON と同じ扱いにする。
+const CLAUDE_EXHAUSTED_PASSTHROUGH_MAP_REASON = 'claude_exhausted_passthrough';
+
 /**
  * Claude 全枯渇の写像（設計書 §8.6・§8.7、契約 §C10.4）。7系統の終端経路すべてがこの関数を通る。
  *
@@ -555,9 +560,14 @@ function withoutBodyHeaders(headers) {
  * へ倒す。**bothUnusableStatus の値域（403／529）と既定 403 は変えない**——429 は設定値では
  * なくこの経路がコードで返す（フラグ有効時は本経路が bothUnusableStatus より優先する）。
  *
+ * claudeExhaustedTo529 に**真偽値の false** を渡したときだけ、全枯渇の 429 を 529 へ
+ * 写像せず、ステータス・ヘッダ・本文をどれも触らずに返す（母艦裁定 D-261・段 2 方式イ）。
+ * 合成 429 が運ぶ `anthropic-ratelimit-unified-*` は Claude Code が「週次上限」を判別する
+ * 根拠そのものなので、素通しでは1バイトも落とさない。未指定は写像する側（現行）。
+ *
  * @param {{statusCode:number, headers:object, body:Buffer}|null} candidate これから返そうとしている応答。
  * @param {{enabled?:boolean, claudeAllUnusable?:boolean, commonFamilyAllUnusable?:boolean,
- *          commonFamilyQuotaState?:string, recoveryWaitEnabled?:boolean,
+ *          commonFamilyQuotaState?:string, recoveryWaitEnabled?:boolean, claudeExhaustedTo529?:boolean,
  *          gptPoolState?:string, mapPath?:string, bothUnusableStatus?:number, headersSent?:boolean,
  *          gptResetAt?:string|null, claudeResetAt?:string|null}} ctx
  * @returns {object|null} 写像しない場合も degradeLog（痕跡）を添えて返す。enabled が偽なら入力をそのまま返す。
@@ -574,6 +584,15 @@ export function mapClaudeExhaustion(candidate, ctx = {}) {
   // 写像するのは「台帳が全枯渇」かつ「429」かつ「まだヘッダを送出していない」ときだけ。
   if (ctx.claudeAllUnusable !== true || from !== 429 || ctx.headersSent === true) {
     return { ...candidate, degradeLog };
+  }
+
+  // D-261（段 2・方式イ）: ここから下が写像の本体なので、素通しの判定はこの位置に置く。
+  // 上の早期 return より後ろにあるのは、写像条件を満たさない要求（全枯渇でない等）の
+  // degradeLog に mapReason を足さないためである——それをすると、写像と無関係な要求の
+  // ログ行が1フィールド増える。candidate は分割代入で写すだけで、statusCode も headers も
+  // body も**参照ごとそのまま**返す（合成 429 の unified ヘッダを1つも落とさない）。
+  if (ctx.claudeExhaustedTo529 === false) {
+    return { ...candidate, degradeLog: { ...degradeLog, mapReason: CLAUDE_EXHAUSTED_PASSTHROUGH_MAP_REASON } };
   }
 
   // 403 へ昇格してよいのは「GPT プールが使えない」かつ「**共通枠まで**全口座が

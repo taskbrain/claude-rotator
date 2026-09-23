@@ -65,6 +65,13 @@ export const DISABLED_DEGRADE_MAPPING = Object.freeze({
   // 独立に効く（Claude 専用の機能であり、bridge の有無と関係がないため）。
   upstreamOverloadTo429: false,
   upstreamOverloadRetryAfterSeconds: 30,
+  // 母艦裁定 D-261（段 2・方式イ）: Claude 口座が**全枯渇**したときに rotator が合成する
+  // 429 を 529 へ写像するかどうか。**このキーだけ既定が true**＝現行どおり写像する。
+  // false にすると合成 429 を unified ヘッダ・本文ごと素通しし、週次上限の待機は
+  // Claude Code 側（同じモデルのまま再試行）へ委ねる。
+  // 既定が true なので、無効化として受け付けるのは**真偽値の false だけ**にする
+  // （'false' や 0 は既定のまま）。判定式を1つに保つ規律は他キーと同じで、向きだけが逆。
+  claudeExhaustedTo529: true,
   gptPoolUnusableTtlMs: 60000,
   codexStatusUrl: null,
   codexStatusTimeoutMs: 1500,
@@ -102,6 +109,13 @@ const RECOVERY_WAIT_PRECEDENCE_NOTICE =
 const UPSTREAM_OVERLOAD_NOTICE =
   'degradeMapping.upstreamOverloadTo429 answers a Claude upstream 529 overloaded_error '
   + 'with 429 + Retry-After';
+
+// D-261（段 2・方式イ）: 全枯渇の 529 写像を止めた構成は、Claude Code が週次上限として
+// 認識できる合成 429 を素通しする。既定（true）では1行も出ない——出るのは運用者が
+// 明示的に false を書いたときだけで、「なぜ 529 が出なくなったのか」を後から読めるようにする。
+const CLAUDE_EXHAUSTED_PASSTHROUGH_NOTICE =
+  'degradeMapping.claudeExhaustedTo529 is off; an all-accounts-exhausted 429 is returned '
+  + 'unchanged instead of being mapped to 529';
 
 const CODEX_STATUS_URL_NOT_LOOPBACK_NOTICE =
   'degradeMapping.codexStatusUrl must be loopback; codex status section disabled';
@@ -187,6 +201,9 @@ export function normalizeDegradeMapping(raw) {
     recoveryWaitEnabled: raw.recoveryWaitEnabled === true,
     // 上流 529 の写像も同じ規律。各キーは独立に正規化するので enabled には依存しない。
     upstreamOverloadTo429: raw.upstreamOverloadTo429 === true,
+    // D-261: 既定が true のキーなので、**真偽値の false だけ**を無効化として受ける。
+    // 'false'・0・null・未指定はすべて既定（写像する＝現行どおり）へ倒れる。
+    claudeExhaustedTo529: raw.claudeExhaustedTo529 !== false,
     // 秒は 1..3600 の整数のみ。0 以下は待機の意味を失い、長すぎる値は再開を遅らせる。
     upstreamOverloadRetryAfterSeconds: boundedInteger(
       raw.upstreamOverloadRetryAfterSeconds,
@@ -225,6 +242,11 @@ export function logDegradeMappingConfigNotice(settings, logger) {
   // (2b) 上流 529 → 429 写像（Claude 専用。degradeMapping.enabled・bridge の有無に依存しない）。
   if (degradeMapping.upstreamOverloadTo429 === true) {
     reasons.push(UPSTREAM_OVERLOAD_NOTICE);
+  }
+  // (2c) 全枯渇の 529 写像を止めた構成（D-261・方式イ）。既定 true と、正規化を通って
+  // いない手組みの settings（キーそのものが無い）では1行も出ない。
+  if (degradeMapping.claudeExhaustedTo529 === false) {
+    reasons.push(CLAUDE_EXHAUSTED_PASSTHROUGH_NOTICE);
   }
   // (3) 正規化で捨てた設定（非ループバック等の codexStatusUrl。設計書 §7.2）。
   // fail-safe 3経路では degradeMapping ごと DISABLED_DEGRADE_MAPPING に倒れており
