@@ -27,9 +27,9 @@ import {
 import { createNativeClaudeRefresher } from './native-claude-refresher.js';
 import { isFableScopeIdentity, parseRateLimitHeaders } from './quota.js';
 import { duplicateRefreshTokenAccountIds } from './secret-store.js';
-// 観測整備（PR #42）が sticky から純関数だけ切り出した複製。sticky 側の
-// `./session-affinity.js` が同名・同実装を export しているので、こちらは別名で束ねる。
-// 実装の一本化は今回の合流の範囲外（Follow-up）。
+// 観測整備（PR #42）が sticky から切り出した純関数。実装は `./session-key.js` の
+// 1箇所にあり、`./session-affinity.js` はそれを再 export しているだけである。
+// 観測側の呼び出しを見分けやすくするため、こちらは別名で束ねたままにする。
 import {
   sessionKeyFrom as observationSessionKeyFrom,
   sidHash as observationSidHash,
@@ -85,6 +85,20 @@ const DEFAULT_UPSTREAM_IDLE_TIMEOUT_MS = 180000;
 const DEFAULT_UPSTREAM_CONNECT_TIMEOUT_MS = 10_000;
 const DEFAULT_UPSTREAM_CONNECT_RETRIES = 3;
 const DEFAULT_UPSTREAM_CONNECT_RETRY_DELAY_MS = 250;
+// 受信本文の上限（`config.proxy.maxRequestBodyBytes` で上書きできる）。
+// Anthropic の要求サイズ上限は Messages / Token Counting が 32 MB（超過は 413
+// `request_too_large`）。その 2 倍の 64 MiB を既定にして、正当な要求は必ず通しつつ、
+// 本文を無制限に抱え込む（約 512MiB 超で `Buffer#toString` が投げる）ことを防ぐ。
+export const DEFAULT_MAX_REQUEST_BODY_BYTES = 64 * 1024 * 1024;
+// 上限を超えた後の読み捨ての上限。送信中のクライアントに 413 を届けるには、残りを
+// 読み捨ててから閉じる必要がある（読まずに閉じると RST で 413 が捨てられる）。
+// 無限には読まない: 捨てる量は既定の上限と同じ 64 MiB まで（loopback なら 1 秒未満）、
+// 時間は 10 秒まで。どちらかを超えたら接続を破棄する。
+export const DEFAULT_REQUEST_BODY_DRAIN = Object.freeze({
+  maxBytes: 64 * 1024 * 1024,
+  timeoutMs: 10_000,
+});
+const REQUEST_BODY_TOO_LARGE = 'REQUEST_BODY_TOO_LARGE';
 const REACTIVE_QUOTA_CONFIRM_TIMEOUT_MS = 5_000;
 const REACTIVE_QUOTA_EXHAUSTION_THRESHOLD = 1;
 const REACTIVE_QUOTA_SINGLE_FLIGHT_GRACE_MS = 250;
@@ -125,6 +139,8 @@ export function createProxyServer({
   sessionAffinityPersistIntervalMs = SESSION_AFFINITY_PERSIST_INTERVAL_MS,
   platform = process.platform,
   serviceGeneration = null,
+  // 試験用の注入口。本番は既定（DEFAULT_REQUEST_BODY_DRAIN）のまま。
+  requestBodyDrain = DEFAULT_REQUEST_BODY_DRAIN,
 }) {
   assertLoopbackProxyHost(config.proxy?.host || '127.0.0.1');
   const upstream = config.upstream || 'https://api.anthropic.com';
@@ -140,6 +156,8 @@ export function createProxyServer({
   const upstreamConnectRetryDelayMs = config.proxy?.upstreamConnectRetryDelayMs
     ?? config.upstreamConnectRetryDelayMs
     ?? DEFAULT_UPSTREAM_CONNECT_RETRY_DELAY_MS;
+  const maxRequestBodyBytes = normalizeMaxRequestBodyBytes(config.proxy?.maxRequestBodyBytes, logger);
+  const readBody = req => readRequestBody(req, maxRequestBodyBytes);
   const resolvedTokenRefresher = tokenRefresher || defaultTokenRefresher({
     platform,
     nativeOptions: {
@@ -824,6 +842,11 @@ export function createProxyServer({
       });
       await persistState();
     } catch (error) {
+      if (error?.code === REQUEST_BODY_TOO_LARGE && !res.headersSent) {
+        logger?.(`${new Date().toISOString()} proxy-error method=${req.method} path=${safeRequestPath(req.url)} error=request_too_large limitBytes=${error.limitBytes}`);
+        sendRequestTooLarge(req, res, { ...requestBodyDrain, logger });
+        return;
+      }
       const message = shortErrorMessage(error);
       logger?.(`${new Date().toISOString()} proxy-error method=${req.method} path=${safeRequestPath(req.url)} error=${message}`);
       if (!res.headersSent) {
@@ -4411,10 +4434,151 @@ function epochSeconds(milliseconds) {
     : null;
 }
 
-async function readBody(req) {
-  const chunks = [];
-  for await (const chunk of req) chunks.push(chunk);
-  return Buffer.concat(chunks);
+function normalizeMaxRequestBodyBytes(value, logger = null) {
+  if (value === undefined) return DEFAULT_MAX_REQUEST_BODY_BYTES;
+  if (Number.isSafeInteger(value) && value > 0) return value;
+  logger?.(
+    `${new Date().toISOString()} config-warning proxy.maxRequestBodyBytes=${JSON.stringify(value) ?? String(value)} `
+    + `is not a positive integer; using default ${DEFAULT_MAX_REQUEST_BODY_BYTES}`,
+  );
+  return DEFAULT_MAX_REQUEST_BODY_BYTES;
+}
+
+/**
+ * 受信本文を読む。`maxBytes` を超えた時点で読み込みを打ち切り、
+ * `code === 'REQUEST_BODY_TOO_LARGE'` の例外で reject する。
+ *
+ * `for await` で読んで途中で抜けると要求（＝ソケット）が破棄され 413 を返せないので、
+ * 超過時は `data` の購読を外して一時停止するだけにする。残りの本文は
+ * `sendRequestTooLarge` が上限付きで読み捨てる。
+ *
+ * @param {import('node:http').IncomingMessage} req 受信要求。
+ * @param {number} [maxBytes] 本文の上限（バイト）。
+ * @returns {Promise<Buffer>} 本文。
+ */
+export function readRequestBody(req, maxBytes = DEFAULT_MAX_REQUEST_BODY_BYTES) {
+  return new Promise((resolve, reject) => {
+    const declared = Number(req.headers?.['content-length']);
+    if (Number.isFinite(declared) && declared > maxBytes) {
+      req.pause?.();
+      reject(requestBodyTooLargeError(maxBytes));
+      return;
+    }
+    // 読み終えた後に呼ばれた場合（旧実装の `for await` と同じく空を返す）。
+    if (req.readableEnded) {
+      resolve(Buffer.alloc(0));
+      return;
+    }
+    const chunks = [];
+    let received = 0;
+    const cleanup = () => {
+      req.off('data', onData);
+      req.off('end', onEnd);
+      req.off('error', onError);
+      req.off('close', onClose);
+    };
+    const onData = chunk => {
+      received += chunk.length;
+      if (received > maxBytes) {
+        cleanup();
+        chunks.length = 0;
+        req.pause();
+        reject(requestBodyTooLargeError(maxBytes));
+        return;
+      }
+      chunks.push(chunk);
+    };
+    const onEnd = () => {
+      cleanup();
+      resolve(Buffer.concat(chunks));
+    };
+    const onError = error => {
+      cleanup();
+      reject(error);
+    };
+    // 本文の途中で相手が切断した場合（`end` の前に `close`）。
+    const onClose = () => {
+      cleanup();
+      const error = new Error('Request body aborted');
+      error.code = 'ECONNRESET';
+      reject(error);
+    };
+    req.on('data', onData);
+    req.on('end', onEnd);
+    req.on('error', onError);
+    req.on('close', onClose);
+  });
+}
+
+function requestBodyTooLargeError(limitBytes) {
+  const error = new Error(`Request body exceeds ${limitBytes} bytes`);
+  error.code = REQUEST_BODY_TOO_LARGE;
+  error.limitBytes = limitBytes;
+  return error;
+}
+
+const REQUEST_TOO_LARGE_BODY = JSON.stringify({
+  type: 'error',
+  error: { type: 'request_too_large', message: 'Request exceeds the maximum allowed number of bytes.' },
+});
+
+/**
+ * 413 `request_too_large`（Anthropic API が同じ状況で返す形）を返す。
+ *
+ * 応答（ヘッダと本文）は先に書くが、`end()` は残りの本文を読み捨て終えてから呼ぶ。
+ * `Connection: close` の応答を end すると Node はソケットを閉じるので、クライアントが
+ * まだ送信中だと RST になり、受け取るはずの 413 が捨てられるためである。
+ * 読み捨ては `maxBytes`・`timeoutMs` のどちらかを超えた時点で打ち切り、接続を破棄する。
+ */
+function sendRequestTooLarge(req, res, {
+  maxBytes = DEFAULT_REQUEST_BODY_DRAIN.maxBytes,
+  timeoutMs = DEFAULT_REQUEST_BODY_DRAIN.timeoutMs,
+  logger = null,
+} = {}) {
+  res.writeHead(413, {
+    'Content-Type': 'application/json',
+    'Content-Length': Buffer.byteLength(REQUEST_TOO_LARGE_BODY),
+    Connection: 'close',
+  });
+  res.write(REQUEST_TOO_LARGE_BODY);
+  if (req.readableEnded || req.destroyed) {
+    res.end();
+    return;
+  }
+  let discarded = 0;
+  let timer = null;
+  const cleanup = () => {
+    clearTimeout(timer);
+    req.off('data', onData);
+    req.off('end', onEnd);
+    req.off('error', onGone);
+    req.off('close', onGone);
+  };
+  const abort = reason => {
+    cleanup();
+    logger?.(
+      `${new Date().toISOString()} request-body-drain aborted reason=${reason} `
+      + `path=${safeRequestPath(req.url)} discardedBytes=${discarded}`,
+    );
+    res.end();
+    req.socket?.destroy();
+  };
+  const onData = chunk => {
+    discarded += chunk.length;
+    if (discarded > maxBytes) abort('bytes');
+  };
+  const onEnd = () => {
+    cleanup();
+    res.end();
+  };
+  const onGone = () => cleanup();
+  timer = setTimeout(() => abort('timeout'), timeoutMs);
+  timer.unref?.();
+  req.on('data', onData);
+  req.on('end', onEnd);
+  req.on('error', onGone);
+  req.on('close', onGone);
+  req.resume();
 }
 
 function sendJson(res, status, body) {
