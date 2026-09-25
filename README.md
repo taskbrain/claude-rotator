@@ -693,6 +693,14 @@ Codex Rotator                          sendable 0/2  (held 1, capped 1)
 
 値が無いところは `-` になります。`totalRequests` は **usage を読めた応答だけ**を 1 件として数えます（読めなかった件数は `usageParse=` の分布から数えてください）。
 
+キャッシュの使われ具合は `scripts/cache-report.sh` で集計できます（読み取りのみ。`server.log.1` と `server.log` を読みます）。ヒット率は `cr ÷ (in + cr + cc)` で、集計単位ごとの件数・`in`/`cr`/`cc` の合計・`c1h`/`c5m` の内訳・`usageParse=no-usage` の件数と、最後に `TOTAL` 行を出します。`--since` は行頭の時刻（UTC）で絞ります。
+
+```bash
+scripts/cache-report.sh --since 1h                 # モデル別（既定）
+scripts/cache-report.sh --since 1d --by account    # アカウント ID（メールアドレスの記号を置換したもの）別。ほかに sid / none
+scripts/cache-report.sh --by sid --json            # 機械可読。--log <path> で別ファイルを指定
+```
+
 #### 設定
 
 ```json
@@ -1655,6 +1663,14 @@ The three values of `mode`:
 ```
 
 See [Troubleshooting](#troubleshooting) for how to check the resident server's file log.
+
+The per-request cache fields that the proxy lines carry (`model`, `sid`, `in`, `out`, `cr`, `cc`, `c1h`, `c5m`, `usageParse`) can be summarized with `scripts/cache-report.sh` (read-only; it reads `server.log.1` and `server.log`). The hit rate is `cr / (in + cr + cc)`. For each group it prints the request count, the `in`/`cr`/`cc` totals, the `c1h`/`c5m` split, and the `usageParse=no-usage` count, followed by a `TOTAL` row. `--since` filters on the line timestamp (UTC).
+
+```bash
+scripts/cache-report.sh --since 1h                 # by model (default)
+scripts/cache-report.sh --since 1d --by account    # by account ID (the email address with symbols replaced); also sid / none
+scripts/cache-report.sh --by sid --json            # machine-readable; --log <path> reads another file
+```
 
 The only fields written to the proxy request log are `account`, `method`, `path`, `status`, `durationMs`, `outcome`, `requestId`, and, on a timeout/network error, `errorType`. Internal proxy errors are logged as a short `proxy-error method=... path=... error=...` line. Tokens, the `Authorization` header, API keys, request bodies, and response bodies are never logged.
 
