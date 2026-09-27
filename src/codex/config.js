@@ -1,0 +1,406 @@
+// codex-rotator の設定ファイル（$XDG_CONFIG_HOME/codex-rotator/config.json）の読込と検証。
+//
+// 方針:
+//   - 知らないキーは、最上位・daemon・口座・usagePolicy のどの階層でも拒否する（書き損じた
+//     設定が黙って既定値で動くのを防ぐ）。ほかのモジュールでだけ使うキーもここで全部定義する。
+//   - 使用量は常に usage GET（http）で読む。観測方式を選ぶキー usageObservationMode は無い。
+//   - 既定値を補うのはこのファイルだけ。とくに daemon.port の既定値 37892 は、ここで1回だけ
+//     補う。接続先の URL を作る側は既定値を持たず、0・未定義を受け取ったら拒否する。
+//   - 例外のメッセージには、設定の値（パス・User-Agent・originator・ラベルの候補）を入れない。
+//     どのキーが悪いかだけを言う（例外はログや標準エラーへ出うるため）。
+//   - パスの重なりは、存在する祖先まで実パスに直して比べる（シンボリックリンクの別名で
+//     ~/.codex や他の口座を指す形を見逃さないため）。macOS（darwin）のディスクは大文字小文字と
+//     Unicode の正規化形を区別しないので、比べる前にそろえる。validateCodexConfig が読むのは
+//     パスの情報だけで、中身は開かない。
+//   - loadCodexConfig は、設定ファイルとその親フォルダが自分だけのものであること、既にある
+//     accountsDir が自分だけのフォルダであることも確かめる（fsguard.js）。
+import { lstatSync, realpathSync } from 'node:fs';
+import { basename, dirname, isAbsolute, join, parse, resolve, sep } from 'node:path';
+import { FSGUARD_REASON, FsGuardError, assertPrivateDirectory, readPrivateFile } from './fsguard.js';
+import {
+  CodexPathsError, DEFAULT_ACCOUNTS_DIR, codexRotatorConfigPath, defaultCodexHome, expandHomePath, shimDir,
+} from './paths.js';
+
+// 常駐の待受ポートの既定値。Claude 側の待受とも、OpenAI ブリッジ（設定 openaiBridge）の既定とも違う番号にする。
+export const DEFAULT_DAEMON_PORT = 37892;
+// 口座のラベル。表示・JSON・ログで口座を指すのはこのラベルだけである。
+export const CODEX_ACCOUNT_LABEL = /^[a-z0-9][a-z0-9_-]{0,31}$/;
+export const USAGE_USER_AGENT_MAX_LENGTH = 256;
+export const USAGE_ORIGINATOR_MAX_LENGTH = 64;
+// 設定ファイルの大きさの上限（口座が多くても十分に収まる）。
+export const CONFIG_FILE_MAX_BYTES = 256 * 1024;
+
+// 時間の既定値。有効期限の既定値 125000 は、下の下限（取得の間隔2回分＋読取の期限1回分）を
+// 既定値どうしで満たす最小の値である。
+export const CODEX_CONFIG_DEFAULTS = Object.freeze({
+  enabled: false,
+  acknowledgedMultiAccountRisk: false,
+  accountsDir: DEFAULT_ACCOUNTS_DIR,
+  daemonPort: DEFAULT_DAEMON_PORT,
+  usagePollIntervalMs: 60000,
+  usageReadTimeoutMs: 5000,
+  rotationObservationTtlMs: 125000,
+  rotationUsageCapNoResetProbeMs: 3600000,
+});
+
+const TIMING_RANGES = Object.freeze({
+  usagePollIntervalMs: [30000, 3600000],
+  usageReadTimeoutMs: [1000, 15000],
+  rotationObservationTtlMs: [1000, 86400000],
+});
+// 0 は「リセット時刻の記録が無い窓の停止を、時間の条件では外さない」。それ以外は範囲内。
+const NO_RESET_PROBE_RANGE = Object.freeze([60000, 604800000]);
+
+const TOP_LEVEL_KEYS = new Set(['enabled', 'acknowledgedMultiAccountRisk', 'accountsDir', 'daemon',
+  'usagePollIntervalMs', 'usageReadTimeoutMs', 'rotationObservationTtlMs', 'rotationUsageCapNoResetProbeMs',
+  'codexPath', 'usageUserAgent', 'usageOriginator', 'accounts']);
+const DAEMON_KEYS = new Set(['port']);
+const ACCOUNT_KEYS = new Set(['label', 'codexHome', 'usagePolicy']);
+const USAGE_POLICY_KEYS = new Set(['stopUsedPercent', 'resumeUsedPercent', 'blockWhenUnknown']);
+
+export class CodexConfigError extends Error {
+  constructor(message) {
+    super(message);
+    this.name = 'CodexConfigError';
+  }
+}
+
+// 知らないキーの名前は、識別子の形のときだけ例外のメッセージに入れる。
+const PRINTABLE_KEY = /^[A-Za-z_][A-Za-z0-9_]{0,63}$/;
+
+function isPlainObject(value) {
+  if (value === null || typeof value !== 'object' || Array.isArray(value)) return false;
+  const prototype = Object.getPrototypeOf(value);
+  return prototype === Object.prototype || prototype === null;
+}
+
+function assertKnownKeys(value, allowed, where) {
+  if (!isPlainObject(value)) throw new CodexConfigError(`${where} must be an object`);
+  for (const key of Object.keys(value)) {
+    if (!allowed.has(key)) {
+      throw new CodexConfigError(`${where} has an unknown key: ${PRINTABLE_KEY.test(key) ? key : '(unprintable)'}`);
+    }
+  }
+}
+
+function optionalBoolean(value, fallback, where) {
+  if (value === undefined) return fallback;
+  if (typeof value !== 'boolean') throw new CodexConfigError(`${where} must be true or false`);
+  return value;
+}
+
+function integerInRange(value, [min, max], where) {
+  if (!Number.isInteger(value) || value < min || value > max) {
+    throw new CodexConfigError(`${where} must be an integer between ${min} and ${max}`);
+  }
+  return value;
+}
+
+/** 観測の有効期限の下限。取得が1回失敗しても、次の取得と読取の期限まで観測が古くならない長さ。 */
+export function minimumObservationTtlMs({ usagePollIntervalMs, usageReadTimeoutMs }) {
+  return 2 * usagePollIntervalMs + usageReadTimeoutMs;
+}
+
+function validateTiming(raw) {
+  const timing = {};
+  for (const [key, range] of Object.entries(TIMING_RANGES)) {
+    timing[key] = raw[key] === undefined ? CODEX_CONFIG_DEFAULTS[key] : integerInRange(raw[key], range, key);
+  }
+  const probe = raw.rotationUsageCapNoResetProbeMs === undefined
+    ? CODEX_CONFIG_DEFAULTS.rotationUsageCapNoResetProbeMs
+    : raw.rotationUsageCapNoResetProbeMs;
+  const [probeMin, probeMax] = NO_RESET_PROBE_RANGE;
+  if (probe !== 0 && (!Number.isInteger(probe) || probe < probeMin || probe > probeMax)) {
+    throw new CodexConfigError(`rotationUsageCapNoResetProbeMs must be 0 or an integer between ${probeMin} and ${probeMax}`);
+  }
+  timing.rotationUsageCapNoResetProbeMs = probe;
+  // 観測方式は http に固定なので、この下限の検査は常に掛かり、外す設定も引数も無い。
+  const minimum = minimumObservationTtlMs(timing);
+  if (timing.rotationObservationTtlMs < minimum) {
+    throw new CodexConfigError(`rotationObservationTtlMs must be at least ${minimum} (2 x usagePollIntervalMs + usageReadTimeoutMs)`);
+  }
+  return timing;
+}
+
+function validateDaemon(rawDaemon) {
+  if (rawDaemon === undefined) return { port: DEFAULT_DAEMON_PORT };
+  assertKnownKeys(rawDaemon, DAEMON_KEYS, 'daemon');
+  // 0 は「空いている番号を OS に選ばせる」（テストの待受）。接続先の URL は 0 から作れない。
+  const port = rawDaemon.port === undefined ? DEFAULT_DAEMON_PORT : integerInRange(rawDaemon.port, [0, 65535], 'daemon.port');
+  return { port };
+}
+
+/**
+ * User-Agent・originator の値として使えない理由を返す。使えるなら null。値そのものは返さない。
+ * 条件: 文字列・1〜maxLength 文字・表示可能な ASCII（0x20〜0x7E）だけ・前後に空白が無い
+ * （空白だけの値もここで落ちる）。実行時に組み立てる User-Agent・originator の値にも同じ検査を当てる。
+ */
+export function usageHeaderValueProblem(value, maxLength) {
+  if (typeof value !== 'string') return 'must be a string';
+  if (value.length < 1 || value.length > maxLength) return `must be 1 to ${maxLength} characters long`;
+  for (let index = 0; index < value.length; index++) {
+    const code = value.charCodeAt(index);
+    if (code < 0x20 || code > 0x7e) return 'must contain only printable ASCII characters';
+  }
+  if (value.trim() !== value) return 'must not start or end with a space';
+  return null;
+}
+
+export const isValidUsageUserAgent = value => usageHeaderValueProblem(value, USAGE_USER_AGENT_MAX_LENGTH) === null;
+export const isValidUsageOriginator = value => usageHeaderValueProblem(value, USAGE_ORIGINATOR_MAX_LENGTH) === null;
+
+function validateUsageIdentity(raw) {
+  const hasUserAgent = raw.usageUserAgent !== undefined;
+  const hasOriginator = raw.usageOriginator !== undefined;
+  if (hasUserAgent !== hasOriginator) {
+    throw new CodexConfigError('usageUserAgent and usageOriginator must be set together or both omitted');
+  }
+  if (!hasUserAgent) return { usageUserAgent: null, usageOriginator: null };
+  const userAgentProblem = usageHeaderValueProblem(raw.usageUserAgent, USAGE_USER_AGENT_MAX_LENGTH);
+  if (userAgentProblem) throw new CodexConfigError(`usageUserAgent ${userAgentProblem}`);
+  const originatorProblem = usageHeaderValueProblem(raw.usageOriginator, USAGE_ORIGINATOR_MAX_LENGTH);
+  if (originatorProblem) throw new CodexConfigError(`usageOriginator ${originatorProblem}`);
+  return { usageUserAgent: raw.usageUserAgent, usageOriginator: raw.usageOriginator };
+}
+
+function isInside(child, parent) {
+  return child.startsWith(parent.endsWith(sep) ? parent : `${parent}${sep}`);
+}
+
+/** child が parent と同じか、parent の中にあるか。 */
+export function isSameOrInside(child, parent) {
+  return child === parent || isInside(child, parent);
+}
+
+/** 2つのパスが同じ・どちらかがもう一方を含む・どちらかがファイルシステムの根、のどれか。 */
+export function pathsOverlap(a, b) {
+  return isSameOrInside(a, b) || isSameOrInside(b, a) || a === parse(a).root || b === parse(b).root;
+}
+
+// 比べるための形。darwin のディスクは大文字小文字と正規化形を区別しないので、そろえる。
+// まだ存在しない部分は実パスに直せず、書いたとおりの大文字小文字が残るため、ここでそろえる。
+function comparisonKey(path, platform) {
+  return platform === 'darwin' ? path.normalize('NFC').toLowerCase() : path;
+}
+
+// 存在する祖先まで実パスに直す。まだ無い部分はそのままつなぐ。行き先の無いシンボリック
+// リンクは、どこを指すか確かめられないので拒否する。
+function canonicalPath(absolutePath, where, fsImpl) {
+  try {
+    return fsImpl.realpath(absolutePath);
+  } catch (error) {
+    if (error?.code !== 'ENOENT') throw new CodexConfigError(`${where} cannot be resolved`);
+    if (isDanglingLink(absolutePath, fsImpl)) throw new CodexConfigError(`${where} cannot be resolved`);
+    const parent = dirname(absolutePath);
+    if (parent === absolutePath) throw new CodexConfigError(`${where} cannot be resolved`);
+    return join(canonicalPath(parent, where, fsImpl), basename(absolutePath));
+  }
+}
+
+function isDanglingLink(path, fsImpl) {
+  try {
+    return fsImpl.lstat(path).isSymbolicLink();
+  } catch {
+    return false;
+  }
+}
+
+// 絶対パスか `~/` で始まるパスだけを受ける。返す path は ~ を展開して正規化した絶対パス
+// （末尾の / なし）、canonical は重なりの比較に使う形（実パスを comparisonKey でそろえたもの）。
+function pathSetting(value, where, context) {
+  if (typeof value !== 'string' || value.includes('\0') || !(isAbsolute(value) || value.startsWith('~/'))) {
+    throw new CodexConfigError(`${where} must be an absolute path or start with ~/`);
+  }
+  const path = resolve(expandHomePath(value, context.env));
+  return { path, canonical: comparisonKey(canonicalPath(path, where, context.fsImpl), context.platform) };
+}
+
+function validateAccountsDir(rawValue, context) {
+  const dir = pathSetting(rawValue === undefined ? DEFAULT_ACCOUNTS_DIR : rawValue, 'accountsDir', context);
+  if (pathsOverlap(dir.canonical, context.defaultCodexHome)) {
+    throw new CodexConfigError('accountsDir must be separate from ~/.codex (neither inside it nor containing it)');
+  }
+  return dir;
+}
+
+function validateUsagePolicy(policy, where) {
+  // 口座の選択は方針で決めるので、方針の無い口座は置けない。
+  if (policy === undefined) throw new CodexConfigError(`${where} is required for every account`);
+  assertKnownKeys(policy, USAGE_POLICY_KEYS, where);
+  const { stopUsedPercent: stop, resumeUsedPercent: resume } = policy;
+  if (typeof stop !== 'number' || !Number.isFinite(stop) || stop <= 0 || stop > 100) {
+    throw new CodexConfigError(`${where}.stopUsedPercent must be a number greater than 0 and at most 100`);
+  }
+  if (typeof resume !== 'number' || !Number.isFinite(resume) || resume < 0 || resume >= stop) {
+    throw new CodexConfigError(`${where}.resumeUsedPercent must be a number from 0 up to, but not including, stopUsedPercent`);
+  }
+  // 省略は false。文字列や数値を真偽として読まない（書き損じで口座が送れる側に倒れないように）。
+  const blockWhenUnknown = optionalBoolean(policy.blockWhenUnknown, false, `${where}.blockWhenUnknown`);
+  return { stopUsedPercent: stop, resumeUsedPercent: resume, blockWhenUnknown };
+}
+
+// 返すのは、正規化した口座の並びと、各口座のフォルダの比較用の形（codexPath の検査に使う）。
+function validateAccounts(rawAccounts, accountsDir, context) {
+  if (rawAccounts === undefined) return { accounts: [], homes: [] };
+  if (!Array.isArray(rawAccounts)) throw new CodexConfigError('accounts must be an array');
+  const labels = new Set();
+  const homes = [];
+  const accounts = rawAccounts.map((account, index) => {
+    const where = `accounts[${index}]`;
+    assertKnownKeys(account, ACCOUNT_KEYS, where);
+    if (typeof account.label !== 'string' || !CODEX_ACCOUNT_LABEL.test(account.label)) {
+      throw new CodexConfigError(`${where}.label must be 1 to 32 characters of a-z, 0-9, _ and -, starting with a-z or 0-9`);
+    }
+    if (labels.has(account.label)) throw new CodexConfigError(`${where}.label is used by another account`);
+    labels.add(account.label);
+    const home = pathSetting(account.codexHome, `${where}.codexHome`, context);
+    // ~/.codex は口座の外。その中・それを含む場所も口座にしない。
+    if (pathsOverlap(home.canonical, context.defaultCodexHome)) {
+      throw new CodexConfigError(`${where}.codexHome must be separate from ~/.codex (neither inside it nor containing it)`);
+    }
+    if (homes.some(other => pathsOverlap(other, home.canonical))) {
+      throw new CodexConfigError(`${where}.codexHome overlaps the codexHome of another account`);
+    }
+    homes.push(home.canonical);
+    // 口座のフォルダは accountsDir の中に置けるが、accountsDir を口座のフォルダの中には置けない。
+    if (isSameOrInside(accountsDir.canonical, home.canonical)) {
+      throw new CodexConfigError(`accountsDir must not be the same as or inside ${where}.codexHome`);
+    }
+    const usagePolicy = validateUsagePolicy(account.usagePolicy, `${where}.usagePolicy`);
+    return { label: account.label, codexHome: home.path, usagePolicy };
+  });
+  return { accounts, homes };
+}
+
+function validateCodexPath(rawValue, accountsDir, accountHomes, context) {
+  if (rawValue === undefined) return null;
+  const codexPath = pathSetting(rawValue, 'codexPath', context);
+  if (isSameOrInside(codexPath.canonical, accountsDir.canonical)) {
+    throw new CodexConfigError('codexPath must not point inside accountsDir');
+  }
+  // accountsDir の外に置いた口座のフォルダも、実行するファイルの置き場所にしない。
+  if (accountHomes.some(home => isSameOrInside(codexPath.canonical, home))) {
+    throw new CodexConfigError('codexPath must not point inside an account folder');
+  }
+  if (isSameOrInside(codexPath.canonical, context.shimDir)) {
+    throw new CodexConfigError('codexPath must not point inside the codex-rotator shim directory');
+  }
+  return codexPath.path;
+}
+
+function fromEnv(read) {
+  try {
+    return read();
+  } catch (error) {
+    if (error instanceof CodexPathsError) throw new CodexConfigError(error.message);
+    throw error;
+  }
+}
+
+function deepFreeze(value) {
+  if (value && typeof value === 'object' && !Object.isFrozen(value)) {
+    Object.freeze(value);
+    for (const child of Object.values(value)) deepFreeze(child);
+  }
+  return value;
+}
+
+/**
+ * 生の設定を検証し、既定値を補った設定を返す（凍結済み）。不正なら CodexConfigError。
+ * パスの情報だけを見る同期の検査で、フォルダの権限は見ない（それは loadCodexConfig）。
+ * @param {unknown} raw JSON.parse した設定
+ * @param {{ env: object, platform?: string, realpathImpl?: Function, lstatImpl?: Function }} options
+ *   env は HOME と XDG_* を読む元（~ の展開・~/.codex・shim の置き場所）。platform は比べ方を
+ *   決める（darwin なら大文字小文字をそろえる）。
+ */
+export function validateCodexConfig(raw, {
+  env, platform = process.platform, realpathImpl = realpathSync.native, lstatImpl = lstatSync,
+} = {}) {
+  if (isPlainObject(raw) && Object.hasOwn(raw, 'usageObservationMode')) {
+    throw new CodexConfigError('usageObservationMode is not a setting: usage is always read over http');
+  }
+  assertKnownKeys(raw, TOP_LEVEL_KEYS, 'config');
+  const enabled = optionalBoolean(raw.enabled, false, 'enabled');
+  const acknowledgedMultiAccountRisk = optionalBoolean(raw.acknowledgedMultiAccountRisk, false, 'acknowledgedMultiAccountRisk');
+  const daemon = validateDaemon(raw.daemon);
+  const timing = validateTiming(raw);
+  const usageIdentity = validateUsageIdentity(raw);
+  const fsImpl = { realpath: realpathImpl, lstat: lstatImpl };
+  const context = fromEnv(() => ({
+    env,
+    fsImpl,
+    platform,
+    defaultCodexHome: comparisonKey(canonicalPath(defaultCodexHome(env), '~/.codex', fsImpl), platform),
+    shimDir: comparisonKey(canonicalPath(shimDir(env), 'the shim directory', fsImpl), platform),
+  }));
+  const accountsDir = fromEnv(() => validateAccountsDir(raw.accountsDir, context));
+  const { accounts, homes } = fromEnv(() => validateAccounts(raw.accounts, accountsDir, context));
+  const codexPath = fromEnv(() => validateCodexPath(raw.codexPath, accountsDir, homes, context));
+  return deepFreeze({
+    enabled,
+    acknowledgedMultiAccountRisk,
+    accountsDir: accountsDir.path,
+    daemon,
+    ...timing,
+    codexPath,
+    ...usageIdentity,
+    accounts,
+  });
+}
+
+// fsguard の拒否を設定の拒否に替える（メッセージはパスを含まない fsguard のものをそのまま使う）。
+async function guarded(check) {
+  try {
+    return await check();
+  } catch (error) {
+    if (error instanceof FsGuardError) throw new CodexConfigError(error.message);
+    throw error;
+  }
+}
+
+/**
+ * env の置き場所から設定ファイルを読み、検証して返す。ファイルが無いときだけ null を返す
+ * （ファイルは作らない）。次のときは CodexConfigError（中身とパスはメッセージに入れない）:
+ *   - 設定ファイルが自分だけのものでない（シンボリックリンク・通常のファイルでない・所有者が
+ *     違う・0600 より広い）、または親フォルダが自分だけのフォルダでない（0700 より広いなど）
+ *   - 読めない・JSON でない・validateCodexConfig を通らない
+ *   - accountsDir が既にあり、自分だけのフォルダでない（リンクも拒否する）。無ければ通す
+ * @param {{ env: object, openImpl?: Function, platform?: string, realpathImpl?: Function, lstatImpl?: Function }} options
+ */
+export async function loadCodexConfig({ env, openImpl, ...validateOptions } = {}) {
+  const path = fromEnv(() => codexRotatorConfigPath(env));
+  let text;
+  try {
+    text = await readPrivateFile(path, { what: 'the codex-rotator config file', maxBytes: CONFIG_FILE_MAX_BYTES, openImpl });
+  } catch (error) {
+    if (error instanceof FsGuardError && error.reason === FSGUARD_REASON.missing) return null;
+    if (error instanceof FsGuardError) throw new CodexConfigError(error.message);
+    throw error;
+  }
+  await guarded(() => assertPrivateDirectory(dirname(path), { what: 'the codex-rotator config folder' }));
+  let raw;
+  try {
+    raw = JSON.parse(text);
+  } catch {
+    throw new CodexConfigError('the codex-rotator config file is not valid JSON');
+  }
+  const config = validateCodexConfig(raw, { env, ...validateOptions });
+  await guarded(async () => {
+    try {
+      await assertPrivateDirectory(config.accountsDir, { what: 'accountsDir' });
+    } catch (error) {
+      if (!(error instanceof FsGuardError && error.reason === FSGUARD_REASON.missing)) throw error;
+    }
+  });
+  return config;
+}
+
+/** 有効化の二重ゲート: enabled と多口座のリスク承認の両方が true のときだけ動かす。 */
+export function isCodexRotatorActivated(config) {
+  return config?.enabled === true && config?.acknowledgedMultiAccountRisk === true;
+}
+
+/** ロガーへ「秘密として登録する値」として渡す設定の値（User-Agent と originator の上書き）。 */
+export function configSecretValues(config) {
+  return [config?.usageUserAgent, config?.usageOriginator].filter(value => typeof value === 'string' && value.length > 0);
+}
