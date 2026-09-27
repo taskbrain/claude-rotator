@@ -497,3 +497,93 @@ describe('observationLogFields', () => {
     assert.match(rendered, / sid=[0-9a-f]{12} /);
   });
 });
+
+// ---------------------------------------------------------------------------
+// observationLogFields / 猶予（usage-limit grace）の追記（差分案 3章 (b)・案A）
+// ---------------------------------------------------------------------------
+
+describe('observationLogFields / 猶予（grace）', () => {
+  const base = {
+    model: 'claude-opus-5-1',
+    sid: 'ab12cd34ef56',
+    inputTokens: 10,
+    outputTokens: 20,
+    cacheReadTokens: 99000,
+    cacheCreationTokens: 1500,
+    cacheCreation1hTokens: 1500,
+    cacheCreation5mTokens: 0,
+    quota: { unified5h: 0.76, unified5hReset: 1789012345, unified7d: 0.33, unified7dReset: 1789098765 },
+    encoding: 'gzip',
+    parse: 'ok',
+  };
+  // grace を持たない現行の材料で出る文字列（既存テスト「計画書の順序どおりに追記する」と同じ）。
+  const WITHOUT_GRACE = ' model=claude-opus-5-1 sid=ab12cd34ef56 in=10 out=20 cr=99000 cc=1500 c1h=1500 c5m=0'
+    + ' u5h=0.76 u5hReset=1789012345 u7d=0.33 u7dReset=1789098765 enc=gzip';
+
+  it('猶予ヘッダが無い応答（g5h・g7d とも null）では行が現行とバイト同一', () => {
+    // grace キー自体が無い材料（旧版の buildObservationLog が返す形）。
+    assert.equal(observationLogFields(base), WITHOUT_GRACE);
+    // grace はあるが g5h/g7d とも null。status や overage だけ来ても追記しない。
+    const noGrace = {
+      ...base,
+      grace: { g5h: null, g7d: null, ustat: 'allowed', ovs: 'rejected', ovu: 'false' },
+    };
+    assert.equal(observationLogFields(noGrace), WITHOUT_GRACE);
+    assert.equal(Buffer.compare(Buffer.from(observationLogFields(noGrace)), Buffer.from(WITHOUT_GRACE)), 0);
+    // grace が null でも同じ。
+    assert.equal(observationLogFields({ ...base, grace: null }), WITHOUT_GRACE);
+  });
+
+  it('猶予ヘッダが来た応答だけ末尾へ g5h g7d ustat ovs ovu の順で足す', () => {
+    const withGrace = {
+      ...base,
+      grace: { g5h: 0.02, g7d: 0, ustat: 'allowed_warning', ovs: 'rejected', ovu: 'false' },
+    };
+    assert.equal(
+      observationLogFields(withGrace),
+      WITHOUT_GRACE + ' g5h=0.02 g7d=0 ustat=allowed_warning ovs=rejected ovu=false',
+    );
+  });
+
+  it('片方だけ来たときはもう片方と欠けた文字列項目を - にする', () => {
+    const only7d = { ...base, grace: { g5h: null, g7d: 0.5, ustat: null, ovs: null, ovu: null } };
+    assert.ok(
+      observationLogFields(only7d).endsWith(' enc=gzip g5h=- g7d=0.5 ustat=- ovs=- ovu=-'),
+      observationLogFields(only7d),
+    );
+  });
+
+  it('grace=0 は null ではないので追記する（上流が常に 0 を付ける場合の挙動）', () => {
+    const zero = { ...base, grace: { g5h: 0, g7d: 0, ustat: 'allowed', ovs: null, ovu: null } };
+    assert.ok(observationLogFields(zero).endsWith(' g5h=0 g7d=0 ustat=allowed ovs=- ovu=-'));
+  });
+
+  it('g5h が数値でなくても null でなければ追記し値は - になる。文字列項目は logToken で1トークンに収める', () => {
+    // 本番では数値として読めない値は buildObservationLog 側で null になる。ここは
+    // それ以外の値が渡ったときの observationLogFields 単体の挙動を固定する。
+    const junk = { ...base, grace: { g5h: 'abc', g7d: undefined, ustat: 'allowed', ovs: null, ovu: null } };
+    // 'abc' は != null なので条件は真になるが、numberOrDash で - に倒れる。
+    assert.ok(observationLogFields(junk).endsWith(' g5h=- g7d=- ustat=allowed ovs=- ovu=-'));
+
+    const spaced = {
+      ...base,
+      grace: { g5h: 1.2, g7d: null, ustat: 'allowed warning', ovs: 'org level/disabled', ovu: '' },
+    };
+    const rendered = observationLogFields(spaced);
+    assert.ok(rendered.endsWith(' g5h=1.2 g7d=- ustat=allowed_warning ovs=org_level_disabled ovu=-'), rendered);
+    // 既存13トークン＋猶予5トークン。値の空白でトークン数が増えていない。
+    assert.equal(rendered.trim().split(' ').length, 18);
+  });
+
+  it('usageParse= より後ろ（行の最末尾）に付く', () => {
+    const failed = {
+      ...base,
+      parse: 'unsupported-encoding',
+      grace: { g5h: 0.1, g7d: null, ustat: 'allowed', ovs: 'rejected', ovu: 'false' },
+    };
+    assert.ok(
+      observationLogFields(failed).endsWith(' usageParse=unsupported-encoding g5h=0.1 g7d=- ustat=allowed ovs=rejected ovu=false'),
+      observationLogFields(failed),
+    );
+  });
+});

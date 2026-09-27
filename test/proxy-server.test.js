@@ -14160,6 +14160,80 @@ describe('cache observability', () => {
     assert.ok(!logLines.join('\n').includes('synthetic-session-0001'));
   });
 
+  it('猶予ヘッダが来た応答だけ proxy 行の末尾へ g5h g7d ustat ovs ovu を足す', async () => {
+    const zlib = await import('node:zlib');
+    const { proxy, logLines } = await startObservabilityProxy({
+      upstreamHandler: (req, res) => {
+        res.writeHead(200, {
+          'Content-Type': 'text/event-stream',
+          'Content-Encoding': 'gzip',
+          ...QUOTA_HEADERS,
+          'anthropic-ratelimit-unified-grace-5h-utilization': '0.02',
+          'anthropic-ratelimit-unified-grace-7d-utilization': '0',
+          'anthropic-ratelimit-unified-status': 'allowed_warning',
+          'anthropic-ratelimit-unified-overage-status': 'rejected',
+          'anthropic-ratelimit-unified-overage-in-use': 'false',
+        });
+        res.end(zlib.gzipSync(Buffer.from(OBSERVED_SSE, 'utf8')));
+      },
+    });
+
+    await requestRaw(`${proxy.url}/v1/messages`, {
+      method: 'POST',
+      body: JSON.stringify({ model: 'claude-opus-5-1' }),
+      headers: { 'x-claude-code-session-id': 'synthetic-session-0002' },
+    });
+
+    assert.match(
+      proxyLine(logLines),
+      / u7dReset=1789098765 enc=gzip g5h=0\.02 g7d=0 ustat=allowed_warning ovs=rejected ovu=false$/,
+    );
+  });
+
+  it('猶予ヘッダが無ければ status・overage ヘッダが来ても proxy 行は現行とバイト同一', async () => {
+    const zlib = await import('node:zlib');
+    const runOnce = async extraHeaders => {
+      const { proxy, logLines } = await startObservabilityProxy({
+        upstreamHandler: (req, res) => {
+          res.writeHead(200, {
+            'Content-Type': 'text/event-stream',
+            'Content-Encoding': 'gzip',
+            ...QUOTA_HEADERS,
+            ...extraHeaders,
+          });
+          res.end(zlib.gzipSync(Buffer.from(OBSERVED_SSE, 'utf8')));
+        },
+      });
+      await requestRaw(`${proxy.url}/v1/messages`, {
+        method: 'POST',
+        body: JSON.stringify({ model: 'claude-opus-5-1' }),
+        headers: { 'x-claude-code-session-id': 'synthetic-session-0003' },
+      });
+      // 時刻・所要時間は要求ごとに変わるので、比較は outcome= 以降に限る。
+      return proxyLine(logLines).replace(/^.* outcome=/, 'outcome=');
+    };
+
+    const plain = await runOnce({});
+    const withStatusOnly = await runOnce({
+      'anthropic-ratelimit-unified-status': 'allowed',
+      'anthropic-ratelimit-unified-overage-status': 'rejected',
+      'anthropic-ratelimit-unified-overage-in-use': 'false',
+      // 数値として読めない猶予値は「来ていない」と同じ扱い。
+      'anthropic-ratelimit-unified-grace-5h-utilization': 'not-a-number',
+    });
+    assert.match(plain, / enc=gzip$/);
+    assert.equal(Buffer.compare(Buffer.from(withStatusOnly), Buffer.from(plain)), 0, `${withStatusOnly}\n${plain}`);
+    assert.ok(!withStatusOnly.includes('g5h='), withStatusOnly);
+
+    // 読み方は quota.js の setNumber と同じ（Number() 全体一致）。先頭だけ数値の値や、
+    // 重複ヘッダが ", " で連結された値は捨てる（parseFloat なら 0.5 / 0.02 と読んでしまう）。
+    const withMalformedGrace = await runOnce({
+      'anthropic-ratelimit-unified-grace-5h-utilization': '0.5abc',
+      'anthropic-ratelimit-unified-grace-7d-utilization': '0.02, 0.5',
+    });
+    assert.equal(Buffer.compare(Buffer.from(withMalformedGrace), Buffer.from(plain)), 0, `${withMalformedGrace}\n${plain}`);
+  });
+
   it('セッションヘッダの無い要求では sid=- になる（付与率の測定）', async () => {
     const { proxy, logLines } = await startObservabilityProxy({
       upstreamHandler: (req, res) => {
