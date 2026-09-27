@@ -187,6 +187,7 @@ export function upstreamAcceptEncoding(raw) {
  * @property {'ok'|'unsupported-encoding'|'too-large'|'unparsable'|'no-usage'} parse
  * @property {string|null} encoding 正規化した content-encoding（無圧縮なら null）。
  * @property {string|null} model 応答の model id。
+ * @property {string|null} messageId 応答の message id（`msg_...`。usage-events の照合補助）。
  * @property {number} inputTokens
  * @property {number} outputTokens
  * @property {number} cacheReadTokens
@@ -200,6 +201,7 @@ function emptyObservation(parse, encoding = null) {
     parse,
     encoding,
     model: null,
+    messageId: null,
     inputTokens: 0,
     outputTokens: 0,
     cacheReadTokens: 0,
@@ -255,6 +257,7 @@ function readUsage(text, encoding) {
     if (!json.usage || typeof json.usage !== 'object') return emptyObservation('no-usage', encoding);
     const observation = emptyObservation('ok', encoding);
     observation.model = readModel(json.model);
+    observation.messageId = readModel(json.id);
     applyUsage(observation, json.usage);
     return observation;
   }
@@ -272,6 +275,7 @@ function readUsage(text, encoding) {
     if (data.type === 'message_start' && data.message?.usage) {
       sawUsage = true;
       observation.model = readModel(data.message.model) ?? observation.model;
+      observation.messageId = readModel(data.message.id) ?? observation.messageId;
       applyUsage(observation, data.message.usage);
     } else if (data.type === 'message_delta' && data.usage) {
       sawUsage = true;
