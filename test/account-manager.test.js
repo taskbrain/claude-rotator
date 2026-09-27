@@ -3392,8 +3392,15 @@ describe('quota usage freshness (usageUpdatedAt / usageSource)', () => {
     assert.equal(quota.usageUpdatedAt, 1_700_000_000_000);
   });
 
-  it('drops out-of-range and non-numeric utilization and records a quota-header-rejected event', () => {
-    for (const bad of ['1.0000001', '-0.01', 'abc', 'NaN', 'Infinity']) {
+  it('drops negative and non-numeric utilization and records a quota-header-rejected event', () => {
+    const cases = [
+      ['-0.01', -0.01],
+      ['abc', 'abc'],
+      ['NaN', 'NaN'],
+      ['Infinity', 'Infinity'],
+      ['x'.repeat(40), 'x'.repeat(32)],
+    ];
+    for (const [bad, recorded] of cases) {
       const clock = { value: 1_700_000_000_000 };
       const manager = freshManager(clock);
       manager.updateQuota('acct_1', { 'anthropic-ratelimit-unified-7d-utilization': '0.2' });
@@ -3408,22 +3415,66 @@ describe('quota usage freshness (usageUpdatedAt / usageSource)', () => {
         type: 'quota-header-rejected',
         account: 'acct_1',
         key: 'unified7d',
-        value: bad,
+        value: recorded,
       });
     }
   });
 
-  it('accepts the 0 and 1 boundaries and rejects values outside them in parseRateLimitHeaders', () => {
+  it('records the same rejected account/key/value at most once per 10 minutes', () => {
+    const clock = { value: 1_700_000_000_000 };
+    const manager = freshManager(clock);
+    const bad = { 'anthropic-ratelimit-unified-5h-utilization': '-1' };
+    const rejected = () => manager.getStatus().events.filter(event => event.type === 'quota-header-rejected');
+    manager.updateQuota('acct_1', bad);
+    clock.value += 9 * 60 * 1000;
+    manager.updateQuota('acct_1', bad);
+    assert.equal(rejected().length, 1, 'suppressed inside the interval');
+    manager.updateQuota('acct_1', { 'anthropic-ratelimit-unified-5h-utilization': '-2' });
+    assert.equal(rejected().length, 2, 'a different value is recorded');
+    clock.value += 60 * 1000;
+    manager.updateQuota('acct_1', bad);
+    assert.equal(rejected().length, 3, 'recorded again once 10 minutes have passed');
+  });
+
+  it('keeps a utilization above 1 from a 429 and judges the account exhausted', () => {
+    const clock = { value: 1_700_000_000_000 };
+    const manager = freshManager(clock);
+    manager.updateQuota('acct_1', {
+      'anthropic-ratelimit-unified-5h-utilization': '1.02',
+      'anthropic-ratelimit-unified-5h-reset': RESET_5H,
+    }, { atomicUnifiedWindows: true });
+    const account = manager.find('acct_1');
+    assert.equal(account.quota.unified5h, 1.02);
+    assert.equal(account.quota.usageSource, 'header');
+    assert.equal(manager.unavailableReason(account)?.type, 'quota_exhausted');
+    assert.equal(manager.getStatus().events.some(event => event.type === 'quota-header-rejected'), false);
+  });
+
+  it('accepts 0 and values above 1 and rejects negative values in parseRateLimitHeaders', () => {
     const rejected = [];
     const parsed = parseRateLimitHeaders({
       'anthropic-ratelimit-unified-5h-utilization': '0',
-      'anthropic-ratelimit-unified-7d-utilization': '1',
+      'anthropic-ratelimit-unified-7d-utilization': '1.0000001',
     }, { onInvalid: r => rejected.push(r) });
     assert.equal(parsed.unified5h, 0);
-    assert.equal(parsed.unified7d, 1);
+    assert.equal(parsed.unified7d, 1.0000001);
     assert.deepEqual(rejected, []);
-    const out = parseRateLimitHeaders({ 'anthropic-ratelimit-unified-5h-utilization': '1.5' });
+    const out = parseRateLimitHeaders({ 'anthropic-ratelimit-unified-5h-utilization': '-0.5' });
     assert.equal('unified5h' in out, false);
+  });
+
+  it('does not stamp poll when the Usage API payload only updates scoped weekly limits', () => {
+    const clock = { value: 1_700_000_000_000 };
+    const manager = freshManager(clock);
+    manager.updateQuota('acct_1', { 'anthropic-ratelimit-unified-5h-utilization': '0.4' });
+    clock.value += 5_000;
+    manager.applyUsage('acct_1', {
+      scoped_weekly: [{ key: 'fable', label: 'Fable', utilization: 0.3 }],
+    });
+    const quota = manager.find('acct_1').quota;
+    assert.equal(quota.weeklyScoped.length, 1);
+    assert.equal(quota.usageSource, 'header');
+    assert.equal(quota.usageUpdatedAt, 1_700_000_000_000);
   });
 
   it('restores saved state written before the keys existed, and round-trips them once present', () => {

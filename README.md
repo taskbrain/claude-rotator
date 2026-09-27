@@ -782,7 +782,7 @@ OAuth usage refresh は Node.js fetch の 10 秒 connect timeout に依存しな
 
 直近の quota / usage / `current` account は `~/.config/claude-rotator/runtime-state.json` に保存されます。これにより、service 再起動直後に Usage API へ到達できない場合でも、最後に取得できた status を復元して切り替え判断に使えます。reset 時刻を過ぎた quota は、復元後の status 計算時に stale として消去されます。
 
-`/internal/status` の各アカウントの `quota` には、使用率（`unified5h` / `unified7d`）を最後に取得した時刻 `usageUpdatedAt`（エポックミリ秒）と取得元 `usageSource`（`header` = 転送した応答のヘッダ、`poll` = Usage API）が入ります。未取得なら両方 `null` です。0〜1 の範囲外や数値でない使用率ヘッダは捨て、`quota-header-rejected` イベントとして記録します。
+`/internal/status` の各アカウントの `quota` には、使用率（`unified5h` / `unified7d`）を最後に取得した時刻 `usageUpdatedAt`（エポックミリ秒）と取得元 `usageSource`（`header` = 転送した応答のヘッダ、`poll` = Usage API）が入ります。未取得なら両方 `null` で、Usage API の応答がスコープ別の週次枠だけのときは更新しません。数値でない値と負の値の使用率ヘッダは捨て、`quota-header-rejected` イベントとして記録します（同じアカウント・キー・値は10分に1回まで）。1 を超える値は捨てず、そのまま記録して枠切れ判定に使います。
 
 `cc-auto-resume` などの外部再注入ツールからは、再注入前に次のコマンドを呼ぶと、rotator が最短で再開できるアカウントへ切り替え、再注入すべき時刻を返します。利用可能なアカウントがあれば `action=ready`、全候補が枯渇していれば最短 reset の `action=wait` になります。
 
@@ -1721,7 +1721,7 @@ OAuth usage refreshes use a native HTTP client rather than Node's `fetch`, so th
 
 The most recent quota/usage state and `current` account are persisted to `~/.config/claude-rotator/runtime-state.json`. This lets the service restore the last known status for switching decisions right after a restart, even if the Usage API isn't reachable yet. A quota whose reset time has already passed is discarded as stale when status is recomputed after restore.
 
-Each account's `quota` in `/internal/status` carries `usageUpdatedAt` (epoch milliseconds) — when utilization (`unified5h` / `unified7d`) was last taken — and `usageSource` (`header` = a proxied response's headers, `poll` = the Usage API); both are `null` until the first reading. A utilization header that is not a number or lies outside 0–1 is dropped and recorded as a `quota-header-rejected` event.
+Each account's `quota` in `/internal/status` carries `usageUpdatedAt` (epoch milliseconds) — when utilization (`unified5h` / `unified7d`) was last taken — and `usageSource` (`header` = a proxied response's headers, `poll` = the Usage API); both are `null` until the first reading, and a Usage API reply that only carries scoped weekly limits leaves them unchanged. A utilization header that is not a number or is negative is dropped and recorded as a `quota-header-rejected` event (at most once per 10 minutes for the same account, key and value); a value above 1 is kept as is and counts towards the exhaustion check.
 
 External reinjection tools such as `cc-auto-resume` can call the following before reinjecting, to have the rotator switch to whichever account can resume soonest and report when to reinject. It returns `action=ready` if an account is available, or `action=wait` with the soonest reset if every candidate is exhausted.
 

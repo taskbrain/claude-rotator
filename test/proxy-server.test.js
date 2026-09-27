@@ -2285,6 +2285,62 @@ describe('createProxyServer', () => {
     assert.deepEqual(upstreamSeen, ['Bearer access-token-1', 'Bearer access-token-2']);
   });
 
+  it('treats a 429 whose utilization header is above 1 (1.02) as exhausted and retries on the next account', async () => {
+    const upstreamSeen = [];
+    const upstream = await listen(http.createServer((req, res) => {
+      upstreamSeen.push(req.headers.authorization);
+      if (req.headers.authorization === 'Bearer access-token-1') {
+        res.writeHead(429, {
+          'Content-Type': 'application/json',
+          'anthropic-ratelimit-unified-5h-utilization': '1.02',
+          'anthropic-ratelimit-unified-5h-reset': String(
+            Math.floor(Date.parse(futureReset()) / 1000),
+          ),
+        });
+        res.end(JSON.stringify({
+          type: 'error', error: { type: 'rate_limit_error', message: 'over the limit' },
+        }));
+        return;
+      }
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ ok: true }));
+    }));
+    const secretStore = new MemorySecretStore();
+    await secretStore.set('acct_1', { accessToken: 'access-token-1' });
+    await secretStore.set('acct_2', { accessToken: 'access-token-2' });
+    const accountManager = new AccountManager({
+      accounts: [
+        { id: 'acct_1', type: 'oauth' },
+        { id: 'acct_2', type: 'oauth' },
+      ],
+    });
+    accountManager.updateQuota('acct_2', {
+      'anthropic-ratelimit-unified-5h-utilization': '0.1',
+    });
+    const proxy = await listen(createProxyServer({
+      accountManager,
+      secretStore,
+      config: { upstream: upstream.url, usagePolling: { enabled: false } },
+      usageFetcher: async () => assert.fail('complete quota headers must not require Usage'),
+    }));
+    cleanupAfterTest(async () => {
+      await close(proxy.server);
+      await close(upstream.server);
+    });
+
+    const response = await requestJson(`${proxy.url}/v1/messages`, {
+      method: 'POST', body: JSON.stringify({ model: 'claude-opus-4' }),
+    });
+
+    assert.equal(response.status, 200);
+    assert.deepEqual(upstreamSeen, ['Bearer access-token-1', 'Bearer access-token-2']);
+    const quota = accountManager.find('acct_1').quota;
+    assert.equal(quota.unified5h, 1.02);
+    assert.equal(quota.usageSource, 'header');
+    assert.equal(accountManager.unavailableReason(accountManager.find('acct_1'))?.type, 'quota_exhausted');
+    assert.equal(accountManager.events.some(event => event.type === 'quota-header-rejected'), false);
+  });
+
   it('requires actual 100% Usage for reactive replay even when the rotation threshold is lower', async () => {
     const upstreamSeen = [];
     const originalBody = {

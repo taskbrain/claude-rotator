@@ -22,10 +22,11 @@ export const USAGE_SOURCES = Object.freeze(['header', 'poll']);
 
 /**
  * @param {object} headers
- * @param {{ onInvalid?: (rejected: { key: string, value: string }) => void }} [options]
+ * @param {{ onInvalid?: (rejected: { key: string, value: number|string }) => void }} [options]
  *   `onInvalid` is told about every utilization header that was dropped because
- *   it was not a number or fell outside 0..1. Callers without it behave as before
- *   except that such a value no longer reaches the result.
+ *   it was not a finite number or was negative. `value` is the parsed number when
+ *   it is finite, otherwise the raw text cut to 32 characters. Callers without it
+ *   behave as before except that such a value no longer reaches the result.
  */
 export function parseRateLimitHeaders(headers, { onInvalid = null } = {}) {
   const get = createHeaderGetter(headers);
@@ -91,17 +92,18 @@ function createHeaderGetter(headers) {
   return name => normalized.get(name.toLowerCase());
 }
 
-// Utilization is a 0..1 fraction. Anything else (not a number, below 0, above 1 -
-// including 1.0000001) is dropped rather than clamped, so a malformed header can
-// never overwrite the last good value.
+// Only a value that is not a finite number, or is negative, is dropped, so a
+// malformed header can never overwrite the last good value. A value above 1
+// (e.g. 1.02 on a 429) is kept as is: it is the exhaustion signal that the
+// switch threshold and the quota-retry path rely on.
 function setUtilization(target, key, raw, onInvalid) {
   if (raw == null || raw === '') return;
   const value = Number(raw);
-  if (Number.isFinite(value) && value >= 0 && value <= 1) {
+  if (Number.isFinite(value) && value >= 0) {
     target[key] = value;
     return;
   }
-  onInvalid?.({ key, value: String(raw).slice(0, 64) });
+  onInvalid?.({ key, value: Number.isFinite(value) ? value : String(raw).slice(0, 32) });
 }
 
 function setInteger(target, key, raw) {
