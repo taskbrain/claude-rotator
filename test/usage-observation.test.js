@@ -64,6 +64,32 @@ function assertUsage(actual, expected = EXPECTED) {
 }
 
 // ---------------------------------------------------------------------------
+// parseUsageObservation: message id（usage-events.jsonl の照合補助）
+// ---------------------------------------------------------------------------
+
+describe('parseUsageObservation / messageId', () => {
+  it('非ストリームは本文の id、SSE は message_start の message.id を返す', async () => {
+    const json = await parseUsageObservation(Buffer.from(JSON.stringify({
+      id: 'msg_json',
+      model: 'claude-opus-5-1',
+      usage: { input_tokens: 1, output_tokens: 2 },
+    }), 'utf8'), {});
+    assert.equal(json.parse, 'ok');
+    assert.equal(json.messageId, 'msg_json');
+
+    const sse = SSE.replace('"message":{', '"message":{"id":"msg_sse",');
+    const stream = await parseUsageObservation(Buffer.from(sse, 'utf8'), {});
+    assertUsage(stream);
+    assert.equal(stream.messageId, 'msg_sse');
+  });
+
+  it('id が無い・読めないときは null', async () => {
+    assert.equal((await parseUsageObservation(Buffer.from(SSE, 'utf8'), {})).messageId, null);
+    assert.equal((await parseUsageObservation(Buffer.from('not json', 'utf8'), {})).messageId, null);
+  });
+});
+
+// ---------------------------------------------------------------------------
 // parseUsageObservation: 圧縮された応答本文（本件の根本原因）
 // ---------------------------------------------------------------------------
 

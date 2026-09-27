@@ -41,6 +41,7 @@ import {
   parseUsageObservation,
   upstreamAcceptEncoding,
 } from './usage-observation.js';
+import { buildUsageEvent, createUsageEventWriter, usageFromObservation } from './usage-events.js';
 import {
   buildBridgeLogMeta,
   claudeAllUnusable,
@@ -141,9 +142,17 @@ export function createProxyServer({
   serviceGeneration = null,
   // 試験用の注入口。本番は既定（DEFAULT_REQUEST_BODY_DRAIN）のまま。
   requestBodyDrain = DEFAULT_REQUEST_BODY_DRAIN,
+  // usage-events.jsonl の出力先。**明示されたときだけ**書く（本番は src/cli.js の
+  // runServer が渡す）。既定を実ディレクトリにすると、これを渡さない既存テストが
+  // 実行のたびに実マシンの ~/.config/claude-rotator/usage-events/ へ書いてしまう。
+  usageEventsDir = null,
+  // 試験用の注入口（書込の停滞・chmod 失敗を再現する writer を渡す）。本番は渡さない。
+  usageEventWriter: injectedUsageEventWriter = null,
 }) {
   assertLoopbackProxyHost(config.proxy?.host || '127.0.0.1');
   const upstream = config.upstream || 'https://api.anthropic.com';
+  const usageEventWriter = injectedUsageEventWriter
+    || (usageEventsDir ? createUsageEventWriter({ dir: usageEventsDir, logger }) : null);
   const upstreamIdleTimeoutMs = config.proxy?.upstreamIdleTimeoutMs
     ?? config.upstreamIdleTimeoutMs
     ?? DEFAULT_UPSTREAM_IDLE_TIMEOUT_MS;
@@ -839,6 +848,7 @@ export function createProxyServer({
           ? { sessionAffinity, sessionAffinitySettings, sessionAffinityCounts: affinityRequestCounts }
           : {}),
         observability: observabilitySettings,
+        usageEventWriter,
       });
       await persistState();
     } catch (error) {
@@ -2564,7 +2574,11 @@ async function forwardWithRotation({
   sessionAffinitySettings = null,
   sessionAffinityCounts = null,
   observability = DEFAULT_OBSERVABILITY,
+  usageEventWriter = null,
 }) {
+  // 論理要求1件につき1つ。forwardOnce() を呼ぶたびに attempt が1つ進む（401 後の再送・
+  // 口座の切り替え・利用不可口座での実送信を含む）。writer が無ければ null で、計測しない。
+  const usageEvents = usageEventWriter ? createUsageEventContext(usageEventWriter) : null;
   const attemptedAccountIds = new Set();
   let lastRetryableResponse = null;
   // 再生する応答を作った口座（P-b の replay 行の account= に使う。写像したときだけ読む）。
@@ -2691,6 +2705,7 @@ async function forwardWithRotation({
         upstreamOverloadMapper,
         affinityLog: affinityRequest,
         observability,
+        usageEvents,
       })) return;
       sendUnavailableAccounts(res, accountManager, mapExhaustion, { req, logger, affinityLog: affinityRequest });
       return;
@@ -2891,6 +2906,7 @@ async function forwardWithRotation({
       upstreamOverloadMapper,
       affinityLog: affinityRequest,
       observability,
+      usageEvents,
     });
     if (!accountManager.accounts.includes(account)) {
       finishStaleAccountResponse(res, result.passthroughResponse, mapExhaustion);
@@ -2943,6 +2959,7 @@ async function forwardWithRotation({
         upstreamOverloadMapper,
         affinityLog: affinityRequest,
         observability,
+        usageEvents,
       });
       if (!accountManager.accounts.includes(account)) {
         finishStaleAccountResponse(res, retryResult.passthroughResponse, mapExhaustion);
@@ -3027,6 +3044,7 @@ async function forwardWithRotation({
       upstreamOverloadMapper,
       affinityLog: affinityRequest,
       observability,
+      usageEvents,
     })) return;
     sendUnavailableAccounts(res, accountManager, mapExhaustion, { req, logger, affinityLog: affinityRequest });
   }
@@ -3053,6 +3071,7 @@ async function forwardCurrentUnavailableAccount({
   upstreamOverloadMapper = null,
   affinityLog = null,
   observability = DEFAULT_OBSERVABILITY,
+  usageEvents = null,
 }) {
   if (sendCurrentQuotaUnavailableResponse({
     req,
@@ -3132,6 +3151,7 @@ async function forwardCurrentUnavailableAccount({
     upstreamOverloadMapper,
     affinityLog,
     observability,
+    usageEvents,
   });
   return true;
 }
@@ -3454,7 +3474,107 @@ function throwIfOperationAborted(signal) {
   throw error;
 }
 
-async function forwardOnce({
+const USAGE_MEASURED_PATH = '/v1/messages';
+
+function createUsageEventContext(writer) {
+  let attempts = 0;
+  return { writer, nextAttempt: () => (attempts += 1) };
+}
+
+function isUsageMeasuredRequest(req) {
+  if (req.method !== 'POST') return false;
+  try {
+    return new URL(req.url, 'http://claude-rotator.local').pathname === USAGE_MEASURED_PATH;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * 上流への送信1回。`usageEvents` があり、要求が `POST /v1/messages` のときだけ、
+ * どの経路で終わっても（成功・401・429・5xx・接続エラー・途中切断・想定外の例外）
+ * usage-events.jsonl へちょうど1行書く。`usageEvents` が無ければ forwardOnceInner() を
+ * そのまま呼ぶだけで、挙動は計測を入れる前と同一である。
+ *
+ * 追記は await しない（writer の直列キューへ積むだけ）。401 後の再送・口座の切り替え・
+ * 途中切断時の res.destroy をディスク I/O の完了まで待たせないため。
+ */
+async function forwardOnce(options) {
+  const { usageEvents = null } = options;
+  if (!usageEvents || !isUsageMeasuredRequest(options.req)) return forwardOnceInner(options);
+  const attempt = usageEvents.nextAttempt();
+  const usageEventState = {
+    // 正常な経路はすべて上書きする。forwardOnceInner() が想定外の例外で抜けたときは
+    // 下の catch が proxy-error へ戻す。
+    outcome: 'proxy-error',
+    requestId: null,
+    statusCode: null,
+    errorType: null,
+    // 上流の応答（本文を溜め切った後）と、forwardOnceInner() が解析した結果。
+    // 解析する前に抜ける経路（reload で口座が台帳から消えた等）は undefined のまま残り、
+    // その場合だけ recordUsageEvent() が解析する。
+    upstreamResponse: null,
+    observation: undefined,
+    // forwardOnceInner() が上流の失敗をそのまま投げ直したときの例外（outcome は設定済み）。
+    upstreamError: null,
+  };
+  try {
+    return await forwardOnceInner({ ...options, usageEventState });
+  } catch (error) {
+    // 200 を解析した後に集計・ログが投げた等。outcome が 'ok' のまま残らないようにする。
+    if (error !== usageEventState.upstreamError) {
+      usageEventState.outcome = 'proxy-error';
+      usageEventState.errorType = error?.code || error?.name || 'unknown';
+    }
+    throw error;
+  } finally {
+    // 計測は fail-open: writer が同期で投げても、返した Promise が reject しても転送へ漏らさない。
+    try {
+      Promise.resolve(usageEvents.writer.append(buildUsageEventLater({ options, attempt, usageEventState })))
+        .catch(() => {});
+    } catch {
+      // 転送・口座の切り替えを優先する。
+    }
+  }
+}
+
+/**
+ * forwardOnce() の後で1行ぶんのイベントを組み立てる。writer のキューの中で待たれるので、
+ * 転送側はこれを待たない。計測は fail-open: ここで何が起きても（ロガーが投げても）
+ * reject せず null（書かない）を返す。
+ */
+async function buildUsageEventLater({ options, attempt, usageEventState }) {
+  try {
+    let { observation } = usageEventState;
+    if (observation === undefined && usageEventState.upstreamResponse?.body?.length > 0) {
+      observation = await parseUsageObservation(usageEventState.upstreamResponse.body, {
+        contentEncoding: headerValue(usageEventState.upstreamResponse.headers['content-encoding']),
+        maxBytes: (options.observability || DEFAULT_OBSERVABILITY).requestLog.maxBodyBytes,
+      });
+    }
+    return buildUsageEvent({
+      ts: new Date().toISOString(),
+      requestId: usageEventState.requestId,
+      attempt,
+      accountId: options.account.id,
+      messageId: observation?.messageId ?? null,
+      model: observation?.model ?? null,
+      outcome: usageEventState.outcome,
+      statusCode: usageEventState.statusCode,
+      errorType: usageEventState.errorType,
+      usage: usageFromObservation(observation, usageEventState.statusCode),
+    });
+  } catch (error) {
+    try {
+      options.logger?.(`${new Date().toISOString()} usage-event account=${options.account.id} result=failed errorType=${error?.code || error?.name || 'unknown'}`);
+    } catch {
+      // ロガー自身も信用しない。
+    }
+    return null;
+  }
+}
+
+async function forwardOnceInner({
   req,
   res,
   body,
@@ -3476,6 +3596,8 @@ async function forwardOnce({
   exhaustionMapper = null,
   upstreamOverloadMapper = null,
   observability = DEFAULT_OBSERVABILITY,
+  // forwardOnce() が計測するときだけ渡る。null なら何も記録しない。
+  usageEventState = null,
 }) {
   const target = configuredUpstreamTarget(req.url, upstream);
   const headers = buildUpstreamHeaders(req.headers, account, secret, observability);
@@ -3539,6 +3661,11 @@ async function forwardOnce({
         logger?.(`${new Date().toISOString()} upstream-connect-retry account=${account.id} method=${req.method} path=${target.pathname} attempt=${attempt}/${maxAttempts} errorType=${error.code || error.name}`);
       },
       onResponse(upstreamRes) {
+        if (usageEventState) {
+          usageEventState.statusCode = upstreamRes.statusCode ?? null;
+          usageEventState.requestId = headerValue(upstreamRes.headers['request-id'])
+            || headerValue(upstreamRes.headers['x-request-id']);
+        }
         if (!accountManager.accounts.includes(account)) {
           // reload と同時に 529 が届いた場合も写像する。ここを落とすと「reload と重なった
           // 529 だけ写像されない」という再現困難な穴になる。
@@ -3615,10 +3742,13 @@ async function forwardOnce({
       },
     });
   } catch (error) {
+    if (usageEventState) usageEventState.errorType = error?.code || error?.name || null;
     if (error?.code === 'CLIENT_REQUEST_ABORTED' || req.aborted || res.destroyed) {
+      if (usageEventState) usageEventState.outcome = 'client-aborted';
       return { retryNextAccount: false };
     }
     outcome = isUpstreamTimeout(error) ? 'upstream-timeout' : 'upstream-error';
+    if (usageEventState) usageEventState.outcome = outcome;
     if (accountManager.accounts.includes(account)) {
       recordProxyRequest({
         accountManager,
@@ -3637,7 +3767,14 @@ async function forwardOnce({
       sendBufferedResponse(res, syntheticUpstreamErrorResponse(error));
       return { retryNextAccount: false };
     }
+    if (usageEventState) usageEventState.upstreamError = error;
     throw error;
+  }
+
+  if (usageEventState) {
+    usageEventState.upstreamResponse = upstreamResponse;
+    usageEventState.statusCode = upstreamResponse.statusCode ?? usageEventState.statusCode;
+    usageEventState.outcome = outcomeForResponse(outcome, upstreamResponse.statusCode);
   }
 
   // 上流 529 の写像はここで確定させる。**この位置より後ろへ動かさないこと**——直後の
@@ -3711,6 +3848,11 @@ async function forwardOnce({
       maxBytes: observability.requestLog.maxBodyBytes,
     })
     : null;
+  if (usageEventState) {
+    // 解析しなかった（null）ときは undefined のまま残し、forwardOnce() 側で解析させる。
+    if (observation) usageEventState.observation = observation;
+    usageEventState.outcome = outcomeForResponse(outcome, upstreamResponse.statusCode);
+  }
 
   if (accountManager.accounts.includes(account)) {
     recordProxyRequest({

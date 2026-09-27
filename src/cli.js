@@ -22,6 +22,7 @@ import {
 import { createProxyServer, defaultTokenRefresher } from './proxy-server.js';
 import { createServerLogWriter } from './log-rotation.js';
 import { normalizeObservability } from './usage-observation.js';
+import { usageEventsDir } from './usage-events.js';
 import {
   createSecretStore,
   duplicateRefreshTokenAccountIds,
@@ -421,6 +422,9 @@ async function runServer({ write }) {
     credentialChangedAccountIds,
     stateWriter: createRuntimeStateWriter(statePath),
     serviceGeneration: process.env.CLAUDE_ROTATOR_SERVICE_GENERATION || null,
+    // 要求ごとの使用量イベント（usage-events.jsonl）。既定 ~/.config/claude-rotator/usage-events/、
+    // CLAUDE_ROTATOR_USAGE_EVENTS_DIR で上書きできる。
+    usageEventsDir: usageEventsDir(),
   });
   await new Promise(resolve => server.listen(
     config.proxy?.port || DEFAULT_PORT,
