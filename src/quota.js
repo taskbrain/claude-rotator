@@ -11,15 +11,29 @@ export function emptyQuota() {
     requestsLimit: null,
     requestsRemaining: null,
     resetsAt: null,
+    // When unified5h / unified7d were last taken (epoch ms, like the *Reset keys)
+    // and from where: 'header' (a proxied response) or 'poll' (the Usage API).
+    usageUpdatedAt: null,
+    usageSource: null,
   };
 }
 
-export function parseRateLimitHeaders(headers) {
+export const USAGE_SOURCES = Object.freeze(['header', 'poll']);
+
+/**
+ * @param {object} headers
+ * @param {{ onInvalid?: (rejected: { key: string, value: number|string }) => void }} [options]
+ *   `onInvalid` is told about every utilization header that was dropped because
+ *   it was not a finite number or was negative. `value` is the parsed number when
+ *   it is finite, otherwise the raw text cut to 32 characters. Callers without it
+ *   behave as before except that such a value no longer reaches the result.
+ */
+export function parseRateLimitHeaders(headers, { onInvalid = null } = {}) {
   const get = createHeaderGetter(headers);
   const quota = {};
 
-  setNumber(quota, 'unified5h', get('anthropic-ratelimit-unified-5h-utilization'));
-  setNumber(quota, 'unified7d', get('anthropic-ratelimit-unified-7d-utilization'));
+  setUtilization(quota, 'unified5h', get('anthropic-ratelimit-unified-5h-utilization'), onInvalid);
+  setUtilization(quota, 'unified7d', get('anthropic-ratelimit-unified-7d-utilization'), onInvalid);
   setEpochSeconds(quota, 'unified5hReset', get('anthropic-ratelimit-unified-5h-reset'));
   setEpochSeconds(quota, 'unified7dReset', get('anthropic-ratelimit-unified-7d-reset'));
   setString(quota, 'unifiedStatus', get('anthropic-ratelimit-unified-status'));
@@ -78,10 +92,18 @@ function createHeaderGetter(headers) {
   return name => normalized.get(name.toLowerCase());
 }
 
-function setNumber(target, key, raw) {
+// Only a value that is not a finite number, or is negative, is dropped, so a
+// malformed header can never overwrite the last good value. A value above 1
+// (e.g. 1.02 on a 429) is kept as is: it is the exhaustion signal that the
+// switch threshold and the quota-retry path rely on.
+function setUtilization(target, key, raw, onInvalid) {
   if (raw == null || raw === '') return;
   const value = Number(raw);
-  if (Number.isFinite(value)) target[key] = value;
+  if (Number.isFinite(value) && value >= 0) {
+    target[key] = value;
+    return;
+  }
+  onInvalid?.({ key, value: Number.isFinite(value) ? value : String(raw).slice(0, 32) });
 }
 
 function setInteger(target, key, raw) {

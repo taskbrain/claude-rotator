@@ -1,4 +1,10 @@
-import { emptyQuota, normalizeWeeklyScopedUsage, parseRateLimitHeaders, scopeMatchesModelFamily } from './quota.js';
+import {
+  emptyQuota,
+  normalizeWeeklyScopedUsage,
+  parseRateLimitHeaders,
+  scopeMatchesModelFamily,
+  USAGE_SOURCES,
+} from './quota.js';
 import {
   DEFAULT_MAX_PROVIDER_RETRY_AFTER_MS,
   DEFAULT_MAX_TOKEN_REFRESH_BACKOFF_MS,
@@ -35,6 +41,9 @@ const ASSIGN_BAND_EPSILON = 1e-9;
 // `getStatus()` has always returned the newest 50 events; the same number bounds
 // the array in memory and in the saved state once the history is enabled.
 const EVENT_HISTORY_LIMIT = 50;
+// The same account / key / value dropped from a utilization header is recorded
+// as a `quota-header-rejected` event at most once per this interval.
+const QUOTA_HEADER_REJECT_EVENT_INTERVAL_MS = 10 * 60 * 1000;
 const ACCOUNT_SWITCH_TRIGGERS = new Set([
   'usage-refresh',
   '429',
@@ -68,6 +77,7 @@ export class AccountManager {
     this.rotationPolicy = normalizeRotationPolicy(rotationPolicy);
     this.eventHistoryEnabled = eventHistory === true;
     this.events = [];
+    this.quotaHeaderRejectRecordedAt = new Map();
     this.accounts = accounts.map((account, index) => this.createAccount(account, index));
     const configuredIndex = currentAccountId
       ? this.accounts.findIndex(account => account.id === currentAccountId || account.name === currentAccountId)
@@ -156,18 +166,45 @@ export class AccountManager {
 
   updateQuota(accountId, headers, { atomicUnifiedWindows = false } = {}) {
     const account = this.find(accountId);
-    const parsed = parseRateLimitHeaders(headers);
+    const parsed = parseRateLimitHeaders(headers, {
+      onInvalid: rejected => this.recordQuotaHeaderRejected(account, rejected),
+    });
     if (atomicUnifiedWindows) {
       keepUnifiedWindowAtomic(parsed, 'unified5h', 'unified5hReset');
       keepUnifiedWindowAtomic(parsed, 'unified7d', 'unified7dReset');
+    }
+    // A response without unified utilization (or whose values were all dropped)
+    // leaves the previous reading and its source untouched.
+    if ('unified5h' in parsed || 'unified7d' in parsed) {
+      parsed.usageSource = 'header';
+      parsed.usageUpdatedAt = this.now();
     }
     account.quota = { ...account.quota, ...parsed };
     this.refreshQuotaState(account);
   }
 
+  recordQuotaHeaderRejected(account, { key, value }) {
+    const now = this.now();
+    const dedupeKey = JSON.stringify([account.id, key, value]);
+    const last = this.quotaHeaderRejectRecordedAt.get(dedupeKey);
+    if (last != null && now - last < QUOTA_HEADER_REJECT_EVENT_INTERVAL_MS) return;
+    for (const [entry, at] of this.quotaHeaderRejectRecordedAt) {
+      if (now - at >= QUOTA_HEADER_REJECT_EVENT_INTERVAL_MS) this.quotaHeaderRejectRecordedAt.delete(entry);
+    }
+    this.quotaHeaderRejectRecordedAt.set(dedupeKey, now);
+    this.recordEvent({
+      at: new Date(now).toISOString(),
+      type: 'quota-header-rejected',
+      account: account.id,
+      key,
+      value,
+    });
+  }
+
   applyUsage(accountId, payload) {
     const account = this.find(accountId);
     this.markAuthenticated(account);
+    let utilizationUpdated = false;
     if (Object.prototype.hasOwnProperty.call(payload || {}, 'five_hour')) {
       if (payload.five_hour == null) {
         account.quota.unified5h = null;
@@ -175,7 +212,10 @@ export class AccountManager {
       }
     }
     if (payload?.five_hour) {
-      if (typeof payload.five_hour.utilization === 'number') account.quota.unified5h = payload.five_hour.utilization;
+      if (typeof payload.five_hour.utilization === 'number') {
+        account.quota.unified5h = payload.five_hour.utilization;
+        utilizationUpdated = true;
+      }
       if (Object.prototype.hasOwnProperty.call(payload.five_hour, 'resets_at')) {
         account.quota.unified5hReset = parseUsageReset(payload.five_hour.resets_at);
       }
@@ -187,13 +227,22 @@ export class AccountManager {
       }
     }
     if (payload?.seven_day) {
-      if (typeof payload.seven_day.utilization === 'number') account.quota.unified7d = payload.seven_day.utilization;
+      if (typeof payload.seven_day.utilization === 'number') {
+        account.quota.unified7d = payload.seven_day.utilization;
+        utilizationUpdated = true;
+      }
       if (Object.prototype.hasOwnProperty.call(payload.seven_day, 'resets_at')) {
         account.quota.unified7dReset = parseUsageReset(payload.seven_day.resets_at);
       }
     }
     if (Array.isArray(payload?.scoped_weekly)) {
       account.quota.weeklyScoped = normalizeWeeklyScopedUsage(payload.scoped_weekly);
+    }
+    // Only a 5h / 7d utilization reading counts; a scoped-weekly-only payload
+    // leaves the previous source and time in place.
+    if (utilizationUpdated) {
+      account.quota.usageSource = 'poll';
+      account.quota.usageUpdatedAt = this.now();
     }
     this.refreshQuotaState(account);
   }
@@ -1693,6 +1742,8 @@ function restoreQuota(value) {
   quota.weeklyScoped = normalizeWeeklyScopedUsage(value.weeklyScoped);
   if (typeof value.unifiedStatus === 'string') quota.unifiedStatus = value.unifiedStatus;
   if (typeof value.resetsAt === 'string') quota.resetsAt = value.resetsAt;
+  // Saved before these keys existed -> both stay null.
+  if (USAGE_SOURCES.includes(value.usageSource)) quota.usageSource = value.usageSource;
   return quota;
 }
 
