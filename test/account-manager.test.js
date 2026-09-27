@@ -677,6 +677,8 @@ describe('AccountManager', () => {
       requestsLimit: null,
       requestsRemaining: null,
       resetsAt: null,
+      usageUpdatedAt: null,
+      usageSource: null,
     });
     assert.deepEqual(account.usage, {
       totalInputTokens: 0,
@@ -940,6 +942,8 @@ describe('AccountManager', () => {
       requestsLimit: null,
       requestsRemaining: null,
       resetsAt: null,
+      usageUpdatedAt: null,
+      usageSource: null,
     });
     assert.deepEqual(account.usage, {
       totalInputTokens: 0,
@@ -3333,5 +3337,132 @@ describe('updateUsage / キャッシュ4分類と countRequest', () => {
     assert.equal(usage.totalCacheCreation1hTokens, 1500);
     assert.equal(usage.totalCacheCreation5mTokens, 300);
     assert.equal(usage.totalRequests, 1);
+  });
+});
+
+describe('quota usage freshness (usageUpdatedAt / usageSource)', () => {
+  const RESET_5H = '4000000000';
+  function freshManager(clock) {
+    return new AccountManager({
+      accounts: [{ id: 'acct_1', name: 'a@example.com', type: 'oauth' }],
+      now: () => clock.value,
+    });
+  }
+
+  it('records header as the source and the injected clock when a response carries unified utilization', () => {
+    const clock = { value: 1_700_000_000_000 };
+    const manager = freshManager(clock);
+    manager.updateQuota('acct_1', {
+      'anthropic-ratelimit-unified-5h-utilization': '0.4',
+      'anthropic-ratelimit-unified-5h-reset': RESET_5H,
+    });
+    const quota = manager.find('acct_1').quota;
+    assert.equal(quota.unified5h, 0.4);
+    assert.equal(quota.usageSource, 'header');
+    assert.equal(quota.usageUpdatedAt, 1_700_000_000_000);
+  });
+
+  it('records poll as the source and the injected clock when the Usage API payload is applied', () => {
+    const clock = { value: 1_700_000_000_000 };
+    const manager = freshManager(clock);
+    manager.updateQuota('acct_1', { 'anthropic-ratelimit-unified-5h-utilization': '0.4' });
+    clock.value += 5_000;
+    manager.applyUsage('acct_1', {
+      five_hour: { utilization: 0.5, resets_at: '2096-10-02T07:06:40.000Z' },
+    });
+    const quota = manager.find('acct_1').quota;
+    assert.equal(quota.unified5h, 0.5);
+    assert.equal(quota.usageSource, 'poll');
+    assert.equal(quota.usageUpdatedAt, 1_700_000_005_000);
+  });
+
+  it('keeps the previous values, source and time when a response has no unified utilization', () => {
+    const clock = { value: 1_700_000_000_000 };
+    const manager = freshManager(clock);
+    manager.applyUsage('acct_1', { seven_day: { utilization: 0.3 } });
+    clock.value += 60_000;
+    manager.updateQuota('acct_1', {});
+    manager.updateQuota('acct_1', {
+      'anthropic-ratelimit-tokens-limit': '1000',
+      'anthropic-ratelimit-unified-status': 'allowed',
+    });
+    const quota = manager.find('acct_1').quota;
+    assert.equal(quota.unified7d, 0.3);
+    assert.equal(quota.usageSource, 'poll');
+    assert.equal(quota.usageUpdatedAt, 1_700_000_000_000);
+  });
+
+  it('drops out-of-range and non-numeric utilization and records a quota-header-rejected event', () => {
+    for (const bad of ['1.0000001', '-0.01', 'abc', 'NaN', 'Infinity']) {
+      const clock = { value: 1_700_000_000_000 };
+      const manager = freshManager(clock);
+      manager.updateQuota('acct_1', { 'anthropic-ratelimit-unified-7d-utilization': '0.2' });
+      clock.value += 1_000;
+      manager.updateQuota('acct_1', { 'anthropic-ratelimit-unified-7d-utilization': bad });
+      const quota = manager.find('acct_1').quota;
+      assert.equal(quota.unified7d, 0.2, `value kept for ${bad}`);
+      assert.equal(quota.usageUpdatedAt, 1_700_000_000_000, `time kept for ${bad}`);
+      const [event] = manager.getStatus().events;
+      assert.deepEqual(event, {
+        at: new Date(1_700_000_001_000).toISOString(),
+        type: 'quota-header-rejected',
+        account: 'acct_1',
+        key: 'unified7d',
+        value: bad,
+      });
+    }
+  });
+
+  it('accepts the 0 and 1 boundaries and rejects values outside them in parseRateLimitHeaders', () => {
+    const rejected = [];
+    const parsed = parseRateLimitHeaders({
+      'anthropic-ratelimit-unified-5h-utilization': '0',
+      'anthropic-ratelimit-unified-7d-utilization': '1',
+    }, { onInvalid: r => rejected.push(r) });
+    assert.equal(parsed.unified5h, 0);
+    assert.equal(parsed.unified7d, 1);
+    assert.deepEqual(rejected, []);
+    const out = parseRateLimitHeaders({ 'anthropic-ratelimit-unified-5h-utilization': '1.5' });
+    assert.equal('unified5h' in out, false);
+  });
+
+  it('restores saved state written before the keys existed, and round-trips them once present', () => {
+    const clock = { value: 1_700_000_000_000 };
+    const legacy = freshManager(clock);
+    legacy.restoreState({
+      version: 1,
+      currentAccount: 'acct_1',
+      accounts: [{ id: 'acct_1', status: 'ready', quota: { unified7d: 0.3 }, usage: {} }],
+    });
+    const restoredLegacy = legacy.find('acct_1').quota;
+    assert.equal(restoredLegacy.unified7d, 0.3);
+    assert.equal(restoredLegacy.usageUpdatedAt, null);
+    assert.equal(restoredLegacy.usageSource, null);
+
+    const writer = freshManager(clock);
+    writer.applyUsage('acct_1', { seven_day: { utilization: 0.3 } });
+    const saved = JSON.parse(JSON.stringify(writer.exportState()));
+    const reader = freshManager(clock);
+    reader.restoreState(saved);
+    assert.equal(reader.find('acct_1').quota.usageSource, 'poll');
+    assert.equal(reader.find('acct_1').quota.usageUpdatedAt, 1_700_000_000_000);
+
+    saved.accounts[0].quota.usageSource = 'bogus';
+    const strict = freshManager(clock);
+    strict.restoreState(saved);
+    assert.equal(strict.find('acct_1').quota.usageSource, null);
+  });
+
+  it('exposes both keys on every account in getStatus()', () => {
+    const clock = { value: 1_700_000_000_000 };
+    const manager = freshManager(clock);
+    let quota = manager.getStatus().accounts[0].quota;
+    assert.equal(Object.hasOwn(quota, 'usageUpdatedAt'), true);
+    assert.equal(Object.hasOwn(quota, 'usageSource'), true);
+    assert.equal(quota.usageUpdatedAt, null);
+    manager.updateQuota('acct_1', { 'anthropic-ratelimit-unified-7d-utilization': '0.6' });
+    quota = manager.getStatus().accounts[0].quota;
+    assert.equal(quota.usageSource, 'header');
+    assert.equal(quota.usageUpdatedAt, 1_700_000_000_000);
   });
 });

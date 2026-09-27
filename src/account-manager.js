@@ -1,4 +1,10 @@
-import { emptyQuota, normalizeWeeklyScopedUsage, parseRateLimitHeaders, scopeMatchesModelFamily } from './quota.js';
+import {
+  emptyQuota,
+  normalizeWeeklyScopedUsage,
+  parseRateLimitHeaders,
+  scopeMatchesModelFamily,
+  USAGE_SOURCES,
+} from './quota.js';
 import {
   DEFAULT_MAX_PROVIDER_RETRY_AFTER_MS,
   DEFAULT_MAX_TOKEN_REFRESH_BACKOFF_MS,
@@ -156,10 +162,24 @@ export class AccountManager {
 
   updateQuota(accountId, headers, { atomicUnifiedWindows = false } = {}) {
     const account = this.find(accountId);
-    const parsed = parseRateLimitHeaders(headers);
+    const parsed = parseRateLimitHeaders(headers, {
+      onInvalid: ({ key, value }) => this.recordEvent({
+        at: new Date(this.now()).toISOString(),
+        type: 'quota-header-rejected',
+        account: account.id,
+        key,
+        value,
+      }),
+    });
     if (atomicUnifiedWindows) {
       keepUnifiedWindowAtomic(parsed, 'unified5h', 'unified5hReset');
       keepUnifiedWindowAtomic(parsed, 'unified7d', 'unified7dReset');
+    }
+    // A response without unified utilization (or whose values were all dropped)
+    // leaves the previous reading and its source untouched.
+    if ('unified5h' in parsed || 'unified7d' in parsed) {
+      parsed.usageSource = 'header';
+      parsed.usageUpdatedAt = this.now();
     }
     account.quota = { ...account.quota, ...parsed };
     this.refreshQuotaState(account);
@@ -195,6 +215,8 @@ export class AccountManager {
     if (Array.isArray(payload?.scoped_weekly)) {
       account.quota.weeklyScoped = normalizeWeeklyScopedUsage(payload.scoped_weekly);
     }
+    account.quota.usageSource = 'poll';
+    account.quota.usageUpdatedAt = this.now();
     this.refreshQuotaState(account);
   }
 
@@ -1693,6 +1715,8 @@ function restoreQuota(value) {
   quota.weeklyScoped = normalizeWeeklyScopedUsage(value.weeklyScoped);
   if (typeof value.unifiedStatus === 'string') quota.unifiedStatus = value.unifiedStatus;
   if (typeof value.resetsAt === 'string') quota.resetsAt = value.resetsAt;
+  // Saved before these keys existed -> both stay null.
+  if (USAGE_SOURCES.includes(value.usageSource)) quota.usageSource = value.usageSource;
   return quota;
 }
 
