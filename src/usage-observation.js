@@ -367,6 +367,18 @@ export function observationLogFields(observationLog, affinityLog = null) {
   if (observationLog.parse && observationLog.parse !== 'ok') {
     fields.push(`usageParse=${observationLog.parse}`);
   }
+  // 猶予（usage-limit grace）ヘッダが来た応答だけ末尾へ足す。g5h/g7d がどちらも
+  // null なら何も足さず、行は現行とバイト同一になる（追記は必ず末尾へ）。
+  const grace = observationLog.grace;
+  if (grace && (grace.g5h != null || grace.g7d != null)) {
+    fields.push(
+      `g5h=${numberOrDash(grace.g5h)}`,
+      `g7d=${numberOrDash(grace.g7d)}`,
+      `ustat=${logToken(grace.ustat)}`,
+      `ovs=${logToken(grace.ovs)}`,
+      `ovu=${logToken(grace.ovu)}`,
+    );
+  }
   return ` ${fields.join(' ')}`;
 }
 

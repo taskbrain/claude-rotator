@@ -4093,6 +4093,15 @@ function headerValue(value) {
   return value == null ? null : String(value);
 }
 
+// 猶予ヘッダ用。読み方は quota.js の setNumber に揃える（Number() で全体を読む）。
+// 値が無い・空・数値として読めないときは null（ログでは `-`）。
+function finiteHeaderNumber(value) {
+  const raw = headerValue(value);
+  if (raw == null || raw === '') return null;
+  const n = Number(raw);
+  return Number.isFinite(n) ? n : null;
+}
+
 function isUpstreamTimeout(error) {
   return error?.code === 'UPSTREAM_IDLE_TIMEOUT'
     || error?.code === 'UPSTREAM_CONNECT_TIMEOUT';
@@ -4425,6 +4434,15 @@ function buildObservationLog({ req, body, observation, upstreamResponse, observa
     },
     encoding: observation?.encoding ?? null,
     parse: observation?.parse ?? 'no-usage',
+    // 猶予（usage-limit grace）の観測。ヘッダが無い応答では g5h/g7d とも null になり、
+    // observationLogFields は何も足さない（行は現行とバイト同一）。
+    grace: {
+      g5h: finiteHeaderNumber(upstreamResponse.headers['anthropic-ratelimit-unified-grace-5h-utilization']),
+      g7d: finiteHeaderNumber(upstreamResponse.headers['anthropic-ratelimit-unified-grace-7d-utilization']),
+      ustat: headerValue(upstreamResponse.headers['anthropic-ratelimit-unified-status']),
+      ovs: headerValue(upstreamResponse.headers['anthropic-ratelimit-unified-overage-status']),
+      ovu: headerValue(upstreamResponse.headers['anthropic-ratelimit-unified-overage-in-use']),
+    },
   };
 }
 
