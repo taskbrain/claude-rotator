@@ -405,8 +405,6 @@ claude-rotator status
 - 新しい credential は比較更新で保存し、同時に行われた再ログインを上書きしません。handoff 後に別方式へ fallback して、どの token が有効か分からない状態にすることもありません。
 - installed gateway mode では保存アカウントを Rotator が更新し、古い通常ログインの credential を保存アカウントへ再コピーしません。live credential の追従は、gateway credential を使わない手動互換モードだけです。
 
-詳細設計は [OAuth credential lifecycle design](./docs/specs/2026-07-10-oauth-credential-lifecycle-design.md) を参照してください。
-
 </details>
 
 ## 設定ファイルと環境変数
@@ -1416,8 +1414,6 @@ Rotator cannot revive an explicitly revoked refresh token, so revocation also re
 - Concurrent refreshes of the same refresh token are coalesced, and credential mutations across accounts are serialized. Duplicate tokens, competing logins, and uncertain handoffs stop fail-closed.
 - New credentials use compare-and-update persistence, so a concurrent re-login is not overwritten. After handoff, Rotator does not fall back to another refresh driver and create ambiguity about which token won.
 - In installed gateway mode, saved accounts remain Rotator-owned and stale normal-login credentials are not copied back into them. Live-credential following is limited to the manual compatibility mode without gateway credentials.
-
-See [OAuth credential lifecycle design](./docs/specs/2026-07-10-oauth-credential-lifecycle-design.md) for the detailed design.
 
 </details>
 

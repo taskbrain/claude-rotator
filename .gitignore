@@ -16,5 +16,7 @@ install-state.json
 *.secret.json
 server.err
 
-# Internal session records (not part of the public repository)
+# Working documents kept outside the published repository
 docs/sessions/
+docs/superpowers/
+docs/specs/
