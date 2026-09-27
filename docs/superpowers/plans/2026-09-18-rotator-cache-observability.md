@@ -1,17 +1,17 @@
 # Rotator Cache Observability Implementation Plan
 
-> **公開時の注記（2026-09-25）:** 本計画は実装済みで、main に反映されている。以下は計画時点（2026-09-18）の歴史的記録であり、チェックボックスは更新していない。本文中の行番号は計画時点のもので（本計画の起点は `60da9aa` だが、修正条件3以前の不採用の記述として `6baf211` 基準の行番号が一部の節に残っている）、現行のソースとは異なる。
+> **公開時の注記（2026-09-25）:** 本計画は実装済みで、main に反映されている。以下は計画時点（2026-09-18）の歴史的記録であり、チェックボックスは更新していない。本文中の行番号は計画時点のもので（本計画の起点は `60da9aa` だが、レビューで起点を固定する前の記述として `6baf211` 基準の行番号が各所に残っている）、現行のソースとは異なる。
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** 本番 rotator が、応答 usage のキャッシュ4分類・要求ごとのモデルとセッション指紋・5時間枠/週次枠の使用率を1要求1行で記録し、`runtime-state.json` の usage 集計が実際に増えるようにする。切替の観測は sticky R-S1 が既に実装済みなので作り直さない。
+**Goal:** 本番 rotator が、応答 usage のキャッシュ4分類・要求ごとのモデルとセッション指紋・5時間枠/週次枠の使用率を1要求1行で記録し、`runtime-state.json` の usage 集計が実際に増えるようにする。切替の観測は sticky（セッション単位の口座固定）の切替ログが既に実装済みなので作り直さない。
 
-> **最終レビューの修正条件を反映済み（2026-09-18）。** 変更点は5つ。
-> ①**Task 3 を削除した**（R-S1 `c76ff12` が `trigger` 付きの `account_switch` を既に3経路へ付与しており、
+> **最終レビューの指摘を反映済み（2026-09-18）。** 変更点は5つ。
+> ①**Task 3 を削除した**（sticky の切替ログ `c76ff12` が `trigger` 付きの `account_switch` を既に3経路へ付与しており、
 > 起点 `60da9aa` には `selectBestExhaustedFallback({ trigger: 'request' })` も prepare-resume も入っている。
 > 残すと sticky 所有行の二重変更になる）。
 > ②`sid` 抑止の述語を `affinityLog === null` から **`!affinityLog?.sid`** へ直した。
-> ③**起点を `60da9aa` に固定**（第1段階の配備対象＝`6baf211` ＋ sticky R-S1・R-S2）。
+> ③**起点を `60da9aa` に固定**（第1段階の配備対象＝`6baf211` ＋ sticky の切替ログと口座選択の調整）。
 > ④**Task 1 に Step 0（`accept-encoding` の実測）を追加**した。
 > ⑤オーナーの決定を反映（未決事項1＝第1段階と同便・未決事項2＝`sid` は 12 hex・未決事項3＝既定 on・未決事項4＝`logMaxBytes` 32 MiB）。
 
@@ -19,17 +19,17 @@
 
 **Tech Stack:** Node.js 18.18+ ESM、`node:test`、`node:zlib`、`node:crypto`。
 
-**Spec:** 非公開の調査記録（口座切替時のキャッシュ喪失の原因分析。本文では「RCA」と呼ぶ）に基づく。対象はその §7-8（観測の整備）と §8 の gaps 1・2・3・6・9。
+**目的:** 口座の切替時にプロンプトキャッシュが失われる事象を観測できるようにする（観測の整備）。
 
 ---
 
 ## Global Constraints
 
 - 上流へ送る**要求のバイト列を1バイトも変えない**。応答本文もクライアントへは無改変で流し続ける。読むのは `Buffer.concat` 済みの写しだけとする。
-- **要求ヘッダの唯一の例外は `accept-encoding` である**（Task 1 Step 0 の実測を受けた修正条件4）。本機の Node が解けない符号化（`zstd`）だけを一覧から落として上流へ渡す。それ以外のヘッダは現行どおり素通しする。この書き換えは `observability.upstream.dropUndecodableAcceptEncoding`（既定 `true`）で切れ、`false` にすれば要求ヘッダは現行とバイト同一へ戻る。
+- **要求ヘッダの唯一の例外は `accept-encoding` である**（Task 1 Step 0 の実測を受けたレビューでの指摘）。本機の Node が解けない符号化（`zstd`）だけを一覧から落として上流へ渡す。それ以外のヘッダは現行どおり素通しする。この書き換えは `observability.upstream.dropUndecodableAcceptEncoding`（既定 `true`）で切れ、`false` にすれば要求ヘッダは現行とバイト同一へ戻る。
 - **`observability.requestLog.enabled` を `false` と明示したとき**、`server.log` の1行が現行とバイト単位で同一になることをテストで固定する（`test/invariance.test.js`）。
   **「未指定なら同一」ではない。** 未決事項3 の決定で既定を `true` にしたので、未指定の構成では行が伸びる。未指定（既定 on）については「行の**前半が `enabled:false` の行とバイト単位で同一**で、観測は末尾に足されているだけ」を固定する。
-- 口座切替のログ行（`account_switch`）を**この計画では実装しない**。sticky R-S1（`c76ff12`、第1段階の配備対象 `60da9aa` に含まれる）が既に持っている。同じ関数を二重に変えない。**`trigger` の穴を塞ぐ作業（旧 Task 3）も行わない** — 起点 `60da9aa` の `proxy-server.js` には `selectBestExhaustedFallback({ trigger: 'request' })` と prepare-resume の `trigger` が既に入っており、`trigger=unknown` は出ない。
+- 口座切替のログ行（`account_switch`）を**この計画では実装しない**。sticky の切替ログ（`c76ff12`、第1段階の配備対象 `60da9aa` に含まれる）が既に持っている。同じ関数を二重に変えない。**`trigger` の穴を塞ぐ作業（旧 Task 3）も行わない** — 起点 `60da9aa` の `proxy-server.js` には `selectBestExhaustedFallback({ trigger: 'request' })` と prepare-resume の `trigger` が既に入っており、`trigger=unknown` は出ない。
 - 生のセッション id・`metadata.user_id` の原文・会話本文・プロンプト断片・トークン・資格情報を、ログ・`runtime-state.json`・テスト fixture・本計画書のいずれにも書かない。出してよいのは sha256 の先頭 12 桁だけとする。
 - 口座の表記は既存 `proxy` 行の `account=` と同じ `account.id`（スラッグ）に揃える。新しい口座由来フィールドを増やさない。**本計画書の中の口座は「口座A」「口座B」のような仮名で書く。**
 - 秘密を argv・fixture・log・error・文書へ出さない。未追跡の `package-lock.json` を変更・stage しない。
@@ -45,7 +45,7 @@
 - Create: `src/session-key.js` … セッション鍵の抽出・正規化・`sidHash`。sticky の `session-affinity.js:76-160` から純関数だけを切り出したもの。
 - Create: `test/usage-observation.test.js`
 - Create: `test/session-key.test.js`
-**この File Map の行番号は起点 `60da9aa` のもの**（修正条件3で起点を固定したので、当初の要件や `6baf211` 基準の番号からずれる）。後続の「変更点の一覧」節と Task 1 の一部は、修正条件3以前の `6baf211` 基準の行番号のまま残っている。
+**この File Map の行番号は起点 `60da9aa` のもの**（レビューでの指摘で起点を固定したので、当初の要件や `6baf211` 基準の番号からずれる）。本文の他の箇所（根本原因の節・変更点の一覧・設定の節・各 Task など）には、起点を固定する前の `6baf211` 基準の行番号が各所に残っている。
 
 - Modify: `src/proxy-server.js:47-57`（`HOP_HEADERS` は変えない。判定の根拠として参照する）、`:2980-2994`（`recordProxyRequest` へ観測を渡す）、`:3022-3024`（`extractUsage` の差し替え）、`:3105-3121`（`buildUpstreamHeaders` の `accept-encoding` 書き換え）、`:3343-3373`（`recordProxyRequest`）、`:3389-3403`（`writeProxyLog`）、`:3573-3606`（`extractUsage`）、`createProxyServer` の設定解決と reload（`:248-254`・`:423-443`）
 - Modify: `src/account-manager.js:163-169`（`updateUsage`）、`:898-905`（`emptyAccountUsage`）、`:1308-1315`（`restoreUsage`）
@@ -89,14 +89,14 @@
 
 ## 変更点の一覧（最小差分・行番号は 6baf211 基準）
 
-**修正条件3以前の記述（不採用）**: この節の行番号は `6baf211` を起点にした作業ツリーのもので、当時は「`6baf211` を起点にして作業する」前提だった。修正条件3で起点は `60da9aa` に固定され、`6baf211` 起点は採らないことになった（「配備」節を参照）。行番号は当時のまま残しているので、起点 `60da9aa` の番号とはずれる。
+**起点を固定する前の記述（不採用）**: この節の行番号は `6baf211` を起点にした作業ツリーのもので、当時は「`6baf211` を起点にして作業する」前提だった。レビューでの指摘で起点は `60da9aa` に固定され、`6baf211` 起点は採らないことになった（「配備」節を参照）。行番号は当時のまま残しているので、起点 `60da9aa` の番号とはずれる。
 
 ### (a) `extractUsage` の拡張
 
 - `src/proxy-server.js:3553-3586` を、新モジュール `src/usage-observation.js` の純関数 `parseUsageObservation(body, { contentEncoding, maxBytes })` への薄い委譲に置き換える。純関数の戻り値は次の形とする。
 
 ```js
-// 1応答ぶんの観測。数えられなかったときは parse に理由が入り、トークンは null になる。
+// 1応答ぶんの観測。数えられなかったときは parse に理由が入り、トークンは 0 になる。
 {
   parse: 'ok' | 'unsupported-encoding' | 'too-large' | 'unparsable' | 'no-usage',
   model: string | null,          // message_start.message.model / 非ストリームの json.model
@@ -126,15 +126,15 @@
  model=<応答の model id> sid=<12hex|-> in=<n> out=<n> cr=<n> cc=<n> c1h=<n> c5m=<n> u5h=<0..1|-> u5hReset=<epoch秒|-> u7d=<0..1|-> u7dReset=<epoch秒|-> enc=<gzip|br|deflate|-> usageParse=<ok 以外のときだけ>
 ```
 
-- `sid` は `src/session-key.js` の `sidHash(sessionKeyFrom(req, body))`。**sha256 の hex 先頭 12 桁**とする。当初の要件は8桁だったが、sticky R-S7 が `sid=<12hex>` を同じ `proxy` 行へ出す実装を既に持ち（`session-affinity.js:90-94`、`SID_HASH_PATTERN = /^[0-9a-f]{12}$/`）、8桁と12桁が混在すると2つのログを突合できなくなる。**この1点は当初の要件からの意図的な逸脱なので、Task 6 の前に承認を取る**（未決事項2）。
-- 当面は**ヘッダ `x-claude-code-session-id` だけ**を読む。本文 `metadata.user_id` の `session_id` へのフォールバックは `observability.requestLog.sessionFromBody`（既定 `false`）で切り替える。理由は、要求本文が数百 KB〜数 MB あり、`JSON.parse` の追加1回が要求ごとの実コストになるためで、まずヘッダ付与率（RCA gap 3）を測ってから決める。
+- `sid` は `src/session-key.js` の `sidHash(sessionKeyFrom(req, body))`。**sha256 の hex 先頭 12 桁**とする。当初の要件は8桁だったが、sticky のセッション固定 が `sid=<12hex>` を同じ `proxy` 行へ出す実装を既に持ち（`session-affinity.js:90-94`、`SID_HASH_PATTERN = /^[0-9a-f]{12}$/`）、8桁と12桁が混在すると2つのログを突合できなくなる。**この1点は当初の要件からの意図的な逸脱なので、Task 6 の前に承認を取る**（未決事項2）。
+- 当面は**ヘッダ `x-claude-code-session-id` だけ**を読む。本文 `metadata.user_id` の `session_id` へのフォールバックは `observability.requestLog.sessionFromBody`（既定 `false`）で切り替える。理由は、要求本文が数百 KB〜数 MB あり、`JSON.parse` の追加1回が要求ごとの実コストになるためで、まずヘッダ付与率を測ってから決める。
 - 使用率は `parseRateLimitHeaders(upstreamResponse.headers)`（`src/quota.js:17-34`）の戻り値をそのまま使う。`updateQuota()` が `onResponse` で既に同じ解析をしているが、そちらは口座台帳を更新する副作用つきなので、ログ用にはもう一度純粋に呼ぶ（この関数は副作用が無い）。
-- `sid` の衝突回避規約: **`observationLog` 側は `!affinityLog?.sid` のときだけ `sid=` を出す。** sticky の `affinityLogFields()` は `affinityLog.sid` が真のときにだけ `sid=` を出すので、「`affinityLog` が `null` のときだけ出す」にすると、**鍵なし要求（`affinityLog` は非 null だが `sid` が無い）で `sid=-` が消えてしまい、セッション付与率（RCA gap 3）が測れなくなる**。述語は `affinityLog` の有無ではなく `sid` の有無で取る。
-- **`writeProxyLog` の第4引数は `affinityLog` を予約する**（修正条件3）。起点 `60da9aa` には sticky R-S7 がまだ無いので実引数は常に `null` だが、引数順を `(logger, event, degradeLog, affinityLog, observationLog)` で先に確定させておき、sticky 合流時に引数の番号を振り直さずに済ませる。連結順は `degradeLogFields` → `affinityLogFields`（未実装のうちは空文字列） → `observationLogFields` の固定とする。
+- `sid` の衝突回避規約: **`observationLog` 側は `!affinityLog?.sid` のときだけ `sid=` を出す。** sticky の `affinityLogFields()` は `affinityLog.sid` が真のときにだけ `sid=` を出すので、「`affinityLog` が `null` のときだけ出す」にすると、**鍵なし要求（`affinityLog` は非 null だが `sid` が無い）で `sid=-` が消えてしまい、セッション付与率が測れなくなる**。述語は `affinityLog` の有無ではなく `sid` の有無で取る。
+- **`writeProxyLog` の第4引数は `affinityLog` を予約する**（レビューでの指摘）。起点 `60da9aa` には sticky のセッション固定 がまだ無いので実引数は常に `null` だが、引数順を `(logger, event, degradeLog, affinityLog, observationLog)` で先に確定させておき、sticky 合流時に引数の番号を振り直さずに済ませる。連結順は `degradeLogFields` → `affinityLogFields`（未実装のうちは空文字列） → `observationLogFields` の固定とする。
 
 ### (c) 口座切替の永続ログ — **実装しない**
 
-sticky R-S1（`c76ff12`）が `src/account-manager.js` に `logAccountSwitch()` を新設し、`AccountManager` のコンストラクタが受け取った `logger` へ次の1行を書く。
+sticky の切替ログ（`c76ff12`）が `src/account-manager.js` に `logAccountSwitch()` を新設し、`AccountManager` のコンストラクタが受け取った `logger` へ次の1行を書く。
 
 ```text
 <ISO8601> account_switch from=<id|none> to=<id|none> reason=<語彙> trigger=<語彙>
@@ -145,13 +145,13 @@ sticky R-S1（`c76ff12`）が `src/account-manager.js` に `logAccountSwitch()` 
 - `trigger` は `ACCOUNT_SWITCH_TRIGGERS`＝`usage-refresh` / `429` / `reload` / `manual` / `request` / `prepare-resume` の6値、語彙外は `unknown`。
 - `from === to` のときは出さない。
 
-**この計画では切替ログに何も足さない。** 初版では「R-S1 が `trigger` を渡し忘れている2経路（`sendCurrentQuotaUnavailableResponse()` の `selectBestExhaustedFallback()` と `prepareResumeTarget()`）を塞ぐ」作業を Task 3 として置いていたが、起点 `60da9aa` の時点で両経路とも `trigger` が既に渡っていることを確認したため、Task 3 ごと削除した（下の「Task 3」節を参照）。現行の main でも、`src/proxy-server.js` の `selectBestExhaustedFallback({ trigger: 'request' })`（2026-09-25 時点の `:4211`）と `src/account-manager.js` の `switchToCandidate(available, 'resume-ready', 'prepare-resume')`（同 `:612`）で `trigger` が渡っており、この2経路の `trigger=unknown` は残存する欠陥ではない。
+**この計画では切替ログに何も足さない。** 初版では「sticky の切替ログが `trigger` を渡し忘れている2経路（`sendCurrentQuotaUnavailableResponse()` の `selectBestExhaustedFallback()` と `prepareResumeTarget()`）を塞ぐ」作業を Task 3 として置いていたが、起点 `60da9aa` の時点で両経路とも `trigger` が既に渡っていることを確認したため、Task 3 ごと削除した（下の「Task 3」節を参照）。現行の main でも、`src/proxy-server.js` の `selectBestExhaustedFallback({ trigger: 'request' })`（2026-09-25 時点の `:4211`）と `src/account-manager.js` の `switchToCandidate(available, 'resume-ready', 'prepare-resume')`（同 `:612`）で `trigger` が渡っており、この2経路の `trigger=unknown` は残存する欠陥ではない。
 
 ### (d) 集計側
 
 - `src/account-manager.js:147-153` `updateUsage(accountId, {...})` を、キャッシュ4分類を受け取り `totalRequests` を**引数 `countRequest` が真のときだけ** 1 増やす形にする（既定は `false`）。
-- **`countRequest` は `parse === 'ok'` のときだけ真にする**（修正条件3）。「usage が読めた要求だけ数える」という意味を保つためで、`unsupported-encoding` / `too-large` / `unparsable` / `no-usage` では `totalRequests` を増やさない。読めなかった要求の件数は `server.log` の `usageParse=` の分布から数える。
-- **`durationMs` は解凍を `await` する前に確定させる**（修正条件3）。`forwardOnce` は現在 `recordProxyRequest` の引数の中で `Date.now() - startedAt` を評価しているが、観測の解凍を手前へ移すと解凍時間が `durationMs` に混入し、配備前後の遅延比較（リスク R-5）が成り立たなくなる。`await` の手前で `const durationMs = Date.now() - startedAt;` を取る。
+- **`countRequest` は `parse === 'ok'` のときだけ真にする**（レビューでの指摘）。「usage が読めた要求だけ数える」という意味を保つためで、`unsupported-encoding` / `too-large` / `unparsable` / `no-usage` では `totalRequests` を増やさない。読めなかった要求の件数は `server.log` の `usageParse=` の分布から数える。
+- **`durationMs` は解凍を `await` する前に確定させる**（レビューでの指摘）。`forwardOnce` は現在 `recordProxyRequest` の引数の中で `Date.now() - startedAt` を評価しているが、観測の解凍を手前へ移すと解凍時間が `durationMs` に混入し、配備前後の遅延比較（リスク R-5）が成り立たなくなる。`await` の手前で `const durationMs = Date.now() - startedAt;` を取る。
 - `src/account-manager.js:846-853` `emptyAccountUsage()` と `:1209-1216` `restoreUsage()` へ3キーを追加する。
 - `src/monitor.js:123` の `requests:` 表示はキー名が変わらないのでそのまま動く。
 
@@ -175,10 +175,10 @@ config.observability = {
 }
 ```
 
-- **`switchLog` キーは置かない**（修正条件1）。起点 `60da9aa` に R-S1 が入っているので、互換キーの出番が無い。
+- **`switchLog` キーは置かない**（レビューでの指摘）。起点 `60da9aa` に sticky の切替ログが入っているので、互換キーの出番が無い。
 - `upstream.dropUndecodableAcceptEncoding` と `requestLog.enabled` は**独立に切れる**。前者は要求ヘッダを、後者は `server.log` の行を、それぞれ現行へ戻すための別々のつまみである。usage 集計の修正そのもの（Task 1）はどちらのつまみにも従属させない。
 
-- **既定を `on` にする理由**: 本件の観測は「すべての対策の効果測定の前提」（RCA §7-8）であり、既定 off だと本番で誰も有効化しないまま次の設計判断へ進むことになる。無効化は 1 キーの変更と `POST /internal/reload` で即座にでき、無効時は行がバイト単位で現行に戻ることをテストで固定するので、切戻しの敷居は十分低い。**未決事項3 はオーナーが「既定 on」で決定済み。配備通知に「`proxy` 行が観測フィールドのぶん伸びる／`POST /internal/reload` で現行へ戻る」と明記する。**
+- **既定を `on` にする理由**: 本件の観測はすべての対策の効果測定の前提であり、既定 off だと本番で誰も有効化しないまま次の設計判断へ進むことになる。無効化は 1 キーの変更と `POST /internal/reload` で即座にでき、無効時は行がバイト単位で現行に戻ることをテストで固定するので、切戻しの敷居は十分低い。**未決事項3 はオーナーが「既定 on」で決定済み。配備通知に「`proxy` 行が観測フィールドのぶん伸びる／`POST /internal/reload` で現行へ戻る」と明記する。**
 - **reload**: `POST /internal/reload`（`src/proxy-server.js:382-439`）は現状 `reloadAccounts` と `reloadOpenAiBridge` しか呼ばない。`src/cli.js:386` の隣へ `reloadObservability: () => loadConfig().then(next => next?.observability)` を足し、`createProxyServer` 内で `observabilitySettings = normalizeObservability(await reloadObservability())` を再評価する。**毎回 `normalizeObservability()` を通し直す**こと（起動時の1回きりの正規化を使い回すと reload 値にクランプが効かない。sticky が `proxy-server.js:599-625` で同じ罠を明示的に避けている）。
 - `logMaxBytes` だけは reload では効かない。`createServerLogWriter()` は起動時に fd を開くため、変更は再起動が必要である。この非対称を README に書く。
 
@@ -201,7 +201,7 @@ config.observability = {
  enc=<gzip|br|deflate|->
 ```
 
-- 追記で行長が伸びるので、`LOG_MAX_BYTES = 10 MiB`（`src/log-rotation.js:3`）と copytruncate 1世代のままだと、**保全期間が現行より縮む**。RCA の再現手順は複数日分のログを前提にしているので、これは実害になる。
+- 追記で行長が伸びるので、`LOG_MAX_BYTES = 10 MiB`（`src/log-rotation.js:3`）と copytruncate 1世代のままだと、**保全期間が現行より縮む**。キャッシュ喪失の再現調査は複数日分のログを前提にしているので、これは実害になる。
 - 対策は `logMaxBytes` を 32 MiB へ上げること（2世代で 64 MiB）。保全期間はローテーション設定に依存するが、現行より広くなる。`maybeRotateLog()` は `maxBytes` を引数で受けるので（`src/log-rotation.js:30`）、`src/cli.js:372` の `createServerLogWriter({ logPath })` へ `maxBytes` を渡すだけで足りる。ディスク消費は 20 MiB → 64 MiB の増加。
 - `copyFileSync` によるローテーションは1回あたりのコピーが 32 MiB に増えるが、ローテーションの頻度は下がるので、I/O の山は大きく増えない。
 
@@ -213,7 +213,7 @@ config.observability = {
 
 - 純関数 `parseUsageObservation()`:
   - 非ストリーム JSON から `input_tokens` / `output_tokens` / `cache_read_input_tokens` / `cache_creation_input_tokens` / `cache_creation.ephemeral_1h_input_tokens` / `ephemeral_5m_input_tokens` を読む。
-  - SSE（`event: message_start\ndata: …\n\n` 形式と `\r\n` 区切りの両方）から同じ値を読む。`message_delta` の `output_tokens` を足す。
+  - SSE（`event: message_start\ndata: …\n\n` 形式と `\r\n` 区切りの両方）から同じ値を読む。`message_delta` の `output_tokens` は `message_start` の値と比べて大きい方を採る（`Math.max`）。
   - **gzip で固めた同じ SSE を渡すと `parse:'ok'` で同じ値が返る**（これが本件の核心。`content-encoding` を渡さなければ `parse:'unparsable'`）。
   - `br` / `deflate` も同様。`zstd` は実行環境の API の有無で分岐する。`zlib.zstdDecompress` があれば（Node 22.15 以降）解凍して `parse:'ok'`、無ければ `parse:'unsupported-encoding'`。
   - `maxBytes` 超過で `parse:'too-large'`、トークンは 0。
@@ -221,7 +221,7 @@ config.observability = {
   - `model` を `message_start.message.model` から取る。
 - 純関数 `sessionKeyFrom` / `sidHash`（sticky の `test/session-affinity.test.js` の該当ケースと**同じ入力・同じ期待値**にする。将来の統合で差が出ないようにするため）:
   - ヘッダ1本なら採用、同名2本なら `null`、128 桁超は `null`、`/^[A-Za-z0-9._:-]+$/` 外は `null`。
-  - `sidHash` は 12 hex。**生値がどこにも出ないことを、出力文字列に生 id が含まれないという走査で固定する**（positive control つきの走査。**`test/invariance.test.js:816` という参照は誤りで、起点 `60da9aa` の同ファイルは 786 行しかない**。その型のテンプレートは sticky R-S13 側にあるので、本計画では `test/invariance.test.js` の既存テスト5「no-identifier-in-degrade-logs」の型に倣って新規に書く）。
+  - `sidHash` は 12 hex。**生値がどこにも出ないことを、出力文字列に生 id が含まれないという走査で固定する**（positive control つきの走査。**`test/invariance.test.js:816` という参照は誤りで、起点 `60da9aa` の同ファイルは 786 行しかない**。その型のテンプレートは sticky の不変性テスト側にあるので、本計画では `test/invariance.test.js` の既存テスト5「no-identifier-in-degrade-logs」の型に倣って新規に書く）。
 - 結線（`test/proxy-server.test.js`）:
   - 偽上流が `content-encoding: gzip` の SSE を返したとき、`accountManager.getStatus().accounts[0].usage` が `totalRequests=1` かつ `totalCacheReadTokens` が期待値になる（現行コードでは 0 のまま＝RED）。
   - 1要求で `totalRequests` が **1 だけ**増える（現行のストリーム経路は 2 増える＝RED）。
@@ -243,15 +243,15 @@ config.observability = {
 
 - **ブランチ**: `feat/cache-observability`
 - **worktree**: `<repo>/cache-observability-20260918`
-- **起点**: **`60da9aa` に固定**（修正条件3。第1段階の配備対象＝`6baf211` ＋ sticky R-S1 `c76ff12` ＋ R-S2）。未決事項1 の決定は「**第1段階と同便で配備する**」。`6baf211` 起点は採らない。
+- **起点**: **`60da9aa` に固定**（レビューでの指摘。第1段階の配備対象＝`6baf211` ＋ sticky の切替ログ `c76ff12` ＋ 口座選択の調整）。未決事項1 の決定は「**第1段階と同便で配備する**」。`6baf211` 起点は採らない。
 - **作業は起点 `60da9aa` の worktree `cache-observability-20260918` で行う**。行番号の基準は節によって異なる（冒頭の注記を参照）。
 - **rebase 順序と衝突しそうな箇所**（sticky 13728e6 との突合で確認済み）:
   - `src/proxy-server.js` の `extractUsage`（sticky は**無改変**。関数本体の sha256 が 6baf211 と一致）と `buildUpstreamHeaders`（同じく無改変）— **衝突しない**。
   - `writeProxyLog` / `recordProxyRequest` / `forwardOnce` — sticky は引数1本の素通しを各3行足すだけ。本計画も同じ形で1本足すので、**同じ行に隣接する変更が3箇所**ある（当初は衝突を見込んでいたが、下記の `merge-tree` の実測では衝突マーカーは 0 件だった）。解決規約は「連結順は `degradeLogFields` → `affinityLogFields` → `observationLogFields` の固定。引数順は `(logger, event, degradeLog, affinityLog, observationLog)`」。
-  - `src/cli.js` — R-S1 が `logPath` / `logWriter` / `logger` を `AccountManager` の**前**へ移す。本計画は同じブロックへ `reloadObservability` を1行足すので衝突する。第1段階を先に入れれば発生しない。
+  - `src/cli.js` — sticky の切替ログが `logPath` / `logWriter` / `logger` を `AccountManager` の**前**へ移す。本計画は同じブロックへ `reloadObservability` を1行足すので衝突する。第1段階を先に入れれば発生しない。
   - `src/account-manager.js` — sticky が触るのは switch 系（`:86` `:294` `:540` `:574`）、本計画が触るのは usage 系（`:147` `:846` `:1209`）。**重ならない**。
   - `createProxyServer` と `forwardWithRotation` — sticky の改変が最も大きい2関数。**実装の結果、当初の「`forwardWithRotation` には一切触らない」は成り立たなかった。** 設定を `forwardOnce` まで届ける必要があるため、`forwardWithRotation` と `forwardCurrentUnavailableAccount` の引数に `observability = DEFAULT_OBSERVABILITY` を1本足し、呼び出し5箇所へ素通しした。`forwardWithRotation` の**本体のロジックには触っていない**（`model` を応答から採り、要求本文を解析しない設計は維持したので、sticky の最大の衝突領域である `routingModelFamily()` の解析には手が入っていない）。
-  - **sticky 先端 `13728e6` との突合（実測）**: `git merge-tree $(git merge-base HEAD feat/session-affinity) HEAD feat/session-affinity` の**衝突マーカーは 0 件**。`src/proxy-server.js` の差分は 13 hunk で、いずれも「同じ位置に引数を1本足す」型であり意味的な重なりは無い。
+  - **sticky 先端 `13728e6` との突合（実測）**: `git merge-tree $(git merge-base HEAD <sticky-branch>) HEAD <sticky-branch>`（`<sticky-branch>` は当時の sticky の作業ブランチ）の**衝突マーカーは 0 件**。`src/proxy-server.js` の差分は 13 hunk で、いずれも「同じ位置に引数を1本足す」型であり意味的な重なりは無い。
   - `src/config.js` — 双方とも触らない。
 - **切戻し**（2段）:
   - 段1: `config.json` の `observability.requestLog.enabled` を `false` にして `POST /internal/reload`。`server.log` の行が現行とバイト同一へ戻る。`account_switch` は第1段階の実装なので残る。
@@ -272,7 +272,7 @@ tail -n 2000 ~/.config/claude-rotator/server.log | grep -o ' usageParse=[a-z-]*'
 jq '[.accounts[] | {id:(.id[0:3]+"…"), tr:.usage.totalRequests, cr:.usage.totalCacheReadTokens, lu:.usage.lastUsed}]' \
   ~/.config/claude-rotator/runtime-state.json
 
-# 5. セッション付与率（RCA gap 3）
+# 5. セッション付与率
 tail -n 2000 ~/.config/claude-rotator/server.log | grep ' proxy ' \
   | awk '{for(i=1;i<=NF;i++) if($i ~ /^sid=/) print ($i=="sid=-" ? "none" : "keyed")}' | sort | uniq -c
 
@@ -299,7 +299,7 @@ grep -c ' account_switch ' ~/.config/claude-rotator/server.log
 - Changes: `AccountManager.updateUsage(accountId, { inputTokens, outputTokens, cacheReadTokens, cacheCreation1hTokens, cacheCreation5mTokens, countRequest })`。
 - Consumes: `node:zlib` の `gunzip` / `inflate` / `brotliDecompress`。
 
-- [x] **Step 0: Claude Code が実際に送る `accept-encoding` を実測する**（修正条件4・実施済み 2026-09-18）
+- [x] **Step 0: Claude Code が実際に送る `accept-encoding` を実測する**（レビューでの指摘・実施済み 2026-09-18）
 
 `127.0.0.1` の空きポートに偽上流を立て、受信ヘッダのうち `accept-encoding` / `content-type` / `anthropic-beta` **だけ**を記録する（`authorization` / `x-api-key` / `cookie` は読み出しも記録もしない。本文も読み捨てる）。`ANTHROPIC_BASE_URL` を偽上流へ向けた `claude -p "ping" --settings '{"disableAllHooks":true}'` を1回だけ実行する。
 
@@ -314,13 +314,13 @@ POST /v1/messages?beta=true :: accept-encoding=gzip, deflate, br, zstd
 ```
 
 - **`zstd` を含む。** 当時の Claude Code の実行ファイルでも、バイナリ内の HTTP 定数表にも同じ既定値 `gzip, deflate, br, zstd` がある（オフラインの裏付け）。
-- **Node のバージョンは実行環境ごとに違う。** 開発シェルの既定 `node` は Node 20 系で `zlib.zstdDecompress` が `undefined` だが、**本番の rotator プロセスは Node 22 系（22.15 以降）で動いており `zstdDecompress` を持つ**（`ps -p <pid> -o args` で確認した実体は Node 22 の実行ファイル）。したがって**本番では zstd を解凍できる**。
+- **Node のバージョンは実行環境ごとに違う。** 開発シェルの既定 `node` は Node 20 系で `zlib.zstdDecompress` が `undefined` だが、Node 22.15 以降は `zstdDecompress` を持つので、その版で動かせば zstd を解凍できる。
 
 **この実測が計画に与える帰結（3点）**
 
 1. `parseUsageObservation()` は `zlib.zstdDecompress` を **feature-detect** する（`typeof zlib.zstdDecompress === 'function'`）。あれば使い、無ければ `parse:'unsupported-encoding'` で観測可能に失敗させる。Node 22.15 以降へ上げれば実装を変えずに解けるようになる。
 2. **`zstd` を解けない実行環境でだけ、上流向けの `accept-encoding` から `zstd` を落として `gzip, deflate, br` を送る。** これが Global Constraints の「要求ヘッダを変えない」に対する唯一の例外で、`observability.upstream.dropUndecodableAcceptEncoding`（既定 `true`）で切れる。落とすのは解けないトークンだけで、残りは受け取った順のまま維持する。全部落ちる構成では `identity` を送る。
-   **本番（Node 22 系）ではこの書き換えは発動せず、要求ヘッダは現行とバイト同一のまま**である。発動するのは Node 22.15 未満で動かした場合だけで、実質的には「古い Node へ載せ替えたときの安全網」として入れる。
+   **zstd を解ける実行環境ではこの書き換えは発動せず、要求ヘッダは現行とバイト同一のまま**である。発動するのは Node 22.15 未満で動かした場合だけで、実質的には「古い Node へ載せ替えたときの安全網」として入れる。
 3. 根本原因（usage 集計が 0）の推定は、これで「圧縮応答が来ている可能性がある」から「**クライアントが圧縮を要求していることは確定、上流が実際に何で返すかだけが未確認**」へ狭まった。残りは配備後の `enc=` の分布で決まる。
 
 - [ ] **Step 1: gzip の SSE で現行が 0 件になることを示す失敗テストを書く**
@@ -495,16 +495,16 @@ git commit -m "feat(observability): proxy 行へ model・sid・キャッシュ�
 第1段階と同便で配備するため、本計画のブランチは sticky 先端 `13728e6` と合流する。実測に基づく注意点は次の3つ。
 
 - **衝突は出ない見込み。** `git merge-tree` の衝突マーカーは 0 件（起点 `60da9aa`・sticky 先端 `13728e6` で確認）。`src/proxy-server.js` の 13 hunk はすべて「同じ位置に引数を1本足す」型で、意味的に重なっていない。
-- **合流後にやること**は2つだけ。①`writeProxyLog` の第4引数（`affinityLog`）に sticky R-S7 の実引数を実際に渡す ②`affinityLogFields()` を `degradeLogFields` と `observationLogFields` の間へ挟む。引数順 `(logger, event, degradeLog, affinityLog, observationLog)` と連結順は本計画で先に確定させてある。
+- **合流後にやること**は2つだけ。①`writeProxyLog` の第4引数（`affinityLog`）に sticky のセッション固定 の実引数を実際に渡す ②`affinityLogFields()` を `degradeLogFields` と `observationLogFields` の間へ挟む。引数順 `(logger, event, degradeLog, affinityLog, observationLog)` と連結順は本計画で先に確定させてある。
 - **`sid=` の二重出力に注意する。** `observationLogFields` は `!affinityLog?.sid` のときだけ `sid=` を出す。sticky 側が `affinityLog.sid` を持つ行では自動的に譲るが、**鍵なし要求では `observationLog` 側が `sid=-` を出し続ける**のが正しい挙動である（セッション付与率の測定に必要）。ここを「`affinityLog` が `null` のときだけ」に戻さないこと。
 
 ---
 
 ### Task 3: 切替ログの穴だけを塞ぐ — **削除（実施しない）**
 
-**最終レビューの修正条件1により、このタスクは計画から削除した。**
+**最終レビューの指摘により、このタスクは計画から削除した。**
 
-理由: sticky R-S1（`c76ff12`）が起点 `60da9aa` に含まれており、`src/proxy-server.js` の
+理由: sticky の切替ログ（`c76ff12`）が起点 `60da9aa` に含まれており、`src/proxy-server.js` の
 `selectBestExhaustedFallback({ trigger: 'request' })` と prepare-resume の両経路に `trigger` が
 既に渡っている。よって第1段階の配備で `trigger=unknown` は出ない（現行の main でも同様。上の「(c) 口座切替の永続ログ」節を参照）。ここへ手を入れると
 **sticky 所有の行を本計画が二重に変更する**ことになり、リスク R-4（二重実装）を自ら踏む。
@@ -615,7 +615,7 @@ Expected: `src/` の変更が `usage-observation.js`（新規）・`session-key.
 Run:
 
 ```bash
-git merge-tree $(git merge-base HEAD feat/session-affinity) HEAD feat/session-affinity | grep -c '<<<<<<<'
+git merge-tree $(git merge-base HEAD <sticky-branch>) HEAD <sticky-branch> | grep -c '<<<<<<<'
 ```
 
 Expected: 衝突マーカーは 0 件（「配備」節と「sticky rebase への注記」節の実測と同じ）。`writeProxyLog` / `recordProxyRequest` / `forwardOnce` の3箇所は同じ位置に引数を1本足す隣接の変更で、衝突にはならない。`extractUsage` と `buildUpstreamHeaders` に衝突が出たら設計が崩れているので止める。
@@ -631,6 +631,8 @@ Expected: 衝突マーカーは 0 件（「配備」節と「sticky rebase へ�
 - [ ] **Step 5: 配備し、根本原因の最終確認をする**
 
 「配備」節の確認コマンド 1〜6 を順に実行する。**確認 2 で `enc=-` が支配的、かつ確認 4 の `totalRequests` が 0 のままなら、根本原因の推定が外れている。** その場合は切戻し段1を実行し、`usageParse=` の分布を証拠として再調査へ戻す。
+
+あわせて、配備前後の `proxy` 行の `durationMs` を `awk` で分位点（中央値・p95・p99）に集計して比べ、解凍による遅延の増加が無いことを確かめる（リスク R-5）。
 
 ---
 
@@ -654,10 +656,10 @@ Expected: 衝突マーカーは 0 件（「配備」節と「sticky rebase へ�
 
 - **R-1（最大）: 根本原因の推定が外れている場合、Task 1 の修正が効かない。** 本番応答に実際に `content-encoding` が付いているかを直接観測していない（外部 API を直接叩けず、稼働中 rotator へ要求も送れないため）。緩和は二重で置いてある。①Task 1 Step 1 の gzip テストが「圧縮されていれば現行は必ず 0 件になる」ことを機構として証明する ②`enc=` と `usageParse=` を本番へ出すので、配備後の最初の 2,000 行で真偽が決まる。**外れていた場合でも、追加した観測フィールド自体は残り、次の調査の材料になる**（`usageParse=` がどの理由で落ちているかが分かる）。
 - **R-2: `sid` の桁数が当初の要件（8桁）と違う。** sticky と揃えて 12 桁にしたが、承認前に実装すると手戻りになる。未決事項2 で先に決める。
-- **R-3: ログ保全期間が縮む。** `logMaxBytes` を上げなければ保全期間が現行より縮み、RCA の複数日分の解析が再現できなくなる。Task 4 を落とさない。
+- **R-3: ログ保全期間が縮む。** `logMaxBytes` を上げなければ保全期間が現行より縮み、複数日分のログによる再現調査ができなくなる。Task 4 を落とさない。
 - **R-4: sticky との二重実装。** `account_switch` を作り直さないこと、`sid` を二重に出さないこと、`sessionKeyFrom` を2箇所に持たないこと、の3点が守られないと、第1段階・sticky 本体・本計画のどれかが rebase で壊れる。Task 6 Step 2 の `merge-tree` で機械的に確認する。
-- **R-5: 解凍のコスト。** 1応答あたり数 ms のイベントループ占有が積み上がると、高並列時のピークで遅延になる。非同期版を使い、`maxBodyBytes` で上限を置くことで緩和するが、配備後に `durationMs` の分布を配備前と比較する必要がある（確認コマンドに入れていないので、Task 6 Step 5 で `awk` による分位点比較を追加する）。
-- **R-6: 本文へ触ること自体のリスク。** rotator の強みは「本文を無改変で転送する」ことで、RCA §5 H4 はこれを棄却根拠にしている。本計画は `Buffer.concat` 済みの**写しを読むだけ**でクライアントへ流すバイト列には触れないが、実装で誤ってヘッダの `content-encoding` を落とすと応答が壊れる。Task 5 Step 1 の不変性テストで固定する。
+- **R-5: 解凍のコスト。** 1応答あたり数 ms のイベントループ占有が積み上がると、高並列時のピークで遅延になる。非同期版を使い、`maxBodyBytes` で上限を置くことで緩和するが、配備後に `durationMs` の分布を配備前と比較する必要がある（確認コマンドには入れず、Task 6 Step 5 で `awk` による分位点比較を行う）。
+- **R-6: 本文へ触ること自体のリスク。** rotator の強みは「本文を無改変で転送する」ことで、キャッシュ喪失の原因調査でもこの性質を根拠に「本文の改変が原因」という仮説を退けている。本計画は `Buffer.concat` 済みの**写しを読むだけ**でクライアントへ流すバイト列には触れないが、実装で誤ってヘッダの `content-encoding` を落とすと応答が壊れる。Task 5 Step 1 の不変性テストで固定する。
 - **R-7: PII。** `metadata.user_id` は `user_<hash>_account_<uuid>_session_<uuid>` の形で口座 UUID を含む。当面は本文を読まない設定（`sessionFromBody:false`）を既定にし、有効化する場合も `session_id` 部分だけを取り出して即ハッシュする。生値をログにも状態ファイルにも残さない。
 
 ---
@@ -666,17 +668,17 @@ Expected: 衝突マーカーは 0 件（「配備」節と「sticky rebase へ�
 
 **未決事項1〜4 はオーナーが決定済み（2026-09-18）。以下は決定内容。未決事項5・6 は配備後の実測で決める。**
 
-- **未決事項1（決定）: 第1段階（sticky R-S1・R-S2）と同便で配備する。** 起点は `60da9aa` に固定した。`6baf211` 起点で先に作って後から rebase する案は採らない。
+- **未決事項1（決定）: 第1段階（sticky の切替ログと口座選択の調整）と同便で配備する。** 起点は `60da9aa` に固定した。`6baf211` 起点で先に作って後から rebase する案は採らない。
 - **未決事項2（決定）: `sid` は 12 hex** とする（sticky の語彙に合わせる）。当初の要件の 8 hex からは意図的に逸脱している。これで `affinity_*` / `proxy` の2系統が同じ `sid` で突合できる。`account_switch` 行は `sid` を持たない（口座単位の切替であり、セッションに紐づかない）ので、切替との突合は時刻と口座 id で行う。
 - **未決事項3（決定）: `observability.requestLog.enabled` の既定は `true`。** 配備通知に「`proxy` 行が観測フィールドのぶん伸びる」「`POST /internal/reload` で現行の行へ戻せる」の2点を明記する。
 - **未決事項4（決定）: `logMaxBytes` は 32 MiB。** 2世代で 64 MiB。保全期間はローテーション設定に依存するが、現行（10 MiB × 2 世代）より広くなる。
 - **未決事項5: `observability.requestLog.sessionFromBody` をいつ有効化するか。** ヘッダ付与率（配備後の確認コマンド 5）が 9 割を超えていれば本文フォールバックは不要で、要求本文の追加解析コストを払わずに済む。付与率が低ければ有効化する。**配備後 24 時間の実測で決める。**
-- **未決事項6（実質解決）: `zstd` の扱い。** Task 1 Step 0 で **Claude Code が `accept-encoding: gzip, deflate, br, zstd` を送ることが確定**した。**本番の rotator プロセスは Node 22 系（22.15 以降）で動いており `zlib.zstdDecompress` を持つので、`content-encoding: zstd` が返っても解凍して数えられる。** したがって本番では①上流向けの書き換えは発動せず（要求ヘッダはバイト同一）②`enc=zstd` の行が出ても `usageParse` は `ok` になる。残る論点は「開発機の既定 `node` が Node 20 系で zstd の分岐をテストできない」ことだけで、`test/usage-observation.test.js` は Node 22 系では実際に zstd を往復させ、20 系では `t.skip()` で**明示的に飛ばした**と記録する（通ったつもりにしない）。`engines` の `>=18.18.0` を引き上げるかは別途。
+- **未決事項6（実質解決）: `zstd` の扱い。** Task 1 Step 0 で **Claude Code が `accept-encoding: gzip, deflate, br, zstd` を送ることが確定**した。**`zlib.zstdDecompress` を持つ実行環境（Node 22.15 以降）では、`content-encoding: zstd` が返っても解凍して数えられる。** したがってその環境では①上流向けの書き換えは発動せず（要求ヘッダはバイト同一）②`enc=zstd` の行が出ても `usageParse` は `ok` になる。残る論点は「開発機の既定 `node` が Node 20 系で zstd の分岐をテストできない」ことだけで、`test/usage-observation.test.js` は zstd の API を持つ Node では実際に zstd を往復させ、20 系では `t.skip()` で**明示的に飛ばした**と記録する（通ったつもりにしない）。`engines` の `>=18.18.0` を引き上げるかは別途。
 
 ---
 
 ## 受入判定の Follow-up（事実の訂正）
 
-- `test/invariance.test.js:816 以降` という参照は**起点 `60da9aa` には存在しない**（同ファイルは 786 行）。その型のテンプレートは sticky R-S13 側にある。本計画では既存テスト5「no-identifier-in-degrade-logs」の型に倣って新規に書く。
+- `test/invariance.test.js:816 以降` という参照は**起点 `60da9aa` には存在しない**（同ファイルは 786 行）。その型のテンプレートは sticky の不変性テスト側にある。本計画では既存テスト5「no-identifier-in-degrade-logs」の型に倣って新規に書く。
 - 口座数は計画時点以降も変動している（本文「根本原因」節の「全口座」は `runtime-state.json` の `savedAt` 2026-09-18T00:20:09Z 時点の記述である）。
 - 工数の実勢は **18〜26 人時**（旧 30〜42 人時から改訂）。
