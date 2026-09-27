@@ -93,12 +93,24 @@ function sessionIdFromBody(body) {
 
 function parseBody(body) {
   if (body === null || body === undefined) return null;
-  if (Buffer.isBuffer(body)) return parseJson(body.toString('utf8'));
+  if (Buffer.isBuffer(body)) return parseJson(bufferText(body));
   if (typeof body === 'string') return parseJson(body);
   return typeof body === 'object' ? body : null;
 }
 
+// `Buffer#toString` は文字列長の上限（V8 で約 512MiB）を超える本文で
+// `ERR_STRING_TOO_LONG` を投げる。`JSON.parse` の失敗と同じく「鍵なし」へ倒し、
+// 要求の処理そのものは止めない。
+function bufferText(buffer) {
+  try {
+    return buffer.toString('utf8');
+  } catch {
+    return null;
+  }
+}
+
 function parseJson(text) {
+  if (typeof text !== 'string') return null;
   try {
     const value = JSON.parse(text);
     return value && typeof value === 'object' ? value : null;

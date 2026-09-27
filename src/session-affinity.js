@@ -10,7 +10,16 @@
 // 要る。生の鍵を表の鍵にすると、その鍵を保存しない限り復元が成立せず、保存すれば §8 の
 // 「生 UUID を含まない」に反する。F14 の衝突（10,000 セッションで約 1.8×10⁻⁷）は残るが、
 // 衝突しても要求は必ず通る（R1）。
-import { createHash } from 'node:crypto';
+// 鍵の抽出・正規化・指紋化（設計書 §2.1〜§2.3・D-54-1）は `./session-key.js` の1箇所に置き、
+// ここからは再 export するだけにする。以前は同じ実装がこのファイルにも複製されていた。
+import { sidHash } from './session-key.js';
+
+export {
+  MAX_SESSION_KEY_LENGTH,
+  normalizeSessionKey,
+  sessionKeyFrom,
+  sidHash,
+} from './session-key.js';
 
 /** 保存形式の版（§8）。読み込み時に一致しなければ表ごと捨てる。 */
 export const SESSION_AFFINITY_STATE_VERSION = 1;
@@ -26,8 +35,6 @@ export const DEFAULT_MAX_SESSIONS = 10_000;
  * 表に残る——残っていなければ「冷えた固定を解放する」判断そのものができない。
  */
 export const DEFAULT_WARM_TTL_MS = 3_600_000;
-/** 鍵の最大長（§2.2）。これを超える値は鍵にしない。 */
-export const MAX_SESSION_KEY_LENGTH = 128;
 /**
  * 温かい数の掃除を回す間隔（要求数・設計書 v1.7 P-c）。
  * **新しいタイマーは作らない。** 冷えることは事象を伴わないので、要求の流れに乗せて
@@ -72,9 +79,6 @@ const SESSION_AFFINITY_RANGES = Object.freeze({
   drainStartUtilization: { min: 0, max: 1 },
 });
 
-const SESSION_ID_HEADER = 'x-claude-code-session-id';
-// 制御文字・改行・空白・カンマ結合された重複ヘッダを鍵にしない（§2.2）。
-const SESSION_KEY_PATTERN = /^[A-Za-z0-9._:-]+$/;
 const SID_HASH_PATTERN = /^[0-9a-f]{12}$/;
 
 // 結び付け先を付け替えてよい理由（§4.3 の表・§7.2）。確定（§4.4 ②）でこの3つ以外の理由が
@@ -92,95 +96,6 @@ const CONFIRM_REBIND_REASONS = new Set(['common_exhausted', 'family_exhausted'])
 // 退避の理由（§7.2 の `affinity_evict` ＋ §8.1 の reload で台帳から消えた口座）。
 const EVICT_REASONS = new Set(['ttl', 'capacity', 'credential_changed', 'account_removed']);
 const UNKNOWN_REASON = 'unknown';
-
-/**
- * セッション鍵を正規化する（設計書 §2.2）。
- * 受理しない値は `null` を返すだけで、要求を拒否も記録もしない（F7）。
- *
- * @param {unknown} raw ヘッダまたは本文から取り出した値。
- * @returns {string|null} 正規化された鍵。使えなければ `null`。
- */
-export function normalizeSessionKey(raw) {
-  if (typeof raw !== 'string') return null;
-  const trimmed = raw.trim();
-  if (trimmed.length === 0 || trimmed.length > MAX_SESSION_KEY_LENGTH) return null;
-  return SESSION_KEY_PATTERN.test(trimmed) ? trimmed : null;
-}
-
-/**
- * ログ・永続化・表の鍵に使う 48bit の指紋（設計書 §2.3・D-54-1）。
- * 正規化してから数えるので、前後に空白の付いた同じセッションは同じ値になる。
- *
- * @param {unknown} key セッション鍵（正規化前でよい）。
- * @returns {string|null} 16進12桁。鍵として使えない値なら `null`。
- */
-export function sidHash(key) {
-  const normalized = normalizeSessionKey(key);
-  if (!normalized) return null;
-  return createHash('sha256').update(normalized).digest('hex').slice(0, 12);
-}
-
-/**
- * 要求からセッション鍵を取り出す（設計書 §2.1・D-54-1）。
- * ①ヘッダ `x-claude-code-session-id` ②本文 `metadata.user_id`（JSON 文字列）の `session_id`
- * ③どちらも使えなければ `null`＝セッション無しとして現行経路へ落とす。
- *
- * `x-claude-code-agent-id` は鍵に混ぜない——混ぜるとサブエージェントだけ別口座へ飛び、
- * 親子ともキャッシュを失う（D-54-1）。
- *
- * @param {{headers?:object, rawHeaders?:string[]}|null} req 受信要求。
- * @param {Buffer|string|object|null} body 本文。解析済みのオブジェクトを渡してもよい
- *   （R-S7 は `routingModelFamily` の解析結果を共有して二重解析を避ける）。
- * @returns {string|null} 正規化済みのセッション鍵。
- */
-export function sessionKeyFrom(req, body) {
-  const fromHeader = normalizeSessionKey(sessionHeaderValue(req));
-  if (fromHeader) return fromHeader;
-  return normalizeSessionKey(sessionIdFromBody(body));
-}
-
-// 同名ヘッダが複数あれば鍵にしない（§2.2）。Node の http はそれをカンマで結合するので、
-// 結合後の値も §2.2 の文字集合で弾かれる（二重の防御）。
-function sessionHeaderValue(req) {
-  const raw = req?.rawHeaders;
-  if (Array.isArray(raw)) {
-    let found = null;
-    for (let index = 0; index + 1 < raw.length; index += 2) {
-      const name = raw[index];
-      if (typeof name !== 'string' || name.toLowerCase() !== SESSION_ID_HEADER) continue;
-      if (found !== null) return null;
-      found = raw[index + 1];
-    }
-    if (found !== null) return found;
-  }
-  const value = req?.headers?.[SESSION_ID_HEADER];
-  if (Array.isArray(value)) return value.length === 1 ? value[0] : null;
-  return typeof value === 'string' ? value : null;
-}
-
-function sessionIdFromBody(body) {
-  const userId = parseBody(body)?.metadata?.user_id;
-  // spike06 の実測どおり `user_id` は JSON を文字列にしたもの。構造体で来た場合も読む。
-  const parsed = typeof userId === 'string' ? parseJson(userId) : userId;
-  const sessionId = parsed && typeof parsed === 'object' ? parsed.session_id : null;
-  return typeof sessionId === 'string' ? sessionId : null;
-}
-
-function parseBody(body) {
-  if (body === null || body === undefined) return null;
-  if (Buffer.isBuffer(body)) return parseJson(body.toString('utf8'));
-  if (typeof body === 'string') return parseJson(body);
-  return typeof body === 'object' ? body : null;
-}
-
-function parseJson(text) {
-  try {
-    const value = JSON.parse(text);
-    return value && typeof value === 'object' ? value : null;
-  } catch {
-    return null;
-  }
-}
 
 /**
  * 設定セクション `sessionAffinity` を正規化する（設計書 §6）。

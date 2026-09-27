@@ -458,6 +458,7 @@ claude-rotator status
 | `proxy.upstreamConnectTimeoutMs` | `10000`（10秒） | upstream への TCP 接続確立のタイムアウト |
 | `proxy.upstreamConnectRetries` | `3` | 接続確立前の timeout / unreachable 時に同一アカウントで内部 retry する回数 |
 | `proxy.upstreamConnectRetryDelayMs` | `250` | 上記 retry の間隔 |
+| `proxy.maxRequestBodyBytes` | `67108864`（64 MiB） | 受信本文の上限。超えた要求には 413 `request_too_large` を返し、残りの本文は最大 64 MiB・10 秒まで読み捨ててから接続を閉じます（`config.json` に書かなければ既定値） |
 | `upstream` | `https://api.anthropic.com` | 転送先の Anthropic API |
 | `switchThreshold` | `1`（＝100%） | この使用率に達したアカウントを利用不可とみなす閾値 |
 | `rotationPolicy.mode` | `use-expiring-weekly` | 切り替えアルゴリズムのモード |
@@ -1465,6 +1466,7 @@ What the main keys mean:
 | `proxy.upstreamConnectTimeoutMs` | `10000` (10 sec) | Timeout for establishing the TCP connection to upstream |
 | `proxy.upstreamConnectRetries` | `3` | Number of internal retries on the same account for a connection-establishment timeout / unreachable error |
 | `proxy.upstreamConnectRetryDelayMs` | `250` | Delay between the retries above |
+| `proxy.maxRequestBodyBytes` | `67108864` (64 MiB) | Maximum request body size. A larger request gets 413 `request_too_large`; the rest of its body is discarded for up to 64 MiB or 10 seconds before the connection is closed (the default applies when the key is absent from `config.json`) |
 | `upstream` | `https://api.anthropic.com` | The Anthropic API the proxy forwards requests to |
 | `switchThreshold` | `1` (= 100%) | The usage ratio at which an account is considered unavailable |
 | `rotationPolicy.mode` | `use-expiring-weekly` | The switching algorithm's mode |
