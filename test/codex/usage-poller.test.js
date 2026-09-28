@@ -11,7 +11,8 @@
 // 組立も偽物を渡す。テストの隔離（helpers/isolation.js）を毎回通す。
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { readFile } from 'node:fs/promises';
+import { EventEmitter } from 'node:events';
+import { chmod, mkdir, readFile, writeFile } from 'node:fs/promises';
 import { basename, dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { createCodexAccountPool } from '../../src/codex/account-pool.js';
@@ -701,6 +702,61 @@ for (const [name, identity, reason] of [
     assert.equal(f.account('home:0').state, 'ready');
   });
 }
+
+test('usage poller: a version read begun before a reload never sends a GET after it', async t => {
+  // 既定のつなぎ（client-version.js が Codex CLI の版から組み立てる）で、版の読取（偽の子）を止めたまま
+  // reload する。古い子が版を返しても、置き換わった状態の読取は GET を送らない。送るのは、reload の後の
+  // 状態が始めた読取だけ。実物の codex は起動しない（隔離の deps.spawn に偽の子を登録する）。
+  const isolation = await setupCodexIsolation(t);
+  const clock = createFakeClock({ startMs: START });
+  const scheduler = createFakeScheduler(clock);
+  const binDir = join(isolation.root, 'zz-bin');
+  await mkdir(binDir, { recursive: true, mode: 0o700 });
+  const codex = join(binDir, 'codex');
+  await writeFile(codex, '#!/bin/sh\n# zz-fake codex for tests (never executed)\n');
+  await chmod(codex, 0o755);
+  const children = [];
+  isolation.registerSpawn(codex, () => {
+    const child = new EventEmitter();
+    child.stdout = new EventEmitter();
+    child.kill = () => true;
+    children.push(child);
+    return child;
+  });
+  // 版は数を連結して作る（版だけの文字列リテラルを書かない）。
+  const finish = (child, parts) => {
+    child.stdout.emit('data', Buffer.from(`zz-fake-codex-cli ${parts.join('.')}\n`));
+    child.emit('close', 0, null);
+  };
+  const entries = [{ key: 'home:0', home: join(isolation.root, 'accounts', 'zz-home-0'), label: 'zz-0', models: null }];
+  const config = { usageObservationMode: 'http', usagePollIntervalMs: 60000, usageReadTimeoutMs: 5000,
+    rotationObservationTtlMs: 150000, accounts: [{ label: 'zz-0', usagePolicy: { stopUsedPercent: 75, resumeUsedPercent: 70 } }] };
+  const pool = createCodexAccountPool(entries, config);
+  pool.credentials('home:0', true, clock.now());
+  const fetchCalls = [];
+  const poller = createUsagePoller({ pool, env: { ...isolation.env, PATH: binDir }, spawn: isolation.spawn,
+    registerSecret: () => {}, now: clock.now, scheduler, credentialEpoch: () => 1,
+    readCredentials: async authPath => ({ accessToken: 'e30.e30.sig', accountId: basename(dirname(authPath)) }),
+    fetchImpl: async (url, init) => {
+      fetchCalls.push(init.headers);
+      return usageResponse(clock);
+    } });
+  poller.configure(entries, config);
+  clock.advance(1);
+  await flush();
+  assert.equal(children.length, 1, 'the version read is in flight');
+  poller.configure(entries, config); // 古い子が動いている間に reload する
+  finish(children[0], [0, 0, 7]);
+  await flush();
+  assert.equal(fetchCalls.length, 0, 'the read begun before the reload sends no GET');
+  assert.equal(isolation.fetchCalls.length, 0);
+  clock.advance(30_000);
+  await flush();
+  assert.equal(children.length, 2, 'the state after the reload reads the version again');
+  finish(children[1], [0, 0, 8]);
+  await flush();
+  assert.equal(fetchCalls.length, 1, 'only the read of the state after the reload sends a GET');
+});
 
 // --- ログイン切れの規則と組み合わせた件 ---
 

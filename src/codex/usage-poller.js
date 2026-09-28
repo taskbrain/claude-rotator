@@ -13,7 +13,9 @@
 //     401・403 と、資格情報の期限切れ・読めなさが唯一の根拠になる。それ以外の使用量の GET の
 //     失敗（タイムアウト・5xx・429 など）では認証状態を変えない。ログイン切れの間は GET を送らない。
 //   - User-Agent と originator の値は、依存として受け取る resolveClientIdentity() の戻り値を使う。
-//     値が作れなければ GET を送らない（既定値を補わない）。
+//     値が作れなければ GET を送らない（既定値を補わない）。resolveClientIdentity を渡さなければ、
+//     client-version.js の既定の実装（Codex CLI の版から組み立てる）を作って使い、configure() の
+//     たびに設定を渡して読み直させる（起動と reload で絶対パスの決め方からやり直す）。
 //   - ログは codex-rotator のロガー（logger.js）の許可リストに載るフィールドだけを出す。
 //   - 資格情報ファイルの更新時刻は既定で自分で見る（credentialEpoch を渡せば差し替えられる）。
 //   - 完全な観測かどうかは使用量の正規化（usage.js）の判定だけで決める。primary 窓があることは
@@ -23,6 +25,7 @@ import { statSync } from 'node:fs';
 import { join } from 'node:path';
 import { WINDOW_CAP_DROPPED } from './account-pool.js';
 import { CREDENTIALS_OUTCOME, createAuthTracker } from './auth-tracker.js';
+import { createClientIdentityResolver } from './client-version.js';
 import { readCodexSendSnapshot } from './credentials.js';
 import { readCodexUsage } from './usage.js';
 
@@ -123,20 +126,34 @@ function clientIdentityOf(identity) {
  * 生成を伴わない使用量 GET のスケジューラ。観測をプールへ適用し、ログイン切れの規則
  * （auth-tracker.js）へ結果を渡す。
  *
+ * User-Agent と originator は、resolveClientIdentity を渡せばその戻り値を使う。渡さなければ env と
+ * registerSecret（ロガーの registerSecret。組み立てた値を「秘密として登録した値」にする）から
+ * client-version.js の既定の実装を作る（spawn は省略すると node:child_process の spawn）。
+ *
  * @param {{
- *   pool: object, resolveClientIdentity: () => ({ userAgent?: string, originator?: string, reason?: string }
+ *   pool: object, resolveClientIdentity?: () => ({ userAgent?: string, originator?: string, reason?: string }
  *     | Promise<{ userAgent?: string, originator?: string, reason?: string }>),
+ *   env?: object, registerSecret?: (value: string) => void, spawn?: Function,
  *   now?: () => number, scheduler?: object, readUsage?: Function, readCredentials?: Function,
  *   fetchImpl?: typeof fetch, credentialEpoch?: (account: object) => number|null,
  *   log?: (level: string, event: string, fields: object) => void,
  * }} options
  */
-export function createUsagePoller({ pool, resolveClientIdentity, now = Date.now, scheduler = globalThis,
-  readUsage = readCodexUsage, readCredentials = readCodexSendSnapshot, fetchImpl = fetch,
+export function createUsagePoller({ pool, resolveClientIdentity, env, registerSecret, spawn, now = Date.now,
+  scheduler = globalThis, readUsage = readCodexUsage, readCredentials = readCodexSendSnapshot, fetchImpl = fetch,
   credentialEpoch = credentialsMtime,
   // `log(level, event, fields)`。未指定なら何もしない。観測の適用はログの有無に依存しない。
   log = () => {} } = {}) {
-  if (typeof resolveClientIdentity !== 'function') throw new TypeError('resolveClientIdentity required');
+  // 既定の実装。configure() で設定を渡す（渡すまでは読取の予定が無いので呼ばれない）。
+  let clientIdentity = null;
+  if (resolveClientIdentity === undefined && env !== undefined) {
+    clientIdentity = createClientIdentityResolver({ env, registerSecret, now, scheduler, log,
+      ...(spawn === undefined ? {} : { spawn }) });
+    resolveClientIdentity = clientIdentity.resolveClientIdentity;
+  }
+  if (typeof resolveClientIdentity !== 'function') {
+    throw new TypeError('resolveClientIdentity required (or env and registerSecret for the default codex version reader)');
+  }
   const auth = createAuthTracker({ pool, now, log });
   let descriptors = [], intervalMs = DEFAULT_POLL_INTERVAL_MS, timeoutMs = DEFAULT_READ_TIMEOUT_MS, stopped = false;
   const states = new Map();
@@ -299,7 +316,9 @@ export function createUsagePoller({ pool, resolveClientIdentity, now = Date.now,
       // 終了の後は新しい GET を始めない。資格情報の読取を待つ間に終了した場合がここに当たる。
       if (stopped) return;
       const identity = await resolveIdentity();
-      if (stopped) return;
+      // 版の読取を待つ間に終了したか、reload でこの口座の状態が置き換わったら、GET を送らない（reload の
+      // 前に始めた読取の結果で、reload の後に送らない。予約は finally が新しい状態で組み直す）。
+      if (stopped || states.get(account.key) !== state) return;
       if (identity.userAgent === null) {
         // User-Agent を作れなかった。GET を送らない。ログイン切れの数え方には触れない。
         if (current()) {
@@ -333,6 +352,8 @@ export function createUsagePoller({ pool, resolveClientIdentity, now = Date.now,
   return {
     // 起動時と reload の後に、検証（口座ごとに GET を1回・生成なし）をやり直す。
     configure(accounts, config = {}) {
+      // 既定の実装は、起動と reload のたびに絶対パスの決め方からやり直す（読取の予定を組む前に）。
+      clientIdentity?.reload(config);
       for (const [key, state] of states) {
         if (accounts.some(account => account.key === key)) continue;
         scheduler.clearTimeout(state.timer);
