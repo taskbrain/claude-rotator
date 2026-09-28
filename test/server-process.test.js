@@ -1,7 +1,7 @@
 import { it } from 'node:test';
 import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
-import { mkdtemp, rm } from 'node:fs/promises';
+import { access, mkdir, mkdtemp, readFile, rm, utimes, writeFile } from 'node:fs/promises';
 import http from 'node:http';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
@@ -18,6 +18,34 @@ it('keeps the server process alive after listening', async () => {
     assert.equal(child.exitCode, null);
     const health = await getJson(`http://127.0.0.1:${port}/internal/health`);
     assert.equal(health.ok, true);
+  } finally {
+    await stopServer(child);
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+it('removes stale runtime-state temp files of dead processes once at startup', async () => {
+  const { dir, env } = await prepareSandbox();
+  // runtime-state.json は XDG_CONFIG_HOME 配下（一時ディレクトリ）に置かれる。実 ~/.config には触れない。
+  const stateDir = join(env.XDG_CONFIG_HOME, 'claude-rotator');
+  await mkdir(stateDir, { recursive: true });
+  // pid 999999999 は macOS（上限 99998）・Linux（pid_max の上限 4194304）とも存在し得ない＝ESRCH。
+  const stale = join(stateDir, 'runtime-state.json.999999999.0123456789ab.tmp');
+  const fresh = join(stateDir, 'runtime-state.json.999999998.0123456789ab.tmp');
+  const unrelated = join(stateDir, 'other.json.999999999.0123456789ab.tmp');
+  const old = new Date(Date.now() - 60 * 60_000);
+  for (const path of [stale, fresh, unrelated]) await writeFile(path, '{}\n');
+  await utimes(stale, old, old);
+  await utimes(unrelated, old, old);
+  const child = spawnServer(env);
+
+  try {
+    await waitForOutput(child, /listening on/);
+    await assert.rejects(access(stale), { code: 'ENOENT' });
+    await access(fresh);
+    await access(unrelated);
+    const log = await readFile(join(dir, 'server.log'), 'utf8');
+    assert.match(log, /runtime state temp cleanup: removed 1 stale temp file\(s\)/);
   } finally {
     await stopServer(child);
     await rm(dir, { recursive: true, force: true });

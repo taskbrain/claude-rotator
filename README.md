@@ -800,6 +800,8 @@ OAuth usage refresh は Node.js fetch の 10 秒 connect timeout に依存しな
 
 直近の quota / usage / `current` account は `~/.config/claude-rotator/runtime-state.json` に保存されます。これにより、service 再起動直後に Usage API へ到達できない場合でも、最後に取得できた status を復元して切り替え判断に使えます。reset 時刻を過ぎた quota は、復元後の status 計算時に stale として消去されます。
 
+`runtime-state.json` は一時ファイル（`runtime-state.json.<pid>.<乱数>.tmp`）へ書いてから置き換えるため、書き込み中にプロセスが強制終了されると一時ファイルが残ることがあります。server は起動時に1回、**書いたプロセスが存在せず（`kill(pid, 0)` が `ESRCH`）、10分より古い通常ファイル**だけを削除します。この判定は、設定ディレクトリを同じ PID 名前空間のプロセスだけが使う前提です。ホストとコンテナで設定ディレクトリを共有する構成では、生存中の書き手を不在と誤認し得るため、環境変数 `CLAUDE_ROTATOR_RUNTIME_TMP_CLEANUP=off` で無効にしてください。
+
 `/internal/status` の各アカウントの `quota` には、使用率（`unified5h` / `unified7d`）を最後に取得した時刻 `usageUpdatedAt`（エポックミリ秒）と取得元 `usageSource`（`header` = 転送した応答のヘッダ、`poll` = Usage API）が入ります。未取得なら両方 `null` で、Usage API の応答がスコープ別の週次枠だけのときは更新しません。数値でない値と負の値の使用率ヘッダは捨て、`quota-header-rejected` イベントとして記録します（同じアカウント・キー・値は10分に1回まで）。1 を超える値は捨てず、そのまま記録して枠切れ判定に使います。
 
 `cc-auto-resume` などの外部再注入ツールからは、再注入前に次のコマンドを呼ぶと、rotator が最短で再開できるアカウントへ切り替え、再注入すべき時刻を返します。利用可能なアカウントがあれば `action=ready`、全候補が枯渇していれば最短 reset の `action=wait` になります。
@@ -1775,6 +1777,8 @@ OAuth usage refreshes use a native HTTP client rather than Node's `fetch`, so th
 `usagePolling.concurrency` defaults to `1`. Only raise it if TCP connections from your network to Anthropic are reliably stable and you deliberately want to fetch several accounts at once.
 
 The most recent quota/usage state and `current` account are persisted to `~/.config/claude-rotator/runtime-state.json`. This lets the service restore the last known status for switching decisions right after a restart, even if the Usage API isn't reachable yet. A quota whose reset time has already passed is discarded as stale when status is recomputed after restore.
+
+`runtime-state.json` is written to a temporary file (`runtime-state.json.<pid>.<random>.tmp`) and then renamed into place, so a process killed mid-write can leave that temporary file behind. Once at startup, the server removes only **regular files whose writing process no longer exists (`kill(pid, 0)` fails with `ESRCH`) and that are older than 10 minutes**. This check assumes the config directory is used only by processes in the same PID namespace. If you share the config directory between a host and a container, a live writer can look absent, so disable the cleanup with the environment variable `CLAUDE_ROTATOR_RUNTIME_TMP_CLEANUP=off`.
 
 Each account's `quota` in `/internal/status` carries `usageUpdatedAt` (epoch milliseconds) — when utilization (`unified5h` / `unified7d`) was last taken — and `usageSource` (`header` = a proxied response's headers, `poll` = the Usage API); both are `null` until the first reading, and a Usage API reply that only carries scoped weekly limits leaves them unchanged. A utilization header that is not a number or is negative is dropped and recorded as a `quota-header-rejected` event (at most once per 10 minutes for the same account, key and value); a value above 1 is kept as is and counts towards the exhaustion check.
 
