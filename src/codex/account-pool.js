@@ -8,22 +8,22 @@ function time(nowMs) {
 // time and never a reset instant. Recovery needs this many complete GETs.
 const RESUME_CONFIRMATIONS = 2;
 
+// usageAuthRejected() が受け取る理由（auth-tracker.js の規則が決める）。これ以外は拒否する。
+export const USAGE_AUTH_REJECTION_REASONS = Object.freeze(['upstream-unauthorized', 'upstream-forbidden', 'access-token-expired']);
+
 export function createCodexAccountPool(initialAccounts = [], options = {}) {
-  let thresholds, policies, freshnessMs, ttlMs, httpMode, needsLoginRecheckMs, probeIntervalMs, probeEnabled;
+  let thresholds, policies, freshnessMs, ttlMs, httpMode, needsLoginRecheckMs;
   let generation = 0; // Configuration epoch: a read started earlier describes another world.
   let revision = 0; // Advances only when availability improves; terminal caches key off it.
   function applyOptions({
     rotationPrimaryUsedPercentMax = 95, rotationSecondaryUsedPercentMax = 95,
     rotationNeedsLoginRecheckMs = 600000, rotationObservationTtlMs = 60000,
     usagePollIntervalMs = 60000, usageReadTimeoutMs = 5000,
-    rotationUsageCapNoResetProbeMs = 3600000, rotationRecoveryProbeEnabled = true,
     usageObservationMode = 'passive', accounts,
   } = {}) {
     thresholds = { primary: rotationPrimaryUsedPercentMax, secondary: rotationSecondaryUsedPercentMax };
     needsLoginRecheckMs = rotationNeedsLoginRecheckMs;
     httpMode = usageObservationMode === 'http';
-    probeIntervalMs = rotationUsageCapNoResetProbeMs; // 0 disables the no-reset valve only.
-    probeEnabled = rotationRecoveryProbeEnabled !== false;
     ttlMs = rotationObservationTtlMs; // The passive freshness, and the ceiling for the http one.
     // An http observation may not outlive two polls plus one read deadline.
     freshnessMs = httpMode ? Math.min(ttlMs, 2 * usagePollIntervalMs + usageReadTimeoutMs) : ttlMs;
@@ -46,11 +46,10 @@ export function createCodexAccountPool(initialAccounts = [], options = {}) {
     stopEpoch: entry.stopEpoch ?? 0,
     ...(entry.observation ? { observation: copyObservation(entry.observation) } : {}),
     ...(entry.capped ? { capped: { ...entry.capped } } : {}) });
-  // 使用量読取の縮退は口座ごとに効く。GET が壊れた口座だけを passive の規律（使用量
-  // 不明でも選択可・latch は probe で解ける・鮮度は TTL）で扱い、まだ読める口座は
-  // http の規律のまま残す。プール全体のモード（httpMode）はここでは動かさない。
-  const httpFor = entry => httpMode && entry.usageDegraded !== true;
-  const freshnessOf = entry => (httpFor(entry) ? freshnessMs : ttlMs);
+  // 使用量の読取が壊れた口座（縮退）も、選択の規則は変えない。縮退は「使用量が読めない」という
+  // 記録とログのためだけのもので、取得処理（usage-poller.js）が持ち、プールへは伝えない。口座ごとに
+  // 規則を切り替える経路（使用量不明でも選べる・停止が試し打ちで解ける・鮮度を TTL で測る）は無い。
+  const freshnessOf = () => (httpMode ? freshnessMs : ttlMs);
   const fresh = (entry, window, nowMs) => window && nowMs - window.observedAt < freshnessOf(entry) &&
     (window.resetAt === undefined || nowMs < window.resetAt);
   const capped = entry => Object.keys(entry.capped ?? {}).length > 0;
@@ -63,15 +62,14 @@ export function createCodexAccountPool(initialAccounts = [], options = {}) {
   const surveyed = (entry, nowMs) => Number.isFinite(entry.usageGetAt) && nowMs - entry.usageGetAt < freshnessOf(entry);
   // Reserved accounts: the single piece of evidence that opens a reserved account -- a complete GET
   // the upstream also declared usable. It is judged by the configured ceiling rather than
-  // by freshnessOf(), so this account's own degradation can never WIDEN its freshness:
-  // a broken GET must not buy the passive TTL for an account that is not allowed to guess.
+  // by freshnessOf(), so the passive TTL can never WIDEN the evidence a reserved account needs.
   const assured = (entry, nowMs) => Number.isFinite(entry.usageAllowedAt) && nowMs - entry.usageAllowedAt < freshnessMs;
   // Unknown usage blocks selection only under http, where a poll is expected -- except
-  // for a reserved account, which is withheld under every mode and every degradation.
+  // for a reserved account, which is withheld under every mode.
   const blockReason = (entry, nowMs) => capped(entry) ? 'usage-capped'
     : entry.upstreamBlocked ? 'upstream-blocked'
       : reserved(entry) && !assured(entry, nowMs) ? 'usage-unknown-reserved'
-        : httpFor(entry) && !surveyed(entry, nowMs) ? 'usage-unknown' : null;
+        : httpMode && !surveyed(entry, nowMs) ? 'usage-unknown' : null;
   const excluded = (entry, nowMs) => blockReason(entry, nowMs) !== null;
   // Every stop opens a new epoch. A read that began in an older one describes the
   // world before that stop and never counts as a recovery vote, however late it lands.
@@ -83,33 +81,13 @@ export function createCodexAccountPool(initialAccounts = [], options = {}) {
   };
   const release = entry => {
     delete entry.capped; delete entry.cappedSince; delete entry.upstreamBlocked;
-    delete entry.resumeStreak; delete entry.stoppedAt; delete entry.probeUsedAt;
+    delete entry.resumeStreak; delete entry.stoppedAt;
     improved();
   };
-  // passive only: a latched account earns ONE generation once the reset the
-  // upstream advertised has passed, or one safety interval after the latch when it
-  // advertised none. http recovers from complete GETs and never probes -- but an
-  // account whose own GET has broken is on the passive rules and does earn a probe,
-  // otherwise it would stay latched until an observation that can no longer arrive.
-  // A reserved account is the one exception to that exception. Its latch is only
-  // ever lifted by two complete GETs in a row, so a probe would be a generation sent on an
-  // account whose usage is either known to be above its stop or not known at all --
-  // precisely what the reserve forbids. Neither a reset nor the safety interval buys one.
-  const probeReadyAt = entry => {
-    if (!probeEnabled || reserved(entry) || httpFor(entry) || entry.upstreamBlocked || !capped(entry)) return Infinity;
-    const valve = probeIntervalMs > 0 ? entry.cappedSince + probeIntervalMs : Infinity;
-    let at = entry.cappedSince;
-    for (const dimension of Object.keys(entry.capped)) {
-      const resetAt = entry.observation?.[dimension]?.resetAt;
-      at = Math.max(at, Number.isFinite(resetAt) && resetAt > entry.cappedSince ? resetAt : valve);
-    }
-    if (entry.probeUsedAt === undefined || at > entry.probeUsedAt) return at;
-    // A spent probe re-arms on newer evidence or after the safety interval, never sooner.
-    return probeIntervalMs > 0 ? entry.probeUsedAt + probeIntervalMs : Infinity;
-  };
+  // 停止中の口座への試し打ち（生成を1回だけ送って停止を確かめる経路）は無い。停止が解けるのは
+  // observe() の復帰の規則（完全な観測の2回連続、方針を持たない口座は位置ごとの共通のしきい値（Legacy global thresholds）を下回る観測の1回）だけ。
   let accounts = new Map();
   const sticky = new Map();
-  const payouts = new Map(); // key -> the last probe handed out, so an unsent one can be returned.
   const stickyKey = (conversation, model) => JSON.stringify([conversation, model]);
   function reconcile(entries, nowMs) {
     time(nowMs);
@@ -125,6 +103,7 @@ export function createCodexAccountPool(initialAccounts = [], options = {}) {
         ...(prior?.forbiddenAt !== undefined ? { forbiddenAt: prior.forbiddenAt } : {}),
         ...(prior?.recheckAt !== undefined ? { recheckAt: prior.recheckAt } : {}),
         ...(prior?.seenMtime !== undefined ? { seenMtime: prior.seenMtime } : {}),
+        ...(prior?.authReason !== undefined ? { authReason: prior.authReason } : {}),
         ...(prior?.observation ? { observation: copyObservation(prior.observation) } : {}),
         // A usage stop survives identity promotion; it is about the upstream account.
         ...(prior?.capped ? { capped: { ...prior.capped } } : {}),
@@ -132,14 +111,12 @@ export function createCodexAccountPool(initialAccounts = [], options = {}) {
         ...(prior?.upstreamBlocked !== undefined ? { upstreamBlocked: prior.upstreamBlocked } : {}),
         ...(prior?.stoppedAt !== undefined ? { stoppedAt: prior.stoppedAt } : {}),
         ...(prior?.stopEpoch !== undefined ? { stopEpoch: prior.stopEpoch } : {}),
-        ...(prior?.probeUsedAt !== undefined ? { probeUsedAt: prior.probeUsedAt } : {}),
         ...(prior?.usageGetAt !== undefined ? { usageGetAt: prior.usageGetAt } : {}),
         ...(prior?.usageAllowedAt !== undefined ? { usageAllowedAt: prior.usageAllowedAt } : {}),
         ...(prior?.observationSequence !== undefined ? { observationSequence: prior.observationSequence } : {}) });
       if (prior && entry.previousKey) promoted.set(entry.previousKey, entry.key);
     }
     accounts = next;
-    for (const key of payouts.keys()) if (!accounts.has(key)) payouts.delete(key);
     for (const [key, accountKey] of sticky) {
       const current = promoted.get(accountKey) ?? accountKey;
       if (accounts.has(current)) sticky.set(key, current);
@@ -234,8 +211,9 @@ export function createCodexAccountPool(initialAccounts = [], options = {}) {
           // effect on this account instead of inferring it from a block that may not be showing.
           blockWhenUnknown: policy ? policy.blockWhenUnknown === true : null,
           fresh: Object.fromEntries(['primary', 'secondary'].map(d => [d, fresh(entry, entry.observation?.[d], nowMs) === true])),
-          // The freshness actually applied to this account: a degraded one is judged
-          // by the passive TTL, because no poll is coming to renew it.
+          // The freshness actually applied to this account: the http ceiling (two polls plus
+          // one read deadline, capped by the TTL) under http, the TTL under passive. A broken
+          // usage read never changes it; the pool is not told about degradation at all.
           surveyed: surveyed(entry, nowMs), freshnessMs: freshnessOf(entry) };
       });
     },
@@ -319,18 +297,6 @@ export function createCodexAccountPool(initialAccounts = [], options = {}) {
       if (entry.resumeStreak < RESUME_CONFIRMATIONS || !stopped(entry)) return;
       release(entry);
     },
-    // The poller marks the account whose usage GET has broken (a failed
-    // verification gate, or five consecutive failures). Only that account falls back
-    // to the passive discipline; every still-readable account keeps the http rules,
-    // so one unreadable account no longer leaves itself unselectable and unprobeable.
-    usageDegraded(key, degraded) {
-      const entry = accounts.get(key);
-      const next = degraded === true;
-      if (!entry || (entry.usageDegraded === true) === next) return;
-      if (!next) { delete entry.usageDegraded; return; }
-      entry.usageDegraded = true;
-      improved(); // Unknown usage becomes selectable again: availability only widens.
-    },
     // A read that produced no observation (timeout, 5xx, unparsable body, unreadable
     // credentials) is evidence of nothing -- but it does break the run of complete
     // readings recovery requires, so a success/failure/success sequence must not recover.
@@ -372,10 +338,6 @@ export function createCodexAccountPool(initialAccounts = [], options = {}) {
       const entry = accounts.get(key);
       if (!entry || (entry.forbiddenAt !== undefined && issuedAtMs <= entry.forbiddenAt)) return;
       // An ordinary generation proves credentials, never a released usage stop.
-      // The one exception is the probe the latch itself authorised: it recovers the
-      // account unless the very response that carried it stopped the account again.
-      if (entry.probeUsedAt !== undefined && issuedAtMs >= entry.probeUsedAt
-        && (entry.stoppedAt ?? -Infinity) < entry.probeUsedAt) release(entry);
       const before = entry.state;
       entry.state = 'ready';
       delete entry.forbiddenAt;
@@ -413,6 +375,45 @@ export function createCodexAccountPool(initialAccounts = [], options = {}) {
       delete entry.retryAt;
       entry.updatedAt = nowMs;
     },
+    // 使用量の GET が 2xx で返った（この口座のトークンを上流が受け付けた）ときの遷移。
+    // unknown・credentials-unavailable・needs-login・probing の口座を ready へ移す。証明するのは
+    // 認証だけで、使用量の停止は解かない（解くのは observe() の復帰の規則だけ）。ログイン切れと
+    // 決めた時刻以前に始まった GET は、その決定を覆さない。
+    usageConfirmed(key, nowMs, startedAtMs = nowMs) {
+      time(nowMs);
+      time(startedAtMs);
+      const entry = accounts.get(key);
+      if (!entry || (entry.forbiddenAt !== undefined && startedAtMs <= entry.forbiddenAt)) return;
+      if (entry.state === 'exhausted' && entry.retryAt > nowMs) return;
+      const before = entry.state;
+      entry.state = 'ready';
+      delete entry.forbiddenAt;
+      delete entry.recheckAt;
+      delete entry.seenMtime;
+      delete entry.authReason;
+      delete entry.resetAt;
+      delete entry.retryAt;
+      entry.updatedAt = nowMs;
+      if (before !== 'ready') improved();
+    },
+    // ログイン切れ（needs-login）へ移す遷移。理由は auth-tracker.js の規則が決めた3つだけ:
+    // upstream-unauthorized（GET の 401 が続いた）・upstream-forbidden（GET の 403 が続き、他の口座の
+    // 成功で裏付けた）・access-token-expired（手元の時計で access token の期限が過ぎていた）。
+    // seenMtime はその時点の資格情報ファイルの更新時刻で、再確認の時期の判断に使う。
+    usageAuthRejected(key, nowMs, { reason, seenMtime = null } = {}) {
+      time(nowMs);
+      if (!USAGE_AUTH_REJECTION_REASONS.includes(reason)) throw new TypeError('known auth rejection reason required');
+      const entry = accounts.get(key);
+      if (!entry) return;
+      entry.state = 'needs-login';
+      entry.authReason = reason;
+      entry.forbiddenAt = Math.max(entry.forbiddenAt ?? nowMs, nowMs);
+      entry.seenMtime = seenMtime;
+      entry.recheckAt = nowMs + needsLoginRecheckMs;
+      delete entry.resetAt;
+      delete entry.retryAt;
+      entry.updatedAt = nowMs;
+    },
     select(model, nowMs, conversation, attempted) {
       time(nowMs);
       const preferred = conversation ? accounts.get(sticky.get(stickyKey(conversation, model))) : null;
@@ -422,25 +423,15 @@ export function createCodexAccountPool(initialAccounts = [], options = {}) {
           ?? candidates.find(a => a.state === 'probing') ?? candidates[0];
       return entry ? copy(entry) : null;
     },
-    // Last resort after select() finds nothing: hand back one latched account so a
-    // single generation can test the stop. Callers must treat it as an attempt.
-    probe(model, nowMs, attempted) {
+    // 最後の手段。select() が1つも選べなかったときだけ呼ぶ。使用量が分からない口座のうち、
+    // (i) 停止していない（窓の停止も上流の拒否も無い）、(ii) blockWhenUnknown が付いていない、
+    // (iii) 使える状態（ready）である、の3つを満たす口座を、設定の並び順で1つ返す。無ければ null。
+    // 停止中の口座は選ばない（試し打ちはしない）。使用量が分かっていて選べない口座も選ばない。
+    lastResort(model, nowMs) {
       time(nowMs);
-      const entry = [...accounts.values()].find(a => !attempted?.has(a.key) && ['ready', 'probing'].includes(a.state)
-        && assigned(a, model) && nowMs >= probeReadyAt(a));
-      if (!entry) return null;
-      payouts.set(entry.key, { at: nowMs, previous: entry.probeUsedAt });
-      entry.probeUsedAt = nowMs;
-      return copy(entry);
-    },
-    // A payout the caller never sent buys nothing: the latch is still owed its one
-    // generation, so the spend is undone and probeReadyAt() returns to what it was.
-    refundProbe(key) {
-      const entry = accounts.get(key);
-      const payout = payouts.get(key);
-      if (!entry || !payout || entry.probeUsedAt !== payout.at) return;
-      if (payout.previous === undefined) delete entry.probeUsedAt; else entry.probeUsedAt = payout.previous;
-      payouts.delete(key);
+      const entry = [...accounts.values()].find(a => a.state === 'ready' && assigned(a, model)
+        && !stopped(a) && !reserved(a) && blockReason(a, nowMs) === 'usage-unknown');
+      return entry ? copy(entry) : null;
     },
     bind(conversation, model, key, nowMs) {
       time(nowMs);
