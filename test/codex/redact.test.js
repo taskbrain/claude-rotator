@@ -131,14 +131,15 @@ test('redact: long runs of letters, digits or dots are handled well within the t
 
 // 切る長さより短い入力は切る処理を通らないので、メールの規則そのものが速いことをここで固定する。
 // 1つの規則で先頭の制限も上限も無い旧規則は、この長さで20回に約0.8〜1.3秒かかった（修正後は
-// 約0.04〜0.06秒）。0.3秒は、両者の間で双方に余裕を持たせた上限。
+// 約0.04〜0.06秒）。上限は0.5秒。テストを全部並べて走らせたときに修正後の規則でも 312ms を観測した
+// ため 0.3秒から広げた。旧規則とは、0.5秒でも見分けられる。
 test('redact: the email patterns themselves are fast on text shorter than the cut', () => {
   for (const ch of ['a', '.']) {
     const text = ch.repeat(8000);
     const started = process.hrtime.bigint();
     for (let i = 0; i < 20; i += 1) redactSecrets(text);
     const elapsedMs = Number(process.hrtime.bigint() - started) / 1e6;
-    assert.ok(elapsedMs < 300, `${ch} x 8000, 20 times: ${elapsedMs} ms`);
+    assert.ok(elapsedMs < 500, `${ch} x 8000, 20 times: ${elapsedMs} ms`);
   }
 });
 
