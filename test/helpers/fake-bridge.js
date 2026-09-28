@@ -2,12 +2,9 @@
 // 偽 bridge（codex-rotator のスタブ）。
 //
 // 目的:
-//   契約 v1.4（docs/sessions/20260908_codex-rotation/02_P2_契約案_v1.4.md）の
-//   §C3（ヘッダ仕様）・§C4（開始マーカー）・§D2（Part 2a の状態表）が定める
-//   「状態ごとの status ／ error.type ／ x-ombr-* の組」を、実 TCP で1つずつ再現する。
-//   R4-1 の統合テストからモジュールとして使い、設計書 §11.4 の受入検証 (1)〜(5)
-//   （docs/sessions/20260908_codex-rotation/10_設計書_codexローテーションとフォールバック写像.md）
-//   では単体のプロセスとして使う。
+//   bridge が状態ごとに返す「HTTP status ／ error.type ／ x-ombr-* ヘッダの組」と、
+//   200 SSE の開始マーカー（その後の終端・無音・切断）を、実 TCP で1つずつ再現する。
+//   統合テストからはモジュールとして、受入の手動確認では単体のプロセスとして使う。
 //
 // 単体起動:
 //   node test/helpers/fake-bridge.js --port 18799 --mode exhausted
