@@ -690,21 +690,31 @@ describe('macOS watchdog lifecycle', () => {
     const fixture = await createMacosLifecycleFixture();
     let healthSignal;
     let guardTimer;
+    // 見張りは health check が初めて呼ばれた時点から数える。導入前の準備（ファイル
+    // 書込み等）の所要時間は CI の負荷で伸びるため、テスト開始から数えると見張りが
+    // 先に鳴って落ちる。見張りの長さは healthTimeoutMs（20ms）より十分長く、既定の
+    // 15_000ms より十分短くする（healthTimeoutMs が無視されて既定値で待つ退行も検出する）。
+    let armGuard;
+    const guard = new Promise(resolve => {
+      armGuard = () => {
+        if (guardTimer !== undefined) return;
+        guardTimer = setTimeout(() => resolve({ type: 'still-pending' }), 5_000);
+      };
+    });
     try {
       const outcome = await Promise.race([
         installMacosLifecycle(fixture.installOptions({
           healthTimeoutMs: 20,
           healthCheck: ({ signal } = {}) => {
             healthSignal = signal;
+            armGuard();
             return new Promise(() => {});
           },
         })).then(
           () => ({ type: 'resolved' }),
           error => ({ type: 'rejected', error }),
         ),
-        new Promise(resolve => {
-          guardTimer = setTimeout(() => resolve({ type: 'still-pending' }), 250);
-        }),
+        guard,
       ]);
       clearTimeout(guardTimer);
 
