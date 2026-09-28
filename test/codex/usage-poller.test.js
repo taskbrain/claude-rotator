@@ -196,14 +196,15 @@ test('usage poller: a read that began before a stop never votes for recovery', a
     ? new Promise(resolve => { release = () => resolve(usageResponse(clock, { used: 10 })); })
     : usageResponse(clock, { used: 10 }) });
   const key = 'home:0';
-  // A response header stops the account before the first read is even scheduled.
-  f.pool.observe(key, { primary_used_percent: 99 }, f.clock.now(), {});
+  // A response header stops the account before the first read is even scheduled. It names the
+  // same five-hour window the GETs report (windows are matched by their length, not their position).
+  f.pool.observe(key, { primary_used_percent: 99, primary_window_minutes: 300 }, f.clock.now(), {});
   assert.equal(f.pool.snapshot()[0].stopEpoch, 1);
   await f.start();
   await f.tick(1);
   assert.equal(f.calls.length, 1);
   // While that read is in flight the account is stopped again: a newer epoch opens.
-  f.pool.observe(key, { primary_used_percent: 99 }, f.clock.now(), {});
+  f.pool.observe(key, { primary_used_percent: 99, primary_window_minutes: 300 }, f.clock.now(), {});
   assert.equal(f.pool.snapshot()[0].stopEpoch, 2);
   release();
   await f.tick(0);
@@ -262,7 +263,8 @@ test('usage poller: a failed read breaks the run of complete readings a recovery
   const f = await fixture(t, { accounts: 1,
     respond: ({ clock }) => (healthy ? usageResponse(clock, { used: 10 }) : httpError(500)) });
   const key = 'home:0';
-  f.pool.observe(key, { primary_used_percent: 99 }, f.clock.now(), {}); // A response header stops it.
+  // A response header stops it, naming the same five-hour window the GETs report.
+  f.pool.observe(key, { primary_used_percent: 99, primary_window_minutes: 300 }, f.clock.now(), {});
   assert.deepEqual(f.account(key).capped, { primary: true });
   await f.start();
   await f.tick(1);
@@ -526,6 +528,19 @@ test('usage poller: an unexpected exception outside the credential read is recor
     ['internal-error', 'internal-error']);
   assert.equal(f.logged('codex_credentials_unavailable').length, 0);
   assert.equal(JSON.stringify(f.logs).includes('zz-marker-internal-error'), false, 'the exception message is not logged');
+});
+
+test('usage poller: completeness is the reader\'s verdict alone; a response with no window at all is window-absent', async t => {
+  // 完全かどうかに primary 窓の有無を足さない（primary 窓の無い応答は usage-pipeline.test.js で確かめる）。
+  // 窓が1つも無い応答は正規化が不完全と判定し、理由の語は window-absent になる。
+  const f = await fixture(t, { accounts: 1, respond: () => new Response(JSON.stringify({ rate_limit: { allowed: true } }),
+    { status: 200, headers: { 'content-type': 'application/json' } }) });
+  await f.start();
+  await f.tick(1);
+  assert.equal(f.observed.length, 1);
+  assert.equal(f.observed[0].meta.complete, false);
+  assert.equal(f.poller.accountHealth('home:0').observationErrorCode, 'window-absent');
+  assert.equal(f.poller.observation().gate, 'failed');
 });
 
 // --- ログ（読取ごとの debug と、停止・解除・読めないこと・ログイン切れの info） ---

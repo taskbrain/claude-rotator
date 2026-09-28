@@ -5,24 +5,44 @@ function time(nowMs) {
 }
 
 // A stop is a latch: only a qualifying observation clears it, never elapsed
-// time and never a reset instant. Recovery needs this many complete GETs.
+// time and never a reset instant. Recovery needs this many complete GETs. A reset
+// instant (or, without one, the probe interval) matters only for dropping the stop of
+// a window that vanished from the upstream, and only together with misses: see countMisses().
 const RESUME_CONFIRMATIONS = 2;
+// 窓の停止を、上流から消えた窓について外すのに要る、続けての欠落の回数（時刻の条件と併せて要る）。
+const MISSES_TO_DROP = 2;
+const POSITIONS = Object.freeze(['primary', 'secondary']);
+// RFC3339 で表現できる上限。
+const MAX_TIMESTAMP_MS = 253402300799999;
+// observe() が返す出来事の種類: 上流から消えた窓の停止だけを外した。
+export const WINDOW_CAP_DROPPED = 'window-cap-dropped';
 
 // usageAuthRejected() が受け取る理由（auth-tracker.js の規則が決める）。これ以外は拒否する。
 export const USAGE_AUTH_REJECTION_REASONS = Object.freeze(['upstream-unauthorized', 'upstream-forbidden', 'access-token-expired']);
 
+// 窓は長さで識別する。鍵は長さの申告があれば len:<分>、無ければ pos:<位置>（位置は、長さの
+// 申告が無いときにだけ鍵に使う）。停止の記録・観測の保存・票の照合・欠落の数え方はこの鍵で行い、
+// しきい値だけを位置で引く。len: の鍵は同じ長さを申告した窓とだけ、pos: の鍵は同じ位置の長さの
+// 申告が無い窓とだけ照合する。
+const windowKeyOf = (position, windowDurationMins) =>
+  (windowDurationMins === undefined ? `pos:${position}` : `len:${windowDurationMins}`);
+
 export function createCodexAccountPool(initialAccounts = [], options = {}) {
-  let thresholds, policies, freshnessMs, ttlMs, httpMode, needsLoginRecheckMs;
+  let thresholds, policies, freshnessMs, ttlMs, httpMode, needsLoginRecheckMs, noResetProbeMs;
   let generation = 0; // Configuration epoch: a read started earlier describes another world.
   let revision = 0; // Advances only when availability improves; terminal caches key off it.
   function applyOptions({
     rotationPrimaryUsedPercentMax = 95, rotationSecondaryUsedPercentMax = 95,
     rotationNeedsLoginRecheckMs = 600000, rotationObservationTtlMs = 60000,
     usagePollIntervalMs = 60000, usageReadTimeoutMs = 5000,
+    rotationUsageCapNoResetProbeMs = 3600000,
     usageObservationMode = 'passive', accounts,
   } = {}) {
     thresholds = { primary: rotationPrimaryUsedPercentMax, secondary: rotationSecondaryUsedPercentMax };
     needsLoginRecheckMs = rotationNeedsLoginRecheckMs;
+    // リセット時刻の記録が無い窓の停止を、欠落2回に加えて停止からこの時間が過ぎたら外す。0 は外さない。
+    // 値の検査は設定の読込（config.js）が行う。
+    noResetProbeMs = rotationUsageCapNoResetProbeMs;
     httpMode = usageObservationMode === 'http';
     ttlMs = rotationObservationTtlMs; // The passive freshness, and the ceiling for the http one.
     // An http observation may not outlive two polls plus one read deadline.
@@ -35,28 +55,68 @@ export function createCodexAccountPool(initialAccounts = [], options = {}) {
   const improved = () => { revision++; };
   const policyOf = entry => policies.get(entry.label) ?? null;
   // Window thresholds and account policy are alternatives, never multiplied together.
-  const stopOf = (entry, dimension) => policyOf(entry)?.stopUsedPercent ?? thresholds[dimension];
+  // Both are looked up by the position a window was reported at, never by its key.
+  const stopOf = (entry, position) => policyOf(entry)?.stopUsedPercent ?? thresholds[position];
   // An account may be reserved -- forbidden to carry
   // ANY request while its usage is unknown. This is not a threshold: no observation at
   // all withholds the account exactly as a high one does.
   const reserved = entry => policyOf(entry)?.blockWhenUnknown === true;
-  const copyObservation = observation => Object.fromEntries(Object.entries(observation).map(([key, value]) => [key, { ...value }]));
-  const copy = entry => ({ ...entry, models: entry.models ? [...entry.models] : null,
-    // Always a number: a reader captures it before a GET and hands it back to observe().
-    stopEpoch: entry.stopEpoch ?? 0,
-    ...(entry.observation ? { observation: copyObservation(entry.observation) } : {}),
-    ...(entry.capped ? { capped: { ...entry.capped } } : {}) });
+  // 口座の中の窓の記録（すべて窓の鍵で引く）:
+  //   windows[鍵]    保存した観測（鍵・最後に報告された位置・使用率・時刻・長さ・リセット時刻）。
+  //                  resetAt は表示用で、観測ごとに置き換わる。confirmedResetAt は、使用量の GET の完全な
+  //                  観測が届けた未来のリセット時刻だけを持ち、それ以外の観測では前の値を引き継ぐ
+  //   positions[位置] その位置で最後に報告された窓の鍵
+  //   windowCaps[鍵] 窓の停止の記録（missing は欠落の連続回数、resetAt は外す判定に使うリセット時刻）
+  //   cleanReads     直近の票の候補（完全・allowed・今の停止世代・全窓が復帰しきい値以下の観測）ごとに、
+  //                  その観測に載っていなかった停止中の窓の鍵。新しい順に RESUME_CONFIRMATIONS 個まで
+  //   resumePending  窓の停止を全部外した後も、口座の停止が復帰の規則を待っている
+  const copyEach = records => Object.fromEntries(Object.entries(records).map(([key, value]) => [key, { ...value }]));
+  // その位置で最後に報告された窓。窓が別の位置へ移った後は、元の位置には何も無い。
+  const windowAt = (entry, position) => {
+    const window = entry.windows?.[entry.positions?.[position]];
+    return window?.position === position ? window : undefined;
+  };
+  // 票: 直近の候補のうち、載っていなかった窓の停止がもう残っていないものを、新しい方から続けて数える。
+  // 停止した窓が載らない観測は、その窓の停止が残っている間は票にならない。欠落を数えてその窓の停止を
+  // 外したら、その観測は（残りの条件を満たしていれば）票になる。
+  const votes = entry => {
+    let count = 0;
+    for (const lacking of [...(entry.cleanReads ?? [])].reverse()) {
+      if (lacking.some(key => entry.windowCaps?.[key])) break;
+      count++;
+    }
+    return count;
+  };
+  // 位置で見た写し（窓を primary・secondary の位置で読む読み手のため）: observation はその位置で最後に報告された窓、capped は
+  // 停止中の窓が最後に報告された位置。窓の鍵で見たものは windows と windowCaps にある。
+  const copy = entry => {
+    const { windows, positions, windowCaps, cleanReads, ...rest } = entry;
+    const observation = Object.fromEntries(POSITIONS.filter(position => windowAt(entry, position))
+      .map(position => [position, { ...windowAt(entry, position) }]));
+    const streak = votes(entry);
+    return { ...rest, models: entry.models ? [...entry.models] : null,
+      // Always a number: a reader captures it before a GET and hands it back to observe().
+      stopEpoch: entry.stopEpoch ?? 0,
+      ...(windows ? { windows: copyEach(windows), observation } : {}),
+      ...(windowCaps ? { windowCaps: copyEach(windowCaps),
+        capped: Object.fromEntries(Object.keys(windowCaps).filter(key => windows?.[key])
+          .map(key => [windows[key].position, true])) } : {}),
+      ...(streak > 0 ? { resumeStreak: streak } : {}) };
+  };
   // 使用量の読取が壊れた口座（縮退）も、選択の規則は変えない。縮退は「使用量が読めない」という
   // 記録とログのためだけのもので、取得処理（usage-poller.js）が持ち、プールへは伝えない。口座ごとに
   // 規則を切り替える経路（使用量不明でも選べる・停止が試し打ちで解ける・鮮度を TTL で測る）は無い。
   const freshnessOf = () => (httpMode ? freshnessMs : ttlMs);
   const fresh = (entry, window, nowMs) => window && nowMs - window.observedAt < freshnessOf(entry) &&
     (window.resetAt === undefined || nowMs < window.resetAt);
-  const capped = entry => Object.keys(entry.capped ?? {}).length > 0;
-  // The latched windows themselves, not whichever observation is still fresh.
-  const cappedWindows = entry => Object.keys(entry.capped ?? {}).map(key => entry.observation?.[key]).filter(Boolean);
-  const stopped = entry => capped(entry) || entry.upstreamBlocked === true;
-  const observed = (entry, nowMs) => Object.values(entry.observation ?? {}).some(window => fresh(entry, window, nowMs));
+  const capped = entry => Object.keys(entry.windowCaps ?? {}).length > 0;
+  // The latched windows themselves, not whichever observation is still fresh -- and only
+  // those still reported at their position: a window another one has replaced there no
+  // longer dates a reset for the account.
+  const cappedWindows = entry => Object.keys(entry.windowCaps ?? {}).map(key => entry.windows?.[key])
+    .filter(window => window && entry.positions?.[window.position] === window.key);
+  const stopped = entry => capped(entry) || entry.upstreamBlocked === true || entry.resumePending === true;
+  const observed = (entry, nowMs) => Object.values(entry.windows ?? {}).some(window => fresh(entry, window, nowMs));
   // Selection under http rests on the freshness of complete GETs alone. A response
   // header may stop an account, never make one selectable or recovered again.
   const surveyed = (entry, nowMs) => Number.isFinite(entry.usageGetAt) && nowMs - entry.usageGetAt < freshnessOf(entry);
@@ -65,27 +125,69 @@ export function createCodexAccountPool(initialAccounts = [], options = {}) {
   // by freshnessOf(), so the passive TTL can never WIDEN the evidence a reserved account needs.
   const assured = (entry, nowMs) => Number.isFinite(entry.usageAllowedAt) && nowMs - entry.usageAllowedAt < freshnessMs;
   // Unknown usage blocks selection only under http, where a poll is expected -- except
-  // for a reserved account, which is withheld under every mode.
+  // for a reserved account, which is withheld under every mode. An account whose window
+  // stops were all dropped still waits for the resume rule under the usage-capped reason.
   const blockReason = (entry, nowMs) => capped(entry) ? 'usage-capped'
     : entry.upstreamBlocked ? 'upstream-blocked'
-      : reserved(entry) && !assured(entry, nowMs) ? 'usage-unknown-reserved'
-        : httpMode && !surveyed(entry, nowMs) ? 'usage-unknown' : null;
+      : entry.resumePending ? 'usage-capped'
+        : reserved(entry) && !assured(entry, nowMs) ? 'usage-unknown-reserved'
+          : httpMode && !surveyed(entry, nowMs) ? 'usage-unknown' : null;
   const excluded = (entry, nowMs) => blockReason(entry, nowMs) !== null;
+  const clearMisses = entry => { for (const cap of Object.values(entry.windowCaps ?? {})) cap.missing = 0; };
   // Every stop opens a new epoch. A read that began in an older one describes the
   // world before that stop and never counts as a recovery vote, however late it lands.
   // The epoch, not `stoppedAt`, decides: a stop and a read can share a millisecond.
+  // A new stop also restarts every miss count.
   const stop = (entry, nowMs) => {
     entry.stopEpoch = (entry.stopEpoch ?? 0) + 1;
     entry.stoppedAt = nowMs;
-    delete entry.resumeStreak;
+    delete entry.cleanReads;
+    clearMisses(entry);
+  };
+  // 新しい窓の停止は、その窓について完全な GET が届けたリセット時刻を、まだ先の時刻なら引き継ぐ。
+  const latch = (entry, window, nowMs) => {
+    entry.windowCaps ??= {};
+    entry.windowCaps[window.key] ??= { missing: 0,
+      ...(window.confirmedResetAt > nowMs ? { resetAt: window.confirmedResetAt } : {}) };
+    entry.cappedSince ??= nowMs;
   };
   const release = entry => {
-    delete entry.capped; delete entry.cappedSince; delete entry.upstreamBlocked;
-    delete entry.resumeStreak; delete entry.stoppedAt;
+    delete entry.windowCaps; delete entry.cappedSince; delete entry.upstreamBlocked;
+    delete entry.cleanReads; delete entry.stoppedAt; delete entry.resumePending;
     improved();
   };
+  // 上流から消えた窓の停止を外してよいか。条件の1つ目: その窓の停止に記録したリセット時刻（windowCaps[鍵].resetAt。
+  // 使用量の GET の完全な観測が届けた未来の時刻だけで入れ替え、ほかの観測では消さない）を過ぎている。
+  // 条件の2つ目: その値が一度も入らなかったときだけ、停止（今の停止世代の始まり）から noResetProbeMs が過ぎている
+  // （0 なら外さない）。どちらも、欠落の連続回数の条件（呼び出し側）と併せて初めて成り立つ。
+  const lapsed = (entry, cap, nowMs) => (Number.isFinite(cap.resetAt) ? nowMs >= cap.resetAt
+    : noResetProbeMs > 0 && Number.isFinite(entry.stoppedAt) && nowMs - entry.stoppedAt >= noResetProbeMs);
+  // 停止した窓の鍵ごとの欠落の連続回数。今の停止世代で始まった、allowed が読めた完全な GET に、その鍵に
+  // 照合できる窓が無ければ1つ増やす。その窓が載った回（使用率によらない）と、数えられない観測（不完全・
+  // 別の停止世代・応答ヘッダ）では0に戻す。2回以上続き、かつ lapsed() なら、その鍵の停止と保存した観測の
+  // 両方を消す（configure() が古い観測で掛け直さないため）。外した窓の出来事を返す。
+  function countMisses(entry, applied, countable, nowMs) {
+    const present = new Set(applied.map(window => window.key));
+    const events = [];
+    for (const [windowKey, cap] of Object.entries(entry.windowCaps ?? {})) {
+      if (present.has(windowKey) || !countable) { cap.missing = 0; continue; }
+      cap.missing++;
+      const window = entry.windows?.[windowKey];
+      if (cap.missing < MISSES_TO_DROP || !lapsed(entry, cap, nowMs)) continue;
+      delete entry.windowCaps[windowKey];
+      delete entry.windows?.[windowKey];
+      if (window && entry.positions?.[window.position] === windowKey) delete entry.positions[window.position];
+      events.push({ type: WINDOW_CAP_DROPPED, window: windowKey, position: window?.position,
+        ...(window?.windowDurationMins !== undefined ? { windowMinutes: window.windowDurationMins } : {}), at: nowMs });
+    }
+    // 窓の停止が残らなくても、口座の停止は復帰の規則で解けるまで残す。
+    if (events.length && !capped(entry)) { delete entry.windowCaps; entry.resumePending = true; }
+    return events;
+  }
   // 停止中の口座への試し打ち（生成を1回だけ送って停止を確かめる経路）は無い。停止が解けるのは
-  // observe() の復帰の規則（完全な観測の2回連続、方針を持たない口座は位置ごとの共通のしきい値（Legacy global thresholds）を下回る観測の1回）だけ。
+  // observe() の復帰の規則（完全な観測の2回連続、方針を持たない口座は窓ごとに位置ごとの共通のしきい値（Legacy global thresholds）を下回る観測の1回、上流の
+  // 拒否は方針の有無によらず allowed:true の完全な観測の2回連続）だけ。窓の停止
+  // だけは、上流から消えた窓について countMisses() が外す（口座の停止は復帰の規則で解くまで残る）。
   let accounts = new Map();
   const sticky = new Map();
   const stickyKey = (conversation, model) => JSON.stringify([conversation, model]);
@@ -104,9 +206,11 @@ export function createCodexAccountPool(initialAccounts = [], options = {}) {
         ...(prior?.recheckAt !== undefined ? { recheckAt: prior.recheckAt } : {}),
         ...(prior?.seenMtime !== undefined ? { seenMtime: prior.seenMtime } : {}),
         ...(prior?.authReason !== undefined ? { authReason: prior.authReason } : {}),
-        ...(prior?.observation ? { observation: copyObservation(prior.observation) } : {}),
+        ...(prior?.windows ? { windows: copyEach(prior.windows) } : {}),
+        ...(prior?.positions ? { positions: { ...prior.positions } } : {}),
         // A usage stop survives identity promotion; it is about the upstream account.
-        ...(prior?.capped ? { capped: { ...prior.capped } } : {}),
+        ...(prior?.windowCaps ? { windowCaps: copyEach(prior.windowCaps) } : {}),
+        ...(prior?.resumePending !== undefined ? { resumePending: prior.resumePending } : {}),
         ...(prior?.cappedSince !== undefined ? { cappedSince: prior.cappedSince } : {}),
         ...(prior?.upstreamBlocked !== undefined ? { upstreamBlocked: prior.upstreamBlocked } : {}),
         ...(prior?.stoppedAt !== undefined ? { stoppedAt: prior.stoppedAt } : {}),
@@ -171,14 +275,16 @@ export function createCodexAccountPool(initialAccounts = [], options = {}) {
       generation++;
       for (const entry of accounts.values()) {
         // A tightened stop latches now; a loosened one never resumes on old evidence.
+        // A dropped window left no stored reading behind, so nothing latches it again here.
         let latched = false;
-        for (const [dimension, window] of Object.entries(entry.observation ?? {})) {
-          if (window.usedPercent < stopOf(entry, dimension)) continue;
-          entry.capped = { ...entry.capped, [dimension]: true };
-          entry.cappedSince ??= nowMs;
+        for (const window of Object.values(entry.windows ?? {})) {
+          if (window.usedPercent < stopOf(entry, window.position)) continue;
+          latch(entry, window, nowMs);
           latched = true;
         }
-        if (latched) stop(entry, nowMs); else delete entry.resumeStreak;
+        // Either way the reload restarts the vote run and every miss count.
+        if (latched) stop(entry, nowMs);
+        else { delete entry.cleanReads; clearMisses(entry); }
       }
     },
     terminal(model, nowMs) {
@@ -210,7 +316,7 @@ export function createCodexAccountPool(initialAccounts = [], options = {}) {
           // The applied reserve, so a deployment can verify the flag really took
           // effect on this account instead of inferring it from a block that may not be showing.
           blockWhenUnknown: policy ? policy.blockWhenUnknown === true : null,
-          fresh: Object.fromEntries(['primary', 'secondary'].map(d => [d, fresh(entry, entry.observation?.[d], nowMs) === true])),
+          fresh: Object.fromEntries(POSITIONS.map(position => [position, fresh(entry, windowAt(entry, position), nowMs) === true])),
           // The freshness actually applied to this account: the http ceiling (two polls plus
           // one read deadline, capped by the TTL) under http, the TTL under passive. A broken
           // usage read never changes it; the pool is not told about degradation at all.
@@ -226,31 +332,46 @@ export function createCodexAccountPool(initialAccounts = [], options = {}) {
     },
     // `source` separates integer GET readings from fractional response headers;
     // the two are never compared as one series and only a GET may recover.
+    // Returns what happened beyond the latch itself: the windows whose stop was dropped
+    // because they vanished from the upstream (see countMisses()). Empty otherwise.
     observe(key, observation, nowMs, meta = {}) {
       time(nowMs);
       const entry = accounts.get(key);
-      if (!entry || !observation) return;
+      if (!entry || !observation) return [];
       // `stopEpoch` is the epoch the reader held when the GET began (snapshot().stopEpoch).
       const { source = 'response-header', complete = false, ordinaryUsageAllowed, sequence, stopEpoch } = meta;
-      if (meta.generation !== undefined && meta.generation !== generation) return;
+      if (meta.generation !== undefined && meta.generation !== generation) return [];
       if (Number.isFinite(sequence)) {
-        if (sequence <= (entry.observationSequence ?? -Infinity)) return;
+        if (sequence <= (entry.observationSequence ?? -Infinity)) return [];
         entry.observationSequence = sequence;
       }
       const applied = [];
-      for (const dimension of ['primary', 'secondary']) {
-        const usedPercent = observation[`${dimension}_used_percent`];
+      const confirmed = new Set(); // 窓の鍵: この観測が、外す判定に使うリセット時刻を届けた窓
+      for (const position of POSITIONS) {
+        const usedPercent = observation[`${position}_used_percent`];
         if (!Number.isFinite(usedPercent) || usedPercent < 0 || usedPercent > 100) continue;
-        if (entry.observation?.[dimension]?.observedAt > nowMs) continue;
+        const minutes = observation[`${position}_window_minutes`];
+        const windowDurationMins = Number.isFinite(minutes) && minutes > 0 ? minutes : undefined;
+        const windowKey = windowKeyOf(position, windowDurationMins);
+        const prior = entry.windows?.[windowKey];
+        if (prior?.observedAt > nowMs) continue;
         // A rolling window's duration is not evidence of its reset time.
-        const resetAt = observation[`${dimension}_reset_at`];
-        const windowDurationMins = observation[`${dimension}_window_minutes`];
-        entry.observation ??= {};
-        entry.observation[dimension] = { usedPercent, observedAt: nowMs, source,
-          ...(Number.isFinite(windowDurationMins) && windowDurationMins > 0 ? { windowDurationMins } : {}),
-          // Only advertise a reset representable as an RFC3339 timestamp.
-          ...(Number.isSafeInteger(resetAt) && resetAt >= 0 && resetAt <= 253402300799999 ? { resetAt } : {}) };
-        applied.push(dimension);
+        const resetAt = observation[`${position}_reset_at`];
+        // Only advertise a reset representable as an RFC3339 timestamp.
+        const representable = Number.isSafeInteger(resetAt) && resetAt >= 0 && resetAt <= MAX_TIMESTAMP_MS;
+        // Only a complete GET may date the reset a window stop is dropped at, and only with a
+        // future instant. A reading without one, an incomplete one or a header keeps the last.
+        const confirms = source === 'usage-get' && complete === true && representable && resetAt > nowMs;
+        if (confirms) confirmed.add(windowKey);
+        entry.windows ??= {};
+        entry.windows[windowKey] = { key: windowKey, position, usedPercent, observedAt: nowMs, source,
+          ...(windowDurationMins !== undefined ? { windowDurationMins } : {}),
+          ...(representable ? { resetAt } : {}),
+          ...(confirms ? { confirmedResetAt: resetAt }
+            : prior?.confirmedResetAt !== undefined ? { confirmedResetAt: prior.confirmedResetAt } : {}) };
+        entry.positions ??= {};
+        entry.positions[position] = windowKey;
+        applied.push(entry.windows[windowKey]);
       }
       // Only a complete GET dates the survey that http selection rests on.
       if (source === 'usage-get' && complete === true && applied.length > 0) {
@@ -264,45 +385,73 @@ export function createCodexAccountPool(initialAccounts = [], options = {}) {
         entry.upstreamBlocked = true;
         stop(entry, nowMs);
       }
-      // Either source alone stops the account, at or above the threshold.
+      // Either source alone stops the account, at or above the threshold of the position
+      // the window was reported at. The stop is recorded under the window's key.
       let latched = false;
-      for (const dimension of applied) {
-        if (entry.observation[dimension].usedPercent < stopOf(entry, dimension)) continue;
-        entry.capped = { ...entry.capped, [dimension]: true };
-        entry.cappedSince ??= nowMs;
+      for (const window of applied) {
+        if (window.usedPercent < stopOf(entry, window.position)) continue;
+        latch(entry, window, nowMs);
         latched = true;
       }
       if (latched) stop(entry, nowMs);
-      const policy = policyOf(entry);
-      if (!policy) {
-        // Legacy global thresholds keep their single-observation release per window.
-        for (const dimension of applied) {
-          if (entry.observation[dimension].usedPercent >= thresholds[dimension] || !entry.capped?.[dimension]) continue;
-          delete entry.capped[dimension];
-          if (capped(entry)) continue;
-          release(entry);
-        }
-        return;
+      for (const windowKey of confirmed) {
+        const cap = entry.windowCaps?.[windowKey];
+        if (cap) cap.resetAt = entry.windows[windowKey].confirmedResetAt;
       }
-      // Recovery needs a complete GET below the resume threshold, twice in a row.
-      const qualifies = source === 'usage-get' && complete === true && ordinaryUsageAllowed === true
-        && applied.length > 0 && applied.every(d => entry.observation[d].usedPercent <= policy.resumeUsedPercent);
       // Only a read that names the epoch it began in can be placed after the stop that
       // closed it -- including the stop this very call latched, which already advanced it.
       // snapshot() always hands the reader a number, so a missing or mismatched epoch is
       // an unplaceable read: evidence for stopping above, never a vote for recovery.
       const current = Number.isFinite(stopEpoch) && stopEpoch === (entry.stopEpoch ?? 0);
-      if (!qualifies || !current) { delete entry.resumeStreak; return; }
-      entry.resumeStreak = (entry.resumeStreak ?? 0) + 1;
-      if (entry.resumeStreak < RESUME_CONFIRMATIONS || !stopped(entry)) return;
-      release(entry);
+      const events = countMisses(entry, applied, current && source === 'usage-get' && complete === true
+        && typeof ordinaryUsageAllowed === 'boolean' && applied.length > 0, nowMs);
+      const policy = policyOf(entry);
+      if (!policy) {
+        // Legacy global thresholds keep their single-observation release per window: a
+        // reading below the threshold of its position lifts the stop of that window's key.
+        for (const window of applied) {
+          if (window.usedPercent >= thresholds[window.position] || !entry.windowCaps?.[window.key]) continue;
+          delete entry.windowCaps[window.key];
+          if (capped(entry)) continue;
+          delete entry.windowCaps;
+          // An upstream refusal still holds the account; releasing it here would erase the refusal too.
+          if (!entry.upstreamBlocked) release(entry);
+        }
+        // A refusal clears by the same rule as under a policy: two complete allowed GETs of
+        // this stop epoch in a row. The account is then released unless a window stop remains,
+        // which keeps waiting for its own single-observation release above.
+        const allowedGet = source === 'usage-get' && complete === true && ordinaryUsageAllowed === true && current
+          && applied.length > 0;
+        if (!allowedGet) delete entry.cleanReads;
+        else entry.cleanReads = [...(entry.cleanReads ?? []), []].slice(-RESUME_CONFIRMATIONS);
+        if (entry.upstreamBlocked && votes(entry) >= RESUME_CONFIRMATIONS) {
+          delete entry.upstreamBlocked;
+          if (!capped(entry)) release(entry);
+        }
+        // With no window stop left and no refusal, nothing else holds a legacy account.
+        if (entry.resumePending && !capped(entry) && !entry.upstreamBlocked) release(entry);
+        return events;
+      }
+      // Recovery needs, twice in a row, a complete allowed GET of this stop epoch with every
+      // window it carries at or below resume and every stopped window among them (votes()).
+      const clean = source === 'usage-get' && complete === true && ordinaryUsageAllowed === true && current
+        && applied.length > 0 && applied.every(window => window.usedPercent <= policy.resumeUsedPercent);
+      if (!clean) { delete entry.cleanReads; return events; }
+      const present = new Set(applied.map(window => window.key));
+      const lacking = Object.keys(entry.windowCaps ?? {}).filter(windowKey => !present.has(windowKey));
+      entry.cleanReads = [...(entry.cleanReads ?? []), lacking].slice(-RESUME_CONFIRMATIONS);
+      if (votes(entry) >= RESUME_CONFIRMATIONS && stopped(entry)) release(entry);
+      return events;
     },
     // A read that produced no observation (timeout, 5xx, unparsable body, unreadable
     // credentials) is evidence of nothing -- but it does break the run of complete
     // readings recovery requires, so a success/failure/success sequence must not recover.
+    // It breaks every run of misses the same way.
     observationFailed(key) {
       const entry = accounts.get(key);
-      if (entry) delete entry.resumeStreak;
+      if (!entry) return;
+      delete entry.cleanReads;
+      clearMisses(entry);
     },
     exhausted(key, { resetAt, retryAt }, nowMs) {
       time(nowMs);
@@ -424,7 +573,7 @@ export function createCodexAccountPool(initialAccounts = [], options = {}) {
       return entry ? copy(entry) : null;
     },
     // 最後の手段。select() が1つも選べなかったときだけ呼ぶ。使用量が分からない口座のうち、
-    // (i) 停止していない（窓の停止も上流の拒否も無い）、(ii) blockWhenUnknown が付いていない、
+    // (i) 停止していない（窓の停止も上流の拒否も、窓の停止を外した後の復帰待ちも無い）、(ii) blockWhenUnknown が付いていない、
     // (iii) 使える状態（ready）である、の3つを満たす口座を、設定の並び順で1つ返す。無ければ null。
     // 停止中の口座は選ばない（試し打ちはしない）。使用量が分かっていて選べない口座も選ばない。
     lastResort(model, nowMs) {

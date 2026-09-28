@@ -16,8 +16,12 @@
 //     値が作れなければ GET を送らない（既定値を補わない）。
 //   - ログは codex-rotator のロガー（logger.js）の許可リストに載るフィールドだけを出す。
 //   - 資格情報ファイルの更新時刻は既定で自分で見る（credentialEpoch を渡せば差し替えられる）。
+//   - 完全な観測かどうかは使用量の正規化（usage.js）の判定だけで決める。primary 窓があることは
+//     条件に足さない（足すと、primary 窓の無い応答を完全な観測として扱えない）。
+//   - プールが上流から消えた窓の停止だけを外したとき（出来事 window-cap-dropped）を info に出す。
 import { statSync } from 'node:fs';
 import { join } from 'node:path';
+import { WINDOW_CAP_DROPPED } from './account-pool.js';
 import { CREDENTIALS_OUTCOME, createAuthTracker } from './auth-tracker.js';
 import { readCodexSendSnapshot } from './credentials.js';
 import { readCodexUsage } from './usage.js';
@@ -66,15 +70,23 @@ function readingFields(observation) {
 // 完全な観測にならなかった理由。決まった語だけで、上流の文字列は載せない。
 function incompleteCode(observation) {
   if (typeof observation.ordinaryUsageAllowed !== 'boolean') return 'allowed-unusable';
-  if (!observation.primary) return 'primary-window-absent';
+  if (!USAGE_WINDOWS.some(name => observation[name])) return 'window-absent';
   return USAGE_WINDOWS.map(name => observation[name]?.incompleteReason).find(Boolean) ?? 'incomplete';
 }
 
 // 停止と解除の遷移を記録する。プールの更新の前後を比べ、状態が変わる呼び出しそのものを囲む。
+// update() が返すプールの出来事（上流から消えた窓の停止だけを外した）は、遷移より先に出す。
 function withUsageStopLogging(pool, nowMs, log, update) {
-  const stopped = entry => Object.keys(entry.capped ?? {}).length > 0 || entry.upstreamBlocked === true;
+  // 窓の停止を全部外した後も、復帰の規則を待つ間は停止のまま（resumePending）。
+  const stopped = entry => Object.keys(entry.windowCaps ?? {}).length > 0 || entry.upstreamBlocked === true
+    || entry.resumePending === true;
   const before = new Map(pool.snapshot().map(entry => [entry.key, stopped(entry)]));
-  update();
+  const events = update() ?? [];
+  for (const event of events) {
+    if (event?.type !== WINDOW_CAP_DROPPED) continue;
+    log('info', 'codex_usage_window_cap_dropped', { account_label: event.label, event_type: event.type,
+      window: event.position, window_minutes: event.windowMinutes });
+  }
   for (const entry of pool.snapshot()) {
     const latched = stopped(entry);
     if (!before.has(entry.key) || before.get(entry.key) === latched) continue;
@@ -208,13 +220,14 @@ export function createUsagePoller({ pool, resolveClientIdentity, now = Date.now,
       return failed(account.key, state, result.failure ?? result.errorCode ?? result.classification, result);
     }
     const observation = result.observation;
-    const complete = observation.complete === true && observation.primary !== null;
+    // 完全かどうかは正規化の判定だけで決める（primary 窓の無い応答も完全な観測になりうる）。
+    const complete = observation.complete === true;
     // 不完全な観測でも停止は掛かるので、完全かどうかの判定より前に遷移を見る。
-    withUsageStopLogging(pool, result.receivedAt, log, () => {
-      pool.observe(account.key, toPoolObservation(observation), result.receivedAt,
+    withUsageStopLogging(pool, result.receivedAt, log, () =>
+      (pool.observe(account.key, toPoolObservation(observation), result.receivedAt,
         { source: 'usage-get', complete, ordinaryUsageAllowed: observation.ordinaryUsageAllowed,
-          sequence: context.sequence, stopEpoch: context.stopEpoch, generation: context.poolGeneration });
-    });
+          sequence: context.sequence, stopEpoch: context.stopEpoch, generation: context.poolGeneration }) ?? [])
+        .map(event => ({ ...event, label: account.label })));
     state.allowed = typeof observation.ordinaryUsageAllowed === 'boolean' ? observation.ordinaryUsageAllowed : null;
     state.reachedType = observation.rateLimitReachedType ?? null;
     // 読み切れなかった応答も停止の判定には使うが、検証は通さない（選択は完全な観測の鮮度だけに乗るため）。
