@@ -967,7 +967,7 @@ tail -f ~/.config/claude-rotator/server.log
 tail -f ~/.config/claude-rotator/server.err
 ```
 
-`server.log` は10MBを超えると、次のログ書込時に service 自身がローテーションし、直前1世代を `server.log.1` として保持します。非TTYで手動実行した場合も、request ログは標準出力ではなく `server.log` 自体へ直接書かれます。
+`server.log` は既定 32 MiB（`observability.logMaxBytes` で 1 MiB〜256 MiB に変更可。変更は server の再起動で反映。→ [キャッシュ観測（`observability`）](#キャッシュ観測observability)）を超えると、次のログ書込時に service 自身がローテーションし、直前1世代を `server.log.1` として保持します。`server.log` と `server.log.1` は権限 0600（所有者だけが読み書き可）で作成され、既存のファイルも server 起動時とローテーション時に 0600 へ補正されます。非TTYで手動実行した場合も、request ログは標準出力ではなく `server.log` 自体へ直接書かれます。
 
 ### 接続タイムアウトの切り分け
 
@@ -1945,7 +1945,7 @@ tail -f ~/.config/claude-rotator/server.log
 tail -f ~/.config/claude-rotator/server.err
 ```
 
-Once `server.log` exceeds 10MB, the service rotates it on the next log write, keeping the previous generation as `server.log.1`. Even when run manually with a non-TTY stdout, request logs are written directly to `server.log` itself rather than to stdout.
+Once `server.log` exceeds 32 MiB by default (configurable from 1 MiB to 256 MiB with `observability.logMaxBytes`; a change takes effect on server restart), the service rotates it on the next log write, keeping the previous generation as `server.log.1`. `server.log` and `server.log.1` are created with mode 0600 (owner read/write only), and existing files are corrected to 0600 at server startup and on rotation. Even when run manually with a non-TTY stdout, request logs are written directly to `server.log` itself rather than to stdout.
 
 #### Diagnosing Connection Timeouts
 

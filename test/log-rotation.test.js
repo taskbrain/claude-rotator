@@ -1,27 +1,41 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
+import { execFileSync } from 'node:child_process';
 import {
+  chmodSync,
   closeSync,
   existsSync,
   fstatSync,
+  mkdirSync,
   mkdtempSync,
   openSync,
   readFileSync,
+  statSync,
+  symlinkSync,
   writeFileSync,
   writeSync,
 } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
-import { createServerLogWriter, maybeRotateLog, LOG_MAX_BYTES } from '../src/log-rotation.js';
+import { createServerLogWriter, maybeRotateLog, LOG_FILE_MODE, LOG_MAX_BYTES } from '../src/log-rotation.js';
+import { DEFAULT_OBSERVABILITY } from '../src/usage-observation.js';
 
 function tempDir() {
   return mkdtempSync(join(tmpdir(), 'claude-rotator-log-rotation-'));
 }
 
+function modeOf(path) {
+  return statSync(path).mode & 0o777;
+}
+
 describe('LOG_MAX_BYTES', () => {
-  it('is fixed at 10MB', () => {
-    assert.equal(LOG_MAX_BYTES, 10 * 1024 * 1024);
+  it('is 32 MiB, the production effective default', () => {
+    assert.equal(LOG_MAX_BYTES, 32 * 1024 * 1024);
+  });
+
+  it('is the single definition behind config.observability.logMaxBytes', () => {
+    assert.equal(DEFAULT_OBSERVABILITY.logMaxBytes, LOG_MAX_BYTES);
   });
 });
 
@@ -299,7 +313,7 @@ describe('createServerLogWriter', () => {
 // ---------------------------------------------------------------------------
 
 describe('createServerLogWriter の maxBytes', () => {
-  it('渡した閾値でローテーションする（既定の 10 MiB を待たない）', () => {
+  it('渡した閾値でローテーションする（既定の 32 MiB を待たない）', () => {
     const dir = tempDir();
     const logPath = join(dir, 'server.log');
     const writer = createServerLogWriter({ logPath, maxBytes: 64 });
@@ -322,6 +336,179 @@ describe('createServerLogWriter の maxBytes', () => {
     try {
       writer.write('x'.repeat(1024));
       assert.equal(existsSync(`${logPath}.1`), false);
+    } finally {
+      writer.close();
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// server.log / server.log.1 の権限（0600）
+//
+// 既存ファイルは chmodSync で明示的に 0644 にしてから始めるので、実行環境の
+// umask に結果が左右されない。新規作成の検査は umask を 0 にして行い、
+// umask 任せでは 0600 にならない条件でも 0600 になることを確かめる。
+// ---------------------------------------------------------------------------
+
+describe('server.log の権限', () => {
+  it('LOG_FILE_MODE は 0600', () => {
+    assert.equal(LOG_FILE_MODE, 0o600);
+  });
+
+  it('新規作成した server.log は umask が 0 でも 0600', () => {
+    const dir = tempDir();
+    const logPath = join(dir, 'server.log');
+    const previous = process.umask(0);
+    let writer;
+    try {
+      writer = createServerLogWriter({ logPath, maxBytes: 1024 });
+    } finally {
+      process.umask(previous);
+    }
+    try {
+      assert.notEqual(writer, null);
+      writer.write('line');
+      assert.equal(modeOf(logPath), 0o600);
+    } finally {
+      writer.close();
+    }
+  });
+
+  it('起動時に既存の server.log と server.log.1 を 0644 から 0600 へ補正する', () => {
+    const dir = tempDir();
+    const logPath = join(dir, 'server.log');
+    writeFileSync(logPath, 'old\n');
+    writeFileSync(`${logPath}.1`, 'older\n');
+    chmodSync(logPath, 0o644);
+    chmodSync(`${logPath}.1`, 0o644);
+
+    const writer = createServerLogWriter({ logPath, maxBytes: 1024 });
+    try {
+      assert.equal(modeOf(logPath), 0o600);
+      assert.equal(modeOf(`${logPath}.1`), 0o600);
+      assert.equal(readFileSync(logPath, 'utf8'), 'old\n', '補正は中身を変えない');
+      assert.equal(readFileSync(`${logPath}.1`, 'utf8'), 'older\n');
+    } finally {
+      writer.close();
+    }
+  });
+
+  it('server.log.1 が無くても起動できる（.1 はまだ作らない）', () => {
+    const dir = tempDir();
+    const logPath = join(dir, 'server.log');
+    const writer = createServerLogWriter({ logPath, maxBytes: 1024 });
+    try {
+      assert.notEqual(writer, null);
+      assert.equal(existsSync(`${logPath}.1`), false);
+    } finally {
+      writer.close();
+    }
+  });
+
+  it('回転で新規に作る server.log.1 は、複製元が 0644 でも 0600', () => {
+    const dir = tempDir();
+    const logPath = join(dir, 'server.log');
+    writeFileSync(logPath, 'x'.repeat(2048));
+    chmodSync(logPath, 0o644);
+    const fd = openSync(logPath, 'a');
+    try {
+      assert.equal(maybeRotateLog({ fd, logPath, maxBytes: 1024 }), true);
+      assert.equal(modeOf(`${logPath}.1`), 0o600);
+      // .1 の 0600 は複製元を先に 0600 にしたことで得ている（コピー後の chmod ではない）。
+      assert.equal(modeOf(logPath), 0o600, '複製元はコピーの前に 0600 へ補正される');
+    } finally {
+      closeSync(fd);
+    }
+  });
+
+  it(
+    '複製元を 0600 にできないときは回転しない（.1 を作らず、切り詰めもしない）',
+    { skip: process.platform !== 'darwin' && 'chflags uchg で fchmod を失敗させるのは macOS だけ' },
+    () => {
+      const dir = tempDir();
+      const logPath = join(dir, 'server.log');
+      writeFileSync(logPath, 'x'.repeat(2048));
+      chmodSync(logPath, 0o644);
+      const fd = openSync(logPath, 'a');
+      // 変更不可フラグを立てると、所有者でも fchmod が EPERM で失敗する。
+      execFileSync('/usr/bin/chflags', ['uchg', logPath]);
+      try {
+        assert.equal(maybeRotateLog({ fd, logPath, maxBytes: 1024 }), false);
+        assert.equal(existsSync(`${logPath}.1`), false, '0644 の .1 を作らない');
+      } finally {
+        execFileSync('/usr/bin/chflags', ['nouchg', logPath]);
+        closeSync(fd);
+      }
+      assert.equal(readFileSync(logPath, 'utf8'), 'x'.repeat(2048));
+    },
+  );
+
+  it('起動時の補正は server.log.1 のシンボリックリンクをたどらない（リンク先がディレクトリ）', () => {
+    const dir = tempDir();
+    const logPath = join(dir, 'server.log');
+    const target = join(dir, 'elsewhere');
+    mkdirSync(target);
+    writeFileSync(join(target, 'keep.txt'), 'keep\n');
+    chmodSync(target, 0o755);
+    symlinkSync(target, `${logPath}.1`);
+
+    const writer = createServerLogWriter({ logPath, maxBytes: 1024 });
+    try {
+      assert.notEqual(writer, null, 'server は動き続ける');
+      writer.write('line');
+      assert.equal(modeOf(target), 0o755, 'リンク先ディレクトリの権限は変えない');
+      assert.equal(readFileSync(join(target, 'keep.txt'), 'utf8'), 'keep\n');
+    } finally {
+      writer.close();
+    }
+  });
+
+  it('起動時の補正は server.log.1 のシンボリックリンクをたどらない（リンク先が通常ファイル）', () => {
+    const dir = tempDir();
+    const logPath = join(dir, 'server.log');
+    const target = join(dir, 'other-file');
+    writeFileSync(target, 'other\n');
+    chmodSync(target, 0o644);
+    symlinkSync(target, `${logPath}.1`);
+
+    const writer = createServerLogWriter({ logPath, maxBytes: 1024 });
+    try {
+      assert.notEqual(writer, null);
+      writer.write('line');
+      assert.equal(modeOf(target), 0o644, 'リンク先ファイルの権限は変えない');
+      assert.equal(readFileSync(target, 'utf8'), 'other\n', 'リンク先ファイルの中身は変えない');
+    } finally {
+      writer.close();
+    }
+  });
+
+  it('回転で上書きする既存の server.log.1 が 0644 でも 0600 になる', () => {
+    const dir = tempDir();
+    const logPath = join(dir, 'server.log');
+    writeFileSync(logPath, 'x'.repeat(2048));
+    writeFileSync(`${logPath}.1`, 'stale');
+    chmodSync(logPath, 0o644);
+    chmodSync(`${logPath}.1`, 0o644);
+    const fd = openSync(logPath, 'a');
+    try {
+      assert.equal(maybeRotateLog({ fd, logPath, maxBytes: 1024 }), true);
+      assert.equal(modeOf(`${logPath}.1`), 0o600);
+      assert.equal(readFileSync(`${logPath}.1`, 'utf8'), 'x'.repeat(2048));
+    } finally {
+      closeSync(fd);
+    }
+  });
+
+  it('writer 経由の回転後も server.log と server.log.1 は 0600', () => {
+    const dir = tempDir();
+    const logPath = join(dir, 'server.log');
+    const writer = createServerLogWriter({ logPath, maxBytes: 10 });
+    try {
+      writer.write('x'.repeat(20));
+      writer.write('next');
+      assert.equal(existsSync(`${logPath}.1`), true);
+      assert.equal(modeOf(logPath), 0o600);
+      assert.equal(modeOf(`${logPath}.1`), 0o600);
     } finally {
       writer.close();
     }
