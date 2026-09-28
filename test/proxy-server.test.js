@@ -13082,6 +13082,10 @@ describe('session affinity persistence and reload (R-S11)', () => {
       secretStore,
       logger,
       savedState,
+      // reload で accountUuid を付けた口座は現行ログインとの照合に進む。既定の読み手は実 Keychain
+      // （Linux は実 HOME の .credentials.json）を読み、既定の profile 取得は実 API へ出るので差し替える。
+      currentCredentialReader: async () => { throw new Error('no live Claude Code login in tests'); },
+      currentProfileFetcher: async () => { throw new Error('profile fetch must not run in tests'); },
       ...(credentialChangedAccountIds ? { credentialChangedAccountIds } : {}),
       ...(sessionAffinityPersistIntervalMs == null
         ? {}

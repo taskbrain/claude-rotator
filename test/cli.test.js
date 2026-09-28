@@ -305,6 +305,9 @@ describe('runCli', () => {
 
     const code = await runCli(['status'], {
       ...io,
+      // 既定の readCodexStatus() は実 HOME の設定ファイルを読み、degradeMapping が有効なら
+      // その codexStatusUrl へ HTTP を送る。合成設定を渡して実環境へ届かないようにする。
+      loadConfig: async () => ({ accounts: [] }),
       readStatus: async () => ({
         currentAccount: 'acct_1',
         currentAccountName: 'a@example.com',
@@ -404,6 +407,8 @@ describe('runCli', () => {
 
     const code = await runCli(['login'], {
       ...io,
+      // 既定の loadOrCreateConfig() は実 HOME の設定を読み、無ければ作成する。
+      loadConfig: async () => ({ accounts: [] }),
       readCurrentCredentials: async () => ({ accessToken: 'access', refreshToken: 'refresh' }),
       fetchProfile: async () => ({ email: 'person@example.com', accountUuid: 'uuid-1' }),
       saveImportedAccount: async account => imported.push(account),
@@ -1028,6 +1033,8 @@ describe('runCli', () => {
       loadConfig: async () => ({
         accounts: [{ id: 'current', name: 'person@example.com', type: 'oauth' }],
       }),
+      // 既定の createSecretStore() は実 HOME 配下に資格情報セットのロックを作る。
+      secretStore: new MemorySecretStore(),
       readCurrentCredentials: async () => ({
         accessToken: 'expired-current-token',
         refreshToken: 'current-refresh-token',
@@ -1532,7 +1539,14 @@ describe('uninstall --purge-secrets config read failure warning', () => {
         process.exitCode = code;
       `, 'utf8');
 
-      const result = await runNodeScript(scriptPath);
+      // 子プロセス自身の process.env も一時ディレクトリへ向ける（deps.env ／ deps.home を
+      // 渡さない経路が homedir() ／ process.env の既定パスへ落ちても実 HOME に届かない）。
+      const result = await runNodeScript(scriptPath, {
+        HOME: home,
+        XDG_CONFIG_HOME: xdgConfig,
+        XDG_DATA_HOME: xdgData,
+        CLAUDE_CONFIG_DIR: join(home, '.claude'),
+      });
 
       assert.equal(result.code, 0, `stderr: ${result.stderr}`);
       assert.match(result.stdout, /Uninstalled claude-rotator/);
@@ -1543,9 +1557,21 @@ describe('uninstall --purge-secrets config read failure warning', () => {
   });
 });
 
-function runNodeScript(scriptPath) {
+// 親から継承した CLAUDE_ROTATOR_*（USAGE_EVENTS_DIR・CLAUDE_BIN・SERVICE_GENERATION・
+// MACOS_SERVICE_LOCKED 等）は実環境の値なので子プロセスへ持ち込まない。guard のログ先だけ残す。
+function withoutInheritedRotatorEnv(source) {
+  const env = { ...source };
+  for (const name of Object.keys(env)) {
+    if (name.startsWith('CLAUDE_ROTATOR_') && name !== SERVICE_COMMAND_LOG_ENV) delete env[name];
+  }
+  return env;
+}
+
+function runNodeScript(scriptPath, sandboxEnv) {
+  const env = withoutInheritedRotatorEnv(process.env);
+  Object.assign(env, sandboxEnv);
   return new Promise((resolveDone, reject) => {
-    const child = spawn(process.execPath, [scriptPath], { stdio: ['ignore', 'pipe', 'pipe'] });
+    const child = spawn(process.execPath, [scriptPath], { env, stdio: ['ignore', 'pipe', 'pipe'] });
     const stdout = [];
     const stderr = [];
     child.stdout.on('data', chunk => stdout.push(chunk));
@@ -2391,7 +2417,7 @@ async function fu99StartServer({ home, sessionAffinity, guardLogPath }) {
   });
 
   const env = {
-    ...process.env,
+    ...withoutInheritedRotatorEnv(process.env),
     HOME: home,
     XDG_CONFIG_HOME: join(home, 'xdg'),
     XDG_DATA_HOME: join(home, 'share'),
