@@ -326,3 +326,21 @@ test('auth tracker: a 403 before a reload to one account does not block the 401s
   assert.deepEqual(states, ['ready', 'needs-login']);
   assert.equal(f.entry(0).authReason, 'upstream-unauthorized');
 });
+
+test('auth tracker: exactly half a poll interval apart is not the same cycle, on either side of the 403', async t => {
+  // 「同じ周期」は時刻の差が取得の間隔（60s）の半分より短いこと。ちょうど半分（30s）は裏付けの無い側に倒す。
+  const f = await fixture(t);
+  f.cycle(0, rejected(403)); // A at 0s
+  f.advance(CYCLE_MS);
+  f.cycle(0, rejected(403)); // A at 60s: two 403s in a row
+  f.advance(CYCLE_MS / 2);
+  f.cycle(1, ok()); // B at +90000ms: exactly half an interval after A's second 403
+  assert.equal(f.state(0), 'ready', 'a success exactly half an interval later does not corroborate');
+  f.advance(CYCLE_MS / 2);
+  f.cycle(0, rejected(403)); // A at 120s: exactly half an interval after B's success
+  assert.equal(f.state(0), 'ready', 'nor does one exactly half an interval earlier');
+  f.advance(CYCLE_MS / 2 - 1);
+  f.cycle(1, ok()); // B one millisecond inside the half interval
+  assert.equal(f.state(0), 'needs-login');
+  assert.equal(f.entry(0).authReason, 'upstream-forbidden');
+});
