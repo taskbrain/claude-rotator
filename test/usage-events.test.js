@@ -230,11 +230,14 @@ describe('createUsageEventWriter', () => {
     let release;
     const gate = new Promise(resolve => { release = resolve; });
     let appendCalls = 0;
+    let signalWriteStarted;
+    const writeStarted = new Promise(resolve => { signalWriteStarted = resolve; });
     const writer = createUsageEventWriter({
       dir: join(base, 'usage-events'),
       fsOps: {
         async appendFile(...args) {
           appendCalls += 1;
+          signalWriteStarted();
           await gate;
           return appendFile(...args);
         },
@@ -249,8 +252,17 @@ describe('createUsageEventWriter', () => {
       })).then(() => { settled = true; });
       return { promise, isSettled: () => settled };
     });
-    // Let the queue run up to the stalled write.
-    await new Promise(resolve => setTimeout(resolve, 20));
+    // Wait until the queue reaches the stalled write (not a fixed delay), with an upper bound
+    // so an implementation that never starts the write fails instead of hanging.
+    let timer;
+    const timeout = new Promise((_, reject) => {
+      timer = setTimeout(() => reject(new Error('fsOps.appendFile was not called within 5000ms')), 5000);
+    });
+    try {
+      await Promise.race([writeStarted, timeout]);
+    } finally {
+      clearTimeout(timer);
+    }
     assert.ok(appendCalls >= 1);
     assert.equal(results.some(result => result.isSettled()), false);
 
