@@ -14,6 +14,7 @@ npm レジストリでは配布していません（`package.json` は `"private
 
 ## 目次
 
+- [v0.4.0 の主な更新](#v040-の主な更新)
 - [v0.3.0 の主な更新](#v030-の主な更新)
 - [v0.2.2 の主な更新](#v022-の主な更新)
 - [v0.2.1 の主な更新](#v021-の主な更新)
@@ -31,6 +32,7 @@ npm レジストリでは配布していません（`package.json` は `"private
   - [セッション単位のアカウント固定（sessionAffinity）](#セッション単位のアカウント固定sessionaffinity)
 - [ログと切り替え診断](#ログと切り替え診断)
   - [キャッシュ観測（`observability`）](#キャッシュ観測observability)
+  - [使用量イベント（`usage-events.jsonl`）](#使用量イベントusage-eventsjsonl)
 - [主なコマンド](#主なコマンド)
 - [アップデート](#アップデート)
 - [アンインストール](#アンインストール)
@@ -38,6 +40,15 @@ npm レジストリでは配布していません（`package.json` は `"private
 - [安全設計](#安全設計)
 - [開発](#開発)
 - [English](#english)
+
+## v0.4.0 の主な更新
+
+- **要求ごとの使用量イベント `usage-events.jsonl`**（#53）: `POST /v1/messages` を上流へ送るたびに、1試行につき1行、トークン内訳・アカウント ID・結果を JSON Lines で追記します。要求・応答の本文、ヘッダ、OAuth トークン、API キーは書きません。**現時点では出力を止める設定はありません。** ファイルはローテーションせず増え続けます（500 MiB を超えるとログで警告するだけです）。詳細は [使用量イベント（`usage-events.jsonl`）](#使用量イベントusage-eventsjsonl) を参照してください。
+- **受信本文の上限**（#50）: `proxy.maxRequestBodyBytes`（既定 64 MiB）を超える要求は上流へ転送せず、413 `request_too_large` を返します。従来は上限がありませんでした。大きな本文が必要なら `proxy.maxRequestBodyBytes` を上げてください。
+- **使用率の鮮度を `/internal/status` に表示**（#52）: 各アカウントの `quota` に、使用率を最後に取得した時刻 `usageUpdatedAt` と取得元 `usageSource` が加わりました。負の値の使用率ヘッダも捨てるようにし、捨てた値（数値でない値を含む）を `quota-header-rejected` イベントとして記録します。
+- **猶予ヘッダのログ記録**（#51）: 上流応答に usage-limit の猶予ヘッダ（`anthropic-ratelimit-unified-grace-5h-utilization` / `-7d-utilization`）があるときだけ、proxy 行の末尾へ `g5h=` `g7d=` `ustat=` `ovs=` `ovu=` を追記します。ヘッダの無い応答の行は従来と同一です。
+- **上流混雑時に同じモデルのまま待つ `upstreamOverloadTo429`**（#45・既定 `false`）と、**全アカウント枯渇時に 429 をそのまま返す `claudeExhaustedTo529: false`**（#47・既定は従来どおり `true`）を追加しました。`claudeExhaustedTo529` が効くのは `degradeMapping.enabled` が `true`（529 への写像が有効）のときだけです。
+- **`status` の Codex 節の表示改善**（#46）と、**キャッシュのヒット率を集計する `scripts/cache-report.sh`**（#48）を追加しました。
 
 ## v0.3.0 の主な更新
 
@@ -456,7 +467,7 @@ claude-rotator status
 | `proxy.upstreamConnectTimeoutMs` | `10000`（10秒） | upstream への TCP 接続確立のタイムアウト |
 | `proxy.upstreamConnectRetries` | `3` | 接続確立前の timeout / unreachable 時に同一アカウントで内部 retry する回数 |
 | `proxy.upstreamConnectRetryDelayMs` | `250` | 上記 retry の間隔 |
-| `proxy.maxRequestBodyBytes` | `67108864`（64 MiB） | 受信本文の上限。超えた要求には 413 `request_too_large` を返し、残りの本文は最大 64 MiB・10 秒まで読み捨ててから接続を閉じます（`config.json` に書かなければ既定値） |
+| `proxy.maxRequestBodyBytes` | `67108864`（64 MiB） | 受信本文の上限。超えた要求には 413 `request_too_large` を返し、残りの本文は最大 64 MiB・10 秒まで読み捨ててから接続を閉じます（`config.json` に書かなければ既定値。正の整数以外を書いた場合は `config-warning` を1行出して既定値を使います） |
 | `upstream` | `https://api.anthropic.com` | 転送先の Anthropic API |
 | `switchThreshold` | `1`（＝100%） | この使用率に達したアカウントを利用不可とみなす閾値 |
 | `rotationPolicy.mode` | `use-expiring-weekly` | 切り替えアルゴリズムのモード |
@@ -487,9 +498,9 @@ claude-rotator status
 | `degradeMapping.enabled` | `false` | 写像・学習・403 書き換えの総合スイッチ。`false` なら現行と完全に同一の挙動 |
 | `degradeMapping.bothUnusableStatus` | `403` | Claude も GPT も使えないときのステータス。`403` = 明示停止、`529` = 退避を試み続ける。それ以外の値は `403` として扱います。**`recoveryWaitEnabled` が `true` のときは、このキーより下記の待機（429）が優先します** |
 | `degradeMapping.recoveryWaitEnabled` | `false` | **上流が全滅・一時障害のときに Claude Code を止めず、待たせて自動継続させるスイッチ。** `true` のとき、403 の代わりに **429 `rate_limit_error` ＋ `Retry-After: 30`** を返します。真偽値の `true` だけを受け付け、それ以外（`"true"` や `1` を含む）はすべて `false` です。**`false`（既定）なら応答もログも現行と1バイト変わりません** |
-| `degradeMapping.upstreamOverloadTo429` | `false` | **Anthropic 上流が混雑しているとき（529 `overloaded_error`）に、429 `rate_limit_error` ＋ `Retry-After` へ書き換えて返すスイッチ。** Claude Code は 529 を3回受けると `fallbackModel` の次の要素へ移りますが、429 なら**同じモデルのまま待って再試行**します（「ハイデマンドで Fable 5.1 が使えないときに退避させたくない」場合に使います）。真偽値の `true` だけを受け付け、それ以外（`"true"` や `1` を含む）はすべて `false` です。**これは Claude 側だけの機能で、`degradeMapping.enabled` にも `openaiBridge.enabled` にも依存しません**（設定の置き場所が `degradeMapping` の下なのは、`POST /internal/reload` の既存の再読み込み経路にそのまま乗るためです）。**`false`（既定）なら応答もログも現行と1バイト変わりません** |
+| `degradeMapping.upstreamOverloadTo429` | `false` | **Anthropic 上流が混雑しているとき（529 `overloaded_error`）に、429 `rate_limit_error` ＋ `Retry-After` へ書き換えて返すスイッチ。** Claude Code は 529 を3回受けると `fallbackModel` の次の要素へ移りますが、429 なら**同じモデルのまま待って再試行**します（「ハイデマンドで Fable 5.1 が使えないときに退避させたくない」場合に使います）。真偽値の `true` だけを受け付け、それ以外（`"true"` や `1` を含む）はすべて `false` です。**これは Claude 側だけの機能で、`degradeMapping.enabled` にも `openaiBridge.enabled` にも依存しません**（設定の置き場所が `degradeMapping` の下なのは、`POST /internal/reload` の既存の再読み込み経路にそのまま乗るためです）。ただし `openaiBridge.enabled` が `true` で、その `url` / `modelPattern` が不正（`url` がループバックでない場合を含む）なときは、このキーを含む `degradeMapping` 全体が無効になります。**`false`（既定）なら応答もログも現行と1バイト変わりません** |
 | `degradeMapping.upstreamOverloadRetryAfterSeconds` | `30` | 上記で付け直す `Retry-After` の秒数。`1`〜`3600` の整数だけを受け付け、それ以外（小数・文字列・範囲外）はすべて `30` になります |
-| `degradeMapping.claudeExhaustedTo529` | `true` | **Claude の全口座が枠切れになったときに、claude-rotator が返す 429 を 529 `overloaded_error` へ書き換えるかどうか。** 既定の `true` は従来どおりの挙動で、Claude Code を `fallbackModel` の次のモデルへ退避させるための書き換えです。`false` にすると、429 を `anthropic-ratelimit-unified-*` ヘッダと本文のまま**そのまま返します**——Claude Code はこれを「プランの使用量上限」と認識し、`fallbackModel` を使わずに**同じモデルのままリセットまで待って再試行**します（`fallbackModel` を設定しない運用ではこちらが目的の挙動です）。**このキーだけは既定が `true` なので、無効化として受け付けるのは真偽値の `false` だけ**です（`"false"` や `0` を含むそれ以外の値はすべて既定の `true` になります）。`degradeMapping.enabled` にも `openaiBridge.enabled` にも依存しません。`false` にしたときは起動時と `POST /internal/reload` のときに `config-notice` が1行出ます |
+| `degradeMapping.claudeExhaustedTo529` | `true` | **Claude の全口座が枠切れになったときに、claude-rotator が返す 429 を 529 `overloaded_error` へ書き換えるかどうか。** 既定の `true` は従来どおりの写像（529。`bothUnusableStatus` / `recoveryWaitEnabled` によっては 403 / 429）で、Claude Code を `fallbackModel` の次のモデルへ退避させるための書き換えです。`false` にすると、429 を `anthropic-ratelimit-unified-*` ヘッダと本文のまま**そのまま返します**——Claude Code はこれを「プランの使用量上限」と認識し、`fallbackModel` を使わずに**同じモデルのままリセットまで待って再試行**します（`fallbackModel` を設定しない運用ではこちらが目的の挙動です）。**このキーだけは既定が `true` なので、無効化として受け付けるのは真偽値の `false` だけ**です（`"false"` や `0` を含むそれ以外の値はすべて既定の `true` になります）。**このキーが効くのは `degradeMapping.enabled` が `true`（529 への写像が有効）のときだけです。** `degradeMapping.enabled` が `false`（既定）なら、この 429 はもともと書き換えられずにそのまま返るので、`true` でも `false` でも応答は変わりません（`false` にしたときの `config-notice` が出るだけです）。ただし `openaiBridge.enabled` が `true` で、その `url` / `modelPattern` が不正（`url` がループバックでない場合を含む）なときは、このキーを含む `degradeMapping` 全体が無効になります。`false` にしたときは起動時と `POST /internal/reload` のときに `config-notice` が1行出ます |
 | `degradeMapping.gptPoolUnusableTtlMs` | `60000`（60秒） | 「GPT 側は使えない」という学習を、状態不明へ戻すまでの時間。`recoveryWaitEnabled` が `false` のときは**回復見込み時刻を伴わない学習にだけ**効き、`true` のときは回復見込み時刻を伴う学習にも `min(回復見込み時刻, 学習時刻 + この値)` として効きます |
 | `degradeMapping.codexStatusUrl` | `null` | `status` にブリッジ側の枠状況を表示するための取得先（loopback のみ）。`null` なら表示しません |
 | `degradeMapping.codexStatusTimeoutMs` | `1500` | 上記取得のタイムアウト（必ず有限値） |
@@ -560,7 +571,7 @@ claude-rotator status
 
 - 529 は Anthropic が本当に過負荷のときと同じ経路です。`fallbackModel` を設定していない利用者からは、通常の過負荷エラーと区別が付きません。次の要素へ切り替わるのは Claude Code が 529 を3回再試行した後で、これは `fallbackModel` に次の要素がある場合の挙動です。
 - `fallbackModel` の最終要素も同じ枯渇したプールに当たる構成では、Claude Code は指数バックオフ（約0.6秒→約74秒）で再試行を続けます。当リポジトリの実測では、150秒の観測窓内で終端せず、エラー表示も出ませんでした。`bothUnusableStatus` の既定を `403`（明示停止）にしているのはこのためで、`529` にすると同じ無言待ちが起こり得ます。`openaiBridge.enabled` が `false` のまま `degradeMapping.enabled` を `true` にする構成でも同じ限界があるため、起動時とリロード時に警告を1行出します（禁止はしません）。
-- ログにも `status` の表示にも、メールアドレスなどの識別子は出しません（アカウントはラベルだけを扱います）。
+- ログには token を書かず、アカウントはアカウント ID（`account=`）で表します。`--id` を省いて登録した場合、このアカウント ID はメールアドレスの記号をハイフンに置き換えたものなので、元のアドレスがほぼ読み取れます。`status` のアカウント表示には登録時の表示名（`--name`。省略時はログイン中のメールアドレス）がそのまま出ます。
 
 #### `status` の Codex 節（`codexStatusUrl` を設定したとき）
 
@@ -692,6 +703,15 @@ Codex Rotator                          sendable 0/2  (held 1, capped 1)
 
 値が無いところは `-` になります。`totalRequests` は **usage を読めた応答だけ**を 1 件として数えます（読めなかった件数は `usageParse=` の分布から数えてください）。
 
+上流応答に usage-limit の猶予ヘッダ（`anthropic-ratelimit-unified-grace-5h-utilization` / `anthropic-ratelimit-unified-grace-7d-utilization`）が付いているときだけ、さらに行の末尾へ次の5項目を足します。どちらのヘッダも無い（または数値でない）応答では何も足さず、行は従来とバイト単位で同一です。
+
+| フィールド | 意味 |
+| --- | --- |
+| `g5h` / `g7d` | 5時間枠 / 7日枠の猶予の使用率（`anthropic-ratelimit-unified-grace-5h-utilization` / `-7d-utilization`）。片方だけ来たときは、無い方が `-`。 |
+| `ustat` | `anthropic-ratelimit-unified-status`。`ustat` / `ovs` / `ovu` とも、ヘッダが無ければ `-`。 |
+| `ovs` | `anthropic-ratelimit-unified-overage-status`。 |
+| `ovu` | `anthropic-ratelimit-unified-overage-in-use`。 |
+
 キャッシュの使われ具合は `scripts/cache-report.sh` で集計できます（読み取りのみ。`server.log.1` と `server.log` を読みます）。ヒット率は `cr ÷ (in + cr + cc)` で、集計単位ごとの件数・`in`/`cr`/`cc` の合計・`c1h`/`c5m` の内訳・`usageParse=no-usage` の件数と、最後に `TOTAL` 行を出します。`--since` は行頭の時刻（UTC）で絞ります。
 
 ```bash
@@ -749,7 +769,7 @@ proxy request ログに出るのは `account`、`method`、`path`、`status`、`
 - `affinity_disabled` — `mode` を `off` へ戻したので表を破棄した（`sessions=` は破棄した件数）。
 - `affinity_restore` — 保存された表を読み込めなかった（`skipped=malformed` / `version` / `saved-at`）。壊れたデータの中身はログに出しません。
 
-いずれの行にも、生のセッション ID・token・メールアドレスは出しません（`sid` は12桁ハッシュ、アカウントはラベルだけです）。
+いずれの行にも、生のセッション ID・token は出しません（`sid` は12桁ハッシュです）。アカウントはアカウント ID で表します。`--id` を省いて登録した場合、このアカウント ID はメールアドレスの記号をハイフンに置き換えたものなので、元のアドレスがほぼ読み取れます。
 
 `/internal/status` には `sessionAffinity` 節が増えます（**`mode: "off"` ではキー自体がありません**）。内訳は `mode`、`sessions`（保持しているセッション数）、`capacity`（`maxSessions`）、`warmTtlMs`、`sessionsByAccount`（アカウント別のセッション数。**Fable 用の副バインドで1つのセッションが2つのアカウントに数えられるため、合計はセッション総数と一致しません**）、`warmSessionsByAccount`（そのうちキャッシュがまだ生きているとみなしているセッション数。`sessionsByAccount` との差が、冷えたまま表に残っているセッションです）、`switchesByReason`、`evictionsByReason`、`requests`（`proxied` = 転送したリクエスト数、`keyed` = うちセッション鍵が付いていた数）、`sidRate`（`keyed / proxied` を小数第4位で丸めた値。転送が0件なら `null`）です。`claude-rotator status` / `monitor` では、同じ内容を `Session Affinity` の行として表示します。
 
@@ -793,6 +813,31 @@ claude-rotator prepare-resume --json
 ```bash
 claude-rotator prepare-resume --refresh --json
 ```
+
+### 使用量イベント（`usage-events.jsonl`）
+
+常駐 server は、`POST /v1/messages` を上流へ送るたびに、**その1試行ぶんの使用量を JSON Lines で1行**追記します。401 後の再送やアカウント切り替えで同じ要求を複数回送った場合は、試行ごとに1行ずつ書きます。成功・429・5xx・接続エラー・クライアントの途中切断・proxy 内部の想定外エラーのどれで終わっても、1試行につきちょうど1行です。
+
+- **出力先**: `$XDG_CONFIG_HOME/claude-rotator/usage-events/usage-events.jsonl`（`XDG_CONFIG_HOME` 未設定時は `~/.config/claude-rotator/usage-events/usage-events.jsonl`）。環境変数 `CLAUDE_ROTATOR_USAGE_EVENTS_DIR` にディレクトリを指定すると、そこへ書きます（先頭の `~/` は展開します。ファイル名は固定です）。環境変数は `install` が登録する常駐サービス（launchd / systemd）には渡されないため、効くのは、その変数を設定したシェルから `claude-rotator server` を手で起動したときだけです。
+- **書く項目は次だけです**（許可リスト方式）。
+
+| 項目 | 意味 |
+| --- | --- |
+| `ts` | 記録した時刻（ISO 8601） |
+| `eventId` | `<requestId>/<attempt>`。上流の `request-id` が取れなかった試行（接続エラー等）はランダムな UUID |
+| `requestId` / `messageId` | 上流応答の `request-id` / メッセージ ID（`msg_...`）。無ければ `null` |
+| `accountId` | 送った先のアカウント ID（`server.log` や `status` と同じ ID） |
+| `model` | 上流の応答が名乗ったモデル ID |
+| `attempt` | 同じ要求の中で何回目の試行か（1 から） |
+| `outcome` / `statusCode` / `errorType` | 試行の結果（`ok`・`quota-retry`・`upstream-error` など proxy 行の `outcome` と同じ語。クライアントの途中切断は `client-aborted`、proxy 内部の想定外エラーは `proxy-error`）、上流の HTTP ステータス、接続エラー等の種別 |
+| `usage` | `inputTokens` / `outputTokens` / `cacheCreation5m` / `cacheCreation1h` / `cacheRead`。2xx 以外や usage を読めなかった応答は `null`。上流がキャッシュ作成量を合計だけで返し 5m/1h の内訳が無いときは、内訳の2項目を推測せず `null` にします |
+
+- **要求・応答の本文、ヘッダ、OAuth トークン、API キーは書きません。** ただし `accountId` はメールアドレスの記号をハイフンに置き換えたアカウント ID で、元のアドレスがほぼ読み取れるため、`server.log` と同じ扱いで保管してください。
+- **権限**: ディレクトリは `0700`、ファイルは `0600` に直してから書き、書く前に種類・所有者・グループ／他者の権限が残っていないことを確かめます。確保できないときはそのイベントを書かずにログへ `usage-events-chmod result=failed` を出し（同じ種類は10分に1回まで）、次のイベントで再び確保を試みます。
+- **転送は止めません。** 追記は直列のキューへ積むだけで、転送の経路では完了を待ちません。書き込みの失敗はログへ1行出すだけで、転送やアカウント切り替えには影響しません（キューに1万件たまった後のイベントは捨て、そのことをログへ出します）。
+- **ローテーションはしません。** ファイルは増え続けます。1,000 行追記するごとにサイズを確かめ、500 MiB を超えていれば `usage-events-size result=over-limit` をログへ出すだけです。必要に応じて手で退避・切り詰めてください。
+- **記録しない要求**: `POST /v1/messages/count_tokens`、proxy 自身が行う Usage API の取得、OpenAI bridge へ回した要求。
+- **現時点では出力を止める設定はありません。** `claude-rotator` の CLI から server を動かしている限り、常に書き出します。
 
 ## 主なコマンド
 
@@ -884,9 +929,10 @@ claude-rotator uninstall --purge-secrets
 - `~/.config/claude-rotator/config.json`（登録アカウント一覧・設定）
 - `~/.config/claude-rotator/runtime-state.json`（直近の使用率キャッシュ）
 - `~/.config/claude-rotator/server.log` / `server.err`（ログ）
+- `~/.config/claude-rotator/usage-events/usage-events.jsonl`（使用量イベント）
 - `npm install -g .` でインストールしたグローバル npm パッケージ本体
 
-すべて削除するには、`uninstall --purge-secrets` の後に次を実行してください（`XDG_CONFIG_HOME` / `XDG_DATA_HOME` を独自設定している場合はそちらのパスに読み替えてください）。
+すべて削除するには、`uninstall --purge-secrets` の後に次を実行してください（`XDG_CONFIG_HOME` / `XDG_DATA_HOME` を独自設定している場合はそちらのパスに読み替えてください。`CLAUDE_ROTATOR_USAGE_EVENTS_DIR` で使用量イベントの出力先を変えている場合は、そのディレクトリも別に削除してください）。
 
 ```bash
 rm -rf ~/.config/claude-rotator
@@ -993,6 +1039,7 @@ This package is not published to the npm registry (`package.json` sets `"private
 
 ### Table of Contents
 
+- [What's New in v0.4.0](#whats-new-in-v040)
 - [What's New in v0.3.0](#whats-new-in-v030)
 - [What's New in v0.2.2](#whats-new-in-v022)
 - [What's New in v0.2.1](#whats-new-in-v021)
@@ -1009,12 +1056,22 @@ This package is not published to the npm registry (`package.json` sets `"private
 - [Configuration and Environment Variables](#configuration-and-environment-variables)
   - [Per-Session Account Pinning (sessionAffinity)](#per-session-account-pinning-sessionaffinity)
 - [Logs and Rotation Diagnostics](#logs-and-rotation-diagnostics)
+  - [Per-Request Usage Events (usage-events.jsonl)](#per-request-usage-events-usage-eventsjsonl)
 - [Commands](#commands)
 - [Update](#update)
 - [Uninstall](#uninstall)
 - [Troubleshooting](#troubleshooting)
 - [Security Design](#security-design)
 - [Development](#development)
+
+### What's New in v0.4.0
+
+- **Per-request usage events in `usage-events.jsonl`** (#53): Every upstream attempt of `POST /v1/messages` appends one JSON Lines entry with the token breakdown, the account ID, and the outcome. Request and response bodies, headers, OAuth tokens, and API keys are never written. **There is no setting to turn this output off yet.** The file is never rotated and keeps growing (only a log warning past 500 MiB). See [Per-Request Usage Events](#per-request-usage-events-usage-eventsjsonl).
+- **Request body cap** (#50): A request larger than `proxy.maxRequestBodyBytes` (64 MiB by default) is not forwarded and gets 413 `request_too_large`. There was no limit before; raise `proxy.maxRequestBodyBytes` if you need larger bodies.
+- **Usage freshness in `/internal/status`** (#52): Each account's `quota` gains `usageUpdatedAt` (when utilization was last taken) and `usageSource` (where it came from). Negative utilization headers are now dropped as well, and dropped values (including non-numeric ones) are recorded as `quota-header-rejected` events.
+- **Grace headers in the log** (#51): Only when an upstream response carries the usage-limit grace headers (`anthropic-ratelimit-unified-grace-5h-utilization` / `-7d-utilization`), the proxy line gains `g5h=` `g7d=` `ustat=` `ovs=` `ovu=` at the end. Lines for responses without them are unchanged.
+- **`upstreamOverloadTo429`** (#45, default `false`) keeps Claude Code waiting on the same model during an upstream overload, and **`claudeExhaustedTo529: false`** (#47, default stays `true`) passes the plan-limit 429 through when every Claude account is exhausted. `claudeExhaustedTo529` only applies while `degradeMapping.enabled` is `true` (that is, while the 529 mapping is on).
+- **A clearer Codex block in `status`** (#46) and **`scripts/cache-report.sh`** (#48), which summarizes the cache hit rate.
 
 ### What's New in v0.3.0
 
@@ -1464,7 +1521,7 @@ What the main keys mean:
 | `proxy.upstreamConnectTimeoutMs` | `10000` (10 sec) | Timeout for establishing the TCP connection to upstream |
 | `proxy.upstreamConnectRetries` | `3` | Number of internal retries on the same account for a connection-establishment timeout / unreachable error |
 | `proxy.upstreamConnectRetryDelayMs` | `250` | Delay between the retries above |
-| `proxy.maxRequestBodyBytes` | `67108864` (64 MiB) | Maximum request body size. A larger request gets 413 `request_too_large`; the rest of its body is discarded for up to 64 MiB or 10 seconds before the connection is closed (the default applies when the key is absent from `config.json`) |
+| `proxy.maxRequestBodyBytes` | `67108864` (64 MiB) | Maximum request body size. A larger request gets 413 `request_too_large`; the rest of its body is discarded for up to 64 MiB or 10 seconds before the connection is closed (the default applies when the key is absent from `config.json`; any value other than a positive integer logs one `config-warning` line and falls back to the default) |
 | `upstream` | `https://api.anthropic.com` | The Anthropic API the proxy forwards requests to |
 | `switchThreshold` | `1` (= 100%) | The usage ratio at which an account is considered unavailable |
 | `rotationPolicy.mode` | `use-expiring-weekly` | The switching algorithm's mode |
@@ -1495,9 +1552,9 @@ Configuration keys (the whole section may be omitted):
 | `degradeMapping.enabled` | `false` | Master switch for the mapping, the learning, and the 403 rewrite. With `false` the behavior is identical to the current one |
 | `degradeMapping.bothUnusableStatus` | `403` | Status returned when neither Claude nor GPT is usable. `403` = stop explicitly, `529` = keep attempting to degrade. Any other value is treated as `403`. **When `recoveryWaitEnabled` is `true`, the wait below takes precedence over this key** |
 | `degradeMapping.recoveryWaitEnabled` | `false` | **Keeps Claude Code alive while every upstream is exhausted or temporarily broken.** When `true`, the proxy answers **429 `rate_limit_error` with `Retry-After: 30`** instead of 403. Only the boolean `true` is accepted (`"true"` and `1` are not). **With `false` (the default) both the responses and the log lines are byte-for-byte identical to the current behavior** |
-| `degradeMapping.upstreamOverloadTo429` | `false` | **Rewrites an overloaded Anthropic upstream (529 `overloaded_error`) into 429 `rate_limit_error` with `Retry-After`.** Claude Code moves to the next `fallbackModel` entry after three 529s, but on a 429 it **waits and retries on the same model** (use this when a high-demand period must not silently switch you off the model you asked for). Only the boolean `true` is accepted (`"true"` and `1` are not). **This is a Claude-side feature and depends on neither `degradeMapping.enabled` nor `openaiBridge.enabled`** — it lives under `degradeMapping` only so that it is picked up by the existing `POST /internal/reload` path. **With `false` (the default) both the responses and the log lines are byte-for-byte identical to the current behavior** |
+| `degradeMapping.upstreamOverloadTo429` | `false` | **Rewrites an overloaded Anthropic upstream (529 `overloaded_error`) into 429 `rate_limit_error` with `Retry-After`.** Claude Code moves to the next `fallbackModel` entry after three 529s, but on a 429 it **waits and retries on the same model** (use this when a high-demand period must not silently switch you off the model you asked for). Only the boolean `true` is accepted (`"true"` and `1` are not). **This is a Claude-side feature and depends on neither `degradeMapping.enabled` nor `openaiBridge.enabled`** — it lives under `degradeMapping` only so that it is picked up by the existing `POST /internal/reload` path. However, if `openaiBridge.enabled` is `true` and its `url` / `modelPattern` is invalid (including a non-loopback `url`), the whole `degradeMapping`, this key included, is disabled. **With `false` (the default) both the responses and the log lines are byte-for-byte identical to the current behavior** |
 | `degradeMapping.upstreamOverloadRetryAfterSeconds` | `30` | Seconds put into that `Retry-After`. Only integers from `1` to `3600` are accepted; anything else (fractions, strings, out-of-range values) becomes `30` |
-| `degradeMapping.claudeExhaustedTo529` | `true` | **Whether a 429 returned while every Claude account is out of quota is rewritten into 529 `overloaded_error`.** This covers every 429 the proxy answers with in that state — both the one it synthesises locally and one passed through from upstream — because they all reach the same mapping point. The default `true` is the existing behavior: the rewrite is what makes Claude Code move on to the next `fallbackModel` entry. With `false` each of those 429s is **returned unchanged**, keeping its `anthropic-ratelimit-unified-*` headers and body — Claude Code then recognises it as a plan usage limit and **waits for the reset and retries on the same model** instead of falling back (this is what you want when no `fallbackModel` is configured). **This is the one key whose default is `true`, so only the boolean `false` turns it off** (everything else, `"false"` and `0` included, leaves the default `true` in place). It depends on neither `degradeMapping.enabled` nor `openaiBridge.enabled`. Turning it off prints one `config-notice` line at startup and on `POST /internal/reload` |
+| `degradeMapping.claudeExhaustedTo529` | `true` | **Whether a 429 returned while every Claude account is out of quota is rewritten into 529 `overloaded_error`.** This covers every 429 the proxy answers with in that state — both the one it synthesises locally and one passed through from upstream — because they all reach the same mapping point. The default `true` is the existing mapping (529, or 403 / 429 depending on `bothUnusableStatus` / `recoveryWaitEnabled`): the rewrite is what makes Claude Code move on to the next `fallbackModel` entry. With `false` each of those 429s is **returned unchanged**, keeping its `anthropic-ratelimit-unified-*` headers and body — Claude Code then recognises it as a plan usage limit and **waits for the reset and retries on the same model** instead of falling back (this is what you want when no `fallbackModel` is configured). **This is the one key whose default is `true`, so only the boolean `false` turns it off** (everything else, `"false"` and `0` included, leaves the default `true` in place). **It only applies while `degradeMapping.enabled` is `true` (that is, while the 529 mapping is on).** With `degradeMapping.enabled` set to `false` (the default) that 429 is already returned unchanged, so `true` and `false` give the same response (`false` only adds the `config-notice` line). However, if `openaiBridge.enabled` is `true` and its `url` / `modelPattern` is invalid (including a non-loopback `url`), the whole `degradeMapping`, this key included, is disabled. Turning it off prints one `config-notice` line at startup and on `POST /internal/reload` |
 | `degradeMapping.gptPoolUnusableTtlMs` | `60000` (60 sec) | How long a "GPT side is unusable" observation is kept before it reverts to unknown. With `recoveryWaitEnabled: false` it only applies to observations **without** a recovery time; with `true` it also caps observations that carry one, as `min(recovery time, learned at + this value)` |
 | `degradeMapping.codexStatusUrl` | `null` | Endpoint used to show the bridge's quota state in `status` (loopback only). `null` shows nothing |
 | `degradeMapping.codexStatusTimeoutMs` | `1500` | Timeout for that fetch (always finite) |
@@ -1557,7 +1614,7 @@ Caveats:
 
 - A 529 travels the same path as a genuine Anthropic overload. To a user with no `fallbackModel`, it is indistinguishable from an ordinary overload error. Claude Code moves to the next entry after retrying a 529 three times, and that behavior applies only while `fallbackModel` still has a next entry.
 - If the last entry of `fallbackModel` lands in the same exhausted pool, Claude Code keeps retrying with exponential backoff (about 0.6 sec growing to about 74 sec). In our measurements it neither terminated nor surfaced an error within the 150-second observation window. That is why `bothUnusableStatus` defaults to `403` (explicit stop); setting `529` can reproduce the same silent wait. Leaving `openaiBridge.enabled` at `false` while turning `degradeMapping.enabled` on has the same limitation, so a single warning line is logged at startup and on reload (the combination is not forbidden).
-- Neither the logs nor the `status` output ever contain email addresses or similar identifiers; accounts are handled by label only.
+- Tokens are never logged, and accounts appear in the logs by account ID (`account=`). If you registered an account without `--id`, that ID is the email address with symbols replaced by hyphens, so the address is effectively readable. The account cards in `status` show the display name given at registration (`--name`; the logged-in email address when omitted) as is.
 
 #### The Codex Block in `status` (when `codexStatusUrl` is set)
 
@@ -1672,6 +1729,8 @@ scripts/cache-report.sh --since 1d --by account    # by account ID (the email ad
 scripts/cache-report.sh --by sid --json            # machine-readable; --log <path> reads another file
 ```
 
+Only when an upstream response carries a usage-limit grace header (`anthropic-ratelimit-unified-grace-5h-utilization` / `anthropic-ratelimit-unified-grace-7d-utilization`), five more fields are appended at the end of the proxy line: `g5h` / `g7d` (the 5-hour / 7-day grace utilization; `-` for the one that is missing), `ustat` (`anthropic-ratelimit-unified-status`), `ovs` (`anthropic-ratelimit-unified-overage-status`), and `ovu` (`anthropic-ratelimit-unified-overage-in-use`); `ustat` / `ovs` / `ovu` are `-` when their header is absent. When neither grace header is present (or neither is a number), nothing is appended and the line is byte-for-byte unchanged. Like the cache fields, they are written only while `observability.requestLog.enabled` is `true` (the default).
+
 The only fields written to the proxy request log are `account`, `method`, `path`, `status`, `durationMs`, `outcome`, `requestId`, and, on a timeout/network error, `errorType`. Internal proxy errors are logged as a short `proxy-error method=... path=... error=...` line. Tokens, the `Authorization` header, API keys, request bodies, and response bodies are never logged.
 
 Enabling [Per-Session Account Pinning](#per-session-account-pinning-sessionaffinity) (`sessionAffinity`) adds the following fields and lines. **With `mode: "off"` (the default) none of them is written, and the proxy request log line stays byte-identical to today's.**
@@ -1686,7 +1745,7 @@ Enabling [Per-Session Account Pinning](#per-session-account-pinning-sessionaffin
 - `affinity_disabled` — `mode` went back to `off`, so the table was discarded (`sessions=` is how many entries were dropped).
 - `affinity_restore` — the saved table could not be loaded (`skipped=malformed` / `version` / `saved-at`). The contents of the broken data are never logged.
 
-None of these lines contains a raw session id, a token, or an email address (`sid` is the 12-digit hash, and accounts are labels only).
+None of these lines contains a raw session id or a token (`sid` is the 12-digit hash). Accounts appear by account ID; if you registered an account without `--id`, that ID is the email address with symbols replaced by hyphens, so the address is effectively readable.
 
 `/internal/status` gains a `sessionAffinity` section (**the key itself is absent while `mode` is `"off"`**) containing `mode`, `sessions` (how many sessions are held), `capacity` (`maxSessions`), `warmTtlMs`, `sessionsByAccount` (sessions per account — **a Fable sub-binding makes one session count towards two accounts, so this never sums to the session total**), `warmSessionsByAccount` (how many of those are still treated as holding a cache; the difference from `sessionsByAccount` is what has gone cold while staying in the table), `switchesByReason`, `evictionsByReason`, `requests` (`proxied` = requests forwarded, `keyed` = how many of them carried a session key), and `sidRate` (`keyed / proxied`, rounded to four decimal places; `null` when nothing has been forwarded). `claude-rotator status` / `monitor` shows the same values as a `Session Affinity` block.
 
@@ -1730,6 +1789,31 @@ To refetch the Usage API first, only when needed:
 ```bash
 claude-rotator prepare-resume --refresh --json
 ```
+
+#### Per-Request Usage Events (`usage-events.jsonl`)
+
+The resident server appends **one JSON Lines entry per upstream attempt** of `POST /v1/messages`. When the same request is sent more than once (a resend after 401, or an account switch), each attempt gets its own line. Whether the attempt ends in success, 429, 5xx, a connection error, a client abort, or an unexpected proxy error, it produces exactly one line.
+
+- **Location:** `$XDG_CONFIG_HOME/claude-rotator/usage-events/usage-events.jsonl` (`~/.config/claude-rotator/usage-events/usage-events.jsonl` when `XDG_CONFIG_HOME` is unset). Set the environment variable `CLAUDE_ROTATOR_USAGE_EVENTS_DIR` to a directory to write there instead (a leading `~/` is expanded; the file name is fixed). The variable is not passed to the service that `install` registers (launchd / systemd), so it only takes effect when you start `claude-rotator server` by hand from a shell where it is set.
+- **Only these fields are written** (allow-list):
+
+| Field | Meaning |
+| --- | --- |
+| `ts` | When the event was recorded (ISO 8601) |
+| `eventId` | `<requestId>/<attempt>`; a random UUID for an attempt with no upstream `request-id` (a connection error, for example) |
+| `requestId` / `messageId` | The upstream `request-id` / message ID (`msg_...`); `null` when absent |
+| `accountId` | The account the attempt went to (the same ID as in `server.log` and `status`) |
+| `model` | The model ID named by the upstream response |
+| `attempt` | Which attempt of the same request this was (starting at 1) |
+| `outcome` / `statusCode` / `errorType` | The result of the attempt (the same words as the proxy line's `outcome`, such as `ok`, `quota-retry`, `upstream-error`; a client abort is `client-aborted` and an unexpected proxy error is `proxy-error`), the upstream HTTP status, and the kind of connection error |
+| `usage` | `inputTokens` / `outputTokens` / `cacheCreation5m` / `cacheCreation1h` / `cacheRead`. `null` for a non-2xx response or one whose usage could not be read. When the upstream reports cache creation only as a total without the 5m/1h split, both split fields are `null` rather than guessed |
+
+- **Request and response bodies, headers, OAuth tokens, and API keys are never written.** `accountId` is the email address with symbols replaced by hyphens, though, so the address is effectively readable; keep the file as carefully as `server.log`.
+- **Permissions:** the directory is set to `0700` and the file to `0600` before writing, and their type, owner, and the absence of group/other bits are checked. If that cannot be ensured, the event is skipped, `usage-events-chmod result=failed` is logged (at most once per 10 minutes for the same kind), and the next event tries again.
+- **Forwarding is never held up.** Writes are queued in order and never awaited on the forwarding path. A failed write is logged in one line and has no effect on forwarding or account switching (once 10,000 events are pending, further events are dropped and that is logged).
+- **No rotation.** The file keeps growing. Its size is checked every 1,000 appends, and `usage-events-size result=over-limit` is logged once it exceeds 500 MiB; nothing else happens. Move or truncate it yourself when needed.
+- **Not recorded:** `POST /v1/messages/count_tokens`, the proxy's own Usage API calls, and requests routed to the OpenAI bridge.
+- **There is currently no setting to turn this output off.** Whenever the server runs through the `claude-rotator` CLI, the file is written.
 
 ### Commands
 
@@ -1821,9 +1905,10 @@ The scope of `--purge-secrets` differs between macOS and Linux:
 - `~/.config/claude-rotator/config.json` (registered accounts and settings)
 - `~/.config/claude-rotator/runtime-state.json` (the latest usage cache)
 - `~/.config/claude-rotator/server.log` / `server.err` (logs)
+- `~/.config/claude-rotator/usage-events/usage-events.jsonl` (usage events)
 - the global npm package itself, installed via `npm install -g .`
 
-To remove everything, run the following after `uninstall --purge-secrets` (substitute your own paths if you've set `XDG_CONFIG_HOME` / `XDG_DATA_HOME`):
+To remove everything, run the following after `uninstall --purge-secrets` (substitute your own paths if you've set `XDG_CONFIG_HOME` / `XDG_DATA_HOME`; if you pointed `CLAUDE_ROTATOR_USAGE_EVENTS_DIR` elsewhere, remove that directory separately):
 
 ```bash
 rm -rf ~/.config/claude-rotator
