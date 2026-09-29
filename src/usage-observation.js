@@ -11,6 +11,8 @@
 import zlib from 'node:zlib';
 import { promisify } from 'node:util';
 
+import { LOG_MAX_BYTES } from './log-rotation.js';
+
 const MIB = 1024 * 1024;
 
 export const DEFAULT_OBSERVABILITY = Object.freeze({
@@ -34,7 +36,8 @@ export const DEFAULT_OBSERVABILITY = Object.freeze({
     dropUndecodableAcceptEncoding: true,
   }),
   // U-4（母艦の即決）: 32 MiB。2世代で 64 MiB ＝ 約 4.1 日となり現行（約 2.4 日）より広い。
-  logMaxBytes: 32 * MIB,
+  // 値の定義は src/log-rotation.js の LOG_MAX_BYTES の1か所だけ（ここは参照するだけ）。
+  logMaxBytes: LOG_MAX_BYTES,
 });
 
 const OBSERVABILITY_RANGES = Object.freeze({
