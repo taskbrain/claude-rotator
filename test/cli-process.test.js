@@ -6,6 +6,7 @@ import http from 'node:http';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 
+import { SERVICE_COMMAND_LOG_ENV } from '../fixtures/service-command-guard.js';
 import { writeJsonFile } from '../src/json-file.js';
 
 it('flushes large prepare-resume JSON when stdout is a pipe', async () => {
@@ -67,7 +68,7 @@ it('flushes large prepare-resume JSON when stdout is a pipe', async () => {
   try {
     const result = await runProcess(process.execPath, [resolve('bin/claude-rotator.js'), 'prepare-resume', '--json'], {
       cwd: resolve('.'),
-      env: { ...process.env, CLAUDE_ROTATOR_CONFIG: configPath },
+      env: isolatedEnv(dir, configPath),
     });
 
     assert.equal(result.code, 0, result.stderr);
@@ -79,6 +80,23 @@ it('flushes large prepare-resume JSON when stdout is a pipe', async () => {
     await close(server);
   }
 });
+
+// 子プロセスの HOME・XDG・Claude 設定を一時ディレクトリへ向け、親から継承した
+// CLAUDE_ROTATOR_*（guard のログ先を除く）を落とす。CLAUDE_ROTATOR_CONFIG だけの差し替えでは
+// 実 HOME の既定パス（~/.config/claude-rotator 等）へ落ちる経路が残る。
+function isolatedEnv(dir, configPath) {
+  const env = { ...process.env };
+  for (const name of Object.keys(env)) {
+    if (name.startsWith('CLAUDE_ROTATOR_') && name !== SERVICE_COMMAND_LOG_ENV) delete env[name];
+  }
+  return Object.assign(env, {
+    HOME: join(dir, 'home'),
+    XDG_CONFIG_HOME: join(dir, 'xdg-config'),
+    XDG_DATA_HOME: join(dir, 'xdg-data'),
+    CLAUDE_CONFIG_DIR: join(dir, 'claude'),
+    CLAUDE_ROTATOR_CONFIG: configPath,
+  });
+}
 
 function freePort() {
   return new Promise(resolveDone => {
