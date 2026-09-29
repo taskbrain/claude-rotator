@@ -69,6 +69,7 @@ import {
   sessionKeyFrom,
   sidHash,
 } from './session-affinity.js';
+import { assertLoopbackProxyHost, isTrustedLocalHttpRequest } from './shared/local-http.js';
 
 const HOP_HEADERS = new Set([
   'host',
@@ -3963,44 +3964,6 @@ function safeRequestPath(requestTarget) {
   } catch {
     return '<invalid-request-target>';
   }
-}
-
-function assertLoopbackProxyHost(host) {
-  const normalized = String(host || '').trim().toLowerCase();
-  if (['127.0.0.1', '::1', 'localhost'].includes(normalized)) return;
-  throw new Error(`Proxy host must be loopback, received ${normalized || '<empty>'}`);
-}
-
-function isTrustedLocalHttpRequest(req) {
-  const hostAuthority = loopbackHostAuthority(req.headers.host);
-  if (!hostAuthority) return false;
-  if (String(req.headers['sec-fetch-site'] || '').toLowerCase() === 'cross-site') return false;
-  const origin = req.headers.origin;
-  if (!origin) return true;
-  try {
-    const parsed = new URL(origin);
-    return parsed.protocol === 'http:'
-      && isLoopbackHostname(parsed.hostname)
-      && parsed.host.toLowerCase() === hostAuthority;
-  } catch {
-    return false;
-  }
-}
-
-function loopbackHostAuthority(value) {
-  if (typeof value !== 'string' || value.length === 0) return null;
-  try {
-    const parsed = new URL(`http://${value}`);
-    return isLoopbackHostname(parsed.hostname) ? parsed.host.toLowerCase() : null;
-  } catch {
-    return null;
-  }
-}
-
-function isLoopbackHostname(hostname) {
-  return ['127.0.0.1', '::1', '[::1]', 'localhost'].includes(
-    String(hostname || '').trim().toLowerCase(),
-  );
 }
 
 function buildUpstreamHeaders(inputHeaders, account, secret, observability = DEFAULT_OBSERVABILITY) {
