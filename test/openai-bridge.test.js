@@ -3720,17 +3720,22 @@ describe('openai-bridge connect retry hardening', () => {
   });
 
   describe('forwardToOpenAiBridge', () => {
-    it('re-attempts a refused connection after the fixed delay and forwards the recovered response', async () => {
+    it('re-attempts a refused connection after the fixed delay and forwards the recovered response', async t => {
+      // 待機の長さは偽の setTimeout で確かめる。実時計（Date.now() の差）で測ると、
+      // タイマーが実時計より 1ms 早く明けることがあり CI で 499ms と観測されて落ちた。
+      // Date は偽にしない（接続前の締切は実時計のままで、この試験の範囲では尽きない）。
+      t.mock.timers.enable({ apis: ['setTimeout'] });
       const factory = createAttemptRecordingUpstream();
-      const startedAt = Date.now();
       const { res, done } = startForward({ settings: retrySettings({ connectRetries: 1 }), factory });
 
-      await waitFor(() => factory.attempts.length === 1, { label: 'first attempt' });
+      assert.equal(factory.attempts.length, 1, '1本目の接続は同期的に開く');
       emitConnectingSocket(factory.attempts[0]);
       factory.attempts[0].upstream.emit('error', refusedError());
 
-      await waitFor(() => factory.attempts.length === 2, { label: 'second attempt' });
-      assert.ok(Date.now() - startedAt >= 500, '再試行の前に 500ms 待つ（即時再試行は bridge 再起動中の連打になる）');
+      t.mock.timers.tick(499);
+      assert.equal(factory.attempts.length, 1, '再試行の前に 500ms 待つ（即時再試行は bridge 再起動中の連打になる）');
+      t.mock.timers.tick(1);
+      assert.equal(factory.attempts.length, 2, '500ms 待った時点で2本目の接続を開く');
 
       emitConnectedSocket(factory.attempts[1]);
       const upstreamRes = fakeUpstreamResponse(200, { 'content-type': 'application/json' });
