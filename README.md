@@ -967,7 +967,7 @@ tail -f ~/.config/claude-rotator/server.log
 tail -f ~/.config/claude-rotator/server.err
 ```
 
-`server.log` は既定 32 MiB（`observability.logMaxBytes` で 1 MiB〜256 MiB に変更可。変更は server の再起動で反映。→ [キャッシュ観測（`observability`）](#キャッシュ観測observability)）を超えると、次のログ書込時に service 自身がローテーションし、直前1世代を `server.log.1` として保持します。`server.log` と `server.log.1` は権限 0600（所有者だけが読み書き可）で作成され、既存のファイルも server 起動時とローテーション時に 0600 へ補正されます。非TTYで手動実行した場合も、request ログは標準出力ではなく `server.log` 自体へ直接書かれます。
+`server.log` は既定 32 MiB（`observability.logMaxBytes` で 1 MiB〜256 MiB に変更可。変更は server の再起動で反映。→ [キャッシュ観測（`observability`）](#キャッシュ観測observability)）を超えると、次のログ書込時に service 自身がローテーションし、直前1世代を `server.log.1` として保持します。ローテーションは、内容を `server.log.1` へ写してから `server.log` を切り詰める方式のため、ローテーションの最中に書き込まれた内容が失われることがあります。`server.log` と `server.log.1` は所有者だけが読み書きできる権限（0600）を目指し、server の起動時には両方を、ローテーション時には新しい `server.log.1` を、0600 に補正しようとします。環境によっては 0600 にならないことがあります（例: サービス管理側（launchd／systemd）が server より先に `server.log` を作る場合、権限を変えられないファイル）。権限の補正やローテーションがうまくいかなくても server は止まりません。その場合、その回のローテーションを見送ることがあります。非TTYで手動実行した場合も、request ログは通常は標準出力ではなく `server.log` 自体へ直接書かれます。
 
 ### 接続タイムアウトの切り分け
 
@@ -1945,7 +1945,7 @@ tail -f ~/.config/claude-rotator/server.log
 tail -f ~/.config/claude-rotator/server.err
 ```
 
-Once `server.log` exceeds 32 MiB by default (configurable from 1 MiB to 256 MiB with `observability.logMaxBytes`; a change takes effect on server restart), the service rotates it on the next log write, keeping the previous generation as `server.log.1`. `server.log` and `server.log.1` are created with mode 0600 (owner read/write only), and existing files are corrected to 0600 at server startup and on rotation. Even when run manually with a non-TTY stdout, request logs are written directly to `server.log` itself rather than to stdout.
+Once `server.log` exceeds 32 MiB by default (configurable from 1 MiB to 256 MiB with `observability.logMaxBytes`; a change takes effect on server restart), the service rotates it on the next log write, keeping the previous generation as `server.log.1`. Rotation copies the content to `server.log.1` and then truncates `server.log`, so content written while a rotation is in progress can be lost. The service aims to keep `server.log` and `server.log.1` at mode 0600 (the owner can read and write; others have no access): it tries to set both to 0600 at server startup, and the new `server.log.1` on each rotation. Depending on the environment, they may not end up 0600 (for example: the service manager (launchd/systemd) creating `server.log` before the server does, or a file whose mode cannot be changed). If setting the mode or rotating does not work out, the server keeps running. In that case, a rotation may be skipped. Even when run manually with a non-TTY stdout, request logs are normally written directly to `server.log` itself rather than to stdout.
 
 #### Diagnosing Connection Timeouts
 
