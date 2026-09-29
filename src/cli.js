@@ -73,7 +73,7 @@ import {
   runtimeStatePath,
   xdgConfigHome,
 } from './paths.js';
-import { readJsonFile, writeJsonFileDurable } from './json-file.js';
+import { readJsonFile, removeStaleTmpFiles, writeJsonFileDurable } from './json-file.js';
 import { normalizeSessionAffinity } from './session-affinity.js';
 
 const execFileAsync = promisify(execFile);
@@ -393,6 +393,9 @@ async function runServer({ write }) {
     eventHistory: normalizeSessionAffinity(config.sessionAffinity).mode !== 'off',
   });
   const statePath = runtimeStatePath();
+  // 以前のプロセスが rename 前に止められて残した runtime-state の一時ファイルを片付ける。
+  // 起動時に1回だけ。失敗しても起動は止めない（1行ログのみ）。
+  await cleanupStaleRuntimeStateTmpFiles(statePath, { logger });
   // 台帳を先に復元し、その戻り値（資格情報が別物になった口座 ID）を createProxyServer へ
   // 渡す。sticky の表はそこで、口座台帳の復元が終わった後に読み戻される（設計書 §8.1）。
   const { savedState, credentialChangedAccountIds } = await restoreRuntimeState(
@@ -453,6 +456,39 @@ async function runServer({ write }) {
  */
 export function createRuntimeStateWriter(statePath) {
   return state => writeJsonFileDurable(statePath, state);
+}
+
+/**
+ * 起動時に1回だけ呼ぶ、`runtime-state.json` の残留一時ファイルの片付け。
+ *
+ * 持ち主のプロセスが消えて（ESRCH）一定時間（既定10分）より古い通常ファイルだけを消す
+ * （条件の詳細は `removeStaleTmpFiles`）。**例外を投げない**——片付けは起動の前提ではないので、
+ * どんな失敗も1行ログにして返る。消すものが無ければ何も書かない。
+ *
+ * **前提: 設定ディレクトリを異なる PID 名前空間の間で共有しない**（ホストとコンテナで bind mount
+ * する等）。共有すると、相手側で生存中の書き手も `kill(pid, 0)` が ESRCH になり、長く止まった
+ * 書き込み途中の一時ファイルを消し得る。そうした構成では環境変数
+ * `CLAUDE_ROTATOR_RUNTIME_TMP_CLEANUP=off`（`0`・`false` も可）で片付けを無効にする。
+ *
+ * @param {string} statePath `runtime-state.json` の絶対パス。
+ * @param {{logger?: ((line: string) => void)|null, env?: NodeJS.ProcessEnv} & object} [options]
+ *   残りは `removeStaleTmpFiles` へ渡す。
+ * @returns {Promise<void>}
+ */
+export async function cleanupStaleRuntimeStateTmpFiles(statePath, { logger = null, env = process.env, ...options } = {}) {
+  const switchValue = String(env.CLAUDE_ROTATOR_RUNTIME_TMP_CLEANUP ?? '').trim().toLowerCase();
+  if (['off', '0', 'false'].includes(switchValue)) {
+    logger?.('runtime state temp cleanup skipped: disabled by CLAUDE_ROTATOR_RUNTIME_TMP_CLEANUP');
+    return;
+  }
+  try {
+    const { removed, failed } = await removeStaleTmpFiles(statePath, options);
+    if (removed.length === 0 && failed.length === 0) return;
+    const failedNote = failed.length > 0 ? `, ${failed.length} could not be removed` : '';
+    logger?.(`runtime state temp cleanup: removed ${removed.length} stale temp file(s)${failedNote}`);
+  } catch (error) {
+    logger?.(`runtime state temp cleanup failed: ${shortErrorMessage(error)}`);
+  }
 }
 
 /**
