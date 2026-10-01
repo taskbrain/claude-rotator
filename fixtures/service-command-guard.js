@@ -70,7 +70,10 @@
 //     absolute path;
 //   - on a case-insensitive disk, a command given as a path, or an entry path,
 //     that differs only in case, e.g. `/bin/LaunchCtl` or
-//     `bin/Codex-Rotator.js`: belt 2 compares names and paths exactly;
+//     `bin/Codex-Rotator.js`: belt 2 compares names and paths exactly. The
+//     same goes for a bare `node` spelled in another case, e.g. `NODE` or
+//     `Node` running the entry point: belt 2 only knows the name `node`, and
+//     belt 1 has no stand-in for node, so the lookup finds the real one;
 //   - what a child node process does in turn when a test starts it with
 //     spawn, execFile or their Sync forms, e.g. as process.execPath. Those
 //     calls give the child only the arguments they are passed, so --import

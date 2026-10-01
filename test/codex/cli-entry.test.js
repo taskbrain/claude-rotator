@@ -2,6 +2,8 @@
 //
 // bin/codex-rotator.js を node で起動する形はテスト隔離の仕掛けが拒否するので、入口の関数
 // main を直接呼ぶ。本物の振り分けの表の load は呼ばない（本体のモジュールを読ませない）。
+// 例外は下の1本だけで、本物の表の load を呼んで本体のモジュールを読み込む（読み込むだけで、
+// 副コマンドは走らせない）。
 // 振り分けた後の取り決めは、load と本体の呼出しを記録する偽の表を main の第3引数に渡して
 // 確かめる。env は空のオブジェクトを渡し、実の環境を読ませない（省いた欄を確かめるテストは、
 // 渡された物が process の物と同じかを比べるだけで、中身は読まない）。
@@ -111,6 +113,16 @@ test('the subcommand table has exactly exec, login and accounts, each a frozen l
     assert.ok(Object.isFrozen(spec), name);
     // load は呼ばない（本体のモジュールを読ませない）。読み込む先は、load の関数の書き方で固定する。
     assert.equal(String(spec.load), `() => import('${specifier}')`, name);
+  }
+});
+
+// ほかのテストと違い、このテストだけは本物の表の load を呼び、本体のモジュール（exec・login・
+// accounts）を実際に読む。import の行き先が解決し、表の run の欄が名指す関数をそのモジュールが
+// 公開していることを確かめるためで、読むだけで本体の関数は呼ばない（副コマンドは走らない）。
+test('every subcommand in the entry table loads a module that exports its runner', async () => {
+  for (const [name, spec] of Object.entries(SUBCOMMANDS)) {
+    const mod = await spec.load();
+    assert.equal(typeof mod[spec.run], 'function', `${name} exports ${spec.run}`);
   }
 });
 
