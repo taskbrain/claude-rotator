@@ -81,7 +81,7 @@ test('accountDirPath joins the root and the name and refuses other names', () =>
   assert.throws(() => accountDirPath('/zz/accounts', '../x'), assertReason(ACCOUNTS_DIR_REASON.badName));
 });
 
-test('createAccountDir makes the root and the folder 0700 and writes only the three guard lines', async t => {
+test('createAccountDir makes the root and the folder 0700 and writes only the three guard settings', async t => {
   const { accountsDir } = await rootUnder(t);
   const path = await createAccountDir({ accountsDir, name: FIXED_NAME });
   assert.equal(path, join(accountsDir, FIXED_NAME));
@@ -93,7 +93,7 @@ test('createAccountDir makes the root and the folder 0700 and writes only the th
   const text = await readFile(configPath, 'utf8');
   assert.equal(text, ACCOUNT_CONFIG_TOML);
 
-  // 設定の行は3行だけで、承認とサンドボックスの行を持たない。
+  // 設定は3つだけで、承認とサンドボックスの行を持たない。
   const settingLines = text.split('\n').filter(line => line.trim() !== '' && !line.trim().startsWith('['));
   assert.deepEqual(settingLines, [...SECOND_LAYER_ROOT_LINES, ...SECOND_LAYER_FEATURES_LINES]);
   assert.doesNotMatch(text, /approval_policy|sandbox_mode/);

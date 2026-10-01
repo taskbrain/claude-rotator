@@ -5,7 +5,7 @@
 //     この順で必ず付ける。口座のフォルダの config.toml の中身に依存しない。
 //   - 第2層（口座のフォルダに書く設定）: login が作る config.toml は、最初の表より前の
 //     `cli_auth_credentials_store = "file"` と、[features] の表の `apps = false`・`plugins = false`
-//     の3行だけにする（ACCOUNT_CONFIG_TOML）。exec と shim を通らない起動（利用者が口座のフォルダを
+//     の3つの設定だけにする（ACCOUNT_CONFIG_TOML）。exec と shim を通らない起動（利用者が口座のフォルダを
 //     CODEX_HOME にして素の codex を起動する場合）も守るため。
 //   - 起動の型: 口座を選んで起動するのは、下の型1〜3に当たる引数の並びだけにする。広く受けてから
 //     危ない形を塞ぐのではなく、使う形だけを語ごとの完全一致で許す（前後の空白・引用符・大文字と
@@ -56,7 +56,7 @@ export const SECOND_LAYER_FEATURES_TABLE = '[features]';
 export const SECOND_LAYER_FEATURES_LINES = Object.freeze(['apps = false', 'plugins = false']);
 
 /**
- * login が口座のフォルダに書く config.toml の全文。設定の行は上の3行だけで、承認や
+ * login が口座のフォルダに書く config.toml の全文。設定は上の3つだけで、承認や
  * サンドボックスの行（approval_policy・sandbox_mode）は持たない。
  */
 export const ACCOUNT_CONFIG_TOML = [

@@ -20,7 +20,7 @@ import { readCodexCredentials } from '../../src/codex/credentials.js';
 import { setupCodexIsolation } from './helpers/isolation.js';
 import { EventEmitter } from 'node:events';
 import { chmod, realpath, symlink } from 'node:fs/promises';
-import { realpathSync } from 'node:fs';
+import { readFileSync, realpathSync } from 'node:fs';
 import { isAbsolute } from 'node:path';
 import {
   ARGUMENT_REJECTED_KIND, CODEX_GUARD_CHECK_MAX_STDOUT_BYTES, CODEX_GUARD_CHECK_TIMEOUT_MS,
@@ -875,4 +875,73 @@ test('the guard check refuses relative paths and a missing environment before st
     }), TypeError);
   }
   assert.equal(h.isolation.spawnCalls.length, 0);
+});
+
+// ---------------------------------------------------------------------------------------------
+// README の守りの節（日英）と実装の突き合わせ
+// ---------------------------------------------------------------------------------------------
+
+// README はリポジトリの根のものを、このファイルの場所から読む（テストの作業フォルダに依らない）。
+const readReadme = () => readFileSync(new URL('../../README.md', import.meta.url), 'utf8');
+
+// 見出しの行の次から、同じかより上の階層の次の見出しの前までを返す。コードの囲みの中の `#` の行は
+// 見出しに数えない。見出しは README の中にちょうど1つあること。
+function readmeSection(readme, heading) {
+  const lines = readme.split('\n');
+  const start = lines.indexOf(heading);
+  assert.ok(start >= 0, `the README has the heading: ${heading}`);
+  assert.equal(lines.lastIndexOf(heading), start, `the heading appears once: ${heading}`);
+  const level = heading.indexOf(' ');
+  let fenced = false;
+  for (let i = start + 1; i < lines.length; i += 1) {
+    if (/^\s*```/.test(lines[i])) fenced = !fenced;
+    const match = fenced ? null : /^(#+) /.exec(lines[i]);
+    if (match && match[1].length <= level) return lines.slice(start + 1, i).join('\n');
+  }
+  return lines.slice(start + 1).join('\n');
+}
+
+// 節の中の、言語の名前が lang のコードの囲みの中身（囲みの字下げを外し、最後に改行を付けたもの）。
+function fencedBlocks(section, lang) {
+  const blocks = [];
+  const lines = section.split('\n');
+  for (let i = 0; i < lines.length; i += 1) {
+    const open = /^(\s*)```(\S*)$/.exec(lines[i]);
+    if (!open || open[2] !== lang) continue;
+    const indent = open[1].length;
+    const body = [];
+    for (i += 1; i < lines.length && !/^\s*```$/.test(lines[i]); i += 1) body.push(lines[i].slice(indent));
+    blocks.push(`${body.join('\n')}\n`);
+  }
+  return blocks;
+}
+
+const README_GUARD_SECTIONS = Object.freeze([
+  Object.freeze({ heading: '### 口座のフォルダで起動したときの守り', reason: '<理由>', seconds: n => `${n} 秒` }),
+  Object.freeze({ heading: '#### Guards When Codex Runs in an Account Folder', reason: '<reason>', seconds: n => `${n} seconds` }),
+]);
+
+test('the README guard sections in Japanese and English carry the guards that the implementation applies', () => {
+  const readme = readReadme();
+  for (const { heading, reason, seconds } of README_GUARD_SECTIONS) {
+    const section = readmeSection(readme, heading);
+    const has = (text, what) => assert.ok(section.includes(text), `${heading}: ${what}: ${text}`);
+    // 第1層は1つのコードの囲みに、この順で並ぶ。第2層は login が書く config.toml の全文と同じ。
+    assert.ok(fencedBlocks(section, 'text').includes(`${FIRST_LAYER_ARGS.join(' ')}\n`), `${heading}: the first layer`);
+    assert.deepEqual(fencedBlocks(section, 'toml'), [ACCOUNT_CONFIG_TOML], `${heading}: the second layer`);
+    // 起動の型（型1の -s の値と通すキー、型3の語）と、型に当たらないときの1行。
+    for (const value of ALLOWED_SANDBOX_VALUES) has(`\`${value}\``, 'a sandbox value of the first form');
+    for (const { key } of ALLOWED_CONFIG_OVERRIDES) has(`-c ${key}=`, 'a pass-through config key of the first form');
+    has('`--version`', 'the third form');
+    has(formatArgumentRejected(), 'the rejection line');
+    has(`\`${NO_DAEMON_ARG}\``, 'the option added to the interactive form');
+    // 起動ごとの点検の2つの副コマンド・期限・読む上限と、通らなかったときの1行と理由の語の表。
+    has(`codex ${GUARD_CHECK_FEATURES_ARGS.join(' ')}`, 'the features check');
+    has(`codex ${GUARD_CHECK_MCP_ARGS.join(' ')}`, 'the MCP check');
+    has(seconds(CODEX_GUARD_CHECK_TIMEOUT_MS / 1000), 'the time limit of each check');
+    has(`${CODEX_GUARD_CHECK_MAX_STDOUT_BYTES / 1024} KiB`, 'the standard output limit of each check');
+    has(formatGuardUnverified(reason), 'the guard unverified line');
+    const tableWords = section.split('\n').map(line => /^\s*\| `([a-z-]+)` \|/.exec(line)?.[1]).filter(Boolean);
+    assert.deepEqual(tableWords, Object.values(GUARD_UNVERIFIED), `${heading}: one table row per reason, in order`);
+  }
 });
