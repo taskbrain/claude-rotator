@@ -176,11 +176,11 @@ test('accounts --json: zero accounts with the default accountsDir expanded from 
   });
 });
 
-test('accounts --json: one account, with ~ expanded and the trailing / removed from both paths', async t => {
+test('accounts --json: one account, with ~ expanded in accountsDir and the trailing / removed from both paths', async t => {
   const f = await fixture(t);
   await f.writeConfig({
     enabled: true, acknowledgedMultiAccountRisk: true, accountsDir: '~/zz-accounts/',
-    accounts: [{ label: 'zz-one', codexHome: '~/zz-accounts/zz-one/', usagePolicy: policy() }],
+    accounts: [{ label: 'zz-one', codexHome: `${join(f.home, 'zz-accounts', 'zz-one')}/`, usagePolicy: policy() }],
   });
   const { json } = await f.runJson();
   assertAccountsJsonSchema(json);
@@ -484,6 +484,15 @@ test('accounts and accounts --json open nothing in ~/.codex or in the account fo
   const controlStart = recorder.calls.length;
   await readCodexCredentials(join(f.accountsDir, 'zz-one', 'auth.json')).catch(() => null);
   const controlCalls = recorder.calls.slice(controlStart);
+  // 陽性対照（一覧）: このテストで作ったフォルダを、同じ記録の中で readdir（名前付きの import）と
+  // opendir で一覧すると、どちらも記録に出る。下の「一覧していない」の確かめが空振りでないことを示す。
+  const listed = join(f.accountsDir, 'zz-listed-control');
+  await mkdir(listed, { mode: 0o700 });
+  const listStart = recorder.calls.length;
+  await readdir(listed);
+  const dir = await fsPromises.opendir(listed);
+  await dir.close();
+  const listCalls = recorder.calls.slice(listStart);
   recorder.restore();
 
   // そのフォルダそのもの（一覧する readdir・opendir）と、その中のパスを数える。
@@ -501,6 +510,11 @@ test('accounts and accounts --json open nothing in ~/.codex or in the account fo
     'the recorder sees the credential file open (positive control)');
   assert.ok(controlCalls.some(call => call.name === 'readFile' && call.path === join(folder, 'config.toml')),
     'the recorder sees the account folder config.toml read (positive control)');
+  for (const name of ['readdir', 'opendir']) {
+    assert.ok(listCalls.some(call => call.name === name && call.path === listed),
+      `the recorder sees ${name} list a folder made in this test (positive control)`);
+  }
+  assert.ok(listCalls.filter(inside(f.accountsDir)).length >= 2, 'the listing control is counted by the same filter as the runs');
   assertNoOutsideContact(f.isolation);
 });
 
@@ -510,4 +524,79 @@ test('accounts: the module imports only the config loader (no credential reader,
   assert.deepEqual(specifiers, ['./config.js']);
   assert.equal(/\bimport\s*\(/.test(source), false, 'no dynamic import');
   assert.equal(/\brequire\s*\(/.test(source), false, 'no require');
+});
+
+// ---------------------------------------------------------------------------------------------
+// README の accounts の節（日英）と、`--json` のスキーマ・出す行の突き合わせ
+// ---------------------------------------------------------------------------------------------
+
+// 見出しの行の次から、同じかより上の階層の次の見出しの前までを返す。コードの囲みの中の `#` の行は
+// 見出しに数えない。見出しは README の中にちょうど1つあること。
+function readmeSection(readme, heading) {
+  const lines = readme.split('\n');
+  const start = lines.indexOf(heading);
+  assert.ok(start >= 0, `the README has the heading: ${heading}`);
+  assert.equal(lines.lastIndexOf(heading), start, `the heading appears once: ${heading}`);
+  const level = heading.indexOf(' ');
+  let fenced = false;
+  for (let i = start + 1; i < lines.length; i += 1) {
+    if (/^\s*```/.test(lines[i])) fenced = !fenced;
+    const match = fenced ? null : /^(#+) /.exec(lines[i]);
+    if (match && match[1].length <= level) return lines.slice(start + 1, i).join('\n');
+  }
+  return lines.slice(start + 1).join('\n');
+}
+
+// 節の中の、言語の名前が lang のコードの囲みの中身（囲みの字下げを外し、最後に改行を付けたもの）。
+function fencedBlocks(section, lang) {
+  const blocks = [];
+  const lines = section.split('\n');
+  for (let i = 0; i < lines.length; i += 1) {
+    const open = /^(\s*)```(\S*)$/.exec(lines[i]);
+    if (!open || open[2] !== lang) continue;
+    const indent = open[1].length;
+    const body = [];
+    for (i += 1; i < lines.length && !/^\s*```$/.test(lines[i]); i += 1) body.push(lines[i].slice(indent));
+    blocks.push(`${body.join('\n')}\n`);
+  }
+  return blocks;
+}
+
+const README_ACCOUNTS_HEADINGS = Object.freeze([
+  '### 口座の一覧（codex-rotator accounts）',
+  '#### Listing Accounts (codex-rotator accounts)',
+]);
+
+test('accounts: the README sections in Japanese and English match the --json schema keys and the printed lines', async () => {
+  // README はリポジトリの根のものを、このファイルの場所から読む（テストの作業フォルダに依らない）。
+  const readme = await readFile(new URL('../../README.md', import.meta.url), 'utf8');
+  for (const heading of README_ACCOUNTS_HEADINGS) {
+    const section = readmeSection(readme, heading);
+    // `--json` の例は1つで、キーとその並びがスキーマと同じ。
+    const jsonBlocks = fencedBlocks(section, 'json');
+    assert.equal(jsonBlocks.length, 1, `${heading}: one --json example`);
+    const example = JSON.parse(jsonBlocks[0]);
+    assert.deepEqual(Object.keys(example), [...ACCOUNTS_JSON_KEYS], `${heading}: the top-level keys`);
+    assert.equal(example.schemaVersion, ACCOUNTS_JSON_SCHEMA_VERSION);
+    assert.equal(example.kind, ACCOUNTS_JSON_KIND);
+    assert.equal(example.generatedAt, formatGeneratedAt(Date.parse(example.generatedAt)));
+    assert.ok(example.accounts.length > 0, `${heading}: the example lists an account`);
+    for (const account of example.accounts) {
+      assert.deepEqual(Object.keys(account), [...ACCOUNTS_JSON_ACCOUNT_KEYS], `${heading}: the keys of an account`);
+      assert.ok(Object.values(REGISTRATION).includes(account.registration), `${heading}: a known registration word`);
+    }
+    // キーの表は1行に1つの最上位のキーで、スキーマと同じ並び。口座のキーと登録の状態の語も載っている。
+    const tableKeys = section.split('\n').map(line => /^\s*\| `([A-Za-z]+)` \|/.exec(line)?.[1]).filter(Boolean);
+    assert.deepEqual(tableKeys, [...ACCOUNTS_JSON_KEYS], `${heading}: one table row per top-level key, in order`);
+    for (const key of ACCOUNTS_JSON_ACCOUNT_KEYS) assert.ok(section.includes(`\`${key}\``), `${heading}: ${key}`);
+    for (const word of Object.values(REGISTRATION)) assert.ok(section.includes(`\`${word}\``), `${heading}: ${word}`);
+    // 使い方の1行・設定ファイルが無いときの1行・人向けの一覧の例は、実装が出すものと同じ。
+    const textBlocks = fencedBlocks(section, 'text');
+    assert.ok(textBlocks.includes(`${ACCOUNTS_USAGE}\n`), `${heading}: the usage line`);
+    assert.ok(section.includes(`\`${NO_CONFIG_LINE}\``), `${heading}: the line without a config file`);
+    const listing = formatAccountsText({
+      enabled: true, acknowledgedMultiAccountRisk: true, accounts: [{ label: 'work' }, { label: 'personal' }],
+    });
+    assert.ok(textBlocks.includes(listing), `${heading}: the listing example is what the command prints`);
+  }
 });

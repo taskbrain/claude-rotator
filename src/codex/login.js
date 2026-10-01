@@ -18,17 +18,21 @@
 //      - 本物の codex の絶対パスが見つかる（real-codex.js。素の名前の codex は起動しない）。
 //      - 登録済みの口座の資格情報が、どれも読める（読めない口座があると、新しい口座がそれと同じかを
 //        確かめられない）。読めなければ、読めない口座のラベル（検証済みの設定の値。設定の並びの順）を
-//        並べた1行と、その口座の登録を外してから新しいフォルダで入り直すよう案内する1行も出す
+//        並べた1行と、並べた口座の登録をすべて外してから、それぞれ新しいフォルダで入り直すよう案内する1行も出す
 //        （login し直しは前の資格情報が読めないと始めないので、案内しない）。
 //   3. 口座のフォルダを新しく作り、login が書く config.toml を置く（accounts-dir.js）。作る前に、
 //      login し直しの c と同じ規則でシグナルの受け口を付け、コマンドが終わるときに外す（作っている
-//      間に受けたシグナルでも親は終わらず、フォルダを残したことを出せるようにするため）。
+//      間に受けたシグナルでも親は終わらず、フォルダを残したことを出せるようにするため）。作っている
+//      間はシグナルを送る子がまだ無いので、その間に受けたシグナルは捨てられ、作り終えるとそのまま 4 の
+//      対話ログインが始まる。
 //   4. そのフォルダを CODEX_HOME にして `codex -c cli_auth_credentials_store="file" login` を
 //      起動し、終わるのを待つ（標準入出力は利用者の端末につなぐ）。子がシグナルで終わったときも、
 //      ほかの失敗と同じく設定を変えずに 1 で終わる。
 //   5. そのフォルダの資格情報を読み、口座の識別子のハッシュ（使用量の読取と同じ関数）を、登録済みの
 //      ほかの口座のものと比べる。同じなら登録しない。ほかの口座の資格情報がこの時点で読めなければ、
-//      2 と同じく止めて案内する。識別子とハッシュはメモリの中だけで比べ、出さない・書かない。
+//      2 と同じく止めて案内する。比べるのは設定の並びの順で、読めない口座より先に同じ口座に当たった
+//      ときは重複として止め、読めない口座の案内は出さない。識別子とハッシュはメモリの中だけで比べ、
+//      出さない・書かない。
 //   6. 設定へ口座を1件追記する（appendCodexAccount。1回目は設定を作る）。追記は、2 で読んだときの
 //      sha256 と今のファイルが同じときだけ行い、失敗しても元のファイルは変わらない。
 // 設定を書き換えるのは 6 だけなので、失敗したときは必ず「設定は変えていない」と出す。3 の後で
@@ -116,8 +120,11 @@ export const CONFIG_CREATED_LINE = `${PREFIX}created the codex-rotator config wi
   + ' read the README section on the risks of using several accounts, and only then set both to true by hand to start switching accounts.';
 // 登録済みの口座の資格情報が読めずに止めたとき。読めない口座のラベルを並べる行の書き出しと、案内の行。
 // ラベルは検証済みの設定の値（a-z・0-9・_・- だけ）なので、そのまま並べる。パス・値・ハッシュは出さない。
+// 案内は、並べた口座をすべて外してから入り直す順にする（1つずつ外して入り直すと、まだ外していない
+// 読めない口座があるので、次の login が同じ理由で止まるため）。
 export const UNREADABLE_ACCOUNTS_LINE_START = `${PREFIX}registered accounts whose credentials cannot be read: `;
-export const OTHER_CREDENTIALS_HINT_LINE = `${PREFIX}for each of these accounts, run "codex-rotator remove --label <label>" and then log in with`
+export const OTHER_CREDENTIALS_HINT_LINE = `${PREFIX}first run "codex-rotator remove --label <label>" for every account listed above;`
+  + ' only after all of them are removed, log in to each one again with'
   + ' "codex-rotator login --label <label> --stop <percent> --resume <percent>" (a new folder is made).';
 
 /** 読めない口座のラベルを、渡された順に並べた1行。 */
@@ -379,8 +386,8 @@ export async function readAccountIdHash(codexHome, readCredentials) {
   }
 }
 
-// 登録済みの口座の資格情報が読めないときの止め方（読めない口座のラベルの行と、登録を外してから
-// 新しいフォルダで入り直す案内を付ける）。
+// 登録済みの口座の資格情報が読めないときの止め方（読めない口座のラベルの行と、それらの登録をすべて
+// 外してから、それぞれ新しいフォルダで入り直す案内を付ける）。
 function otherCredentialsUnreadable(labels) {
   return new LoginError(LOGIN_FAILURE.otherCredentialsUnreadable, {
     hints: [unreadableAccountsLine(labels), OTHER_CREDENTIALS_HINT_LINE],

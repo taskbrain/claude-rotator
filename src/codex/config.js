@@ -236,11 +236,16 @@ function isDanglingLink(path, fsImpl) {
   }
 }
 
-// 絶対パスか `~/` で始まるパスだけを受ける。返す path は ~ を展開して正規化した絶対パス
-// （末尾の / なし）、canonical は重なりの比較に使う形（実パスを comparisonKey でそろえたもの）。
-function pathSetting(value, where, context) {
-  if (typeof value !== 'string' || value.includes('\0') || !(isAbsolute(value) || value.startsWith('~/'))) {
-    throw new CodexConfigError(`${where} must be an absolute path or start with ~/`);
+// 絶対パスか `~/` で始まるパスだけを受ける（allowHome が偽なら絶対パスだけ）。返す path は ~ を
+// 展開して正規化した絶対パス（末尾の / なし）、canonical は重なりの比較に使う形（実パスを
+// comparisonKey でそろえたもの）。
+function pathSetting(value, where, context, { allowHome = true } = {}) {
+  const shapeOk = typeof value === 'string' && !value.includes('\0')
+    && (isAbsolute(value) || (allowHome && value.startsWith('~/')));
+  if (!shapeOk) {
+    throw new CodexConfigError(allowHome
+      ? `${where} must be an absolute path or start with ~/`
+      : `${where} must be an absolute path (a path starting with ~/ is not accepted)`);
   }
   const path = resolve(expandHomePath(value, context.env));
   return { path, canonical: comparisonKey(resolveCanonical(path, where, context.fsImpl), context.platform) };
@@ -284,7 +289,9 @@ function validateAccounts(rawAccounts, accountsDir, context) {
     }
     if (labels.has(account.label)) throw new CodexConfigError(`${where}.label is used by another account`);
     labels.add(account.label);
-    const home = pathSetting(account.codexHome, `${where}.codexHome`, context);
+    // 口座のフォルダは絶対パスだけ。~ はこの設定を読むプロセスの HOME で展開されるので、`~/` の形だと
+    // HOME の違うプロセス（常駐とシェルなど）が、同じ設定から別のフォルダを求めうる。
+    const home = pathSetting(account.codexHome, `${where}.codexHome`, context, { allowHome: false });
     // ~/.codex は口座の外。その中・それを含む場所も口座にしない。
     if (pathsOverlap(home.canonical, context.defaultCodexHome)) {
       throw new CodexConfigError(`${where}.codexHome must be separate from ~/.codex (neither inside it nor containing it)`);
@@ -305,7 +312,8 @@ function validateAccounts(rawAccounts, accountsDir, context) {
 
 function validateCodexPath(rawValue, accountsDir, accountHomes, context) {
   if (rawValue === undefined) return null;
-  const codexPath = pathSetting(rawValue, 'codexPath', context);
+  // 口座のフォルダと同じ理由で、絶対パスだけ（読むプロセスによって別の実行ファイルを指さないように）。
+  const codexPath = pathSetting(rawValue, 'codexPath', context, { allowHome: false });
   if (isSameOrInside(codexPath.canonical, accountsDir.canonical)) {
     throw new CodexConfigError('codexPath must not point inside accountsDir');
   }

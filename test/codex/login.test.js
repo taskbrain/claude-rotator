@@ -15,11 +15,12 @@ import fs, { readFileSync, unlinkSync, writeFileSync } from 'node:fs';
 import fsPromises, {
   chmod, lstat, mkdir, mkdtemp, readFile, readdir, realpath, rm, stat, symlink, unlink, writeFile,
 } from 'node:fs/promises';
+import { createServer as createHttpServer } from 'node:http';
 import { syncBuiltinESMExports } from 'node:module';
 import { tmpdir } from 'node:os';
 import { join, sep } from 'node:path';
 import { createHash } from 'node:crypto';
-import { setupCodexIsolation } from './helpers/isolation.js';
+import { REAL_SERVICE_PORTS, setupCodexIsolation } from './helpers/isolation.js';
 import {
   CODEX_LOGOUT_TIMEOUT_MS, CONFIG_CREATED_LINE, CONFIG_UNCHANGED_LINE, CREDENTIALS_STORE_ARGS, FOLDER_LEFT_LINE,
   LOGIN_CHILD_ARGS, LOGIN_EXIT, LOGIN_FAILURE, LOGIN_USAGE, LOGOUT_CHILD_ARGS, OTHER_CREDENTIALS_HINT_LINE,
@@ -30,6 +31,9 @@ import { ACCOUNT_DIR_NAME_PATTERN } from '../../src/codex/accounts-dir.js';
 import { ACCOUNT_CONFIG_TOML, FIRST_LAYER_ARGS } from '../../src/codex/account-config.js';
 import { loadCodexConfigSnapshot } from '../../src/codex/config.js';
 import { accountIdHash, readCodexCredentials } from '../../src/codex/credentials.js';
+import { CODEX_SELECT_OUTCOME } from '../../src/codex/daemon.js';
+import { EXEC_LINE, formatConfigStaleGuidance, runExec } from '../../src/codex/exec.js';
+import { controlTokenPath } from '../../src/codex/paths.js';
 
 const SERVICE_COMMAND_LOG_ENV = 'CLAUDE_ROTATOR_SERVICE_COMMAND_LOG';
 const DUMMY_EMAIL = 'zz-login-test@example.invalid';
@@ -213,7 +217,7 @@ test('the login child is the real codex by absolute path with the file store, sh
   assert.equal(ctx.iso.refusedSpawns.length, 0);
 });
 
-test('the account folder config.toml holds only the three guard lines before the login child starts, and is read as the file store', async t => {
+test('the account folder config.toml holds only the three guard settings before the login child starts, and is read as the file store', async t => {
   const ctx = await setup(t);
   const result = await ctx.run(ARGS_A);
   assert.equal(result.code, LOGIN_EXIT.ok, result.stderr);
@@ -429,10 +433,11 @@ async function withThreeAccounts(ctx) {
   return { config: await fileState(ctx.configPath), folders: await listOrNull(ctx.accountsDir), homes };
 }
 
-// 読めない口座を並べる行と案内の行に、読めた口座のラベル・パスの形・識別子とハッシュが出ていない。
-function assertUnreadableOutputClean(result, homes) {
+// 読めない口座を並べる行と案内の行に、読めた口座のラベル（既定は second）・パスの形・識別子とハッシュが
+// 出ていない。
+function assertUnreadableOutputClean(result, homes, { readable = ['second'] } = {}) {
   const forbidden = [
-    'second', ...Object.values(homes), ACCOUNT_A, ACCOUNT_B, ACCOUNT_X, ACCOUNT_Y,
+    ...readable, ...Object.values(homes), ACCOUNT_A, ACCOUNT_B, ACCOUNT_X, ACCOUNT_Y,
     accountIdHash(ACCOUNT_A), accountIdHash(ACCOUNT_B), accountIdHash(ACCOUNT_X), accountIdHash(ACCOUNT_Y),
   ];
   assert.deepEqual(forbidden.filter(value => result.stderr.includes(value)), []);
@@ -477,6 +482,49 @@ test('registered accounts whose credentials become unreadable during the login a
     OTHER_CREDENTIALS_HINT_LINE,
   ]);
   assertUnreadableOutputClean(result, before.homes);
+  assert.equal(ctx.iso.spawnCalls.length, 1);
+  assert.deepEqual(await fileState(ctx.configPath), before.config);
+});
+
+// ログインの後の比べ方は設定の並びの順で、先に当たったもので止める。読めない口座が2番目以降でも、
+// そこから後ろの読めない口座だけを並べる（前の読めた口座は並べない）。
+test('after the login, unreadable accounts that come after a readable one are named from the first unreadable one on', async t => {
+  const ctx = await setup(t);
+  const before = await withThreeAccounts(ctx);
+  ctx.behave = (args, options) => {
+    ctx.writeCredentials(options, ACCOUNT_Y);
+    unlinkSync(join(before.homes.second, 'auth.json'));
+    unlinkSync(join(before.homes.third, 'auth.json'));
+    return fakeChild();
+  };
+  const result = await ctx.run(ARGS_FOURTH);
+  assertFailedUnchanged(result, { folderLeft: true });
+  assert.deepEqual(stderrLines(result), [
+    `codex-rotator login: ${LOGIN_FAILURE.otherCredentialsUnreadable}.`, CONFIG_UNCHANGED_LINE, FOLDER_LEFT_LINE,
+    'codex-rotator login: registered accounts whose credentials cannot be read: second, third',
+    OTHER_CREDENTIALS_HINT_LINE,
+  ]);
+  assertUnreadableOutputClean(result, before.homes, { readable: [] });
+  assert.equal(ctx.iso.spawnCalls.length, 1);
+  assert.deepEqual(await fileState(ctx.configPath), before.config);
+});
+
+// 同じ口座が読めない口座より先に並ぶときは、重複で止め、読めない口座の行と案内は出さない。
+test('after the login, a duplicate that comes before an unreadable account stops as a duplicate without the unreadable lines', async t => {
+  const ctx = await setup(t);
+  const before = await withThreeAccounts(ctx);
+  ctx.behave = (args, options) => {
+    ctx.writeCredentials(options, ACCOUNT_A);
+    unlinkSync(join(before.homes.third, 'auth.json'));
+    return fakeChild();
+  };
+  const result = await ctx.run(ARGS_FOURTH);
+  assertFailedUnchanged(result, { folderLeft: true });
+  assert.deepEqual(stderrLines(result), [
+    `codex-rotator login: ${LOGIN_FAILURE.duplicateAccount}.`, CONFIG_UNCHANGED_LINE, FOLDER_LEFT_LINE,
+  ]);
+  assert.equal(result.stderr.includes(UNREADABLE_ACCOUNTS_LINE_START), false);
+  assert.equal(result.stderr.includes(OTHER_CREDENTIALS_HINT_LINE), false);
   assert.equal(ctx.iso.spawnCalls.length, 1);
   assert.deepEqual(await fileState(ctx.configPath), before.config);
 });
@@ -1031,6 +1079,117 @@ for (const [what, withSecond, writes, word, remaining] of [
   });
 }
 
+// --- login し直しで登録を外した後の exec ---------------------------------------------------------
+
+// OpenAI ブリッジ（設定 openaiBridge）の待受の既定値（偽の常駐がこの番号に当たったら待ち受け直す）。
+const BRIDGE_DEFAULT_PORT = 18765;
+const EXEC_CONTROL_TOKEN = 'ZZEXECCONTROLTOKEN'.repeat(2);
+
+// ポート0で待ち受ける偽の常駐。受けた要求の数を数え、answer() の本文で 200 を返す。
+async function startSelectDaemon(t, iso, answer) {
+  for (let attempt = 0; attempt < 6; attempt++) {
+    const requests = [];
+    const server = createHttpServer((req, res) => {
+      req.resume();
+      req.on('end', () => {
+        requests.push({ method: req.method, url: req.url });
+        res.writeHead(200, { 'content-type': 'application/json', connection: 'close' });
+        res.end(JSON.stringify(answer()));
+      });
+    });
+    await new Promise((resolveListen, rejectListen) => {
+      server.once('error', rejectListen);
+      server.listen(0, '127.0.0.1', resolveListen);
+    });
+    const close = () => new Promise(resolveClose => {
+      server.closeAllConnections();
+      server.close(() => resolveClose());
+    });
+    const { port } = server.address();
+    if ([...REAL_SERVICE_PORTS, BRIDGE_DEFAULT_PORT].includes(port)) {
+      await close();
+      continue;
+    }
+    t.after(close);
+    iso.allowRequest(port);
+    return { port, requests };
+  }
+  throw new Error('the system kept assigning a port that must not be used');
+}
+
+// 登録が1つ（first）の設定を、切替を有効にした形にする（daemonPort を渡すと daemon.port も書く）。
+async function enableSwitching(rig, daemonPort) {
+  const raw = await rig.ctx.readRaw();
+  const next = { ...raw, enabled: true, acknowledgedMultiAccountRisk: true, ...(daemonPort ? { daemon: { port: daemonPort } } : {}) };
+  writeFileSync(rig.ctx.configPath, JSON.stringify(next), { mode: 0o600 });
+}
+
+// exec を差し替えの部品（隔離の spawn・数える要求関数・偽のシグナルの受け口）で走らせる。
+async function runExecAfter(rig, argv) {
+  const stdout = captureStream();
+  const stderr = captureStream();
+  const requests = [];
+  const request = (...args) => {
+    requests.push(args[0]);
+    return rig.ctx.iso.request(...args);
+  };
+  const code = await runExec(argv, { stdout, stderr, env: rig.ctx.env }, {
+    spawn: rig.ctx.iso.spawn, request, processCwd: () => rig.ctx.iso.root,
+    signals: { on: () => {}, off: () => {} }, raiseSignal: () => {},
+  });
+  return { code, stdout: stdout.text(), lines: stderr.text().split('\n').filter(Boolean), requests };
+}
+
+// --account に外したラベルを渡すと、自分の設定に無いラベルとして常駐に問い合わせずに止まる。--account が
+// 無いときは、外す前の設定のままの常駐がそのラベルを返しても、設定の sha256 が違うので config stale で
+// 止まる（常駐が無ければ、自分の設定に口座が無いので選ばない）。どれも codex は起動しない。
+for (const withDaemon of [true, false]) {
+  for (const accountFlag of [true, false]) {
+    const daemonText = withDaemon ? 'with a daemon that still has the old config' : 'without a daemon';
+    const flagText = accountFlag ? 'exec --account with the removed label' : 'exec without --account';
+    test(`after relogin removes the label, ${flagText} ${daemonText} launches nothing`, async t => {
+      const rig = await setupRelogin(t);
+      let oldSha256 = null;
+      const daemon = withDaemon
+        ? await startSelectDaemon(t, rig.ctx.iso, () => ({
+          outcome: CODEX_SELECT_OUTCOME.selected, label: 'first', lastResort: false, usageKnown: true, refusal: null,
+          stateWord: 'ready', reason: null, configSha256: oldSha256,
+        }))
+        : null;
+      await enableSwitching(rig, daemon?.port);
+      if (withDaemon) writeFileSync(controlTokenPath(rig.ctx.env), JSON.stringify({ token: EXEC_CONTROL_TOKEN }), { mode: 0o600 });
+      oldSha256 = (await loadCodexConfigSnapshot({ env: rig.ctx.env })).sha256;
+      rig.loginWrites = ACCOUNT_C;
+      const relogin = await rig.run();
+      assert.equal(relogin.code, LOGIN_EXIT.failed, relogin.stderr);
+      assert.deepEqual(stderrLines(relogin), [wordLine(RELOGIN_WORD.changed), RELOGIN_REMOVED_LINE]);
+      await assertLabelRemoved(rig);
+      const current = await loadCodexConfigSnapshot({ env: rig.ctx.env });
+      assert.notEqual(current.sha256, oldSha256, 'the daemon answers with the config from before the removal');
+      assert.equal(current.config.enabled && current.config.acknowledgedMultiAccountRisk, true);
+
+      rig.ctx.iso.spawnCalls.length = 0;
+      const result = await runExecAfter(rig, [...(accountFlag ? ['--account', 'first'] : []), '--', 'exec', '--json', '-']);
+      assert.notEqual(result.code, 0);
+      assert.equal(result.stdout, '');
+      if (accountFlag) {
+        assert.deepEqual(result.lines, [EXEC_LINE.accountNotRegistered]);
+        assert.equal(result.requests.length, 0, 'no request to the daemon');
+      } else if (withDaemon) {
+        assert.deepEqual(result.lines, [EXEC_LINE.configStale, formatConfigStaleGuidance()]);
+        assert.equal(result.requests.length, 1, 'one select to the daemon');
+      } else {
+        assert.deepEqual(result.lines, [EXEC_LINE.noAccountAvailable]);
+        assert.equal(result.requests.length, 0, 'no control token: no request');
+      }
+      if (daemon) assert.equal(daemon.requests.length, accountFlag ? 0 : 1);
+      assert.equal(rig.ctx.iso.spawnCalls.length, 0, 'codex is not started');
+      assert.equal(result.lines.some(line => line.includes('first')), false, 'the removed label is not chosen');
+      assert.equal(rig.ctx.iso.refusedChildProcesses.length, 0);
+    });
+  }
+}
+
 for (const [what, behaviour] of [
   ['exits non-zero', 'exit'],
   ['does not finish in time', 'hang'],
@@ -1395,15 +1554,20 @@ test('the guidance lines name the next commands, including reload, and carry no 
   // 資格情報が読めない口座には、login し直しではなく、登録を外してから新しいフォルダで入り直す手順を
   // 案内する（login し直しは前の資格情報が読めないと始めないため）。
   assert.equal(UNREADABLE_ACCOUNTS_LINE_START, 'codex-rotator login: registered accounts whose credentials cannot be read: ');
-  assert.equal(OTHER_CREDENTIALS_HINT_LINE, 'codex-rotator login: for each of these accounts, run "codex-rotator remove --label <label>"'
-    + ' and then log in with "codex-rotator login --label <label> --stop <percent> --resume <percent>" (a new folder is made).');
+  // 読めない口座が2つ以上でも通るように、並べた口座をすべて外してから入り直す順を案内する（1つずつ
+  // 外して入り直すと、まだ外していない読めない口座で次の login が止まるため）。
+  assert.equal(OTHER_CREDENTIALS_HINT_LINE, 'codex-rotator login: first run "codex-rotator remove --label <label>" for every account listed above;'
+    + ' only after all of them are removed, log in to each one again with'
+    + ' "codex-rotator login --label <label> --stop <percent> --resume <percent>" (a new folder is made).');
   assert.doesNotMatch(OTHER_CREDENTIALS_HINT_LINE, /--relogin/);
-  for (const step of [
-    'run "codex-rotator remove --label <label>" and then log in with',
-    '"codex-rotator login --label <label> --stop <percent> --resume <percent>" (a new folder is made).',
-  ]) {
-    assert.ok(OTHER_CREDENTIALS_HINT_LINE.includes(step), step);
-    assert.ok(RELOGIN_UNVERIFIED_BEFORE_LINE.includes(step), step);
+  // 2つの案内に共通する部分（外すコマンドと、新しいフォルダで入り直すコマンド）がどちらにもあり、
+  // どちらでも外すコマンドが入り直すコマンドより前にある。
+  const removeStep = '"codex-rotator remove --label <label>"';
+  const loginStep = '"codex-rotator login --label <label> --stop <percent> --resume <percent>" (a new folder is made).';
+  for (const line of [OTHER_CREDENTIALS_HINT_LINE, RELOGIN_UNVERIFIED_BEFORE_LINE]) {
+    assert.ok(line.includes(removeStep), line);
+    assert.ok(line.includes(loginStep), line);
+    assert.ok(line.indexOf(removeStep) < line.indexOf(loginStep), `remove comes before the new login: ${line}`);
   }
   for (const line of [
     RELOAD_HINT_LINE, RELOGIN_REMOVED_LINE, RELOGIN_REMOVE_FAILED_LINE, RELOGIN_UNVERIFIED_BEFORE_LINE, RELOGIN_OK_LINE,
@@ -1412,6 +1576,21 @@ test('the guidance lines name the next commands, including reload, and carry no 
     assert.equal(line.includes('\n'), false);
     assert.doesNotMatch(line, /\/(?:Users|home|tmp)\b|\.codex-accounts|auth\.json/);
   }
+});
+
+// 初回の作成の案内が指す節の名前は、案内の定数から取る（案内の文を変えたら README の見出しも合わせる）。
+// README はリポジトリの根のものを、このファイルの場所から読む（テストの作業フォルダに依らない）。
+test('the README has the section that the first login message points to', () => {
+  const phrase = /README section on the (.+?), and only then /.exec(CONFIG_CREATED_LINE)?.[1];
+  assert.ok(phrase, 'the first login message names a README section');
+  const readme = readFileSync(new URL('../../README.md', import.meta.url), 'utf8');
+  const englishStart = readme.indexOf('\n## English\n');
+  assert.ok(englishStart > 0, 'the README has the English body');
+  const headings = text => text.split('\n').filter(line => /^#{2,6} /.test(line));
+  const english = headings(readme.slice(englishStart));
+  const japanese = headings(readme.slice(0, englishStart));
+  assert.ok(english.some(line => line.includes(phrase)), `an English heading contains "${phrase}"`);
+  assert.ok(japanese.includes('### 複数の口座を使うリスク'), 'the Japanese body has the matching heading');
 });
 
 // ---------------------------------------------------------------------------------------------

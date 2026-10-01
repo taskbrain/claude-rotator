@@ -238,9 +238,9 @@ test('config: labels have one shape, are unique and are never echoed', async t =
 // パス: accountsDir・口座のフォルダ・~/.codex
 // ---------------------------------------------------------------------------
 
-test('config: paths are absolute or start with ~/, and come back expanded without a trailing slash', async t => {
+test('config: accountsDir is absolute or starts with ~/, and paths come back expanded without a trailing slash', async t => {
   const { validate, refuses, home, account } = await setup(t);
-  const config = validate({ accountsDir: '~/zz-accounts/', accounts: [account('zz-one', { codexHome: '~/zz-accounts/one/' })] });
+  const config = validate({ accountsDir: '~/zz-accounts/', accounts: [account('zz-one', { codexHome: `${join(home, 'zz-accounts', 'one')}/` })] });
   assert.equal(config.accountsDir, join(home, 'zz-accounts'));
   assert.equal(config.accounts[0].codexHome, join(home, 'zz-accounts', 'one'));
   for (const accountsDir of ['zz-accounts', './zz-accounts', '~', '~other/zz', '', 42, null]) {
@@ -249,6 +249,31 @@ test('config: paths are absolute or start with ~/, and come back expanded withou
   for (const codexHome of ['zz-one', './zz-one', '~', null]) {
     refuses({ accounts: [account('zz-one', { codexHome })] }, /accounts\[0\]\.codexHome must be an absolute path/);
   }
+});
+
+// ~ は設定を読むプロセスの HOME で展開されるので、口座のフォルダと codexPath は `~/` の形を受けない
+// （HOME の違うプロセスが、同じ設定から別の場所を求めないように）。accountsDir の `~/` は受ける。
+test('config: codexHome and codexPath must be absolute paths, and a path starting with ~/ is refused', async t => {
+  const { validate, refuses, home, account } = await setup(t);
+  for (const codexHome of ['~/zz-accounts/one', '~/zz-accounts/one/', '~/.codex-accounts/zz-one', 'zz-accounts/one', './zz-one', '../zz-one']) {
+    refuses({ accounts: [account('zz-one', { codexHome })] },
+      /^accounts\[0\]\.codexHome must be an absolute path \(a path starting with ~\/ is not accepted\)$/);
+  }
+  // 2件目の口座でも同じ（どの口座の値かだけを言う）。
+  refuses({ accounts: [account('zz-one'), account('zz-two', { codexHome: '~/zz-two' })] }, /^accounts\[1\]\.codexHome must be an absolute path/);
+  for (const codexPath of ['~/zz-tools/bin/codex', '~/codex', 'zz-tools/bin/codex', './codex']) {
+    refuses({ codexPath }, /^codexPath must be an absolute path \(a path starting with ~\/ is not accepted\)$/);
+  }
+  // 拒否の文に値を入れない。
+  assert.throws(() => validate({ accounts: [account('zz-one', { codexHome: '~/zz-marker-one' })] }),
+    error => error instanceof CodexConfigError && !error.message.includes('zz-marker-one'));
+  // 絶対パスなら通り、そのままの形で返る。accountsDir の `~/` は今までどおり展開して受ける。
+  const one = join(home, 'zz-accounts', 'one');
+  const codexPath = join(home, 'zz-tools', 'bin', 'codex');
+  const config = validate({ accountsDir: '~/zz-accounts', accounts: [account('zz-one', { codexHome: one })], codexPath });
+  assert.equal(config.accountsDir, join(home, 'zz-accounts'));
+  assert.equal(config.accounts[0].codexHome, one);
+  assert.equal(config.codexPath, codexPath);
 });
 
 test('config: accountsDir is refused when it is, is inside or contains ~/.codex', async t => {
@@ -266,7 +291,7 @@ test('config: an account folder is refused when it is, is inside or contains ~/.
   const { refuses, home, account } = await setup(t);
   await mkdir(join(home, '.codex'), { mode: 0o700 });
   await symlink(join(home, '.codex'), join(home, 'zz-alias'));
-  for (const codexHome of ['~/.codex', join(home, '.codex'), '~/.codex/sessions', home, '~/zz-alias', '~/zz-alias/inner']) {
+  for (const codexHome of [join(home, '.codex'), join(home, '.codex', 'sessions'), home, join(home, 'zz-alias'), join(home, 'zz-alias', 'inner')]) {
     refuses({ accounts: [account('zz-one', { codexHome })] }, /accounts\[0\]\.codexHome must be separate from ~\/\.codex/);
   }
 });
@@ -302,14 +327,13 @@ test('config: codexPath is optional, absolute, and never inside accountsDir or t
   assert.equal(validate({}).codexPath, null);
   const external = join(home, 'zz-tools', 'bin', 'codex');
   assert.equal(validate({ codexPath: external }).codexPath, external);
-  assert.equal(validate({ codexPath: '~/zz-tools/bin/codex' }).codexPath, external);
   for (const codexPath of ['codex', 'bin/codex', './codex', '../codex', '', null, 42]) {
     refuses({ codexPath }, /codexPath must be an absolute path/);
   }
   refuses({ codexPath: join(accountsDir, 'zz-one', 'codex') }, /codexPath must not point inside accountsDir/);
   refuses({ codexPath: accountsDir }, /codexPath must not point inside accountsDir/);
   refuses({ codexPath: join(shimDir(env), 'codex') }, /codexPath must not point inside the codex-rotator shim directory/);
-  refuses({ accountsDir: '~/zz-custom-accounts', codexPath: '~/zz-custom-accounts/codex' }, /inside accountsDir/);
+  refuses({ accountsDir: '~/zz-custom-accounts', codexPath: join(home, 'zz-custom-accounts', 'codex') }, /inside accountsDir/);
 });
 
 test('config: codexPath is compared by its real path, so a link into the shim directory is refused', async t => {
@@ -340,12 +364,12 @@ test('config: on darwin, paths that differ only in letter case (or Unicode form)
   const { env, home, account } = await setup(t);
   const cases = [
     [{ accountsDir: '~/.CODEX/accounts' }, /accountsDir must be separate from ~\/\.codex/],
-    [{ accounts: [account('zz-one', { codexHome: '~/.Codex' })] }, /accounts\[0\]\.codexHome must be separate from ~\/\.codex/],
+    [{ accounts: [account('zz-one', { codexHome: join(home, '.Codex') })] }, /accounts\[0\]\.codexHome must be separate from ~\/\.codex/],
     [{ accounts: [account('zz-one', { codexHome: join(home, 'zz-accts', 'One') }),
       account('zz-two', { codexHome: join(home, 'zz-accts', 'one') })] }, /accounts\[1\]\.codexHome overlaps/],
     [{ accounts: [account('zz-one', { codexHome: join(home, 'zz-caf\u00e9') }),
       account('zz-two', { codexHome: join(home, 'zz-cafe\u0301') })] }, /accounts\[1\]\.codexHome overlaps/],
-    [{ accountsDir: '~/zz-Accounts', codexPath: '~/ZZ-ACCOUNTS/codex' }, /codexPath must not point inside accountsDir/],
+    [{ accountsDir: '~/zz-Accounts', codexPath: join(home, 'ZZ-ACCOUNTS', 'codex') }, /codexPath must not point inside accountsDir/],
     [{ codexPath: join(env.XDG_DATA_HOME, 'Codex-Rotator', 'BIN', 'codex') }, /shim directory/],
   ];
   for (const [raw, pattern] of cases) {
