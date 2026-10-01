@@ -31,6 +31,7 @@ import {
 import { main } from '../../src/codex/cli.js';
 import { createCodexLogger } from '../../src/codex/logger.js';
 import { codexRotatorConfigDir, codexRotatorConfigPath, controlTokenPath } from '../../src/codex/paths.js';
+import { CODEX_STATE_OF_WORD } from '../../src/shared/codex-status-schema.js';
 import { requestLocal } from '../../src/shared/local-http.js';
 import { createFakeClock, createFakeScheduler } from './helpers/fake-time.js';
 import { REAL_SERVICE_PORTS, setupCodexIsolation } from './helpers/isolation.js';
@@ -151,7 +152,9 @@ function fakeFetch(respondFor) {
 /**
  * ポート0で待ち受ける偽の常駐。受けた要求（方法・パス・ヘッダ・本文）を requests に残し、answer(request)
  * の戻り値 { status?, body } で答える（body が文字列でなければ JSON にする）。answer が null を返したら
- * 答えない（期限切れを確かめる）。{ cutOff: true } を返したら、200 の本文の途中で接続を切る。実際の番号が接続してはならない番号に当たったら、閉じて待ち受け直す。
+ * 答えない（期限切れを確かめる）。{ cutOff: true } を返したら、200 の本文の途中で接続を切る。{ stall: true } を
+ * 返したら、200 のヘッダと本文の一部を書いて、接続を開いたまま止まる。実際の番号が接続してはならない番号に
+ * 当たったら、閉じて待ち受け直す。
  */
 async function startFakeDaemon(t, isolation, answer) {
   for (let attempt = 0; attempt < 6; attempt++) {
@@ -168,6 +171,12 @@ async function startFakeDaemon(t, isolation, answer) {
           // 本文の途中で接続を切る（宣言した大きさより短いところで、書き出した後に切る）。
           res.writeHead(200, { 'content-type': 'application/json', 'content-length': '4096', connection: 'close' });
           res.write('{"outcome":', () => res.socket?.destroy());
+          return;
+        }
+        if (reply.stall) {
+          // 200 のヘッダと本文の一部を書き、閉じずに止まる（後始末は待受けを閉じるときの closeAllConnections）。
+          res.writeHead(200, { 'content-type': 'application/json', 'content-length': '4096', connection: 'close' });
+          res.write('{"outcome":');
           return;
         }
         const text = typeof reply.body === 'string' ? reply.body : JSON.stringify(reply.body);
@@ -1026,7 +1035,7 @@ test('with a daemon, an account chosen with unknown usage launches once with one
     ['explicit, unread', explicit, unknown('unread'), line => line.startsWith('warning: usage unknown for alpha') && !line.includes('--relogin')],
     ['explicit, needs login', explicit, unknown('needs login'), line => line.startsWith('warning:') && line.includes(RELOGIN_ALPHA.slice(4))],
     ['last resort', ['--', 'exec', '--json', '-'], unknown('unread', { lastResort: true }),
-      line => line === formatLastResortWarning('alpha', false)],
+      line => line === formatLastResortWarning('alpha')],
   ];
   for (const [what, argv, answer, expected] of cases) {
     current = answer;
@@ -1094,7 +1103,7 @@ test('with a daemon, an explicit account chosen with unknown usage whose own pol
   assert.equal(fetch.calls.length, 0);
 });
 
-test('with a daemon, only the state word needs login adds the relogin advice; no creds does not', async t => {
+test('with a daemon, a refusal adds the relogin advice only for the state word needs login, and a selection with no creds or a last resort with needs login stops as config stale', async t => {
   let current = null;
   const f = await fixture(t, { accounts: [{ label: 'alpha' }, { label: 'beta' }], daemon: ({ sha256 }) => ({ body: current(sha256) }) });
   const fetch = fakeFetch(() => jsonResponse(usageBody()));
@@ -1106,20 +1115,125 @@ test('with a daemon, only the state word needs login adds the relogin advice; no
     ['refused as usage unknown, needs login', explicit, sha256 => selectAnswer(sha256, { outcome: CODEX_SELECT_OUTCOME.refused,
       refusal: CODEX_SELECT_REFUSAL.usageUnknown, stateWord: 'needs login', usageKnown: null }), 1,
     [EXEC_LINE.usageUnknownBlocked, RELOGIN_ALPHA]],
-    ['explicit with unknown usage, no creds', explicit, sha256 => selectAnswer(sha256, { usageKnown: false, stateWord: 'no creds' }), 0,
-      ['warning: usage unknown for alpha; launching anyway (blockWhenUnknown is false)']],
-    ['last resort, no creds', auto, sha256 => selectAnswer(sha256, { usageKnown: false, lastResort: true, stateWord: 'no creds' }), 0,
-      [formatLastResortWarning('alpha', false)]],
-    ['last resort, needs login', auto, sha256 => selectAnswer(sha256, { usageKnown: false, lastResort: true, stateWord: 'needs login' }), 0,
-      [formatLastResortWarning('alpha', true)]],
+    // 常駐はこの3つの組を「選んだ」と答えない（no creds は断る。最後の手段は使える状態の口座だけ）。
+    // 起動せず config stale で止まる。
+    ['explicit with unknown usage, no creds', explicit, sha256 => selectAnswer(sha256, { usageKnown: false, stateWord: 'no creds' }),
+      null, STALE_LINES],
+    ['last resort, no creds', auto, sha256 => selectAnswer(sha256, { usageKnown: false, lastResort: true, stateWord: 'no creds' }),
+      null, STALE_LINES],
+    ['last resort, needs login', auto, sha256 => selectAnswer(sha256, { usageKnown: false, lastResort: true, stateWord: 'needs login' }),
+      null, STALE_LINES],
   ];
   for (const [what, argv, answer, code, lines] of cases) {
     current = answer;
+    const spawnsBefore = f.spawnCalls.length;
     const result = await f.run(argv, { fetchImpl: fetch.impl });
-    assert.equal(result.code, code, what);
+    if (code === null) assertStale(f, result, ['alpha', 'beta'], { spawnsBefore });
+    else assert.equal(result.code, code, what);
     assert.deepEqual(result.lines, lines, what);
     assertNoLeaks(result, ['alpha', 'beta']);
   }
+  assert.equal(launchCount(f), 0, 'none of these launches codex');
+  assert.equal(fetch.calls.length, 0);
+});
+
+// exec は、常駐が「選んだ」と答えうる組だけを受け取る（常駐が返しうる組でない答えでは、起動せずに止まる）。
+// 停止の類は、4つの状態の exhausted に写る状態語。
+const EXPLICIT_ALPHA = Object.freeze(['--account', 'alpha', '--', 'exec', '--json', '-']);
+const AUTO = Object.freeze(['--', 'exec', '--json', '-']);
+const STOPPED_STATE_WORDS = Object.freeze(Object.keys(CODEX_STATE_OF_WORD).filter(word => CODEX_STATE_OF_WORD[word] === 'exhausted'));
+
+test('with a daemon, a selection the daemon never answers for the request is config stale; the ones it answers launch', async t => {
+  let current = null;
+  const f = await fixture(t, { accounts: [{ label: 'alpha' }, { label: 'beta' }], daemon: ({ sha256 }) => ({ body: current(sha256) }) });
+  const fetch = fakeFetch(() => jsonResponse(usageBody()));
+  const never = [
+    ['without --account, unknown usage that is not the last resort', AUTO, { usageKnown: false, lastResort: false, stateWord: 'unread' }],
+    ['without --account, known usage marked as the last resort', AUTO, { usageKnown: true, lastResort: true, stateWord: 'ready' }],
+    ['with --account, the last resort with unknown usage', EXPLICIT_ALPHA, { usageKnown: false, lastResort: true, stateWord: 'unread' }],
+    ['with --account, the last resort with known usage', EXPLICIT_ALPHA, { usageKnown: true, lastResort: true, stateWord: 'ready' }],
+    ['without --account, known usage of an account that is not ready', AUTO, { usageKnown: true, stateWord: 'unread' }],
+    ['with --account, known usage of an account that is not ready', EXPLICIT_ALPHA, { usageKnown: true, stateWord: 'needs login' }],
+    ['with --account, unknown usage of a ready account', EXPLICIT_ALPHA, { usageKnown: false, stateWord: 'ready' }],
+    ['with --account, unknown usage of a reserved account', EXPLICIT_ALPHA, { usageKnown: false, stateWord: 'reserved' }],
+    ['the last resort that needs login', AUTO, { usageKnown: false, lastResort: true, stateWord: 'needs login' }],
+    ['the last resort without models', AUTO, { usageKnown: false, lastResort: true, stateWord: 'no models' }],
+    ['the last resort that is reserved', AUTO, { usageKnown: false, lastResort: true, stateWord: 'reserved' }],
+  ];
+  for (const [what, argv, change] of never) {
+    current = sha256 => selectAnswer(sha256, change);
+    const spawnsBefore = f.spawnCalls.length;
+    const result = await f.run(argv, { fetchImpl: fetch.impl });
+    assertStale(f, result, ['alpha', 'beta'], { spawnsBefore });
+  }
+  assert.equal(launchCount(f), 0);
+  // 対照: 常駐が答えうる組は、どれも1回だけ起動する。
+  const answered = [
+    [AUTO, { usageKnown: true, lastResort: false, stateWord: 'ready' }],
+    [AUTO, { usageKnown: false, lastResort: true, stateWord: 'unread' }],
+    [AUTO, { usageKnown: false, lastResort: true, stateWord: 'starting' }],
+    [EXPLICIT_ALPHA, { usageKnown: true, lastResort: false, stateWord: 'ready' }],
+    ...['needs login', 'no models', 'unread', 'starting'].map(stateWord => [EXPLICIT_ALPHA, { usageKnown: false, lastResort: false, stateWord }]),
+  ];
+  for (const [argv, change] of answered) {
+    current = sha256 => selectAnswer(sha256, change);
+    const launchesBefore = launchCount(f);
+    const result = await f.run(argv, { fetchImpl: fetch.impl });
+    assert.equal(result.code, 0, JSON.stringify(change));
+    assert.equal(launchCount(f), launchesBefore + 1, JSON.stringify(change));
+    assert.equal(f.launches.at(-1).options.env.CODEX_HOME, f.homes.alpha);
+  }
+  assert.equal(f.daemonRequests.length, never.length + answered.length);
+  assert.equal(fetch.calls.length, 0);
+});
+
+test('with a daemon, a last-resort selection of an account whose own policy blocks unknown usage is config stale', async t => {
+  let current = null;
+  const f = await fixture(t, { accounts: [{ label: 'alpha', usagePolicy: policy({ blockWhenUnknown: true }) }, { label: 'beta' }],
+    daemon: ({ sha256 }) => ({ body: current(sha256) }) });
+  const fetch = fakeFetch(() => jsonResponse(usageBody()));
+  for (const stateWord of ['unread', 'starting']) {
+    current = sha256 => selectAnswer(sha256, { usageKnown: false, lastResort: true, stateWord });
+    const spawnsBefore = f.spawnCalls.length;
+    const result = await f.run(AUTO, { fetchImpl: fetch.impl });
+    assertStale(f, result, ['alpha', 'beta'], { spawnsBefore });
+    assert.ok(!result.stderr.text().includes('last resort'), 'no last-resort warning for an account its own config withholds');
+  }
+  assert.equal(launchCount(f), 0);
+  // 対照: 自分の設定で blockWhenUnknown が偽の口座（beta）なら、同じ最後の手段の応答で起動する。
+  current = sha256 => selectAnswer(sha256, { label: 'beta', usageKnown: false, lastResort: true, stateWord: 'unread' });
+  const fallback = await f.run(AUTO, { fetchImpl: fetch.impl });
+  assert.equal(fallback.code, 0);
+  assert.deepEqual(fallback.lines, [formatLastResortWarning('beta')]);
+  assert.equal(launchCount(f), 1);
+  assert.equal(f.launches.at(-1).options.env.CODEX_HOME, f.homes.beta);
+  assert.equal(fetch.calls.length, 0);
+});
+
+test('with a daemon, a selection of a stopped account or of one without readable credentials is config stale', async t => {
+  let current = null;
+  const f = await fixture(t, { accounts: [{ label: 'alpha' }, { label: 'beta' }], daemon: ({ sha256 }) => ({ body: current(sha256) }) });
+  const fetch = fakeFetch(() => jsonResponse(usageBody()));
+  // 選び方の4通り（自動の選べる口座・自動の最後の手段・明示の口座の使用量が分かる／分からない）すべてで。
+  const ways = [
+    [AUTO, { usageKnown: true, lastResort: false }],
+    [AUTO, { usageKnown: false, lastResort: true }],
+    [EXPLICIT_ALPHA, { usageKnown: true, lastResort: false }],
+    [EXPLICIT_ALPHA, { usageKnown: false, lastResort: false }],
+  ];
+  assert.deepEqual([...STOPPED_STATE_WORDS].sort(), ['blocked', 'capped', 'exhausted', 'held', 'stopped']);
+  let runs = 0;
+  for (const stateWord of [...STOPPED_STATE_WORDS, 'no creds']) {
+    for (const [argv, way] of ways) {
+      current = sha256 => selectAnswer(sha256, { ...way, stateWord });
+      const spawnsBefore = f.spawnCalls.length;
+      const result = await f.run(argv, { fetchImpl: fetch.impl });
+      assertStale(f, result, ['alpha', 'beta'], { spawnsBefore });
+      runs += 1;
+    }
+  }
+  assert.equal(launchCount(f), 0, 'no stopped account and no account without credentials is launched');
+  assert.equal(f.daemonRequests.length, runs);
   assert.equal(fetch.calls.length, 0);
 });
 
@@ -1219,6 +1333,26 @@ test('with a daemon whose 200 answer cannot be read to the end (over the size li
   assert.deepEqual(notOk.lines, [formatVerdictLine('alpha', 'ok')]);
   assert.equal(fetch.calls.length, 1);
   assert.equal(launchCount(f), 1);
+  assertOnlyDaemonConnections(f, [f.daemonPort]);
+});
+
+test('with a daemon that sends the 200 headers and then stops in the middle of the body, exec stops with config stale at its deadline', async t => {
+  const f = await fixture(t, { accounts: [{ label: 'alpha' }, { label: 'beta' }], daemon: () => ({ stall: true }) });
+  const fetch = fakeFetch(() => jsonResponse(usageBody()));
+  for (const argv of [EXPLICIT_ALPHA, AUTO]) {
+    const spawnsBefore = f.spawnCalls.length;
+    const started = Date.now();
+    const result = await f.run(argv, { fetchImpl: fetch.impl });
+    const elapsed = Date.now() - started;
+    // 下限: 期限まで待ってから止まった（接続が切れた経路ではなく、期限切れの経路を通った）。
+    assert.ok(elapsed >= EXEC_DAEMON_TIMEOUT_MS - 50, 'waited for the deadline');
+    // 上限: 期限を渡し忘れて要求の関数の既定（2000ms）に落ちれば、ここで落ちる。
+    assert.ok(elapsed < 2000, 'gave up well before the default deadline of the request function');
+    assertStale(f, result, ['alpha', 'beta'], { spawnsBefore });
+  }
+  assert.equal(fetch.calls.length, 0, 'no one-shot read after the 200 headers');
+  assert.equal(launchCount(f), 0);
+  assert.equal(f.daemonRequests.length, 2);
   assertOnlyDaemonConnections(f, [f.daemonPort]);
 });
 
@@ -1390,8 +1524,10 @@ test('exec and every module it reaches by relative imports contain no console ca
       queue.push(resolve(dirname(path), specifier));
     }
   }
-  // 陽性対照: 辿った先に、常駐・要求の関数・資格情報の読取・src の直下のモジュールが入っている。
-  for (const name of ['codex/exec.js', 'codex/daemon.js', 'shared/local-http.js', 'codex/credentials.js', 'json-file.js']) {
+  // 陽性対照: 辿った先に、起動の点検・設定の読込み・資格情報の読取・要求の関数・src の直下のモジュールが
+  // 入っている（exec が直接読むものと、設定の読込みが読むものだけ。ほかのモジュールを読むかどうかに左右されない）。
+  for (const name of ['codex/exec.js', 'codex/account-config.js', 'codex/config.js', 'codex/credentials.js',
+    'shared/local-http.js', 'json-file.js']) {
     assert.ok(seen.has(join(srcRoot, name)), `${name} was reached`);
   }
 });

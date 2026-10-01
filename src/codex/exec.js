@@ -35,23 +35,26 @@
 // 常駐があるとき（consultDaemonSelect）:
 //   - 制御トークンのファイルを読み、設定の daemon.port のループバックへ POST /internal/select を1回送る
 //     （本文は {} か {"label":"<ラベル>"}、トークンは要求ヘッダだけに載せる。引数・環境変数には入れない）。
-//   - トークンのファイルが無い・読めない、ポートが使えない、届かない・期限切れ、200 でない応答（401・403
-//     など）のときは、常駐が無いものとして null を返す（呼出し元が1回読みで選ぶ）。
+//   - トークンのファイルが無い・読めない、ポートが使えない、届かない・応答のヘッダが来ないまま期限が
+//     切れた、200 でない応答（401・403 など）のときは、常駐が無いものとして null を返す（呼出し元が1回読みで
+//     選ぶ）。
 //   - 200 の応答は、手順2で読んだ設定と照らす。次のときは、判定を使わずに `config stale` と reload の
 //     案内で止まる（値・パス・ラベルは出さない）。常駐は選んだ記録を先に残すので、ここで止まっても常駐の
 //     記録は進む。
-//       - 200 の本文を読み切れない（上限を超えた・途中で切れた・読み終える前に期限が来た）、JSON でない。
+//       - 200 の本文を読み切れない（上限を超えた・途中で切れた・200 のヘッダを受けた後、本文を読み終える
+//         前に期限が切れた）、JSON でない。
 //       - 応答の configSha256 が無い・64桁の小文字の16進でない・自分の読込みの sha256 と違う。
 //       - 応答のラベルが自分の設定に無い（--account のときは明示したラベルと違う）。
 //       - 判定の形が分からない（知らない判定・知らない理由の語。選んだの応答で usageKnown・lastResort が
 //         真偽でない、stateWord が状態語のどれでもない）。
-//       - 明示の口座を使用量が分からないまま選んだと答えたのに、自分の設定のその口座の blockWhenUnknown
-//         が真（自分の設定では選ばない口座）。
+//       - 「選んだ」の組が、常駐が返しうる組でない（decideSelection の前の表）。no creds と停止中の状態語の
+//         「選んだ」と、使用量が分からないまま選んだと答えたのに自分の設定のその口座の blockWhenUnknown
+//         が真（自分の設定では選ばない口座）のものも、これに当たる。
 //   - 照らして合えば判定を使う。起動する口座のフォルダは、常駐の応答ではなく手順2の設定の口座のもの。
 //     判定の語の行（usage <ラベル>: <語>）は、1回読みをしないので出さない。拒否は account stopped・
 //     usage unknown (blockWhenUnknown)・no creds（どれも案内付き）・no account available。使用量が
 //     分からないまま選んだ（明示の口座・最後の手段）ときは警告の1行を出す。login し直しの案内を足すのは、
-//     状態語が needs login のときだけ（no creds は login し直しでは直らないので足さない）。
+//     明示の口座で状態語が needs login のときだけ（no creds は login し直しでは直らないので足さない）。
 import { spawn as spawnChild } from 'node:child_process';
 import { realpathSync } from 'node:fs';
 import { request as httpRequest } from 'node:http';
@@ -147,9 +150,12 @@ export function formatUnknownUsageWarning(label, word) {
   return unknownUsageWarning(label, NEEDS_LOGIN_VERDICTS.has(word));
 }
 
-/** 常駐が最後の手段で使用量の分からない口座を選んだときの警告の1行。失効していれば login し直しの案内を足す。 */
-export function formatLastResortWarning(label, needsLogin) {
-  return withReloginAdvice(`warning: usage unknown for ${label}; launching it as the last resort`, label, needsLogin);
+/**
+ * 常駐が最後の手段で使用量の分からない口座を選んだときの警告の1行。最後の手段は、使える状態で使用量だけが
+ * 分からない口座（状態語 unread・starting）なので、login し直しの案内は足さない。
+ */
+export function formatLastResortWarning(label) {
+  return `warning: usage unknown for ${label}; launching it as the last resort`;
 }
 
 /** config stale の後に出す案内の1行（値・パス・ラベルを含めない）。 */
@@ -365,7 +371,8 @@ function watchingStatus(request, seen) {
 }
 
 // 常駐へ select を1回送る。200 なら { body }（本文が JSON でない・200 の本文を読み切れなかったときは body は
-// null）、それ以外（トークンのファイルが無い・読めない、ポートが使えない、届かない・期限切れ、200 でない
+// null。200 のヘッダを受けた後に期限が切れたときも、読み切れなかったものとして null）、それ以外（トークンの
+// ファイルが無い・読めない、ポートが使えない、届かない・応答のヘッダが来ないまま期限が切れた、200 でない
 // 応答）は null。例外を投げない。
 async function askDaemonToSelect({ port, label, env, request, readToken, timeoutMs }) {
   let token;
@@ -381,8 +388,9 @@ async function askDaemonToSelect({ port, label, env, request, readToken, timeout
       method: 'POST', headers: { 'content-type': 'application/json', [CONTROL_TOKEN_HEADER]: token },
       body: JSON.stringify(label === null ? {} : { label }), timeoutMs, maxResponseBytes: DAEMON_ANSWER_MAX_BYTES });
   } catch {
-    // 常駐は 200 で答えたが本文を読み切れなかった（上限を超えた・途中で切れた・読み終える前に期限が来た）
-    // ときは、形の分からない応答として扱う（常駐が無いものとして1回読みへ移らない）。
+    // 常駐は 200 で答えたが本文を読み切れなかった（上限を超えた・途中で切れた・200 のヘッダを受けた後、本文を
+    // 読み終える前に期限が切れた）ときは、形の分からない応答として扱う（常駐が無いものとして1回読みへ移らない。
+    // 常駐は選んだ記録を残しているので、1回読みで別の口座を選ばない）。
     return seen.status === 200 ? { body: null } : null;
   }
   if (response.status !== 200) return null;
@@ -407,31 +415,52 @@ function daemonRefusalLines(label, answer) {
   }
 }
 
-// 常駐が使用量の分からない口座を選んだときの警告（分かっていれば行は無い）。
+// 常駐が使用量の分からない口座を選んだときの警告（分かっていれば行は無い）。login し直しの案内は、明示の
+// 口座で状態語が needs login のときだけ（最後の手段の状態語は unread か starting）。
 function daemonSelectionLines(label, answer) {
   if (answer.usageKnown === true) return [];
-  const needsLogin = needsLoginWord(answer.stateWord);
-  return [answer.lastResort === true ? formatLastResortWarning(label, needsLogin) : unknownUsageWarning(label, needsLogin)];
+  if (answer.lastResort === true) return [formatLastResortWarning(label)];
+  return [unknownUsageWarning(label, needsLoginWord(answer.stateWord))];
 }
 
 // 「選んだ」の応答の形が分かるか: usageKnown と lastResort が真偽で、stateWord が状態語のどれか。
 const isSelectionShape = answer => typeof answer.usageKnown === 'boolean' && typeof answer.lastResort === 'boolean'
   && isStateWord(answer.stateWord);
 
-// 「選んだ」の応答を、自分の設定の口座と照らして決定にする。明示の口座を使用量が分からないまま選んだのに、
-// 自分の設定のその口座の blockWhenUnknown が真なら、自分の設定では選ばない口座なので config stale。
+// 常駐が「選んだ」と答えうる組（常駐の select の判定と、状態の JSON の next の規則による）:
+//   - 使用量が分かっている口座（自動の選べる口座・明示の口座）: lastResort が偽で、状態語は ready。
+//   - 明示の口座を使用量が分からないまま選んだ: lastResort が偽で、状態語は needs login・no models・unread・
+//     starting のどれか（停止中と no creds は断る。reserved は blockWhenUnknown が真の口座なので断る）。
+//   - 自動の選択の最後の手段: lastResort が真・usageKnown が偽で、状態語は unread か starting（使える状態で、
+//     使用量だけが分からない口座。blockWhenUnknown が真の口座は選ばない）。
+// no creds と停止の類（4つの状態の exhausted に写る語）は、どの組にも入らない。
+const SELECTED_STATE_WORDS = Object.freeze({
+  usageKnown: new Set(['ready']),
+  explicitUnknown: new Set(['needs login', 'no models', 'unread', 'starting']),
+  lastResort: new Set(['unread', 'starting']),
+});
+
+// 「選んだ」の組が、常駐が返しうる組か（label は --account のラベル。無ければ null）。使用量が分からないまま
+// 選んだと答えたのに、自分の設定のその口座の blockWhenUnknown が真なら、自分の設定では選ばない口座なので偽。
+function isReturnableSelection(account, answer, label) {
+  const { usageKnown, lastResort, stateWord } = answer;
+  if (usageKnown) return !lastResort && SELECTED_STATE_WORDS.usageKnown.has(stateWord);
+  if (account.usagePolicy?.blockWhenUnknown === true) return false;
+  if (label !== null) return !lastResort && SELECTED_STATE_WORDS.explicitUnknown.has(stateWord);
+  return lastResort && SELECTED_STATE_WORDS.lastResort.has(stateWord);
+}
+
+// 「選んだ」の応答を、自分の設定の口座と照らして決定にする。形が分からない、または常駐が返しうる組でなければ
+// config stale（起動しない。資格情報が無い口座・停止中の口座など、常駐が選んだとは答えない組のまま起動しないため）。
 function decideSelection(account, answer, label) {
-  if (!isSelectionShape(answer)) return staleDecision();
-  if (label !== null && answer.usageKnown !== true && account.usagePolicy?.blockWhenUnknown === true) {
-    return staleDecision();
-  }
+  if (!isSelectionShape(answer) || !isReturnableSelection(account, answer, label)) return staleDecision();
   return choose(account, daemonSelectionLines(account.label, answer));
 }
 
 /**
  * 常駐の select の 200 の応答を、自分で読んだ設定と照らして決定にする。値が無い・形が違う・自分の読込みの
  * sha256 と違う、ラベルが自分の設定に無い（label があるときは明示したラベルと違う）、判定の形が分からない、
- * 明示の口座を使用量が分からないまま選んだのに自分の設定では選ばない口座のときは config stale の拒否。
+ * 「選んだ」の組が常駐の返しうる組でない（自分の設定では選ばない口座を含む）ときは config stale の拒否。
  * 起動する口座は、自分の設定の口座（応答のほかのキーは使わない）。
  * @param {unknown} answer 応答の本文を JSON として読んだ値（読めなければ null）
  * @param {{ config: object, configSha256: string, label: string|null }} own
