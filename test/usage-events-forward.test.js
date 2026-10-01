@@ -649,4 +649,87 @@ describe('usage-events.jsonl from forwardOnce', () => {
     assert.equal(events[0].errorType, 'TypeError');
     assert.equal(events[0].statusCode, 200);
   });
+
+  it('keeps upstream-error when the send on a rate-limited account fails and the error is rethrown', async () => {
+    const dir = await tempDir();
+    // The only account is rate limited, so the proxy sends on it anyway with
+    // upstream errors passed through; the connection failure is rethrown
+    // instead of being answered with a synthetic 502 inside the attempt.
+    let proxy;
+    for (let attempt = 1; ; attempt += 1) {
+      // A port that was just released: nothing listens there any more.
+      const closed = await listen(http.createServer());
+      await close(closed.server);
+      ({ proxy } = await startProxy({
+        dir,
+        upstreamUrl: closed.url,
+        accounts: [{ id: 'acct_1', name: 'a@example.com', type: 'oauth' }],
+        secrets: { acct_1: { accessToken: 'access-token-1' } },
+        prepare(manager) {
+          manager.markRateLimited('acct_1', 60);
+        },
+      }));
+      // The OS may hand the released port straight to the proxy; it would then
+      // forward to itself instead of hitting a refused connection. Retry then.
+      if (new URL(proxy.url).port !== new URL(closed.url).port) break;
+      await close(proxy.server);
+      if (attempt >= 3) assert.fail('the proxy kept getting the released upstream port');
+    }
+
+    await new Promise(resolve => {
+      const target = new URL(`${proxy.url}/v1/messages`);
+      const req = http.request({
+        hostname: target.hostname, port: target.port, path: target.pathname, method: 'POST', agent: false,
+      }, res => {
+        res.on('error', () => {});
+        res.resume();
+        res.on('close', resolve);
+      });
+      req.on('error', resolve);
+      req.end('{}');
+    });
+
+    const events = await readEvents(dir, { count: 2, timeoutMs: 300 });
+    assert.equal(events.length, 1);
+    assert.match(events[0].eventId, UUID_V4);
+    assert.equal(events[0].accountId, 'acct_1');
+    assert.equal(events[0].outcome, 'upstream-error');
+    assert.equal(events[0].errorType, 'ECONNREFUSED');
+    assert.equal(events[0].statusCode, null);
+    assert.equal(events[0].usage, null);
+  });
+
+  it('keeps upstream-error, not proxy-error, when upstream drops the socket after sending headers', async () => {
+    const dir = await tempDir();
+    const { proxy } = await startProxy({
+      dir,
+      upstreamHandler(req, res) {
+        req.resume();
+        res.writeHead(200, { 'content-type': 'text/event-stream', 'request-id': 'req_drop' });
+        // Push the head and a first event out, then cut the connection mid-body.
+        res.write('event: message_start\ndata: {"type":"message_start","message":{"id":"msg_d"}}\n\n');
+        setTimeout(() => res.socket?.destroy(), 20);
+      },
+    });
+
+    await new Promise(resolve => {
+      const target = new URL(`${proxy.url}/v1/messages`);
+      const req = http.request({
+        hostname: target.hostname, port: target.port, path: target.pathname, method: 'POST', agent: false,
+      }, res => {
+        res.on('error', () => {});
+        res.resume();
+        res.on('close', resolve);
+      });
+      req.on('error', resolve);
+      req.end('{}');
+    });
+
+    const events = await readEvents(dir, { count: 2, timeoutMs: 300 });
+    assert.equal(events.length, 1);
+    assert.equal(events[0].eventId, 'req_drop/1');
+    assert.equal(events[0].outcome, 'upstream-error');
+    assert.equal(events[0].statusCode, 200);
+    assert.equal(events[0].usage, null);
+  });
 });
