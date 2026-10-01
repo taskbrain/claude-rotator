@@ -1,4 +1,5 @@
 import { createHash } from 'node:crypto';
+import { existsSync, realpathSync } from 'node:fs';
 import { copyFile, mkdir, readFile, rm, symlink } from 'node:fs/promises';
 import { dirname, join } from 'node:path';
 import { isDeepStrictEqual } from 'node:util';
@@ -608,6 +609,28 @@ export async function installLinuxNodeLauncher({ nodePath, configPath }) {
 
 export async function removeLinuxNodeLauncher(configPath) {
   await rm(linuxNodeLauncherPath(configPath), { force: true });
+}
+
+/**
+ * Returns a node path that survives `brew upgrade` for a service definition.
+ *
+ * process.execPath has its symlinks resolved, so a Homebrew node reports the
+ * versioned `<prefix>/Cellar/<formula>/<version>/bin/node`, and that directory
+ * can disappear once the formula is upgraded and cleaned up. When `<prefix>/opt/<formula>/bin/node`
+ * exists and resolves to the same binary, that stable link is returned.
+ * Anything else (not a Cellar path, no opt link, an opt link to another
+ * version, or a resolution error) returns execPath unchanged.
+ */
+export function stableNodePath(execPath, { exists = existsSync, realpath = realpathSync } = {}) {
+  const match = /^(.*)\/Cellar\/([^/]+)\/[^/]+\/bin\/node$/.exec(execPath);
+  if (!match) return execPath;
+  const candidate = `${match[1]}/opt/${match[2]}/bin/node`;
+  try {
+    if (!exists(candidate)) return execPath;
+    return realpath(candidate) === realpath(execPath) ? candidate : execPath;
+  } catch {
+    return execPath;
+  }
 }
 
 export function renderLaunchAgentPlist({

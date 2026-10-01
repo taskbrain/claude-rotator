@@ -185,6 +185,8 @@ watchdog は15秒ごとに main LaunchAgent の登録を確認し、意図せず
 
 インストール時に Claude Code の実行可能ファイルを絶対パスで解決し、macOS LaunchAgent と Ubuntu systemd user service の `CLAUDE_ROTATOR_CLAUDE_BIN` と安全な `PATH` に固定します。Homebrew、nvm、asdf、Volta、custom npm prefix などで管理された `claude` が対話 shell でだけ見つかり、常駐サービスでは見つからない状態を防ぎます。実行場所を明示する場合は、インストール前に `CLAUDE_ROTATOR_CLAUDE_BIN=/absolute/path/to/claude` を設定してください。
 
+Homebrew の node で実行した場合、macOS LaunchAgent の起動コマンドとサービスの `PATH` には、バージョン付きの Cellar のパスではなく、同じ実体を指す安定リンク `<prefix>/opt/<formula>/bin/node`（例 `/opt/homebrew/opt/node@22/bin/node`）を書きます。`brew upgrade` で古い版のフォルダが消えてもサービスが起動できるようにするためです。以前の版が Homebrew の node でインストールした環境で `claude-rotator install` をやり直すと、サービス定義が変わるため、LaunchAgent が1回登録し直されます。
+
 サービス操作:
 
 ```bash
@@ -1193,6 +1195,8 @@ On macOS, WatchDock checks the main LaunchAgent registration every 15 seconds an
 The generated macOS LaunchAgent uses `ProcessType=Interactive` because OAuth refresh synchronously waits for the official `claude auth login --claudeai` flow to finish. launchd's default daemon resource limits can excessively delay a newly upgraded Claude Code binary's cold start and make the auth-login refresh command time out. This classification does not request a UI; it keeps the local proxy responsive to interactive requests.
 
 On macOS and Ubuntu/Linux, installation resolves Claude Code to an executable absolute path and records it as `CLAUDE_ROTATOR_CLAUDE_BIN`, together with the required service `PATH`. This keeps Homebrew, nvm, asdf, Volta, and custom npm-prefix installs available under launchd or systemd's minimal environment. Set `CLAUDE_ROTATOR_CLAUDE_BIN=/absolute/path/to/claude` before `claude-rotator install` to override discovery.
+
+With a Homebrew node, the macOS LaunchAgent's program path and service `PATH` use the stable `<prefix>/opt/<formula>/bin/node` link (for example `/opt/homebrew/opt/node@22/bin/node`) instead of the versioned Cellar path, as long as that link resolves to the same binary, so the service still starts once `brew upgrade` and its cleanup remove the old version. On an installation made by an earlier version with a Homebrew node, running `claude-rotator install` again changes the service definition, so the LaunchAgent is registered again once.
 
 Ubuntu uses a systemd user service:
 

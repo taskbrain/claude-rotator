@@ -17,8 +17,10 @@ import {
   renderSystemdUserService,
   renderServiceStartFailureMessage,
   serviceGenerationForLaunchAgent,
+  stableNodePath,
   uninstallMacosLifecycle,
 } from '../src/install.js';
+import { installMacosCommand } from '../src/cli.js';
 import { LOCAL_GATEWAY_AUTH_TOKEN } from '../src/config.js';
 import { fileSha256, readJsonFile, writeJsonFile } from '../src/json-file.js';
 import '../fixtures/service-command-guard.js';
@@ -1043,3 +1045,127 @@ async function exists(path) {
     throw error;
   }
 }
+
+describe('stableNodePath', () => {
+  const appleSiliconCellar = '/opt/homebrew/Cellar/node@22/22.22.2_2/bin/node';
+  const appleSiliconOpt = '/opt/homebrew/opt/node@22/bin/node';
+
+  function fakeFs({ existing = [], links = {} }) {
+    return {
+      exists: path => existing.includes(path),
+      realpath: path => links[path] ?? path,
+    };
+  }
+
+  it('returns the opt link of a versioned Homebrew formula when it resolves to the same binary', () => {
+    const fs = fakeFs({ existing: [appleSiliconOpt], links: { [appleSiliconOpt]: appleSiliconCellar } });
+    assert.equal(stableNodePath(appleSiliconCellar, fs), appleSiliconOpt);
+  });
+
+  it('returns the opt link under an Intel Homebrew prefix', () => {
+    const cellar = '/usr/local/Cellar/node/24.1.0/bin/node';
+    const opt = '/usr/local/opt/node/bin/node';
+    const fs = fakeFs({ existing: [opt], links: { [opt]: cellar } });
+    assert.equal(stableNodePath(cellar, fs), opt);
+  });
+
+  it('keeps the Cellar path when the opt link points at another version', () => {
+    const fs = fakeFs({
+      existing: [appleSiliconOpt],
+      links: { [appleSiliconOpt]: '/opt/homebrew/Cellar/node@22/22.23.0/bin/node' },
+    });
+    assert.equal(stableNodePath(appleSiliconCellar, fs), appleSiliconCellar);
+  });
+
+  it('keeps the Cellar path when the opt link does not exist', () => {
+    const fs = fakeFs({ existing: [] });
+    assert.equal(stableNodePath(appleSiliconCellar, fs), appleSiliconCellar);
+  });
+
+  it('keeps the Cellar path when resolving the links throws', () => {
+    const fs = {
+      exists: () => true,
+      realpath: () => {
+        throw Object.assign(new Error('permission denied'), { code: 'EACCES' });
+      },
+    };
+    assert.equal(stableNodePath(appleSiliconCellar, fs), appleSiliconCellar);
+  });
+
+  it('leaves a node that is not in a Homebrew Cellar unchanged', () => {
+    const fs = {
+      exists: () => assert.fail('exists must not be called for a non-Cellar path'),
+      realpath: () => assert.fail('realpath must not be called for a non-Cellar path'),
+    };
+    for (const execPath of [
+      '/home/alice/.nvm/versions/node/v22.1.0/bin/node',
+      '/usr/local/bin/node',
+    ]) {
+      assert.equal(stableNodePath(execPath, fs), execPath);
+    }
+  });
+});
+
+describe('installMacosCommand node path', () => {
+  const cellarNode = '/opt/homebrew/Cellar/node@22/22.22.2_2/bin/node';
+  const optNode = '/opt/homebrew/opt/node@22/bin/node';
+
+  async function renderInstalledPlist({ optTarget }) {
+    const home = await mkdtemp(join(tmpdir(), 'claude-rotator-macos-node-path-'));
+    const launchctlCalls = [];
+    const execFileImpl = async (command, args) => {
+      assert.equal(command, '/bin/launchctl');
+      launchctlCalls.push(args);
+      if (args[0] === 'print') throw Object.assign(new Error('not found'), { code: 113 });
+      if (args[0] === 'bootout') return;
+      assert.fail(`unexpected launchctl action: ${args[0]}`);
+    };
+    try {
+      await installMacosCommand({
+        write: () => {},
+        deps: {
+          uid: 501,
+          cliPath: join(home, 'repo', 'bin', 'claude-rotator.js'),
+          execPath: cellarNode,
+          nodePathExists: path => path === optNode,
+          nodeRealpath: path => (path === optNode ? optTarget : path),
+          execFileImpl,
+          healthCheck: async () => assert.fail('health check must not run for --no-start'),
+        },
+        env: { CLAUDE_ROTATOR_MACOS_SERVICE_LOCKED: '1' },
+        home,
+        config: {},
+        configPath: join(home, '.config', 'claude-rotator', 'config.json'),
+        settingsPath: join(home, '.claude', 'settings.json'),
+        statePath: join(home, '.config', 'claude-rotator', 'install-state.json'),
+        claudePath: '/opt/homebrew/bin/claude',
+        force: false,
+        noStart: true,
+      });
+      const plist = await readFile(join(home, 'Library', 'LaunchAgents', 'io.github.claude-rotator.plist'), 'utf8');
+      assert.equal(launchctlCalls.every(args => ['print', 'bootout'].includes(args[0])), true);
+      const program = /<key>ProgramArguments<\/key>\s*<array>\s*<string>([^<]*)<\/string>/.exec(plist);
+      const path = /<key>PATH<\/key>\s*<string>([^<]*)<\/string>/.exec(plist);
+      assert.ok(program, 'plist has ProgramArguments');
+      assert.ok(path, 'plist has PATH');
+      return { node: program[1], pathEntries: path[1].split(':') };
+    } finally {
+      await rm(home, { recursive: true, force: true });
+    }
+  }
+
+  it('writes the Homebrew opt link into ProgramArguments and the service PATH', async () => {
+    const { node, pathEntries } = await renderInstalledPlist({ optTarget: cellarNode });
+    assert.equal(node, optNode);
+    // The node directory follows the Claude Code directory; the rest is the installer's own PATH.
+    assert.deepEqual(pathEntries.slice(0, 2), ['/opt/homebrew/bin', '/opt/homebrew/opt/node@22/bin']);
+  });
+
+  it('keeps the Cellar path when the opt link resolves to a different binary', async () => {
+    const { node, pathEntries } = await renderInstalledPlist({
+      optTarget: '/opt/homebrew/Cellar/node@22/22.23.0/bin/node',
+    });
+    assert.equal(node, cellarNode);
+    assert.deepEqual(pathEntries.slice(0, 2), ['/opt/homebrew/bin', '/opt/homebrew/Cellar/node@22/22.22.2_2/bin']);
+  });
+});

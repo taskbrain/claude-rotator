@@ -46,6 +46,7 @@ import {
   removeInstallState,
   removeLinuxNodeLauncher,
   serviceGenerationForLaunchAgent,
+  stableNodePath,
   uninstallMacosLifecycle,
   uninstallSettings,
 } from './install.js';
@@ -781,7 +782,7 @@ async function uninstallCommand({ argv, write, error, deps = {} }) {
   write('Uninstalled claude-rotator\n');
 }
 
-async function installMacosCommand({
+export async function installMacosCommand({
   write,
   deps,
   env,
@@ -796,9 +797,13 @@ async function installMacosCommand({
 }) {
   const uid = deps.uid ?? (typeof process.getuid === 'function' ? process.getuid() : null);
   const cliPath = resolve(deps.cliPath || process.argv[1]);
-  const servicePath = serviceEnvironmentPath(claudePath);
+  const nodePath = stableNodePath(deps.execPath || process.execPath, {
+    exists: deps.nodePathExists,
+    realpath: deps.nodeRealpath,
+  });
+  const servicePath = serviceEnvironmentPath(claudePath, nodePath);
   const generationOptions = {
-    nodePath: process.execPath,
+    nodePath,
     cliPath,
     configPath,
     claudeConfigDir: dirname(settingsPath),
@@ -859,10 +864,10 @@ function serviceXdgOverrides(env) {
   };
 }
 
-function serviceEnvironmentPath(claudePath) {
+function serviceEnvironmentPath(claudePath, nodePath) {
   return [...new Set([
     claudePath ? dirname(claudePath) : null,
-    dirname(process.execPath),
+    dirname(nodePath),
     process.env.PATH,
     '/opt/homebrew/bin',
     '/usr/local/bin',
