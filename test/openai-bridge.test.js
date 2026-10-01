@@ -3104,9 +3104,17 @@ function rawPost(port, body) {
   });
 }
 
-/** Date ヘッダだけは秒単位の実時刻なので、バイト比較の前に伏せる。 */
+/**
+ * Date ヘッダだけは秒単位の実時刻なので、バイト比較の前に伏せる。
+ * 名前の大文字小文字を問わず、すべての出現を伏せる（名前の綴りはそのまま残す）。
+ * 次の行の先頭の \r\n は消費しないので、Date の行が続いても両方伏せる。
+ * 伏せるのはヘッダの部分（最初の空行より前）だけで、本文は1バイトも変えずに比べる。
+ */
 function maskDateHeader(raw) {
-  return raw.replace(/\r\nDate: [^\r\n]+\r\n/, '\r\nDate: <masked>\r\n');
+  const headerEnd = raw.indexOf('\r\n\r\n');
+  const head = headerEnd < 0 ? raw : raw.slice(0, headerEnd);
+  const rest = headerEnd < 0 ? '' : raw.slice(headerEnd);
+  return head.replace(/\r\n(date): [^\r\n]*(?=\r\n|$)/gi, '\r\n$1: <masked>') + rest;
 }
 
 /** 立てたサーバの接続を握っておく（close() は接続が残っている間は完了しないため）。 */

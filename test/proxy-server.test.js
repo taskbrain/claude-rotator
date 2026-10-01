@@ -10127,6 +10127,7 @@ describe('Claude 全枯渇 429 の 529 写像を7系統へ結線する (R4-2/R4-
   // Opus へ退避できるので 529 に留める（403 にすると Claude Code が止まってしまう）。
   // -------------------------------------------------------------------------
   async function runFableSubCapScenario({ exhaustCommonQuota = false } = {}) {
+    const deadline = Date.now() + FABLE_SUB_CAP_STALL_MS;
     const bridge = await startExhaustedBridge();
     const { upstream, seen } = await startUnusedUpstream();
     const secretStore = new MemorySecretStore();
@@ -10144,12 +10145,7 @@ describe('Claude 全枯渇 429 の 529 写像を7系統へ結線する (R4-2/R4-
       accountManager, secretStore, upstreamUrl: upstream.url, logLines, bridgeUrl: bridge.url,
     });
     // (pool)=unusable を学習させる1往復（この時点の共通枠はまだ残っている）。
-    const warm = await requestJson(`${proxy.url}/v1/messages`, {
-      method: 'POST',
-      body: JSON.stringify({ model: 'gpt-6-astra' }),
-      headers: { 'content-type': 'application/json' },
-      timeoutMs: 3_000,
-    });
+    const warm = await postFreshConnection(proxy, 'warm', 'gpt-6-astra', deadline);
     assert.equal(warm.status, 529, '前提: bridge の 529 は素通しされ (pool) が学習される');
     if (exhaustCommonQuota) {
       accountManager.updateQuota('acct_1', {
@@ -10158,11 +10154,63 @@ describe('Claude 全枯渇 429 の 529 写像を7系統へ結線する (R4-2/R4-
       });
     }
 
-    const response = await ask(proxy, 'claude-fable-5');
+    const response = await postFreshConnection(proxy, 'ask', 'claude-fable-5', deadline);
     return { response, logLines, seen, accountManager };
   }
 
-  it('4-i: keeps the Fable request at 529 while only the Fable sub-cap is exhausted', async () => {
+  // この場面の2要求は、使い回しの keep-alive ソケットに乗らないよう毎回新しい接続
+  // （agent: false）で送る。CI の負荷で遅れただけの要求を落とさないよう、3秒の打ち切り
+  // は掛けない。代わりに場面の開始（サーバを立てる前）から数えた壁時計の期限を、2要求
+  // で共通に1つだけ置く。期限を過ぎても終わらない要求はその時点で止め、どちらの要求か・
+  // 経過 ms をメッセージに残す。テストの timeout は、この期限に assert の余裕を
+  // 足した値にしてあるので、要求が止まった場合はテストの timeout より先にこの期限が効く。
+  const FABLE_SUB_CAP_STALL_MS = 15_000;
+  const FABLE_SUB_CAP_TEST_TIMEOUT = { timeout: 20_000 };
+
+  async function postFreshConnection(proxy, stage, model, deadline) {
+    const target = new URL(`${proxy.url}/v1/messages`);
+    const startedAt = Date.now();
+    const fail = error => new Error(
+      `${stage} request failed after ${Date.now() - startedAt}ms: ${error.message}`,
+      { cause: error },
+    );
+    const { status, headers, bodyText } = await new Promise((resolve, reject) => {
+      let settled = false;
+      let deadlineTimer = null;
+      const settle = (callback, value) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(deadlineTimer);
+        callback(value);
+      };
+      const req = http.request({
+        hostname: target.hostname,
+        port: target.port,
+        path: target.pathname,
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        agent: false,
+      }, res => {
+        const chunks = [];
+        res.on('data', chunk => chunks.push(chunk));
+        res.on('end', () => settle(resolve, {
+          status: res.statusCode,
+          headers: res.headers,
+          bodyText: Buffer.concat(chunks).toString('utf8'),
+        }));
+        res.on('error', error => settle(reject, fail(error)));
+        res.on('close', () => settle(reject, fail(new Error('response closed before end'))));
+      });
+      req.on('error', error => settle(reject, fail(error)));
+      deadlineTimer = setTimeout(() => {
+        req.destroy(new Error(`no response before the scenario deadline (${FABLE_SUB_CAP_STALL_MS}ms)`));
+      }, Math.max(0, deadline - Date.now()));
+      req.end(JSON.stringify({ model }));
+    });
+    return { status, headers, bodyText, body: bodyText ? JSON.parse(bodyText) : null };
+  }
+
+  it('4-i: keeps the Fable request at 529 while only the Fable sub-cap is exhausted', FABLE_SUB_CAP_TEST_TIMEOUT, async () => {
     const { response, logLines, seen, accountManager } = await runFableSubCapScenario();
     const account = accountManager.find('acct_1');
 
@@ -10177,7 +10225,7 @@ describe('Claude 全枯渇 429 の 529 写像を7系統へ結線する (R4-2/R4-
     assert.match(lastMapLine(logLines), /mappedTo=529 mapReason=all_claude_accounts_exhausted/);
   });
 
-  it('4-i: escalates the Fable request to 403 once the common quota is exhausted too', async () => {
+  it('4-i: escalates the Fable request to 403 once the common quota is exhausted too', FABLE_SUB_CAP_TEST_TIMEOUT, async () => {
     const { response, logLines, accountManager } = await runFableSubCapScenario({ exhaustCommonQuota: true });
 
     assert.equal(accountManager.isAvailable(accountManager.find('acct_1'), null), false, '前提: 共通枠も枯渇');
@@ -10193,7 +10241,7 @@ describe('Claude 全枯渇 429 の 529 写像を7系統へ結線する (R4-2/R4-
   // 403 の根拠が共通枠の枯渇である以上、本文へ載せる「最早回復時刻」も共通枠で問う。
   // 要求系列（Fable 週次サブキャップ）で引くと、共通枠より遠いリセット時刻を表示して
   // しまい、実際にはもっと早く再開できるのに「まだ待たされる」と誤解させる。
-  it('4-i: reports the common-quota recovery time in the 403 body, not the far Fable weekly reset', async () => {
+  it('4-i: reports the common-quota recovery time in the 403 body, not the far Fable weekly reset', FABLE_SUB_CAP_TEST_TIMEOUT, async () => {
     const { response, accountManager } = await runFableSubCapScenario({ exhaustCommonQuota: true });
     const earliestResetFor = modelFamily => accountManager
       .getRoutingAvailability(modelFamily)
