@@ -20,7 +20,8 @@
   "private": true,
   "type": "module",
   "bin": {
-    "claude-rotator": "bin/claude-rotator.js"
+    "claude-rotator": "bin/claude-rotator.js",
+    "codex-rotator": "bin/codex-rotator.js"
   },
   "files": [
     "bin",
