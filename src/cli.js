@@ -426,7 +426,7 @@ async function runServer({ write }) {
     credentialChangedAccountIds,
     stateWriter: createRuntimeStateWriter(statePath),
     serviceGeneration: process.env.CLAUDE_ROTATOR_SERVICE_GENERATION || null,
-    // 要求ごとの使用量イベント（usage-events.jsonl）。既定 ~/.config/claude-rotator/usage-events/、
+    // 要求ごとの使用量イベント（日付ごとの usage-events-YYYYMMDD.jsonl）。既定 ~/.config/claude-rotator/usage-events/、
     // CLAUDE_ROTATOR_USAGE_EVENTS_DIR で上書きできる。
     usageEventsDir: usageEventsDir(),
   });

@@ -590,7 +590,7 @@ describe('usage-events.jsonl from forwardOnce', () => {
       logger: line => logs.push(line),
       fsOps: {
         async chmod(target) {
-          if (target.endsWith(USAGE_EVENTS_FILENAME)) throw Object.assign(new Error('nope'), { code: 'EPERM' });
+          if (/usage-events-[0-9]{8}\.jsonl$/.test(target)) throw Object.assign(new Error('nope'), { code: 'EPERM' });
         },
       },
     });
@@ -607,7 +607,8 @@ describe('usage-events.jsonl from forwardOnce', () => {
     assert.equal(response.status, 200);
 
     await writer.flush();
-    assert.equal(await readFile(join(dir, USAGE_EVENTS_FILENAME), 'utf8'), '');
+    // The day's file was created empty and never written to.
+    assert.equal(await readFile(writer.currentPath(), 'utf8'), '');
     assert.equal(logs.length, 1);
     assert.match(logs[0], /usage-events-chmod result=failed target=file reason=chmod errorType=EPERM action=skip-event/);
   });
