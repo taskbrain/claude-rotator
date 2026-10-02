@@ -829,7 +829,7 @@ claude-rotator prepare-resume --refresh --json
 
 常駐 server は、`POST /v1/messages` を上流へ送るたびに、**その1試行ぶんの使用量を JSON Lines で1行**追記します。401 後の再送やアカウント切り替えで同じ要求を複数回送った場合は、試行ごとに1行ずつ書きます。成功・429・5xx・接続エラー・クライアントの途中切断・proxy 内部の想定外エラーのどれで終わっても、1試行につきちょうど1行です。
 
-- **出力先**: `$XDG_CONFIG_HOME/claude-rotator/usage-events/usage-events.jsonl`（`XDG_CONFIG_HOME` 未設定時は `~/.config/claude-rotator/usage-events/usage-events.jsonl`）。環境変数 `CLAUDE_ROTATOR_USAGE_EVENTS_DIR` にディレクトリを指定すると、そこへ書きます（先頭の `~/` は展開します。ファイル名は固定です）。この環境変数は、`install` が書くサービス定義（LaunchAgent / systemd unit）には含まれないため、`install` を実行したシェルで設定しても常駐サービスには届きません。
+- **出力先**: `$XDG_CONFIG_HOME/claude-rotator/usage-events/` の中の、UTC の日付ごとのファイル `usage-events-YYYYMMDD.jsonl`（`XDG_CONFIG_HOME` 未設定時は `~/.config/claude-rotator/usage-events/`）。環境変数 `CLAUDE_ROTATOR_USAGE_EVENTS_DIR` にディレクトリを指定すると、そこへ書きます（先頭の `~/` は展開します。ファイル名の形は変えられません）。この環境変数は、`install` が書くサービス定義（LaunchAgent / systemd unit）には含まれないため、`install` を実行したシェルで設定しても常駐サービスには届きません。
 - **書く項目は次だけです**（許可リスト方式）。
 
 | 項目 | 意味 |
@@ -846,7 +846,9 @@ claude-rotator prepare-resume --refresh --json
 - **要求・応答の本文、ヘッダ、OAuth トークン、API キーは書きません。** ただし `accountId` はメールアドレスの記号をハイフンに置き換えたアカウント ID で、元のアドレスがほぼ読み取れるため、`server.log` と同じ扱いで保管してください。
 - **権限**: ディレクトリは `0700`、ファイルは `0600` に直してから書き、書く前に種類・所有者・グループ／他者の権限が残っていないことを確かめます。確保できないときはそのイベントを書かずにログへ `usage-events-chmod result=failed` を出し（同じ種類は10分に1回まで）、次のイベントで再び確保を試みます。
 - **転送は止めません。** 追記は直列のキューへ積むだけで、転送の経路では完了を待ちません。書き込みの失敗はログへ1行出すだけで、転送やアカウント切り替えには影響しません（キューに1万件たまった後のイベントは捨て、そのことをログへ出します）。
-- **ローテーションはしません。** ファイルは増え続けます。1,000 行追記するごとにサイズを確かめ、500 MiB を超えていれば `usage-events-size result=over-limit` をログへ出すだけです。必要に応じて手で退避・切り詰めてください。
+- **日付ごとのファイル**: どのファイルへ書くかは、イベントの `ts` ではなく、書き込む時刻（UTC）の日付で決めます。そのため、0時の直前に記録したイベントが翌日のファイルに入ることがあります。その日のファイルは、その日の最初のイベントを書くときに作るので、イベントの無い日のファイルはできません。1,000 行追記するごとに書いているファイルのサイズを確かめ、500 MiB を超えていれば `usage-events-size result=over-limit` をログへ出します。
+- **保持**: 名前の日付が当日（UTC）の14日前以前になったファイルを、日付が変わってから最初に書くとき（server の起動後の最初の書込を含みます）に、古いものから1回に2本まで消します（ファイルの更新時刻は見ません。日数は設定では変えられません）。消すのは、名前が `usage-events-YYYYMMDD.jsonl` の形に合い、実在する日付の通常ファイルだけです。
+- **`usage-events.jsonl`（以前のファイル名）**: 最後に書いた日のファイルを指すシンボリックリンクとして残します（日付が変わった後、その日の最初のイベントを書けたときに当日のファイルへ張り替えるので、0時からその日の最初のイベントまでは、それより前に最後に書いた日のファイルを指します）。書き手はこのリンクを通さず、日付ごとのファイルへ直接書きます。読み取る側は日付ごとのファイルを読んでください。以前の版が書いた通常ファイルの `usage-events.jsonl` は、新しい版の server が最初のイベントを書く直前に、中身をコピーせずハードリンクでその日の日付のファイルへ移してから、リンクに置き換えます。同じ名前の日付のファイルが既にあるときは上書きせず、空いている前日以前の名前へ移します。移せなかったときは通常ファイルのまま残し、ログへ `usage-events-migrate result=failed` を出します。**移した以前の履歴は、ほかの日と同じく保持の期限でファイルごと消えます**（当日の名前へ移したときはおよそ14日後、前日以前の名前へ移したときはそれより早く消えます）。以前の履歴を残したい場合は、更新の前に `usage-events.jsonl` を別の場所へ写しておいてください。
 - **記録しない要求**: `POST /v1/messages/count_tokens`、proxy 自身が行う Usage API の取得、OpenAI bridge へ回した要求。
 - **現時点では出力を止める設定はありません。** `claude-rotator` の CLI から server を動かしている限り、常に書き出します。
 
@@ -940,7 +942,7 @@ claude-rotator uninstall --purge-secrets
 - `~/.config/claude-rotator/config.json`（登録アカウント一覧・設定）
 - `~/.config/claude-rotator/runtime-state.json`（直近の使用率キャッシュ）
 - `~/.config/claude-rotator/server.log` / `server.err`（ログ）
-- `~/.config/claude-rotator/usage-events/usage-events.jsonl`（使用量イベント）
+- `~/.config/claude-rotator/usage-events/`（使用量イベント。日付ごとの `usage-events-YYYYMMDD.jsonl` と、それを指す `usage-events.jsonl`）
 - `npm install -g .` でインストールしたグローバル npm パッケージ本体
 
 すべて削除するには、`uninstall --purge-secrets` の後に次を実行してください（`XDG_CONFIG_HOME` / `XDG_DATA_HOME` を独自設定している場合はそちらのパスに読み替えてください。`CLAUDE_ROTATOR_USAGE_EVENTS_DIR` で使用量イベントの出力先を変えている場合は、そのディレクトリも別に削除してください）。
@@ -1816,7 +1818,7 @@ claude-rotator prepare-resume --refresh --json
 
 The resident server appends **one JSON Lines entry per upstream attempt** of `POST /v1/messages`. When the same request is sent more than once (a resend after 401, or an account switch), each attempt gets its own line. Whether the attempt ends in success, 429, 5xx, a connection error, a client abort, or an unexpected proxy error, it produces exactly one line.
 
-- **Location:** `$XDG_CONFIG_HOME/claude-rotator/usage-events/usage-events.jsonl` (`~/.config/claude-rotator/usage-events/usage-events.jsonl` when `XDG_CONFIG_HOME` is unset). Set the environment variable `CLAUDE_ROTATOR_USAGE_EVENTS_DIR` to a directory to write there instead (a leading `~/` is expanded; the file name is fixed). This variable is not written into the service definitions that `install` creates (LaunchAgent / systemd unit), so setting it in the shell where you run `install` does not reach the service.
+- **Location:** one file per UTC day, `usage-events-YYYYMMDD.jsonl`, in `$XDG_CONFIG_HOME/claude-rotator/usage-events/` (`~/.config/claude-rotator/usage-events/` when `XDG_CONFIG_HOME` is unset). Set the environment variable `CLAUDE_ROTATOR_USAGE_EVENTS_DIR` to a directory to write there instead (a leading `~/` is expanded; the file name pattern cannot be changed). This variable is not written into the service definitions that `install` creates (LaunchAgent / systemd unit), so setting it in the shell where you run `install` does not reach the service.
 - **Only these fields are written** (allow-list):
 
 | Field | Meaning |
@@ -1833,7 +1835,9 @@ The resident server appends **one JSON Lines entry per upstream attempt** of `PO
 - **Request and response bodies, headers, OAuth tokens, and API keys are never written.** `accountId` is the email address with symbols replaced by hyphens, though, so the address is effectively readable; keep the file as carefully as `server.log`.
 - **Permissions:** the directory is set to `0700` and the file to `0600` before writing, and their type, owner, and the absence of group/other bits are checked. If that cannot be ensured, the event is skipped, `usage-events-chmod result=failed` is logged (at most once per 10 minutes for the same kind), and the next event tries again.
 - **Forwarding is never held up.** Writes are queued in order and never awaited on the forwarding path. A failed write is logged in one line and has no effect on forwarding or account switching (once 10,000 events are pending, further events are dropped and that is logged).
-- **No rotation.** The file keeps growing. Its size is checked every 1,000 appends, and `usage-events-size result=over-limit` is logged once it exceeds 500 MiB; nothing else happens. Move or truncate it yourself when needed.
+- **One file per day:** the file is chosen by the UTC date at the time the line is written, not by the event's `ts`, so an event recorded just before midnight can land in the next day's file. A day's file is created when that day's first event is written, so a day without events has no file. The size of the file being written is checked every 1,000 appends, and `usage-events-size result=over-limit` is logged once it exceeds 500 MiB.
+- **Retention:** files whose name date is 14 or more days before the current UTC date are removed, oldest first and at most two at a time, on the first write after the date changes (including the first write after the server starts). File modification times are not used, and the number of days is not configurable. Only regular files whose name has the form `usage-events-YYYYMMDD.jsonl` with a real date are removed.
+- **`usage-events.jsonl` (the former file name):** kept as a symbolic link to the most recently written day's file. After the date changes, the link is moved to the new day's file once that day's first event has been written, so from midnight until that event it still points at the file of the last day written before. The writer never writes through this link; it writes to the dated file directly. Readers should read the dated files. A regular `usage-events.jsonl` written by an earlier version is moved to that day's dated name with a hard link (its content is not copied) right before the new server writes its first event, and is then replaced by the link. If a dated file with that name already exists, it is not overwritten; the file is moved to the latest free earlier date instead. If it cannot be moved, it stays a regular file and `usage-events-migrate result=failed` is logged. **The moved history is then removed by retention like any other day's file** (about 14 days later when it took that day's name, and earlier when it took an earlier date). To keep the earlier history, copy `usage-events.jsonl` somewhere else before updating.
 - **Not recorded:** `POST /v1/messages/count_tokens`, the proxy's own Usage API calls, and requests routed to the OpenAI bridge.
 - **There is currently no setting to turn this output off.** Whenever the server runs through the `claude-rotator` CLI, the file is written.
 
@@ -1927,7 +1931,7 @@ The scope of `--purge-secrets` differs between macOS and Linux:
 - `~/.config/claude-rotator/config.json` (registered accounts and settings)
 - `~/.config/claude-rotator/runtime-state.json` (the latest usage cache)
 - `~/.config/claude-rotator/server.log` / `server.err` (logs)
-- `~/.config/claude-rotator/usage-events/usage-events.jsonl` (usage events)
+- `~/.config/claude-rotator/usage-events/` (usage events: the dated `usage-events-YYYYMMDD.jsonl` files and the `usage-events.jsonl` link to the most recently written one)
 - the global npm package itself, installed via `npm install -g .`
 
 To remove everything, run the following after `uninstall --purge-secrets` (substitute your own paths if you've set `XDG_CONFIG_HOME` / `XDG_DATA_HOME`; if you pointed `CLAUDE_ROTATOR_USAGE_EVENTS_DIR` elsewhere, remove that directory separately):

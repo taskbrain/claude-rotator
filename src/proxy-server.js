@@ -142,7 +142,7 @@ export function createProxyServer({
   serviceGeneration = null,
   // 試験用の注入口。本番は既定（DEFAULT_REQUEST_BODY_DRAIN）のまま。
   requestBodyDrain = DEFAULT_REQUEST_BODY_DRAIN,
-  // usage-events.jsonl の出力先。**明示されたときだけ**書く（本番は src/cli.js の
+  // 日付ごとの usage-events-YYYYMMDD.jsonl の出力先。**明示されたときだけ**書く（本番は src/cli.js の
   // runServer が渡す）。既定を実ディレクトリにすると、これを渡さない既存テストが
   // 実行のたびに実マシンの ~/.config/claude-rotator/usage-events/ へ書いてしまう。
   usageEventsDir = null,
@@ -3493,7 +3493,7 @@ function isUsageMeasuredRequest(req) {
 /**
  * 上流への送信1回。`usageEvents` があり、要求が `POST /v1/messages` のときだけ、
  * どの経路で終わっても（成功・401・429・5xx・接続エラー・途中切断・想定外の例外）
- * usage-events.jsonl へちょうど1行書く。`usageEvents` が無ければ forwardOnceInner() を
+ * 使用量イベントのファイルへちょうど1行書く。`usageEvents` が無ければ forwardOnceInner() を
  * そのまま呼ぶだけで、挙動は計測を入れる前と同一である。
  *
  * 追記は await しない（writer の直列キューへ積むだけ）。401 後の再送・口座の切り替え・
