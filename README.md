@@ -14,6 +14,7 @@ npm レジストリでは配布していません（`package.json` は `"private
 
 ## 目次
 
+- [v0.4.1 の主な更新](#v041-の主な更新)
 - [v0.4.0 の主な更新](#v040-の主な更新)
 - [v0.3.0 の主な更新](#v030-の主な更新)
 - [v0.2.2 の主な更新](#v022-の主な更新)
@@ -40,6 +41,12 @@ npm レジストリでは配布していません（`package.json` は `"private
 - [安全設計](#安全設計)
 - [開発](#開発)
 - [English](#english)
+
+## v0.4.1 の主な更新
+
+- **Homebrew の node でも `brew upgrade` の後にサービスが起動できるように**（#64・macOS）: Homebrew の node で `install` したとき、安定リンク `<prefix>/opt/<formula>/bin/node` が実行中の node と同じ実体を指していれば、LaunchAgent の起動コマンドにそのリンクを書きます。既存の環境で効かせるには `claude-rotator install` をやり直してください。
+- **`server.log` と `server.log.1` を 0600 に**（#58）: server の起動時とローテーション時に、所有者だけが読み書きできる権限にします（環境によっては 0600 にならないことがあります）。所有者以外のユーザーやグループでログを読んでいた場合は、読めなくなります。
+- **残った `runtime-state.json` の一時ファイルを起動時に片付け**（#60）: 強制終了で残った一時ファイルのうち、書いたプロセスが存在せず10分より古いものを削除します。止め方は [ログと切り替え診断](#ログと切り替え診断) を参照してください。
 
 ## v0.4.0 の主な更新
 
@@ -802,7 +809,7 @@ OAuth usage refresh は Node.js fetch の 10 秒 connect timeout に依存しな
 
 直近の quota / usage / `current` account は `~/.config/claude-rotator/runtime-state.json` に保存されます。これにより、service 再起動直後に Usage API へ到達できない場合でも、最後に取得できた status を復元して切り替え判断に使えます。reset 時刻を過ぎた quota は、復元後の status 計算時に stale として消去されます。
 
-`runtime-state.json` は一時ファイル（`runtime-state.json.<pid>.<乱数>.tmp`）へ書いてから置き換えるため、書き込み中にプロセスが強制終了されると一時ファイルが残ることがあります。server は起動時に1回、**書いたプロセスが存在せず（`kill(pid, 0)` が `ESRCH`）、10分より古い通常ファイル**だけを削除します。この判定は、設定ディレクトリを同じ PID 名前空間のプロセスだけが使う前提です。ホストとコンテナで設定ディレクトリを共有する構成では、生存中の書き手を不在と誤認し得るため、環境変数 `CLAUDE_ROTATOR_RUNTIME_TMP_CLEANUP=off` で無効にしてください。
+`runtime-state.json` は一時ファイル（`runtime-state.json.<pid>.<乱数>.tmp`）へ書いてから置き換えるため、書き込み中にプロセスが強制終了されると一時ファイルが残ることがあります。server は起動時に1回、**書いたプロセスが存在せず（`kill(pid, 0)` が `ESRCH`）、10分より古い通常ファイル**だけを削除します。この判定は、設定ディレクトリを同じ PID 名前空間のプロセスだけが使う前提です。ホストとコンテナで設定ディレクトリを共有する構成では、生存中の書き手を不在と誤認し得るため、環境変数 `CLAUDE_ROTATOR_RUNTIME_TMP_CLEANUP=off` で無効にしてください。この環境変数は、`install` が書くサービス定義（LaunchAgent / systemd unit）には含まれないため、`install` を実行したシェルで設定しても常駐サービスには届きません。
 
 `/internal/status` の各アカウントの `quota` には、使用率（`unified5h` / `unified7d`）を最後に取得した時刻 `usageUpdatedAt`（エポックミリ秒）と取得元 `usageSource`（`header` = 転送した応答のヘッダ、`poll` = Usage API）が入ります。未取得なら両方 `null` で、Usage API の応答がスコープ別の週次枠だけのときは更新しません。数値でない値と負の値の使用率ヘッダは捨て、`quota-header-rejected` イベントとして記録します（同じアカウント・キー・値は10分に1回まで）。1 を超える値は捨てず、そのまま記録して枠切れ判定に使います。
 
@@ -822,7 +829,7 @@ claude-rotator prepare-resume --refresh --json
 
 常駐 server は、`POST /v1/messages` を上流へ送るたびに、**その1試行ぶんの使用量を JSON Lines で1行**追記します。401 後の再送やアカウント切り替えで同じ要求を複数回送った場合は、試行ごとに1行ずつ書きます。成功・429・5xx・接続エラー・クライアントの途中切断・proxy 内部の想定外エラーのどれで終わっても、1試行につきちょうど1行です。
 
-- **出力先**: `$XDG_CONFIG_HOME/claude-rotator/usage-events/usage-events.jsonl`（`XDG_CONFIG_HOME` 未設定時は `~/.config/claude-rotator/usage-events/usage-events.jsonl`）。環境変数 `CLAUDE_ROTATOR_USAGE_EVENTS_DIR` にディレクトリを指定すると、そこへ書きます（先頭の `~/` は展開します。ファイル名は固定です）。環境変数は `install` が登録する常駐サービス（launchd / systemd）には渡されないため、効くのは、その変数を設定したシェルから `claude-rotator server` を手で起動したときだけです。
+- **出力先**: `$XDG_CONFIG_HOME/claude-rotator/usage-events/usage-events.jsonl`（`XDG_CONFIG_HOME` 未設定時は `~/.config/claude-rotator/usage-events/usage-events.jsonl`）。環境変数 `CLAUDE_ROTATOR_USAGE_EVENTS_DIR` にディレクトリを指定すると、そこへ書きます（先頭の `~/` は展開します。ファイル名は固定です）。この環境変数は、`install` が書くサービス定義（LaunchAgent / systemd unit）には含まれないため、`install` を実行したシェルで設定しても常駐サービスには届きません。
 - **書く項目は次だけです**（許可リスト方式）。
 
 | 項目 | 意味 |
@@ -1043,6 +1050,7 @@ This package is not published to the npm registry (`package.json` sets `"private
 
 ### Table of Contents
 
+- [What's New in v0.4.1](#whats-new-in-v041)
 - [What's New in v0.4.0](#whats-new-in-v040)
 - [What's New in v0.3.0](#whats-new-in-v030)
 - [What's New in v0.2.2](#whats-new-in-v022)
@@ -1067,6 +1075,12 @@ This package is not published to the npm registry (`package.json` sets `"private
 - [Troubleshooting](#troubleshooting)
 - [Security Design](#security-design)
 - [Development](#development)
+
+### What's New in v0.4.1
+
+- **The service keeps starting after `brew upgrade` with a Homebrew node** (#64, macOS): When `install` runs on a Homebrew node, it writes the stable link `<prefix>/opt/<formula>/bin/node` into the LaunchAgent's start command, provided that link points to the same node that is running. To get this on an existing setup, run `claude-rotator install` again.
+- **`server.log` and `server.log.1` are kept at 0600** (#58): At server startup and on rotation, the files are made readable and writable by the owner only (some environments can leave them wider). Other users or groups that used to read the log can no longer read it.
+- **Leftover `runtime-state.json` temporary files are cleaned up at startup** (#60): Temporary files left behind by a killed process are removed when their writing process no longer exists and they are older than 10 minutes. See [Logs and Rotation Diagnostics](#logs-and-rotation-diagnostics) for how to turn this off.
 
 ### What's New in v0.4.0
 
@@ -1782,7 +1796,7 @@ OAuth usage refreshes use a native HTTP client rather than Node's `fetch`, so th
 
 The most recent quota/usage state and `current` account are persisted to `~/.config/claude-rotator/runtime-state.json`. This lets the service restore the last known status for switching decisions right after a restart, even if the Usage API isn't reachable yet. A quota whose reset time has already passed is discarded as stale when status is recomputed after restore.
 
-`runtime-state.json` is written to a temporary file (`runtime-state.json.<pid>.<random>.tmp`) and then renamed into place, so a process killed mid-write can leave that temporary file behind. Once at startup, the server removes only **regular files whose writing process no longer exists (`kill(pid, 0)` fails with `ESRCH`) and that are older than 10 minutes**. This check assumes the config directory is used only by processes in the same PID namespace. If you share the config directory between a host and a container, a live writer can look absent, so disable the cleanup with the environment variable `CLAUDE_ROTATOR_RUNTIME_TMP_CLEANUP=off`.
+`runtime-state.json` is written to a temporary file (`runtime-state.json.<pid>.<random>.tmp`) and then renamed into place, so a process killed mid-write can leave that temporary file behind. Once at startup, the server removes only **regular files whose writing process no longer exists (`kill(pid, 0)` fails with `ESRCH`) and that are older than 10 minutes**. This check assumes the config directory is used only by processes in the same PID namespace. If you share the config directory between a host and a container, a live writer can look absent, so disable the cleanup with the environment variable `CLAUDE_ROTATOR_RUNTIME_TMP_CLEANUP=off`. This variable is not written into the service definitions that `install` creates (LaunchAgent / systemd unit), so setting it in the shell where you run `install` does not reach the service.
 
 Each account's `quota` in `/internal/status` carries `usageUpdatedAt` (epoch milliseconds) — when utilization (`unified5h` / `unified7d`) was last taken — and `usageSource` (`header` = a proxied response's headers, `poll` = the Usage API); both are `null` until the first reading, and a Usage API reply that only carries scoped weekly limits leaves them unchanged. A utilization header that is not a number or is negative is dropped and recorded as a `quota-header-rejected` event (at most once per 10 minutes for the same account, key and value); a value above 1 is kept as is and counts towards the exhaustion check.
 
@@ -1802,7 +1816,7 @@ claude-rotator prepare-resume --refresh --json
 
 The resident server appends **one JSON Lines entry per upstream attempt** of `POST /v1/messages`. When the same request is sent more than once (a resend after 401, or an account switch), each attempt gets its own line. Whether the attempt ends in success, 429, 5xx, a connection error, a client abort, or an unexpected proxy error, it produces exactly one line.
 
-- **Location:** `$XDG_CONFIG_HOME/claude-rotator/usage-events/usage-events.jsonl` (`~/.config/claude-rotator/usage-events/usage-events.jsonl` when `XDG_CONFIG_HOME` is unset). Set the environment variable `CLAUDE_ROTATOR_USAGE_EVENTS_DIR` to a directory to write there instead (a leading `~/` is expanded; the file name is fixed). The variable is not passed to the service that `install` registers (launchd / systemd), so it only takes effect when you start `claude-rotator server` by hand from a shell where it is set.
+- **Location:** `$XDG_CONFIG_HOME/claude-rotator/usage-events/usage-events.jsonl` (`~/.config/claude-rotator/usage-events/usage-events.jsonl` when `XDG_CONFIG_HOME` is unset). Set the environment variable `CLAUDE_ROTATOR_USAGE_EVENTS_DIR` to a directory to write there instead (a leading `~/` is expanded; the file name is fixed). This variable is not written into the service definitions that `install` creates (LaunchAgent / systemd unit), so setting it in the shell where you run `install` does not reach the service.
 - **Only these fields are written** (allow-list):
 
 | Field | Meaning |
