@@ -232,7 +232,9 @@ function reasonOf(entry, view, health) {
   return ACCOUNT_REASONS.has(base) ? base : null;
 }
 
-function projectAccount(entry, view, health, { source, nowMs }) {
+// order は設定の口座の並び順（1から）。プールは設定の並びのまま口座を持つ（reconcile に渡した順）ので、
+// snapshot() の並びの位置から付ける。
+function projectAccount(entry, view, health, { source, nowMs, order }) {
   if (!isCodexLabel(entry.label)) throw new TypeError('every account needs a label of the account label form');
   const policy = projectPolicy(view);
   const { windows, otherWindows, classOfKey, lastObservedAt } = projectWindows(entry, health, view.freshnessMs, nowMs);
@@ -240,6 +242,7 @@ function projectAccount(entry, view, health, { source, nowMs }) {
   if (stateWord === 'unread' && beforeFirstRead(health)) stateWord = 'starting';
   const account = {
     label: entry.label,
+    order,
     state: CODEX_STATE_OF_WORD[stateWord],
     stateWord,
     // 選べるかは、渡されたプールの選択の規則（inspect()）のとおり。常駐が無いときの直接読取でも同じに
@@ -394,11 +397,11 @@ export function projectCodexStatus({ enabled, pool, poller = null, userAgentSour
 
   const entries = pool.snapshot();
   const views = new Map(pool.inspect(nowMs).filter(isRecord).map(view => [view.key, view]));
-  const accounts = entries.map(entry => {
+  const accounts = entries.map((entry, index) => {
     const view = views.get(entry.key);
     if (!view) throw new TypeError('the pool inspection must describe every account');
     const health = poller === null ? null : poller.accountHealth(entry.key);
-    return projectAccount(entry, view, health, { source, nowMs });
+    return projectAccount(entry, view, health, { source, nowMs, order: index + 1 });
   });
   const eligibleCount = entries.filter(entry => views.get(entry.key).selectionEligible === true).length;
   const labelOfKey = new Map(entries.map(entry => [entry.key, entry.label]));

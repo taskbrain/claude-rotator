@@ -855,6 +855,22 @@ test('projection: keys added on the pool side or the poller side never reach the
   daemon: { reachable: true, startedAt: START }, source: 'daemon', nowMs: START + 1 }));
 });
 
+test('projection: order is the place of each account in the configured list, from 1, and follows a reordered list', () => {
+  const projectWith = labels => {
+    const pool = createCodexPool(labels.map(label => ({ key: keyOf(label), label })),
+      { ...TIMING, accounts: labels.map(label => ({ label, usagePolicy: POLICY })) });
+    const json = projectCodexStatus({ enabled: true, pool, source: 'daemon', nowMs: START });
+    assert.equal(codexStatusProblem(json), null);
+    return json.accounts.map(account => [account.label, account.order]);
+  };
+  assert.deepEqual(projectWith(['zz-a', 'zz-b', 'zz-c']), [['zz-a', 1], ['zz-b', 2], ['zz-c', 3]]);
+  assert.deepEqual(projectWith(['zz-c', 'zz-a', 'zz-b']), [['zz-c', 1], ['zz-a', 2], ['zz-b', 3]]);
+  // order はラベルの次に置く（JSON のキーの並び）。
+  const pool = statefulPool();
+  assert.deepEqual(Object.keys(projectCodexStatus({ enabled: true, pool, source: 'daemon', nowMs: START }).accounts[0]).slice(0, 3),
+    ['label', 'order', 'state']);
+});
+
 test('projection: mail-address-like and token-like strings outside the labels never reach the JSON', () => {
   const DUMMY_EMAIL = 'zz-dummy@example.invalid';
   const DUMMY_JWT = ['eyJhbGciOiJub25lIn0', 'eyJ6eiI6InRlc3QifQ', 'zz-fake-signature'].join('.');

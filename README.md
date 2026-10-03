@@ -35,6 +35,7 @@ npm レジストリでは配布していません（`package.json` は `"private
   - [キャッシュ観測（`observability`）](#キャッシュ観測observability)
   - [使用量イベント（`usage-events.jsonl`）](#使用量イベントusage-eventsjsonl)
 - [Codex の口座の切り替え（codex-rotator）](#codex-の口座の切り替えcodex-rotator)
+  - [状態の JSON（codex-rotator status）](#状態の-jsoncodex-rotator-status)
   - [口座のフォルダで起動したときの守り](#口座のフォルダで起動したときの守り)
   - [複数の口座を使うリスク](#複数の口座を使うリスク)
 - [主なコマンド](#主なコマンド)
@@ -859,16 +860,17 @@ claude-rotator prepare-resume --refresh --json
 
 `codex-rotator` は、このリポジトリに同梱しているもう1つのコマンドです（`npm install -g .` で `claude-rotator` と一緒に入ります）。Codex CLI（`codex`）を、登録した複数の ChatGPT アカウント（以下「口座」）のどれかで起動します。口座ごとに専用のフォルダ（以下「口座のフォルダ」）を作り、そのフォルダを `CODEX_HOME` にして本物の `codex` を起動することで、口座を切り替えます。
 
-この版の副コマンドは次の3つです（`codex-rotator` を引数なしで実行したときに出る使い方の1行）。
+この版の副コマンドは次の4つです（`codex-rotator` を引数なしで実行したときに出る使い方の1行）。
 
 ```text
-usage: codex-rotator <exec|login|accounts> [args...]
+usage: codex-rotator <exec|login|accounts|status> [args...]
 ```
 
 | 副コマンド | 何をするか |
 |---|---|
 | `login` | 新しい口座を口座のフォルダへログインさせ、設定に登録する。`--relogin` で、登録済みの口座にログインし直す |
 | `accounts` | 登録した口座の一覧を出す。`--json` で機械向けの形 |
+| `status` | 口座ごとの使用量と状態を出す。`--json` で機械向けの形、`--json --section` は見張りから使う形 |
 | `exec` | 口座を1つ選び、その口座のフォルダで `codex` を起動する |
 
 - **今は `codex-rotator exec` を通した起動だけが口座を切り替えます。** いつもの `codex` の直接の起動は、この版では切り替わらず、これまでどおり `~/.codex`（または利用者が指定した `CODEX_HOME`）で動きます。
@@ -1025,6 +1027,113 @@ usage: codex-rotator accounts [--json]
   | `accounts` | 口座ごとに、`label`（ラベル）・`codexHome`（口座のフォルダの絶対パス）・`registration`（`active` か `stopped`） |
 
 - 読むのは設定ファイルだけで、資格情報は読まず、常駐にも問い合わせません。設定が検証を通らないときは、標準出力に何も出さずに 1 で終わり、理由を標準エラーに出します。
+
+### 状態の JSON（codex-rotator status）
+
+```text
+usage: codex-rotator status [--json [--section]]
+```
+
+- 引数なし：人向けの表示です。口座ごとに、状態語・使用率のバー・停止の線（`stop`）・窓のリセット時刻と、停止が解ける条件や直し方（`clears` の行。ログインが切れた口座には `run codex-rotator login --label <ラベル> --relogin`、資格情報が読めない口座には `run codex-rotator remove --label <ラベル>, then log in again with codex-rotator login`）を出します。停止は窓のリセットでは解けず、条件を満たした使用量の読取でだけ解けます。出来事（`events`）は、新しい方から8件だけを出します。
+- `--json`：機械向けの形（固定のスキーマ）を、標準出力へ1行で出します。
+- `--json --section`：`--json` と同じスキーマ・同じ検査です。違いは、起動から JSON を書き終えるまでの全体の期限（6000 ms）を守ることだけです。期限までに読めなかった口座は、`stateWord` が `unread`（`blockWhenUnknown` が真なら `reserved`）、`reason` が `read-deadline` として入ります。
+- 読み方：codex-rotator の常駐（口座の使用量を見張るバックグラウンドのプロセス）が設定の `daemon.port` で答えれば、その状態を出します（`source` は `daemon`）。1000 ms のうちに使える答えが無ければ、口座ごとにその場で使用量を1回読みます（`source` は `direct`）。常駐が接続を断ったときや、答えが正しい形でないときは、1000 ms を待たずにすぐその場の読取へ移ります。常駐が無いときは停止（ラッチ）の状態が分からないので、`latchKnown` は `false` で、人向けの表示の `latch` の行は `unknown (no daemon)` です。
+- 設定ファイルが無いとき、または `enabled` と `acknowledgedMultiAccountRisk` の両方が `true` でないときは、資格情報を読まず、使用量も読まずに、`enabled` が `false`・`accounts` が空・`next.reason` が `disabled` の形を出します（人向けの表示は `disabled (requires enabled and acknowledgedMultiAccountRisk)` の1行）。設定が読めないときは、標準出力に何も出さずに、標準エラーに `config unreadable` を出して 1 で終わります。読む途中で予期しない失敗が起きたときも、標準出力に何も出さずに、標準エラーに `status unavailable` を出して 1 で終わります。
+- 口座はラベルだけで指します。口座のフォルダのパス・メールアドレス・トークン・User-Agent の値は出しません。
+- 実際の出力は1行で、例は読みやすく改行しています（口座1つ・常駐あり）。
+
+  ```json
+  {
+    "schemaVersion": 1,
+    "provider": "codex",
+    "enabled": true,
+    "generatedAt": "2026-01-01T00:00:00Z",
+    "source": "daemon",
+    "latchKnown": true,
+    "daemon": { "reachable": true, "startedAt": "2025-12-31T23:00:00Z" },
+    "pool": { "state": "ok", "resetAt": null },
+    "observation": { "method": "usage-get", "startupCheck": "passed", "accountUsageIncludesExternalClients": true,
+      "cliConsumptionVisible": false, "userAgentSource": "codex-version" },
+    "next": { "label": "work", "reason": "selectable" },
+    "accounts": [
+      { "label": "work", "order": 1, "state": "available", "stateWord": "ready", "selectable": true, "reason": null,
+        "resetAt": null, "ordinaryUsageAllowed": true, "nextObservationAt": "2026-01-01T00:01:00Z",
+        "policy": { "stopUsedPercent": 85, "resumeUsedPercent": 80, "blockWhenUnknown": true },
+        "latch": null,
+        "windows": {
+          "fiveHour": { "usedPercent": 40, "resetAt": "2026-01-01T02:00:00Z", "windowMinutes": 300, "fresh": true,
+            "observedAt": "2025-12-31T23:59:30Z", "lengthSource": "reported" },
+          "weekly": { "usedPercent": 60, "resetAt": "2026-01-04T00:00:00Z", "windowMinutes": 10080, "fresh": true,
+            "observedAt": "2025-12-31T23:59:30Z", "lengthSource": "reported" }
+        },
+        "otherWindows": [], "observedAt": "2025-12-31T23:59:30Z", "headroomPercent": 25 }
+    ],
+    "aggregate": { "effectiveRemainingPercent": 25, "lowerBoundPercent": 25, "fiveHourRemainingPercent": 45,
+      "weeklyRemainingPercent": 25, "accountsTotal": 1, "accountsAvailable": 1, "accountsSelectable": 1,
+      "accountsUnknown": 0, "unit": "percent-points-of-one-account" },
+    "events": [ { "at": "2025-12-31T23:30:00Z", "type": "selected", "label": "work" } ]
+  }
+  ```
+
+  | キー | 中身 |
+  |---|---|
+  | `schemaVersion` | スキーマの版（今は `1`） |
+  | `provider` | 常に `codex` |
+  | `enabled` | 2つのゲートが両方 `true` か |
+  | `generatedAt` | 出した時刻（UTC、秒まで） |
+  | `source` | `daemon`（常駐の状態）か `direct`（その場で読んだ） |
+  | `latchKnown` | 停止の状態が分かるか（常駐があるときだけ `true`） |
+  | `daemon` | `reachable`（常駐が答えたか）と `startedAt`（常駐の起動時刻） |
+  | `pool` | `state`（`ok`・`degraded`・`exhausted`・`mixed`・`needs-login`・`credentials-unavailable`・`no-account`・`unknown`）と `resetAt`（全体のリセット時刻） |
+  | `observation` | `method`（常に `usage-get`）・`startupCheck`（常駐の起動の後の確かめ：`passed`・`failed`・`pending`、常駐が無ければ `null`）・`accountUsageIncludesExternalClients`（使用率は口座全体の値）・`cliConsumptionVisible`（Codex CLI だけの分は分けられない）・`userAgentSource`（`codex-version`・`config`。作れなかったとき、または使用量の読取を1つも送らなかったときは `null`） |
+  | `next` | 次に自動で選ばれる口座の `label` と、`reason`（`selectable`・`last-resort`・`none`・`disabled`） |
+  | `accounts` | 口座ごとの状態（下の表） |
+  | `aggregate` | 全口座の実効残量と件数（下の表） |
+  | `events` | 常駐が覚えている出来事（メモリだけ・50件まで）の `at`・`type`（`stopped`・`released`・`window-cap-dropped`・`needs-login`・`recovered`・`reloaded`・`selected`）・`label` |
+
+  口座（`accounts` の各要素）のキーです。
+
+  | キー | 中身 |
+  |---|---|
+  | `label` | 口座のラベル |
+  | `order` | 設定の並び順（1から。1 が主口座で、自動で選ぶときはこの順に見ます） |
+  | `state` | 4つの状態：`available`・`exhausted`・`login_required`・`unknown` |
+  | `stateWord` | 人向けの表示の状態語（下の対応表の12語） |
+  | `selectable` | 今、自動で選べるか（スキーマは `null` を許します。今の版は常に真偽値を出します） |
+  | `reason` | 選べない理由の語（選べれば `null`）。ログイン切れは `access-token-expired`・`upstream-unauthorized`・`upstream-forbidden`、使用量を読めなかった原因は `codex-cli-missing`・`codex-version-unreadable`・`read-deadline` |
+  | `resetAt` | 口座のリセット時刻 |
+  | `ordinaryUsageAllowed` | 上流が通常の利用を許していると答えたか（答えを読めていなければ `null`） |
+  | `nextObservationAt` | 次に使用量を読む予定（常駐が無ければ `null`） |
+  | `policy` | `stopUsedPercent`・`resumeUsedPercent`・`blockWhenUnknown` |
+  | `latch` | 停止中のときの `stopped`・`cappedWindows`（`fiveHour`・`weekly`・`other`）・`upstreamBlocked`・`cleanReadsDone`・`cleanReadsNeeded`・`since`（停止していなければ `null`） |
+  | `windows` | `fiveHour`（5時間窓）と `weekly`（週次窓）。無ければ `null` |
+  | `otherWindows` | ほかの長さの窓の並び |
+  | `observedAt` | 最後に使用量を読んだ時刻 |
+  | `headroomPercent` | この口座の実効残量（停止の線までの残り。分からなければ `null`） |
+
+  窓（`windows.fiveHour`・`windows.weekly`・`otherWindows` の各要素）のキーは、`usedPercent`・`resetAt`・`windowMinutes`・`fresh`（新しい値か）・`observedAt`・`lengthSource`（長さを上流が申告した `reported` か、並び順で決めた `position`）です。`aggregate` のキーは、`effectiveRemainingPercent`（全口座の実効残量の合計。1つでも分からなければ `null`）・`lowerBoundPercent`（分かった分の合計）・`fiveHourRemainingPercent`・`weeklyRemainingPercent`・`accountsTotal`・`accountsAvailable`・`accountsSelectable`・`accountsUnknown`・`unit`（常に `percent-points-of-one-account`）です。
+
+  状態語と4つの状態の対応です。
+
+  | `state` | `stateWord` |
+  |---|---|
+  | `available` | `ready` |
+  | `exhausted` | `held`（自分の停止の線で止めた）・`capped`（枠そのものの上限）・`exhausted`・`stopped`・`blocked`（上流が通常の利用を断っている） |
+  | `login_required` | `needs login`・`no creds`（資格情報が読めない） |
+  | `unknown` | `no models`・`reserved`（使用量が分かるまで送らない）・`unread`・`starting` |
+
+#### 見張りから使う（status --json --section）
+
+`codex` を起動する前に口座の状態を確かめる見張りの仕組みからは、次の口を使ってください。
+
+```text
+codex-rotator status --json --section
+```
+
+- 起動から JSON を書き終えるまでの全体の期限は 6000 ms です。待ち時間の目安は 8000 ms です（Node の起動と受け渡しの余裕を足した、呼ぶ側が待つ期限）。終了コード 0 のときだけ、標準出力に上の JSON が1行あります。
+- 見張りは、`next.label` が `null` のとき、または `source` が `daemon` でないときに、起動を断ってください。口座の選び方は codex-rotator と同じで、常駐が無いときだけ、見張りのほうが意図して厳しくなります（常駐が無いと、呼ぶたびに上流へ使用量を読みに行き、頻度の制限に当たりうるためです。常駐が動いているのが正しい状態です）。
+- 有料クレジットの有無は出しません。有料クレジットで動く口も作りません（使用量の応答のクレジットの欄は、欄があるかどうかだけを見て、選択にも表示にも使いません）。
+- 口座は起動（セッション）の単位で選びます。会話の途中で停止の線を越えても、その会話の口座は切り替えません。
 
 ### 口座を選んで起動する（codex-rotator exec）
 
@@ -1359,6 +1468,7 @@ This package is not published to the npm registry (`package.json` sets `"private
 - [Logs and Rotation Diagnostics](#logs-and-rotation-diagnostics)
   - [Per-Request Usage Events (usage-events.jsonl)](#per-request-usage-events-usage-eventsjsonl)
 - [Switching Codex Accounts (codex-rotator)](#switching-codex-accounts-codex-rotator)
+  - [Status JSON (codex-rotator status)](#status-json-codex-rotator-status)
   - [Guards When Codex Runs in an Account Folder](#guards-when-codex-runs-in-an-account-folder)
   - [The risks of using several accounts](#the-risks-of-using-several-accounts)
 - [Commands](#commands)
@@ -2135,16 +2245,17 @@ The resident server appends **one JSON Lines entry per upstream attempt** of `PO
 
 `codex-rotator` is a second command shipped in this repository (`npm install -g .` installs it together with `claude-rotator`). It launches the Codex CLI (`codex`) with one of several registered ChatGPT accounts (below, "accounts"). It creates a dedicated folder for each account (below, "the account folder") and switches accounts by launching the real `codex` with that folder as `CODEX_HOME`.
 
-This version has three subcommands (the usage line printed when `codex-rotator` is run without arguments):
+This version has four subcommands (the usage line printed when `codex-rotator` is run without arguments):
 
 ```text
-usage: codex-rotator <exec|login|accounts> [args...]
+usage: codex-rotator <exec|login|accounts|status> [args...]
 ```
 
 | Subcommand | What it does |
 |---|---|
 | `login` | Logs a new account in to its account folder and registers it in the config. With `--relogin`, logs a registered account in again |
 | `accounts` | Lists the registered accounts. `--json` gives the machine-readable form |
+| `status` | Shows the usage and state of each account. `--json` gives the machine-readable form, and `--json --section` is the form for a watcher |
 | `exec` | Selects one account and launches `codex` in that account folder |
 
 - **Only launches through `codex-rotator exec` switch accounts at present.** Launching the usual `codex` directly does not switch accounts in this version; it keeps running with `~/.codex` (or the `CODEX_HOME` you set).
@@ -2301,6 +2412,113 @@ usage: codex-rotator accounts [--json]
   | `accounts` | Per account: `label`, `codexHome` (absolute path of the account folder) and `registration` (`active` or `stopped`) |
 
 - It reads only the config file: no credentials, and no query to the daemon. When the config does not pass validation, it prints nothing to standard output, exits with 1 and prints the reason to standard error.
+
+#### Status JSON (codex-rotator status)
+
+```text
+usage: codex-rotator status [--json [--section]]
+```
+
+- Without arguments: a view for people. Per account it shows the state word, a usage bar, the stop line (`stop`), the reset time of the window, and what clears a stop or how to fix the account (the `clears` line: `run codex-rotator login --label <label> --relogin` for an account whose login expired, `run codex-rotator remove --label <label>, then log in again with codex-rotator login` for an account whose credentials cannot be read). A stop is not cleared by a window reset; only usage reads that meet the conditions clear it. Of the events (`events`), only the eight newest are shown.
+- `--json`: the machine-readable form (a fixed schema), one line on standard output.
+- `--json --section`: the same schema and the same check as `--json`. The only difference is that it keeps an overall deadline of 6000 ms from start until the JSON is written. An account not read by then is included with `stateWord` `unread` (`reserved` when `blockWhenUnknown` is true) and `reason` `read-deadline`.
+- How it reads: when the codex-rotator daemon (the background process that watches the usage of the accounts) answers on the config's `daemon.port`, it prints the daemon's state (`source` is `daemon`). When no usable answer comes within 1000 ms, it reads the usage of each account once on the spot (`source` is `direct`). When the daemon refuses the connection or its answer is not of the right form, it moves to the on-the-spot read at once, without waiting for the 1000 ms. Without the daemon the stop (latch) state is not known, so `latchKnown` is `false` and the `latch` line of the view reads `unknown (no daemon)`.
+- Without a config file, or unless both `enabled` and `acknowledgedMultiAccountRisk` are `true`, it reads no credentials and no usage, and prints the form with `enabled` `false`, empty `accounts` and `next.reason` `disabled` (the view prints the one line `disabled (requires enabled and acknowledgedMultiAccountRisk)`). When the config cannot be read, it prints nothing to standard output, prints `config unreadable` to standard error and exits with 1. When an unexpected failure happens while reading, it likewise prints nothing to standard output, prints `status unavailable` to standard error and exits with 1.
+- Accounts are named by their labels only. Account folder paths, email addresses, tokens and the User-Agent value are never printed.
+- The real output is a single line; the example is wrapped for reading (one account, with the daemon).
+
+  ```json
+  {
+    "schemaVersion": 1,
+    "provider": "codex",
+    "enabled": true,
+    "generatedAt": "2026-01-01T00:00:00Z",
+    "source": "daemon",
+    "latchKnown": true,
+    "daemon": { "reachable": true, "startedAt": "2025-12-31T23:00:00Z" },
+    "pool": { "state": "ok", "resetAt": null },
+    "observation": { "method": "usage-get", "startupCheck": "passed", "accountUsageIncludesExternalClients": true,
+      "cliConsumptionVisible": false, "userAgentSource": "codex-version" },
+    "next": { "label": "work", "reason": "selectable" },
+    "accounts": [
+      { "label": "work", "order": 1, "state": "available", "stateWord": "ready", "selectable": true, "reason": null,
+        "resetAt": null, "ordinaryUsageAllowed": true, "nextObservationAt": "2026-01-01T00:01:00Z",
+        "policy": { "stopUsedPercent": 85, "resumeUsedPercent": 80, "blockWhenUnknown": true },
+        "latch": null,
+        "windows": {
+          "fiveHour": { "usedPercent": 40, "resetAt": "2026-01-01T02:00:00Z", "windowMinutes": 300, "fresh": true,
+            "observedAt": "2025-12-31T23:59:30Z", "lengthSource": "reported" },
+          "weekly": { "usedPercent": 60, "resetAt": "2026-01-04T00:00:00Z", "windowMinutes": 10080, "fresh": true,
+            "observedAt": "2025-12-31T23:59:30Z", "lengthSource": "reported" }
+        },
+        "otherWindows": [], "observedAt": "2025-12-31T23:59:30Z", "headroomPercent": 25 }
+    ],
+    "aggregate": { "effectiveRemainingPercent": 25, "lowerBoundPercent": 25, "fiveHourRemainingPercent": 45,
+      "weeklyRemainingPercent": 25, "accountsTotal": 1, "accountsAvailable": 1, "accountsSelectable": 1,
+      "accountsUnknown": 0, "unit": "percent-points-of-one-account" },
+    "events": [ { "at": "2025-12-31T23:30:00Z", "type": "selected", "label": "work" } ]
+  }
+  ```
+
+  | Key | Content |
+  |---|---|
+  | `schemaVersion` | Schema version (currently `1`) |
+  | `provider` | Always `codex` |
+  | `enabled` | Whether both gates are `true` |
+  | `generatedAt` | When it was produced (UTC, to the second) |
+  | `source` | `daemon` (the daemon's state) or `direct` (read on the spot) |
+  | `latchKnown` | Whether the stop state is known (`true` only with the daemon) |
+  | `daemon` | `reachable` (whether the daemon answered) and `startedAt` (when the daemon started) |
+  | `pool` | `state` (`ok`, `degraded`, `exhausted`, `mixed`, `needs-login`, `credentials-unavailable`, `no-account`, `unknown`) and `resetAt` (the reset time of the whole pool) |
+  | `observation` | `method` (always `usage-get`), `startupCheck` (the check after the daemon starts: `passed`, `failed`, `pending`, or `null` without the daemon), `accountUsageIncludesExternalClients` (the percentages are those of the whole account), `cliConsumptionVisible` (the Codex CLI's own share cannot be separated) and `userAgentSource` (`codex-version`, `config`, or `null` when it could not be built or when no usage read was sent at all) |
+  | `next` | The `label` of the account picked next and its `reason` (`selectable`, `last-resort`, `none`, `disabled`) |
+  | `accounts` | The state of each account (table below) |
+  | `aggregate` | The effective headroom of all accounts and the counts (below) |
+  | `events` | Events the daemon remembers (in memory only, up to 50): `at`, `type` (`stopped`, `released`, `window-cap-dropped`, `needs-login`, `recovered`, `reloaded`, `selected`) and `label` |
+
+  The keys of an account (each element of `accounts`):
+
+  | Key | Content |
+  |---|---|
+  | `label` | The account label |
+  | `order` | The place in the configured list (from 1; 1 is the main account, and automatic selection looks at accounts in this order) |
+  | `state` | One of four states: `available`, `exhausted`, `login_required`, `unknown` |
+  | `stateWord` | The state word of the view (the twelve words in the table below) |
+  | `selectable` | Whether it can be picked automatically now (the schema allows `null`; this version always gives `true` or `false`) |
+  | `reason` | Why it cannot be picked (`null` when it can). An expired login is `access-token-expired`, `upstream-unauthorized` or `upstream-forbidden`; usage that could not be read is `codex-cli-missing`, `codex-version-unreadable` or `read-deadline` |
+  | `resetAt` | The reset time of the account |
+  | `ordinaryUsageAllowed` | Whether the upstream said ordinary use is allowed (`null` when no such answer has been read) |
+  | `nextObservationAt` | When the usage is read next (`null` without the daemon) |
+  | `policy` | `stopUsedPercent`, `resumeUsedPercent`, `blockWhenUnknown` |
+  | `latch` | While stopped: `stopped`, `cappedWindows` (`fiveHour`, `weekly`, `other`), `upstreamBlocked`, `cleanReadsDone`, `cleanReadsNeeded`, `since` (`null` when not stopped) |
+  | `windows` | `fiveHour` (the five-hour window) and `weekly` (the weekly window); `null` when absent |
+  | `otherWindows` | The windows of other lengths |
+  | `observedAt` | When the usage was last read |
+  | `headroomPercent` | The effective headroom of this account (what is left up to the stop line; `null` when unknown) |
+
+  A window (`windows.fiveHour`, `windows.weekly`, each element of `otherWindows`) has `usedPercent`, `resetAt`, `windowMinutes`, `fresh` (whether the value is current), `observedAt` and `lengthSource` (`reported` when the upstream reported the length, `position` when it was decided by position). `aggregate` has `effectiveRemainingPercent` (the sum over all accounts; `null` when any one is unknown), `lowerBoundPercent` (the sum of the known ones), `fiveHourRemainingPercent`, `weeklyRemainingPercent`, `accountsTotal`, `accountsAvailable`, `accountsSelectable`, `accountsUnknown` and `unit` (always `percent-points-of-one-account`).
+
+  The state words and the four states:
+
+  | `state` | `stateWord` |
+  |---|---|
+  | `available` | `ready` |
+  | `exhausted` | `held` (stopped at our own stop line), `capped` (the plan limit itself), `exhausted`, `stopped`, `blocked` (the upstream refuses ordinary use) |
+  | `login_required` | `needs login`, `no creds` (the credentials cannot be read) |
+  | `unknown` | `no models`, `reserved` (sends nothing until its usage is known), `unread`, `starting` |
+
+##### Using It from a Watcher (status --json --section)
+
+A watcher that checks the accounts before `codex` starts should use this entry point:
+
+```text
+codex-rotator status --json --section
+```
+
+- The overall deadline from start until the JSON is written is 6000 ms. Allow about 8000 ms when waiting for it (the deadline plus a margin for starting Node and handing over the output). Standard output holds the JSON above on one line only when the exit code is 0.
+- The watcher should refuse to start `codex` when `next.label` is `null` or when `source` is not `daemon`. The way an account is picked is the same as in codex-rotator; only without the daemon is the watcher deliberately stricter (without the daemon every call reads the usage from the upstream, which can run into its rate limits; the daemon running is the expected state).
+- Whether paid credits exist is not reported, and there is no entry point that runs on paid credits (the credits field of the usage response is only checked for being there, and is used neither for selection nor for display).
+- Accounts are picked per launch (per session). Crossing the stop line in the middle of a conversation does not switch that conversation to another account.
 
 #### Launching with an Account (codex-rotator exec)
 

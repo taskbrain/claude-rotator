@@ -9,6 +9,7 @@
 // 渡された物が process の物と同じかを比べるだけで、中身は読まない）。
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
+import { readFile } from 'node:fs/promises';
 import { USAGE, SUBCOMMANDS, main } from '../../src/codex/cli.js';
 
 // 副コマンドごとの、本体のモジュールと呼ぶ関数の名前。
@@ -16,6 +17,7 @@ const CONTRACT = Object.freeze({
   exec: Object.freeze({ module: './exec.js', run: 'runExec' }),
   login: Object.freeze({ module: './login.js', run: 'runLogin' }),
   accounts: Object.freeze({ module: './accounts-json.js', run: 'runAccounts' }),
+  status: Object.freeze({ module: './direct-read.js', run: 'runStatus' }),
 });
 
 function captureStream() {
@@ -76,10 +78,23 @@ async function assertRefusedWithoutLoading(argv) {
   assert.deepEqual(calls, [], `no loader ran for ${JSON.stringify(argv)}`);
 }
 
-test('the usage line names the command and the three subcommands', () => {
+test('the usage line names the command and every subcommand', () => {
   assert.match(USAGE, /^usage: codex-rotator /);
   assert.ok(!USAGE.includes('\n'));
   for (const name of Object.keys(CONTRACT)) assert.ok(USAGE.includes(name));
+});
+
+// README の codex-rotator の節（日英）は、使い方の1行をそのまま載せ、その直後の表に副コマンドを1行ずつ挙げる。
+// README はリポジトリの根のものを、このファイルの場所から読む（テストの作業フォルダに依らない）。
+test('the README shows the usage line and one table row for every subcommand, in Japanese and English', async () => {
+  const readme = await readFile(new URL('../../README.md', import.meta.url), 'utf8');
+  const parts = readme.split(`\n${USAGE}\n`);
+  assert.equal(parts.length - 1, 2, 'the usage line appears once in Japanese and once in English');
+  for (const part of parts.slice(1)) {
+    // 使い方の1行の後は、コードの囲みの終わり・空行・表の順に並ぶ。
+    const rows = part.split('\n\n')[1].split('\n').filter(line => line.startsWith('| `'));
+    assert.deepEqual(rows.map(row => /^\| `([a-z]+)` \|/.exec(row)?.[1]).sort(), Object.keys(CONTRACT).sort());
+  }
 });
 
 test('no arguments prints the usage line to stderr, exits 2 and loads nothing', async () => {
@@ -92,8 +107,12 @@ test('an unknown word prints the usage line to stderr, exits 2 and loads nothing
   await assertRefusedWithoutLoading(['']);
 });
 
-test('status is not a subcommand yet and is refused with the usage line without loading anything', async () => {
-  await assertRefusedWithoutLoading(['status']);
+test('status is a subcommand: it loads only the status body and hands it the arguments after the word', async () => {
+  const { calls, table } = recordingTable();
+  const result = await runEntry(['status', '--json', '--section'], table);
+  assert.equal(result.code, 0);
+  assert.deepEqual(calls.map(call => [call.kind, call.name]), [['load', 'status'], ['run', 'status']]);
+  assert.deepEqual(calls[1].argv, ['--json', '--section']);
 });
 
 test('inherited object keys are not taken for subcommands and load nothing', async () => {
@@ -102,7 +121,7 @@ test('inherited object keys are not taken for subcommands and load nothing', asy
   }
 });
 
-test('the subcommand table has exactly exec, login and accounts, each a frozen loader and function name', () => {
+test('the subcommand table has exactly exec, login, accounts and status, each a frozen loader and function name', () => {
   assert.deepEqual(Object.keys(SUBCOMMANDS).sort(), Object.keys(CONTRACT).sort());
   assert.ok(Object.isFrozen(SUBCOMMANDS));
   for (const [name, { module: specifier, run }] of Object.entries(CONTRACT)) {
@@ -117,7 +136,7 @@ test('the subcommand table has exactly exec, login and accounts, each a frozen l
 });
 
 // ほかのテストと違い、このテストだけは本物の表の load を呼び、本体のモジュール（exec・login・
-// accounts）を実際に読む。import の行き先が解決し、表の run の欄が名指す関数をそのモジュールが
+// accounts・status）を実際に読む。import の行き先が解決し、表の run の欄が名指す関数をそのモジュールが
 // 公開していることを確かめるためで、読むだけで本体の関数は呼ばない（副コマンドは走らない）。
 test('every subcommand in the entry table loads a module that exports its runner', async () => {
   for (const [name, spec] of Object.entries(SUBCOMMANDS)) {
