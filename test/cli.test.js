@@ -305,9 +305,6 @@ describe('runCli', () => {
 
     const code = await runCli(['status'], {
       ...io,
-      // 既定の readCodexStatus() は実 HOME の設定ファイルを読み、degradeMapping が有効なら
-      // その codexStatusUrl へ HTTP を送る。合成設定を渡して実環境へ届かないようにする。
-      loadConfig: async () => ({ accounts: [] }),
       readStatus: async () => ({
         currentAccount: 'acct_1',
         currentAccountName: 'a@example.com',
@@ -1869,11 +1866,23 @@ function createIo() {
 }
 
 import { renderStatus } from '../src/monitor.js';
-import { fetchCodexHealth } from '../src/cli.js';
+import { createMonitorCodexSection, MONITOR_CODEX_INTERVAL_MS, monitorLoop } from '../src/cli.js';
+import { createCodexPool, projectCodexStatus } from '../src/codex/snapshot.js';
+import { createFakeClock } from './codex/helpers/fake-time.js';
 
-// `claude-rotator status` grows a Codex section (design doc section 9.6). The
-// fetch lives in the CLI only: proxy-server never talks to codex-rotator, and a
-// missing, slow or malformed codex-rotator may only cost this one block.
+// A Codex status JSON as codex-rotator projects it (one account, no reading yet).
+function codexStatusFrom(source) {
+  const nowMs = Date.UTC(2027, 0, 15, 8, 0, 0);
+  const pool = createCodexPool([{ key: 'zz-key-a', label: 'zz-a' }],
+    { accounts: [{ label: 'zz-a', usagePolicy: { stopUsedPercent: 75, resumeUsedPercent: 60, blockWhenUnknown: false } }] });
+  const daemon = source === 'daemon' ? { reachable: true, startedAt: nowMs - 60000 } : { reachable: false, startedAt: null };
+  return projectCodexStatus({ enabled: true, pool, daemon, source, nowMs });
+}
+
+// `claude-rotator status` and `monitor` draw a Codex section only from what the
+// Codex section reader returns (src/codex-status-child.js, built by
+// bin/claude-rotator.js). runCli never looks for a codex-rotator config or starts a
+// child process by itself, so without the reader the screen is the one it always was.
 describe('codex status section (CLI)', () => {
   const claudeStatus = {
     currentAccount: 'acct_1',
@@ -1889,350 +1898,158 @@ describe('codex status section (CLI)', () => {
   };
   const readStatus = async () => claudeStatus;
 
-  it('OSS independence: prints the current output verbatim when no codexStatusUrl is set', async () => {
+  it('OSS independence: without a Codex section reader the output is the screen without a Codex section', async () => {
     const io = createIo();
 
-    const code = await runCli(['status'], {
-      ...io,
-      readStatus,
-      loadConfig: async () => ({ openaiBridge: { enabled: true, url: 'http://127.0.0.1:18765' } }),
-    });
+    const code = await runCli(['status'], { ...io, readStatus });
 
     assert.equal(code, 0);
     assert.equal(io.output(), renderStatus(claudeStatus));
     assert.doesNotMatch(io.output(), /Codex Rotator/);
   });
 
-  it('renders the codex section from the codex-rotator health endpoint', async () => {
-    const paths = [];
-    const server = http.createServer((request, response) => {
-      paths.push(request.url);
-      response.writeHead(200, { 'Content-Type': 'application/json' });
-      response.end(JSON.stringify({
-        contract: 1,
-        pool: {
-          state: 'available',
-          accountsTotal: 1,
-          accountsAvailable: 1,
-          observation: { cliConsumptionVisible: false },
-          accounts: [{ label: 'pro-a', state: 'available', primaryUsedPercent: 12 }],
-        },
-      }));
-    });
-    const port = await listenOnCodexLoopback(server);
-
-    try {
+  it('draws what the reader returned: nothing for null, the section for a status, one line for a display error', async () => {
+    const status = codexStatusFrom('daemon');
+    for (const result of [null, { ok: true, status }, { ok: false, reason: 'exit 1' }]) {
       const io = createIo();
+      let reads = 0;
       const code = await runCli(['status'], {
         ...io,
         readStatus,
-        loadConfig: async () => codexStatusConfig(`http://127.0.0.1:${port}/healthz`),
+        readCodexSection: async () => { reads += 1; return result; },
       });
 
       assert.equal(code, 0);
-      assert.deepEqual(paths, ['/healthz']);
-      assert.match(io.output(), /Codex Rotator\s+pool: available \(1\/1 available\)/);
-      assert.match(io.output(), /pro-a\s+█░░░░░░░░░\s+12%\s+available/);
-      assert.match(io.output(), /note: the CLI's own share cannot be separated out/);
-      assert.match(io.output(), /a@example\.com\s+active/);
-    } finally {
-      await closeCodexServer(server);
+      assert.equal(reads, 1, 'the child is started once per status');
+      assert.equal(io.output(), renderStatus(claudeStatus, { codex: result }));
+      assert.match(io.output(), /a@example\.com\s+active/, 'the Claude side is drawn as before');
     }
   });
 
-  it('OSS independence: a closed codex-rotator port degrades to one line', async () => {
-    const port = await unusedCodexLoopbackPort();
+  it('a Codex section that throws while it is drawn becomes the schema display error line, and the exit code stays 0', async () => {
+    // Inputs only a substituted reader can return: a status whose accounts throw when read, and
+    // a reason outside the fixed words.
+    const throwing = { enabled: true, get accounts() { throw new Error('zz-render-failure'); } };
+    for (const result of [{ ok: true, status: throwing }, { ok: false, reason: 'zz-not-a-reason' }]) {
+      const io = createIo();
+
+      const code = await runCli(['status'], { ...io, readStatus, readCodexSection: async () => result });
+
+      assert.equal(code, 0);
+      assert.equal(io.output(), renderStatus(claudeStatus, { codex: { ok: false, reason: 'schema' } }));
+      assert.match(io.output(), /Codex Rotator\s+codex: display error \(schema\)\n/);
+      assert.match(io.output(), /a@example\.com\s+active/, 'the Claude side is drawn as before');
+    }
+  });
+
+  it('reads the Claude side first: a status that cannot be read starts no Codex child', async () => {
     const io = createIo();
-    const startedAt = Date.now();
+    let reads = 0;
 
     const code = await runCli(['status'], {
       ...io,
-      readStatus,
-      loadConfig: async () => codexStatusConfig(`http://127.0.0.1:${port}/healthz`, 400),
+      readStatus: async () => { throw new Error('zz-proxy-down'); },
+      readCodexSection: async () => { reads += 1; return null; },
     });
 
-    assert.equal(code, 0);
-    assert.match(io.output(), /Codex Rotator\s+codex: unreachable \(/);
-    assert.match(io.output(), /a@example\.com\s+active/);
-    assert.match(io.output(), /5h ███████░░░  76%/);
-    assert.ok(Date.now() - startedAt < 5000, 'status must not hang on an absent codex-rotator');
-  });
-
-  it('OSS independence: a codex-rotator that never answers is cut off at the configured deadline', async () => {
-    const sockets = new Set();
-    const server = http.createServer(() => {});
-    server.on('connection', socket => sockets.add(socket));
-    const port = await listenOnCodexLoopback(server);
-
-    try {
-      const io = createIo();
-      const startedAt = Date.now();
-
-      const code = await runCli(['status'], {
-        ...io,
-        readStatus,
-        loadConfig: async () => codexStatusConfig(`http://127.0.0.1:${port}/healthz`, 250),
-      });
-      const elapsed = Date.now() - startedAt;
-
-      assert.equal(code, 0);
-      assert.match(io.output(), /Codex Rotator\s+codex: unreachable \(timeout 250ms\)/);
-      assert.match(io.output(), /a@example\.com\s+active/);
-      assert.ok(elapsed >= 200, `the deadline must be honoured, waited ${elapsed}ms`);
-      assert.ok(elapsed < 5000, `status must not hang on a silent codex-rotator, waited ${elapsed}ms`);
-    } finally {
-      for (const socket of sockets) socket.destroy();
-      await closeCodexServer(server);
-    }
-  });
-
-  it('degrades to one line when the health response is not JSON', async () => {
-    const server = http.createServer((request, response) => {
-      response.writeHead(200, { 'Content-Type': 'application/json' });
-      response.end('<html>not json</html>');
-    });
-    const port = await listenOnCodexLoopback(server);
-
-    try {
-      const io = createIo();
-      const code = await runCli(['status'], {
-        ...io,
-        readStatus,
-        loadConfig: async () => codexStatusConfig(`http://127.0.0.1:${port}/healthz`),
-      });
-
-      assert.equal(code, 0);
-      assert.match(io.output(), /Codex Rotator\s+codex: unreachable \(invalid response\)/);
-      assert.doesNotMatch(io.output(), /not json/);
-      assert.match(io.output(), /a@example\.com\s+active/);
-    } finally {
-      await closeCodexServer(server);
-    }
-  });
-
-  it('degrades to one line on an error status without echoing the response body', async () => {
-    const server = http.createServer((request, response) => {
-      response.writeHead(500, { 'Content-Type': 'application/json' });
-      response.end(JSON.stringify({ error: 'secret-looking-detail' }));
-    });
-    const port = await listenOnCodexLoopback(server);
-
-    try {
-      const io = createIo();
-      const code = await runCli(['status'], {
-        ...io,
-        readStatus,
-        loadConfig: async () => codexStatusConfig(`http://127.0.0.1:${port}/healthz`),
-      });
-
-      assert.equal(code, 0);
-      assert.match(io.output(), /Codex Rotator\s+codex: unreachable \(http 500\)/);
-      assert.doesNotMatch(io.output(), /secret-looking-detail/);
-    } finally {
-      await closeCodexServer(server);
-    }
-  });
-
-  it('still draws the section when the health JSON carries only the required keys', async () => {
-    const server = http.createServer((request, response) => {
-      response.writeHead(200, { 'Content-Type': 'application/json' });
-      response.end(JSON.stringify({ status: 'ok', contract: 99, pool: { state: 'available', accounts: [] } }));
-    });
-    const port = await listenOnCodexLoopback(server);
-
-    try {
-      const io = createIo();
-      const code = await runCli(['status'], {
-        ...io,
-        readStatus,
-        loadConfig: async () => codexStatusConfig(`http://127.0.0.1:${port}/healthz`),
-      });
-
-      assert.equal(code, 0);
-      assert.match(io.output(), /Codex Rotator\s+pool: available$/m);
-      assert.doesNotMatch(io.output(), /undefined|NaN/);
-      assert.match(io.output(), /a@example\.com\s+active/);
-    } finally {
-      await closeCodexServer(server);
-    }
-  });
-
-  it('never prints an email-like identifier returned by the health endpoint', async () => {
-    const server = http.createServer((request, response) => {
-      response.writeHead(200, { 'Content-Type': 'application/json' });
-      response.end(JSON.stringify({
-        contract: 1,
-        pool: {
-          state: 'available',
-          accounts: [{
-            label: 'pro-a',
-            state: 'available',
-            display: 'codex-account@example.invalid',
-            email: 'codex-account@example.invalid',
-          }],
-        },
-      }));
-    });
-    const port = await listenOnCodexLoopback(server);
-
-    try {
-      const io = createIo();
-      const code = await runCli(['status'], {
-        ...io,
-        readStatus,
-        loadConfig: async () => codexStatusConfig(`http://127.0.0.1:${port}/healthz`),
-      });
-
-      assert.equal(code, 0);
-      assert.match(io.output(), /pro-a/);
-      assert.doesNotMatch(io.output(), /example\.invalid/);
-    } finally {
-      await closeCodexServer(server);
-    }
-  });
-
-  it('settles when codex-rotator drops the socket after sending headers', async () => {
-    const server = http.createServer((request, response) => {
-      response.writeHead(200, { 'Content-Type': 'application/json', 'Content-Length': '4096' });
-      response.write('{"contract":1,"pool":{"state":"avail');
-      response.socket.destroy();
-    });
-    const port = await listenOnCodexLoopback(server);
-
-    try {
-      const io = createIo();
-      const startedAt = Date.now();
-
-      const code = await runCli(['status'], {
-        ...io,
-        readStatus,
-        loadConfig: async () => codexStatusConfig(`http://127.0.0.1:${port}/healthz`, 5000),
-      });
-      const elapsed = Date.now() - startedAt;
-
-      assert.equal(code, 0);
-      assert.match(io.output(), /Codex Rotator\s+codex: unreachable \(/);
-      assert.match(io.output(), /a@example\.com\s+active/);
-      assert.ok(elapsed < 2000, `a dropped connection must settle at once, waited ${elapsed}ms`);
-    } finally {
-      await closeCodexServer(server);
-    }
-  });
-
-  it('degrades to one line when the health JSON lacks a contract-mandated key', async () => {
-    const server = http.createServer((request, response) => {
-      response.writeHead(200, { 'Content-Type': 'application/json' });
-      response.end(JSON.stringify({ status: 'ok' }));
-    });
-    const port = await listenOnCodexLoopback(server);
-
-    try {
-      const io = createIo();
-      const code = await runCli(['status'], {
-        ...io,
-        readStatus,
-        loadConfig: async () => codexStatusConfig(`http://127.0.0.1:${port}/healthz`),
-      });
-
-      assert.equal(code, 0);
-      assert.match(io.output(), /Codex Rotator\s+codex: unreachable \(invalid payload\)/);
-      assert.match(io.output(), /a@example\.com\s+active/);
-    } finally {
-      await closeCodexServer(server);
-    }
-  });
-
-  it('OSS independence: degradeMapping disabled means no request and no section', async () => {
-    let requests = 0;
-    const server = http.createServer((request, response) => {
-      requests += 1;
-      response.writeHead(200, { 'Content-Type': 'application/json' });
-      response.end('{}');
-    });
-    const port = await listenOnCodexLoopback(server);
-
-    try {
-      const io = createIo();
-      const config = codexStatusConfig(`http://127.0.0.1:${port}/healthz`);
-      config.openaiBridge.degradeMapping.enabled = false;
-
-      const code = await runCli(['status'], { ...io, readStatus, loadConfig: async () => config });
-
-      assert.equal(code, 0);
-      assert.equal(requests, 0);
-      assert.equal(io.output(), renderStatus(claudeStatus));
-      assert.doesNotMatch(io.output(), /Codex Rotator/);
-    } finally {
-      await closeCodexServer(server);
-    }
-  });
-
-  it('never fetches a non-loopback codexStatusUrl', async () => {
-    const io = createIo();
-
-    const code = await runCli(['status'], {
-      ...io,
-      readStatus,
-      loadConfig: async () => codexStatusConfig('http://198.51.100.7:18765/healthz'),
-    });
-
-    assert.equal(code, 0);
-    assert.equal(io.output(), renderStatus(claudeStatus));
-    assert.doesNotMatch(io.output(), /Codex Rotator/);
+    assert.equal(code, 1);
+    assert.equal(reads, 0);
   });
 });
 
-// Opus review NEW-1: http.request() throws synchronously for a url its client
-// cannot use. The fetch has to survive that without leaving a timer armed on an
-// uninitialised request binding, which used to surface as an uncaught
-// ReferenceError and took the whole process down instead of one status block.
-describe('codex health fetch guard', () => {
-  it('rejects at once and arms no late timer when the http client refuses the url', async () => {
-    const startedAt = Date.now();
+// `monitor` redraws every second, but starts the child that reads the Codex
+// section at most once per MONITOR_CODEX_INTERVAL_MS (5 s while the last reading
+// came from the daemon, 60 s otherwise), and never waits for it between frames.
+describe('monitor codex section', () => {
+  const claudeStatus = { currentAccount: null, accounts: [], events: [] };
+  const flush = async () => { for (let i = 0; i < 5; i++) await new Promise(setImmediate); };
+  const STOP = new Error('zz-stop-the-loop');
 
-    await assert.rejects(fetchCodexHealth('https://127.0.0.1:9999/healthz', 30), /invalid url/);
-    const elapsed = Date.now() - startedAt;
-    // Outlive the deadline: a timer left armed on the failed request would fire here.
-    await new Promise(resolve => setTimeout(resolve, 120));
+  // Runs monitorLoop for `frames` frames on the fake clock, one second per frame.
+  async function runFrames(codex, clock, frames) {
+    const drawn = [];
+    let left = frames;
+    await assert.rejects(monitorLoop({
+      write: text => { if (text !== '\x1b[H\x1b[2J') drawn.push(text); },
+      readStatus: async () => claudeStatus,
+      codex,
+      sleep: async ms => {
+        // Let a reading started on the frame just drawn begin before the clock moves on.
+        await flush();
+        if (left === 0) throw STOP;
+        left -= 1;
+        clock.advance(ms);
+        await flush();
+      },
+    }), error => error === STOP);
+    return drawn;
+  }
 
-    assert.ok(elapsed < 500, `a refused url must settle at once, waited ${elapsed}ms`);
-  });
-
-  it('never issues a request for a non-http codexStatusUrl and keeps the output verbatim', async () => {
+  it('monitor --once draws the Codex section on its only frame', async () => {
     const io = createIo();
+    const status = codexStatusFrom('direct');
+    let reads = 0;
 
-    const code = await runCli(['status'], {
+    const code = await runCli(['monitor', '--once'], {
       ...io,
-      readStatus: async () => ({
-        currentAccount: 'acct_1',
-        currentAccountName: 'a@example.com',
-        accounts: [{
-          id: 'acct_1',
-          name: 'a@example.com',
-          status: 'active',
-          quota: { unified5h: 0.76, unified7d: 0.4 },
-          usage: { totalRequests: 1 },
-        }],
-        events: [],
-      }),
-      loadConfig: async () => codexStatusConfig('https://127.0.0.1:18765/healthz'),
+      readStatus: async () => claudeStatus,
+      readCodexSection: async () => { reads += 1; return { ok: true, status }; },
     });
 
     assert.equal(code, 0);
-    assert.doesNotMatch(io.output(), /Codex Rotator/);
-    assert.match(io.output(), /a@example\.com\s+active/);
+    assert.equal(reads, 1);
+    assert.equal(io.output(), renderStatus(claudeStatus, { codex: { ok: true, status } }));
+  });
+
+  it('starts the Codex child at most every 5 s with a daemon and every 60 s otherwise, and redraws every second', async () => {
+    assert.deepEqual(MONITOR_CODEX_INTERVAL_MS, { daemon: 5000, other: 60000 });
+    const cases = [
+      { name: 'daemon', result: () => ({ ok: true, status: codexStatusFrom('daemon') }), interval: 5000 },
+      { name: 'no daemon', result: () => ({ ok: true, status: codexStatusFrom('direct') }), interval: 60000 },
+      { name: 'display error', result: () => ({ ok: false, reason: 'exit 1' }), interval: 60000 },
+      { name: 'no config file', result: () => null, interval: 60000 },
+    ];
+    for (const { name, result, interval } of cases) {
+      const clock = createFakeClock({ startMs: Date.UTC(2027, 0, 15, 8, 0, 0) });
+      const startedAt = clock.now();
+      const starts = [];
+      const codex = createMonitorCodexSection({
+        now: clock.now,
+        readCodexSection: async () => { starts.push(clock.now() - startedAt); return result(); },
+      });
+      assert.deepEqual(await codex.first(), result(), `${name}: the first frame waits for its reading`);
+      const frames = (2 * interval) / 1000 + 1;
+
+      const drawn = await runFrames(codex, clock, frames);
+
+      assert.deepEqual(starts, [0, interval, 2 * interval], `${name}: started once per ${interval} ms`);
+      assert.equal(drawn.length, frames, `${name}: every second is redrawn`);
+      assert.equal(drawn.at(-1), renderStatus(claudeStatus, { codex: result() }), `${name}: the last reading is drawn`);
+    }
+  });
+
+  it('keeps redrawing while a reading is still running, and starts no second child meanwhile', async () => {
+    const clock = createFakeClock({ startMs: Date.UTC(2027, 0, 15, 8, 0, 0) });
+    const first = { ok: true, status: codexStatusFrom('daemon') };
+    let release;
+    let reads = 0;
+    const codex = createMonitorCodexSection({
+      now: clock.now,
+      readCodexSection: () => {
+        reads += 1;
+        return reads === 1 ? Promise.resolve(first) : new Promise(resolve => { release = resolve; });
+      },
+    });
+    await codex.first();
+
+    const drawn = await runFrames(codex, clock, 20);
+
+    assert.equal(reads, 2, 'the reading due at 5 s has not settled, so no other child is started');
+    assert.equal(drawn.length, 20, 'the frames go on without waiting for it');
+    assert.equal(drawn.at(-1), renderStatus(claudeStatus, { codex: first }), 'the last settled reading is still drawn');
+    release({ ok: false, reason: 'timeout 8000ms' });
   });
 });
-
-function codexStatusConfig(codexStatusUrl, codexStatusTimeoutMs = 2000) {
-  return {
-    openaiBridge: {
-      enabled: true,
-      url: 'http://127.0.0.1:18765',
-      degradeMapping: { enabled: true, codexStatusUrl, codexStatusTimeoutMs },
-    },
-  };
-}
 
 async function listenOnCodexLoopback(server) {
   await new Promise((resolve, reject) => {

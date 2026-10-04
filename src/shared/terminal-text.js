@@ -1,11 +1,7 @@
 // 端末に出す文字列の部品（幅・バー・時間・日時）。Claude 側の画面（src/monitor.js）と Codex の状態の表示
-// （src/shared/codex-view.js）が同じ規則で描くために置く。
+// （src/shared/codex-view.js）は、どちらもこの部品で描く（同じ規則で描くために1か所に置く）。
 //
 // 共用部品なので、import してよいのは src/shared/ と node: の標準部品だけ（境界検査）。
-// 中身（terminalPadEnd・terminalDisplayWidth・terminalGraphemeWidth・isFullWidthCodePoint・progressBar・
-// formatDuration・formatJstDate）は、src/monitor.js の同じ働きの部品（formatJstDate は monitor.js では
-// formatDate、ほかは同名）と同じ規則で、同じ入力に同じ文字列を返す
-// （test/shared/codex-view.test.js が monitor.js の公開している部品と突き合わせる）。
 
 const GRAPHEME_SEGMENTER = new Intl.Segmenter('en', { granularity: 'grapheme' });
 const EMOJI_GRAPHEME = /\p{Extended_Pictographic}|\p{Regional_Indicator}/u;

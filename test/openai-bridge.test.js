@@ -1070,8 +1070,6 @@ describe('normalizeDegradeMapping (R3-2 / 設計書 §7.3)', () => {
         enabled: true,
         bothUnusableStatus: 529,
         gptPoolUnusableTtlMs: 30000,
-        codexStatusUrl: 'http://127.0.0.1:18765/healthz',
-        codexStatusTimeoutMs: 800,
       }),
       {
         enabled: true,
@@ -1082,9 +1080,6 @@ describe('normalizeDegradeMapping (R3-2 / 設計書 §7.3)', () => {
         // D-261: 既定 true のキー（全枯渇の 529 写像は現行どおり続ける）。
         claudeExhaustedTo529: true,
         gptPoolUnusableTtlMs: 30000,
-        codexStatusUrl: 'http://127.0.0.1:18765/healthz',
-        codexStatusTimeoutMs: 800,
-        notices: [],
       },
     );
   });
@@ -1100,9 +1095,6 @@ describe('normalizeDegradeMapping (R3-2 / 設計書 §7.3)', () => {
       upstreamOverloadRetryAfterSeconds: 30,
       claudeExhaustedTo529: true,
       gptPoolUnusableTtlMs: 60000,
-      codexStatusUrl: null,
-      codexStatusTimeoutMs: 1500,
-      notices: [],
     });
   });
 
@@ -1166,75 +1158,26 @@ describe('normalizeDegradeMapping (R3-2 / 設計書 §7.3)', () => {
     // ミリ秒は有限の正数のみ。0・負・NaN・Infinity・文字列はすべて既定へ戻す。
     for (const value of [0, -1, Number.NaN, Number.POSITIVE_INFINITY, '60000', null, {}]) {
       assert.equal(normalizeDegradeMapping({ gptPoolUnusableTtlMs: value }).gptPoolUnusableTtlMs, 60000);
-      assert.equal(normalizeDegradeMapping({ codexStatusTimeoutMs: value }).codexStatusTimeoutMs, 1500);
-    }
-    assert.equal(normalizeDegradeMapping({ codexStatusTimeoutMs: 1 }).codexStatusTimeoutMs, 1, '有限の正数は通す');
-  });
-
-  it('accepts only loopback urls for codexStatusUrl', () => {
-    // openaiBridge.url と同じ規律（§7.2）。非ループバックは警告つきで null と同じ扱いにする。
-    for (const value of ['http://127.0.0.1:18765/healthz', 'http://localhost:18765/healthz']) {
-      assert.equal(normalizeDegradeMapping({ codexStatusUrl: value }).codexStatusUrl, value);
-    }
-    for (const value of ['http://evil.example.com/healthz', 'https://1.2.3.4/healthz', 'not a url', '', 123, null]) {
-      assert.equal(
-        normalizeDegradeMapping({ codexStatusUrl: value }).codexStatusUrl,
-        null,
-        `${JSON.stringify(value)} must not be fetched`,
-      );
     }
   });
 
-  it('accepts the IPv6 loopback for codexStatusUrl (bracketed and expanded)', () => {
-    // new URL('http://[::1]:18765/healthz').hostname は角括弧つきの '[::1]' を返すため、
-    // 素の '::1' を持つ許可リストと突き合わせる前に角括弧を外す必要がある
-    // （修正前はこの URL が黙って null になっていた）。
-    for (const value of [
-      'http://[::1]:18765/healthz',
-      'http://[::1]/healthz',
-      // WHATWG URL が '[::1]' へ正規化する展開形。許可リストの素の '::1' と一致する。
-      'http://[0:0:0:0:0:0:0:1]:18765/healthz',
-    ]) {
-      assert.equal(normalizeDegradeMapping({ codexStatusUrl: value }).codexStatusUrl, value, value);
-      assert.deepEqual(normalizeDegradeMapping({ codexStatusUrl: value }).notices, [], value);
+  it('ignores the two keys an earlier version read for the Codex block of status', () => {
+    // 以前の版が status の Codex の節の取得先と期限に読んでいたキー。本番の設定に残っていても、読まずに
+    // 無視し、正規化の結果にも出さない。名前は組み立てて書く（以前の版のキーの名前が src・test・README に
+    // 1つも残っていないことを grep で確かめるため）。
+    const retiredUrlKey = ['codexStatus', 'Url'].join('');
+    const retiredTimeoutKey = ['codexStatus', 'TimeoutMs'].join('');
+    for (const url of ['http://127.0.0.1:18765/healthz', 'http://evil.example.com/healthz', 'not a url', 123, null]) {
+      for (const base of [{}, { enabled: true }, { enabled: true, bothUnusableStatus: 529 }]) {
+        const raw = { ...base, [retiredUrlKey]: url, [retiredTimeoutKey]: 1 };
+        const normalized = normalizeDegradeMapping(raw);
+        assert.deepEqual(normalized, normalizeDegradeMapping(base), JSON.stringify(raw));
+        assert.equal(Object.hasOwn(normalized, retiredUrlKey), false);
+        assert.equal(Object.hasOwn(normalized, retiredTimeoutKey), false);
+      }
     }
-    // ループバック以外の IPv6 は拒否側へ倒す。'[::]'（未指定アドレス）と
-    // '[::ffff:127.0.0.1]'（IPv4 射影。hostname は '[::ffff:7f00:1]' へ正規化される）も
-    // 許可リストに無いので通さない。
-    for (const value of [
-      'http://[fe80::1]:18765/healthz',
-      'http://[2001:db8::1]/healthz',
-      'http://[::]/healthz',
-      'http://[::ffff:127.0.0.1]/healthz',
-    ]) {
-      assert.equal(normalizeDegradeMapping({ codexStatusUrl: value }).codexStatusUrl, null, value);
-    }
-  });
-
-  it('records why a codexStatusUrl was dropped instead of discarding it silently', () => {
-    // 非ループバックを黙って捨てない。理由は notices に載せ、
-    // 起動時と reload 時に logDegradeMappingConfigNotice() が1行で出す（§7.2）。
-    for (const value of ['http://evil.example.com/healthz', 'https://1.2.3.4/healthz', 'http://[fe80::1]/healthz']) {
-      assert.deepEqual(
-        normalizeDegradeMapping({ codexStatusUrl: value }).notices,
-        ['degradeMapping.codexStatusUrl must be loopback; codex status section disabled'],
-        value,
-      );
-    }
-    for (const value of ['not a url', '', 123, {}, true]) {
-      assert.deepEqual(
-        normalizeDegradeMapping({ codexStatusUrl: value }).notices,
-        ['degradeMapping.codexStatusUrl is not a usable url; codex status section disabled'],
-        JSON.stringify(value) ?? String(value),
-      );
-    }
-    // 未指定は既定そのものなので通知しない（既定構成で1行も出さないための条件）。
-    for (const raw of [{}, { codexStatusUrl: null }, { codexStatusUrl: undefined }, { enabled: true }]) {
-      assert.deepEqual(normalizeDegradeMapping(raw).notices, [], JSON.stringify(raw));
-    }
-    assert.deepEqual(DISABLED_DEGRADE_MAPPING.notices, []);
-    // notices も凍結する（消費側が実行時に書き換えられない）。
-    assert.equal(Object.isFrozen(normalizeDegradeMapping({ codexStatusUrl: 'http://evil.example.com' }).notices), true);
+    assert.deepEqual(Object.keys(DISABLED_DEGRADE_MAPPING).sort(), ['bothUnusableStatus', 'claudeExhaustedTo529', 'enabled',
+      'gptPoolUnusableTtlMs', 'recoveryWaitEnabled', 'upstreamOverloadRetryAfterSeconds', 'upstreamOverloadTo429']);
   });
 
   it('returns a frozen section so a consumer cannot flip enabled at runtime', () => {
@@ -1260,9 +1203,6 @@ describe('resolveOpenAiBridgeSettings degradeMapping (R3-2 / 設計書 §7.3-2)'
       upstreamOverloadRetryAfterSeconds: 30,
       claudeExhaustedTo529: true,
       gptPoolUnusableTtlMs: 60000,
-      codexStatusUrl: null,
-      codexStatusTimeoutMs: 1500,
-      notices: [],
     });
   });
 
@@ -1349,36 +1289,20 @@ describe('degradeMapping の config-notice (設計書 §7.3-4)', () => {
     );
   });
 
-  it('logs one line per dropped codexStatusUrl (§7.2)', () => {
-    // 非ループバック URL を黙って捨てない。bridge 分岐が有効なので
-    // §7.3-4 の「bridge 無しで写像だけ有効」の行は出ず、この1行だけになる。
-    const settings = resolveOpenAiBridgeSettings(enabledBridgeConfig({
-      degradeMapping: { enabled: true, codexStatusUrl: 'http://evil.example.com/healthz' },
-    }));
-    assert.equal(settings.degradeMapping.codexStatusUrl, null, '取得先としては使わない');
-    const lines = [];
-    const returned = logDegradeMappingConfigNotice(settings, line => lines.push(line));
-    assert.equal(lines.length, 1);
-    assert.deepEqual(returned, lines);
-    assert.match(
-      lines[0],
-      /^\d{4}-\d{2}-\d{2}T[\d:.]+Z openai-bridge config-notice degradeMapping\.codexStatusUrl must be loopback; codex status section disabled$/,
-    );
-    // 利用者が書いた URL そのものはログへ転記しない。
-    assert.equal(lines[0].includes('evil.example.com'), false);
-  });
-
-  it('logs both notices when the bridge is off and the codexStatusUrl is unusable', () => {
-    const settings = resolveOpenAiBridgeSettings({
-      openaiBridge: {
-        enabled: false,
-        degradeMapping: { enabled: true, codexStatusUrl: 'http://[fe80::1]:18765/healthz' },
-      },
+  it('logs nothing for the two keys an earlier version read for the Codex block of status', () => {
+    // 読まずに無視するキーなので、残っていても通知の行は増えない（名前を組み立てる理由は上の正規化のテスト）。
+    const retired = { [['codexStatus', 'Url'].join('')]: 'http://evil.example.com/healthz',
+      [['codexStatus', 'TimeoutMs'].join('')]: 1 };
+    const withBridge = resolveOpenAiBridgeSettings(enabledBridgeConfig({ degradeMapping: { enabled: true, ...retired } }));
+    assert.deepEqual(logDegradeMappingConfigNotice(withBridge, () => assert.fail('must not log')), []);
+    // bridge 無しで写像だけ有効にした構成では、その1行だけが出る。
+    const withoutBridge = resolveOpenAiBridgeSettings({
+      openaiBridge: { enabled: false, degradeMapping: { enabled: true, ...retired } },
     });
     const lines = [];
-    assert.equal(logDegradeMappingConfigNotice(settings, line => lines.push(line)).length, 2);
+    assert.equal(logDegradeMappingConfigNotice(withoutBridge, line => lines.push(line)).length, 1);
     assert.match(lines[0], /degradeMapping enabled without openaiBridge/);
-    assert.match(lines[1], /degradeMapping\.codexStatusUrl must be loopback/);
+    assert.equal(lines[0].includes('evil.example.com'), false);
   });
 
   it('(g) announces the upstream 529 -> 429 mapping at startup and reload only when it is on', () => {
@@ -1436,15 +1360,6 @@ describe('degradeMapping の config-notice (設計書 §7.3-4)', () => {
     }
   });
 
-  it('logs nothing for a loopback IPv6 codexStatusUrl', () => {
-    // 修正前は [::1] が黙って捨てられていた。いまは値が残り通知も出ない。
-    const settings = resolveOpenAiBridgeSettings(enabledBridgeConfig({
-      degradeMapping: { enabled: true, codexStatusUrl: 'http://[::1]:18765/healthz' },
-    }));
-    assert.equal(settings.degradeMapping.codexStatusUrl, 'http://[::1]:18765/healthz');
-    assert.deepEqual(logDegradeMappingConfigNotice(settings, () => assert.fail('must not log')), []);
-  });
-
   it('logs nothing when the notice does not apply', () => {
     const cases = [
       ['bridge も写像も有効', resolveOpenAiBridgeSettings(enabledBridgeConfig({ degradeMapping: { enabled: true } }))],
@@ -1467,13 +1382,13 @@ describe('degradeMapping の config-notice (設計書 §7.3-4)', () => {
     assert.match(logDegradeMappingConfigNotice(settings)[0], /config-notice/, 'logger 省略でも行を返す');
     assert.deepEqual(logDegradeMappingConfigNotice(undefined, () => { throw new Error('must not log'); }), []);
     assert.deepEqual(logDegradeMappingConfigNotice({}, () => { throw new Error('must not log'); }), []);
-    // 正規化を通っていない手組みの settings（notices 欠落）でも投げない。この関数は
+    // 正規化を通っていない手組みの settings でも投げない。この関数は
     // createProxyServer の起動経路で呼ばれるため、例外は起動そのものを壊す。
     assert.deepEqual(logDegradeMappingConfigNotice({ enabled: true, degradeMapping: { enabled: true } }), []);
     assert.deepEqual(
       logDegradeMappingConfigNotice({ enabled: false, degradeMapping: { enabled: true } }).length,
       1,
-      'notices が無くても §7.3-4 の行は出る',
+      '手組みの settings でも、bridge 無しで写像だけ有効にした行は出る',
     );
   });
 });
@@ -2948,52 +2863,6 @@ describe('forwardToOpenAiBridge > 403 本文の最早回復時刻 (R4-1 再検�
       assert.equal(response.status, 403);
       assert.match(JSON.parse(text).error.message, new RegExp(`Earliest recovery: ${FAR_FUTURE_RESET_AT}\\.$`));
     }
-  });
-});
-
-// Opus review NEW-1: http.request() cannot speak any scheme but http: and throws
-// synchronously, so a loopback https url has to be dropped at settings-resolution
-// time - with a notice, like every other discarded value (design doc 7.2).
-describe('degradeMapping codexStatusUrl scheme', () => {
-  it('drops a non-http scheme even on loopback, with a notice', () => {
-    for (const value of [
-      'https://127.0.0.1:18765/healthz',
-      'https://localhost:18765/healthz',
-      'https://[::1]:18765/healthz',
-    ]) {
-      const normalized = normalizeDegradeMapping({ enabled: true, codexStatusUrl: value });
-      assert.equal(normalized.codexStatusUrl, null, value);
-      assert.deepEqual(
-        normalized.notices,
-        ['degradeMapping.codexStatusUrl must use http: scheme; codex status section disabled'],
-        value,
-      );
-    }
-  });
-
-  it('keeps loopback http urls untouched', () => {
-    for (const value of ['http://127.0.0.1:18765/healthz', 'http://[::1]/healthz']) {
-      const normalized = normalizeDegradeMapping({ enabled: true, codexStatusUrl: value });
-      assert.equal(normalized.codexStatusUrl, value, value);
-      assert.deepEqual(normalized.notices, [], value);
-    }
-  });
-
-  it('logs the dropped scheme without copying the configured url', () => {
-    const settings = resolveOpenAiBridgeSettings({
-      openaiBridge: {
-        enabled: true,
-        url: 'http://127.0.0.1:18765',
-        degradeMapping: { enabled: true, codexStatusUrl: 'https://127.0.0.1:18765/healthz' },
-      },
-    });
-    const lines = [];
-
-    assert.equal(settings.degradeMapping.codexStatusUrl, null);
-    logDegradeMappingConfigNotice(settings, line => lines.push(line));
-    assert.equal(lines.length, 1);
-    assert.match(lines[0], /degradeMapping\.codexStatusUrl must use http: scheme; codex status section disabled$/);
-    assert.equal(lines[0].includes('healthz'), false);
   });
 });
 

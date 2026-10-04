@@ -5,10 +5,10 @@
 //   2. 設定を1回読む。読めなければ `config unreadable` で 1。ファイルが無い・2つのゲート（enabled と
 //      acknowledgedMultiAccountRisk）が真でないときは、資格情報を読まず、読取も送らずに、無効の状態
 //      （enabled:false・accounts:[]・source:"direct"・next.reason:"disabled"）を出す。
-//   3. 版の読取（使用量の読取の User-Agent を組み立てるため）を、常駐への問い合わせと並べて先に始める。
+//   3. 常駐へ GET /internal/status を1回送る（STATUS_DAEMON_TIMEOUT_MS まで）。200 で、スキーマ検査を通り、
+//      source が daemon の値なら、それをそのまま使う（このときは Codex CLI を起こさない）。
+//   4. 常駐が使える値を返さなかったら、版の読取（使用量の読取の User-Agent を組み立てるため）を始める。
 //      設定に User-Agent の上書きの組があるとき・Codex CLI が見つからないときは読まない。
-//   4. 常駐へ GET /internal/status を1回送る（STATUS_DAEMON_TIMEOUT_MS まで）。200 で、スキーマ検査を通り、
-//      source が daemon の値なら、それをそのまま使う。
 //   5. 常駐が無ければ、口座ごとに使用量をその場で1回読み（exec と同じ1回読みの部品 createOneShotUsageReader。
 //      同時に CODEX_DIRECT_READ_CONCURRENCY 口座まで）、結果をプールへ当てて、状態の射影（snapshot.js）で
 //      JSON にする。source は direct で、停止（ラッチ）の状態は分からない（latchKnown:false）。
@@ -226,13 +226,14 @@ export async function readCodexStatus({ config, env, deadlineAt = null, deps = {
   } = deps;
   const codexPath = findCodex({ codexPath: config.codexPath, env, platform }).path ?? null;
   const overridden = config.usageUserAgent != null || config.usageOriginator != null;
-  // 版の読取を、常駐への問い合わせと並べて先に始める（常駐が答えたら結果は使わない）。
-  const version = codexPath === null || overridden ? null
-    : Promise.resolve().then(() => readVersion(codexPath, { spawn, scheduler })).catch(() => null);
 
   const fromDaemon = await askDaemonForStatus({ port: config.daemon?.port, request, scheduler });
   if (fromDaemon !== null) return fromDaemon;
 
+  // 版の読取は、常駐が使える値を返さなかった後にだけ始める（常駐が答えたら Codex CLI を起こさない）。
+  // 全体の期限は、1回の読取の期限を残りの時間で切ることで守る。
+  const version = codexPath === null || overridden ? null
+    : Promise.resolve().then(() => readVersion(codexPath, { spawn, scheduler })).catch(() => null);
   const { pool: entries } = codexAccountEntries(config);
   const pool = createCodexPool(entries, config);
   const readAccount = createOneShotUsageReader({ config, codexPath, spawn, readVersion: () => version,

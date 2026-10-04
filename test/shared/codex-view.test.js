@@ -1,7 +1,7 @@
 // 共用の部品のテスト: Codex の状態の描画（src/shared/codex-view.js）、端末の文字列の部品
 // （src/shared/terminal-text.js）、codex-rotator の置き場所（src/shared/codex-locator.js）。
 //
-// 描画は、旧い画面（src/monitor.js の旧い Codex の節）が出していた項目を全部引き継いだことを、項目ごとに
+// 描画は、Codex の節に出す項目（src/shared/codex-view.js の頭の注記に並べた画面の作り）を、項目ごとに
 // 1つ以上のテストで確かめる。見本の状態の JSON は合成の値で、描く前にスキーマ検査を通す（検査の外の値で
 // 描き方を確かめるテストだけは、その旨を書いて検査を通さない）。
 // 純粋関数だけで、I/O はしない（置き場所のテストが入口のファイルがあるかを1回だけ見る）。
@@ -84,14 +84,9 @@ const detail = (key, text) => `    ${terminalPadEnd(key, 9)}${text}`;
 
 // --- 端末の文字列の部品 -----------------------------------------------------------------------------
 
-test('terminal text: bars and durations are the same as the ones the Claude screen draws', () => {
-  for (const ratio of [null, undefined, Number.NaN, -0.5, 0, 0.05, 0.31, 0.5, 0.99, 1, 1.4]) {
-    assert.equal(progressBar(ratio), monitorBar(ratio), String(ratio));
-    assert.equal(progressBar(ratio, 5), monitorBar(ratio, 5), String(ratio));
-  }
-  for (const ms of [null, -1, 0, 1, 59 * MIN, HOUR, 2 * HOUR + 12 * MIN, DAY, 3 * DAY + 16 * HOUR, Infinity]) {
-    assert.equal(formatDuration(ms), monitorDuration(ms), String(ms));
-  }
+test('terminal text: monitor.js hands out the shared bar and duration functions as they are', () => {
+  assert.equal(monitorBar, progressBar);
+  assert.equal(monitorDuration, formatDuration);
 });
 
 test('terminal text: widths count wide, emoji, combining and control characters the way a terminal shows them', () => {

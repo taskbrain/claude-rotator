@@ -515,8 +515,6 @@ claude-rotator status
 | `degradeMapping.upstreamOverloadRetryAfterSeconds` | `30` | 上記で付け直す `Retry-After` の秒数。`1`〜`3600` の整数だけを受け付け、それ以外（小数・文字列・範囲外）はすべて `30` になります |
 | `degradeMapping.claudeExhaustedTo529` | `true` | **Claude の全口座が枠切れになったときに、claude-rotator が返す 429 を 529 `overloaded_error` へ書き換えるかどうか。** 既定の `true` は従来どおりの写像（529。`bothUnusableStatus` / `recoveryWaitEnabled` によっては 403 / 429）で、Claude Code を `fallbackModel` の次のモデルへ退避させるための書き換えです。`false` にすると、429 を `anthropic-ratelimit-unified-*` ヘッダと本文のまま**そのまま返します**——Claude Code はこれを「プランの使用量上限」と認識し、`fallbackModel` を使わずに**同じモデルのままリセットまで待って再試行**します（`fallbackModel` を設定しない運用ではこちらが目的の挙動です）。**このキーだけは既定が `true` なので、無効化として受け付けるのは真偽値の `false` だけ**です（`"false"` や `0` を含むそれ以外の値はすべて既定の `true` になります）。**このキーが効くのは `degradeMapping.enabled` が `true`（529 への写像が有効）のときだけです。** `degradeMapping.enabled` が `false`（既定）なら、この 429 はもともと書き換えられずにそのまま返るので、`true` でも `false` でも応答は変わりません（`false` にしたときの `config-notice` が出るだけです）。ただし `openaiBridge.enabled` が `true` で、その `url` / `modelPattern` が不正（`url` がループバックでない場合を含む）なときは、このキーを含む `degradeMapping` 全体が無効になります。`false` にしたときは起動時と `POST /internal/reload` のときに `config-notice` が1行出ます |
 | `degradeMapping.gptPoolUnusableTtlMs` | `60000`（60秒） | 「GPT 側は使えない」という学習を、状態不明へ戻すまでの時間。`recoveryWaitEnabled` が `false` のときは**回復見込み時刻を伴わない学習にだけ**効き、`true` のときは回復見込み時刻を伴う学習にも `min(回復見込み時刻, 学習時刻 + この値)` として効きます |
-| `degradeMapping.codexStatusUrl` | `null` | `status` にブリッジ側の枠状況を表示するための取得先（loopback のみ）。`null` なら表示しません |
-| `degradeMapping.codexStatusTimeoutMs` | `1500` | 上記取得のタイムアウト（必ず有限値） |
 
 **既定は無効です。** `degradeMapping` を書かなければ挙動は現行とまったく同じで、新規インストール時に生成される `config.json` にもこのセクションは書き出されません。claude-rotator を単体で使う場合、何もする必要はありません。転送先のブリッジも任意であり、無くても claude-rotator は完全に動作します。
 
@@ -585,56 +583,6 @@ claude-rotator status
 - 529 は Anthropic が本当に過負荷のときと同じ経路です。`fallbackModel` を設定していない利用者からは、通常の過負荷エラーと区別が付きません。次の要素へ切り替わるのは Claude Code が 529 を3回再試行した後で、これは `fallbackModel` に次の要素がある場合の挙動です。
 - `fallbackModel` の最終要素も同じ枯渇したプールに当たる構成では、Claude Code は指数バックオフ（約0.6秒→約74秒）で再試行を続けます。当リポジトリの実測では、150秒の観測窓内で終端せず、エラー表示も出ませんでした。`bothUnusableStatus` の既定を `403`（明示停止）にしているのはこのためで、`529` にすると同じ無言待ちが起こり得ます。`openaiBridge.enabled` が `false` のまま `degradeMapping.enabled` を `true` にする構成でも同じ限界があるため、起動時とリロード時に警告を1行出します（禁止はしません）。
 - ログには token を書かず、アカウントはアカウント ID（`account=`）で表します。`--id` を省いて登録した場合、このアカウント ID はメールアドレスの記号をハイフンに置き換えたものなので、元のアドレスがほぼ読み取れます。`status` のアカウント表示には登録時の表示名（`--name`。省略時はログイン中のメールアドレス）がそのまま出ます。
-
-#### `status` の Codex 節（`codexStatusUrl` を設定したとき）
-
-`degradeMapping.codexStatusUrl` を設定すると、`status` / `monitor` の末尾に転送先ブリッジ（Codex）側の枠状況が表示されます。Claude 側の表示は1行も変わらず、未設定なら節そのものが出ません。
-
-```text
-Codex Rotator                          sendable 0/2  (held 1, capped 1)
-  reading  usage GET, startup check passed   raw pool state: exhausted
-  primary  held      7d █████████░  98%  stop 75%   reset in 5d5h -> 09/21 20:59 JST
-    clears   not at that reset - needs 2 clean usage reads at 70% or less
-    read     09/16 15:32 JST usage GET, ordinary use allowed, stops when unread
-  pro2     capped    7d ██████████ 100%  stop 100%  reset in 3d1h -> 09/19 17:10 JST
-    clears   not at that reset - needs 2 clean usage reads at 99% or less
-    read     09/16 15:32 JST usage GET, ordinary use allowed, sends when unread
-  note: held = stopped at our own line, capped = the plan limit itself
-  note: held / capped read as "cooldown" in /healthz
-  note: second window on pro2 is stale - last read 0% on 09/16 06:23 JST
-  note: percentages cover the whole account - ChatGPT app, Codex CLI, and this bridge
-  note: the CLI's own share cannot be separated out
-  note: accounts are shown by label
-```
-
-**停止はリセット時刻では解けません。** 行末の `reset in ... -> ... JST` は使用率の窓が初期化される時刻であって、その口座が送れるようになる時刻ではありません。解除の条件は必ずその直下の `clears` 行に書かれています。
-
-状態語の意味:
-
-| 語 | 意味 | 何で解けるか |
-|---|---|---|
-| `ready` | 送れる | — |
-| `held` | 当方の停止線（`stop` 欄が100%未満）で止めた＝枠の温存 | 条件を満たす使用率の観測が2回 |
-| `capped` | 上流の枠そのものに到達した（`stop 100%`） | 同上 |
-| `stopped` | 個別の停止線を持たない口座が、全体の既定線で止まった | 条件を満たす観測が1回 |
-| `reserved` | 観測を失っており、読めるまで送らない設定の口座 | 完全な観測が1回 |
-| `unread` | 使用率の観測がまだ無い | 同上 |
-| `exhausted` | 429 を観測した | リセット後の再確認 |
-| `blocked` | 上流が通常利用を拒否している | 通常利用可と読める観測 |
-| `needs login` | ログインが切れている | 再ログイン |
-
-`held` と `capped` の解除条件には、使用率のほかに**上流が通常利用を許可していると読める観測であること**が含まれます。上流が拒否している間は使用率が下がっても解けないため、そのときは `clears` 行の直下に `refused` 行を出します。停止線（`stop` 欄）を緩めても、拒否が続くかぎりその口座は1本も送れません。
-
-読み方の補足:
-
-- `/healthz` の `state` と画面の状態語は1対1ではありません。停止ラッチの掛かった口座（`held` / `capped` / `stopped` / `blocked`）だけが `cooldown` と出て、ラッチを持たない `reserved` / `unread` は `ready` のまま出ます（送れないのは選択側の判断のため）。画面はこの対応を**そのときのペイロードから起こして** `note:` 行に出すので、`/healthz` と突き合わせるときはその行を見てください。
-- ラベル欄は画面に出る最長のラベルに合わせて広がります（契約の上限は32文字）。ラベルが20文字を超える構成では、行はその分だけ長くなります。ラベルを切り詰めると `/healthz` と突き合わせられなくなるため、切り詰めません。
-- `read` 行が観測の出所（`usage GET` など）を併記するのは、それがその読み取りのものだと確かめられるときだけです（ブリッジは口座ごとに1つの出所しか報告せず、それは主窓・副窓のうち最後に読んだ方のものです）。
-- 使用率は主窓（`7d` など）のものだけを表示します。副窓は観測が現在のものであるときだけ主窓の真下へ1行足し、鮮度が切れた副窓は `note` で開示します。
-- `*` は「最後に取れた値であり、現在の観測は途切れている」という印です。このときバーは `----------` になります。
-- 既に過ぎたリセット時刻は表示しません。
-- ブリッジが選択理由（`selectionEligible` など）を報告しない旧版のときは、推測せず従来の `pool: <状態> (N/M available)` 形式のまま表示します。
-- 表示される数字は ChatGPT アプリ・Codex CLI・本ブリッジを含む口座全体の消費であり、CLI 単独の取り分は切り出せません。
 
 ### セッション単位のアカウント固定（`sessionAffinity`）
 
@@ -1040,6 +988,7 @@ usage: codex-rotator status [--json [--section]]
 - 読み方：codex-rotator の常駐（口座の使用量を見張るバックグラウンドのプロセス）が設定の `daemon.port` で答えれば、その状態を出します（`source` は `daemon`）。1000 ms のうちに使える答えが無ければ、口座ごとにその場で使用量を1回読みます（`source` は `direct`）。常駐が接続を断ったときや、答えが正しい形でないときは、1000 ms を待たずにすぐその場の読取へ移ります。常駐が無いときは停止（ラッチ）の状態が分からないので、`latchKnown` は `false` で、人向けの表示の `latch` の行は `unknown (no daemon)` です。
 - 設定ファイルが無いとき、または `enabled` と `acknowledgedMultiAccountRisk` の両方が `true` でないときは、資格情報を読まず、使用量も読まずに、`enabled` が `false`・`accounts` が空・`next.reason` が `disabled` の形を出します（人向けの表示は `disabled (requires enabled and acknowledgedMultiAccountRisk)` の1行）。設定が読めないときは、標準出力に何も出さずに、標準エラーに `config unreadable` を出して 1 で終わります。読む途中で予期しない失敗が起きたときも、標準出力に何も出さずに、標準エラーに `status unavailable` を出して 1 で終わります。
 - 口座はラベルだけで指します。口座のフォルダのパス・メールアドレス・トークン・User-Agent の値は出しません。
+- `claude-rotator status` と `monitor` の画面にも、同じ Codex の節が出ます。`claude-rotator` は `codex-rotator status --json --section` を子プロセスとして起動し（PATH は探さず、同じ Node の実行ファイルと同梱の入口の絶対パスで起動します）、その JSON を引数なしの表示と同じ形で描きます。codex-rotator の設定ファイルが無いと確かめられたとき（ファイルか、その途中のフォルダが無いとき）は子を起動せず、画面は Codex の節の無いものと1バイトも変わりません。権限が無いなどで有無を確かめられないときは子を起動し、子が設定を読めなければ、次に書く `codex: display error` の1行になります。子の出力を使えないとき（8000 ms を過ぎた・0 以外で終わった・シグナルで終わった・起動できなかった・JSON として読めない・スキーマの検査を通らない・256 KiB を超えた）は、節が `codex: display error (<理由>)` の1行だけになり、`claude-rotator status` の終了コードは変わりません。理由は `timeout 8000ms`・`exit N`・`signal <名前>`・`spawn failed`・`invalid json`・`schema`・`too large` のどれかです。子の標準エラーは画面に出しません。`monitor` は画面を1秒ごとに描き直しますが、子を起動するのは、前の起動から、常駐の答えを描いているときは5秒、それ以外のときは60秒が過ぎたときだけです（その間は最後に読めた節を描きます）。
 - 実際の出力は1行で、例は読みやすく改行しています（口座1つ・常駐あり）。
 
   ```json
@@ -1978,8 +1927,6 @@ Configuration keys (the whole section may be omitted):
 | `degradeMapping.upstreamOverloadRetryAfterSeconds` | `30` | Seconds put into that `Retry-After`. Only integers from `1` to `3600` are accepted; anything else (fractions, strings, out-of-range values) becomes `30` |
 | `degradeMapping.claudeExhaustedTo529` | `true` | **Whether a 429 returned while every Claude account is out of quota is rewritten into 529 `overloaded_error`.** This covers every 429 the proxy answers with in that state — both the one it synthesises locally and one passed through from upstream — because they all reach the same mapping point. The default `true` is the existing mapping (529, or 403 / 429 depending on `bothUnusableStatus` / `recoveryWaitEnabled`): the rewrite is what makes Claude Code move on to the next `fallbackModel` entry. With `false` each of those 429s is **returned unchanged**, keeping its `anthropic-ratelimit-unified-*` headers and body — Claude Code then recognises it as a plan usage limit and **waits for the reset and retries on the same model** instead of falling back (this is what you want when no `fallbackModel` is configured). **This is the one key whose default is `true`, so only the boolean `false` turns it off** (everything else, `"false"` and `0` included, leaves the default `true` in place). **It only applies while `degradeMapping.enabled` is `true` (that is, while the 529 mapping is on).** With `degradeMapping.enabled` set to `false` (the default) that 429 is already returned unchanged, so `true` and `false` give the same response (`false` only adds the `config-notice` line). However, if `openaiBridge.enabled` is `true` and its `url` / `modelPattern` is invalid (including a non-loopback `url`), the whole `degradeMapping`, this key included, is disabled. Turning it off prints one `config-notice` line at startup and on `POST /internal/reload` |
 | `degradeMapping.gptPoolUnusableTtlMs` | `60000` (60 sec) | How long a "GPT side is unusable" observation is kept before it reverts to unknown. With `recoveryWaitEnabled: false` it only applies to observations **without** a recovery time; with `true` it also caps observations that carry one, as `min(recovery time, learned at + this value)` |
-| `degradeMapping.codexStatusUrl` | `null` | Endpoint used to show the bridge's quota state in `status` (loopback only). `null` shows nothing |
-| `degradeMapping.codexStatusTimeoutMs` | `1500` | Timeout for that fetch (always finite) |
 
 **Disabled by default.** If you do not write `degradeMapping`, behavior is exactly as before, and the `config.json` generated on a fresh install does not contain this section either. Users running claude-rotator on its own need to do nothing. The bridge is optional too: claude-rotator works fully without it.
 
@@ -2037,56 +1984,6 @@ Caveats:
 - A 529 travels the same path as a genuine Anthropic overload. To a user with no `fallbackModel`, it is indistinguishable from an ordinary overload error. Claude Code moves to the next entry after retrying a 529 three times, and that behavior applies only while `fallbackModel` still has a next entry.
 - If the last entry of `fallbackModel` lands in the same exhausted pool, Claude Code keeps retrying with exponential backoff (about 0.6 sec growing to about 74 sec). In our measurements it neither terminated nor surfaced an error within the 150-second observation window. That is why `bothUnusableStatus` defaults to `403` (explicit stop); setting `529` can reproduce the same silent wait. Leaving `openaiBridge.enabled` at `false` while turning `degradeMapping.enabled` on has the same limitation, so a single warning line is logged at startup and on reload (the combination is not forbidden).
 - Tokens are never logged, and accounts appear in the logs by account ID (`account=`). If you registered an account without `--id`, that ID is the email address with symbols replaced by hyphens, so the address is effectively readable. The account cards in `status` show the display name given at registration (`--name`; the logged-in email address when omitted) as is.
-
-#### The Codex Block in `status` (when `codexStatusUrl` is set)
-
-Setting `degradeMapping.codexStatusUrl` appends the forwarding bridge's (Codex) quota state to `status` / `monitor`. Not one line of the Claude side changes, and without the setting the block is not drawn at all.
-
-```text
-Codex Rotator                          sendable 0/2  (held 1, capped 1)
-  reading  usage GET, startup check passed   raw pool state: exhausted
-  primary  held      7d █████████░  98%  stop 75%   reset in 5d5h -> 09/21 20:59 JST
-    clears   not at that reset - needs 2 clean usage reads at 70% or less
-    read     09/16 15:32 JST usage GET, ordinary use allowed, stops when unread
-  pro2     capped    7d ██████████ 100%  stop 100%  reset in 3d1h -> 09/19 17:10 JST
-    clears   not at that reset - needs 2 clean usage reads at 99% or less
-    read     09/16 15:32 JST usage GET, ordinary use allowed, sends when unread
-  note: held = stopped at our own line, capped = the plan limit itself
-  note: held / capped read as "cooldown" in /healthz
-  note: second window on pro2 is stale - last read 0% on 09/16 06:23 JST
-  note: percentages cover the whole account - ChatGPT app, Codex CLI, and this bridge
-  note: the CLI's own share cannot be separated out
-  note: accounts are shown by label
-```
-
-**A reset instant does not lift a stop.** The trailing `reset in ... -> ... JST` is when the usage window starts over, not when the account can send again. What actually clears the stop is always written on the `clears` line directly underneath it.
-
-What each state word means:
-
-| Word | Meaning | What clears it |
-|---|---|---|
-| `ready` | Can send | — |
-| `held` | Stopped at our own line (the `stop` column is below 100%), i.e. quota held back | 2 qualifying usage readings |
-| `capped` | The plan limit itself was reached (`stop 100%`) | Same |
-| `stopped` | An account with no per-account stop line hit the global default | 1 qualifying reading |
-| `reserved` | The reading was lost and this account is configured not to send while unread | 1 complete reading |
-| `unread` | No usage reading yet | Same |
-| `exhausted` | A 429 was observed | A recheck after that reset |
-| `blocked` | The upstream refuses ordinary use | A reading that says otherwise |
-| `needs login` | The login expired | Signing in again |
-
-Clearing `held` or `capped` takes more than the percentages: the same readings must also say the upstream allows ordinary use. While it refuses, no drop in usage will lift the stop, so a `refused` line is printed directly under `clears`. Relaxing the stop line (the `stop` column) changes nothing for as long as the refusal stands.
-
-Reading the rest of it:
-
-- The `state` in `/healthz` does not map one to one onto the words on this screen. Only an account a stop latch is holding (`held`, `capped`, `stopped`, `blocked`) reads as `cooldown` there; `reserved` and `unread`, which carry no latch and are withheld by the selection rules instead, read as `ready`. The screen derives this mapping **from the payload it was handed** and prints it on a `note:` line, so use that line when matching a row against `/healthz`.
-- The label column stretches to the longest label on screen (the contract allows 32 characters). With labels longer than 20 the rows grow by the difference; they are never truncated, because a truncated label can no longer be matched against `/healthz`.
-- The `read` line names the source of a reading (`usage GET` and the like) only when that source can be shown to be this reading's. The bridge reports one source per account, taken from whichever of the two windows was read last.
-- The percentage is the primary window's (`7d` and the like) only. A second window adds one row directly beneath the primary one while its own reading is current; a stale second window is disclosed in a `note` instead.
-- `*` marks a value that is the last one obtained while the current reading is interrupted. The bar is drawn as `----------` in that case.
-- A reset instant that has already passed is never drawn.
-- An older bridge that reports no selection fields (`selectionEligible` and friends) keeps the previous `pool: <state> (N/M available)` layout rather than having the details guessed at.
-- The percentages cover the whole account - the ChatGPT app, the Codex CLI, and this bridge - and the CLI's own share cannot be separated out.
 
 #### Per-Session Account Pinning (`sessionAffinity`)
 
@@ -2425,6 +2322,7 @@ usage: codex-rotator status [--json [--section]]
 - How it reads: when the codex-rotator daemon (the background process that watches the usage of the accounts) answers on the config's `daemon.port`, it prints the daemon's state (`source` is `daemon`). When no usable answer comes within 1000 ms, it reads the usage of each account once on the spot (`source` is `direct`). When the daemon refuses the connection or its answer is not of the right form, it moves to the on-the-spot read at once, without waiting for the 1000 ms. Without the daemon the stop (latch) state is not known, so `latchKnown` is `false` and the `latch` line of the view reads `unknown (no daemon)`.
 - Without a config file, or unless both `enabled` and `acknowledgedMultiAccountRisk` are `true`, it reads no credentials and no usage, and prints the form with `enabled` `false`, empty `accounts` and `next.reason` `disabled` (the view prints the one line `disabled (requires enabled and acknowledgedMultiAccountRisk)`). When the config cannot be read, it prints nothing to standard output, prints `config unreadable` to standard error and exits with 1. When an unexpected failure happens while reading, it likewise prints nothing to standard output, prints `status unavailable` to standard error and exits with 1.
 - Accounts are named by their labels only. Account folder paths, email addresses, tokens and the User-Agent value are never printed.
+- The screens of `claude-rotator status` and `monitor` show the same Codex section. `claude-rotator` starts `codex-rotator status --json --section` as a child process (with the same Node binary and the absolute path of the bundled entry point, without a PATH search) and draws its JSON the same way as the form without arguments. When the codex-rotator config file is known to be absent (the file, or a folder on its path, does not exist), no child is started, and the screen is byte for byte the one without a Codex section. When its presence cannot be checked (for example, for lack of permission), the child is started, and if it cannot read the config, the section becomes the `codex: display error` line described next. When the child's output cannot be used (it ran past 8000 ms, exited non-zero, ended on a signal, could not start, was not JSON, failed the schema check, or was over 256 KiB), the section is the single line `codex: display error (<reason>)`, and the exit code of `claude-rotator status` does not change. The reason is one of `timeout 8000ms`, `exit N`, `signal <name>`, `spawn failed`, `invalid json`, `schema` and `too large`. The child's standard error is not shown. `monitor` redraws every second, but starts the child only once 5 seconds (while it is drawing an answer from the daemon) or 60 seconds (otherwise) have passed since the previous start; in between it draws the last section it read.
 - The real output is a single line; the example is wrapped for reading (one account, with the daemon).
 
   ```json

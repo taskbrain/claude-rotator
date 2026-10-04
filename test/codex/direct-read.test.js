@@ -1,5 +1,6 @@
 // 常駐が無いときの直接読取（src/codex/direct-read.js）のテスト。時間の約束（全体の期限・常駐への問い合わせの
-// 期限・版の読取を並べて始めること）と、1回の読取の結果を口座の状態へ当てる規則を確かめる。
+// 期限・版の読取は常駐が使える値を返さなかった後にだけ始めること）と、1回の読取の結果を口座の状態へ当てる規則を
+// 確かめる。
 //
 // 隔離: env と要求関数は隔離の補助（helpers/isolation.js）のものを使う。設定は合成の値をそのまま渡し、
 // ファイルを読まない。資格情報の読取・使用量の読取・本物の codex を探す処理は偽物に替え、版の読取は偽の
@@ -226,24 +227,37 @@ test('time budget: eight slow accounts are cut at the deadline as unread (read-d
   assert.equal(usage.calls.length, CODEX_DIRECT_READ_CONCURRENCY, 'no read is started after the deadline');
 });
 
-test('time budget: the version read is started together with the daemon query, through the injected spawn only', async t => {
+test('time budget: after a daemon that accepts and never answers, the version read starts once at 1000 ms, through the injected spawn only, and the JSON is in time', async t => {
   const stall = stallingRequest();
   let version;
   const usage = usageReader(() => usageResult());
   const run = await startSection(t, scheduler => {
-    version = versionSpawn(scheduler, { afterMs: 10 });
+    version = versionSpawn(scheduler, { afterMs: CODEX_VERSION_READ_TIMEOUT_MS - 1 });
     return { config: configOf(['zz-a']), request: stall.request, spawn: version.spawn, readUsage: usage.read };
   });
   await flush();
   assert.equal(stall.calls.length, 1, 'the daemon is being asked');
-  assert.equal(version.calls.length, 1, 'the version read has already started while the daemon query is pending');
+  run.clock.advance(STATUS_DAEMON_TIMEOUT_MS - 1);
+  await flush();
+  assert.equal(version.calls.length, 0, 'no version read while the daemon may still answer');
+  run.clock.advance(1);
+  await flush();
+  assert.equal(version.calls.length, 1, 'the version read starts once the daemon query has run out');
   assert.deepEqual(version.calls[0].args, ['--version']);
   assert.equal(version.calls[0].command, CODEX_PATH);
   assert.equal(version.calls[0].options.shell, false);
-  run.clock.advance(STATUS_DAEMON_TIMEOUT_MS);
+  run.clock.advance(CODEX_VERSION_READ_TIMEOUT_MS - 1);
   await flush();
+  assert.equal(usage.calls.length, 1);
+  assert.equal(usage.calls[0].timeoutMs,
+    CODEX_SECTION_DEADLINE_MS - STATUS_DAEMON_TIMEOUT_MS - (CODEX_VERSION_READ_TIMEOUT_MS - 1),
+    'the usage read is given only what is left of the deadline');
   assert.equal(await run.done, 0);
-  assert.equal(parsed(run.stdout).observation.userAgentSource, 'codex-version');
+  assert.ok(run.stdout.writtenAt <= START + CODEX_SECTION_DEADLINE_MS, 'the JSON is written within the deadline');
+  const json = parsed(run.stdout);
+  assert.equal(json.accounts[0].stateWord, 'ready');
+  assert.equal(json.observation.userAgentSource, 'codex-version');
+  assert.equal(version.calls.length, 1, 'the version is read once');
   assert.deepEqual(run.isolation.refusedChildProcesses, [], 'no real child process was asked for');
   assert.deepEqual(run.isolation.refusedSpawns, []);
 });
@@ -424,6 +438,27 @@ test('daemon: an answer that passes the schema is used as it is; anything else f
     } else {
       assert.equal(usage.calls.length, 1, name);
     }
+    await isolation.cleanup();
+  }
+});
+
+test('daemon: a usable answer from the daemon starts no version read at all; an unusable one starts exactly one', async t => {
+  const cases = [
+    { name: 'valid', reply: () => ({ body: daemonStatus() }), source: 'daemon', versionReads: 0 },
+    { name: 'http 500', reply: () => ({ status: 500, body: { error: 'internal-error' } }), source: 'direct', versionReads: 1 },
+  ];
+  for (const { name, reply, source, versionReads } of cases) {
+    const isolation = await setupCodexIsolation(t);
+    const daemon = await fakeDaemon(t, isolation, reply);
+    const versionCalls = [];
+    const readVersion = async path => { versionCalls.push(path); return FAKE_VERSION; };
+    // User-Agent の上書きの組を書かない設定（常駐が答えなければ版を読む設定）。
+    const json = await readCodexStatus({ config: configOf(['zz-a'], { daemon: { port: daemon.port } }), env: isolation.env,
+      deps: { now: () => START, request: isolation.request, findCodex: () => ({ path: CODEX_PATH }), spawn: isolation.spawn,
+        readVersion, readCredentials: credentialsReader().read, readUsage: usageReader(() => usageResult()).read } });
+    assert.equal(json.source, source, name);
+    assert.deepEqual(versionCalls, Array(versionReads).fill(CODEX_PATH), name);
+    assert.deepEqual(isolation.spawnCalls, [], `${name}: nothing is spawned`);
     await isolation.cleanup();
   }
 });
