@@ -81,6 +81,34 @@ it('flushes large prepare-resume JSON when stdout is a pipe', async () => {
   }
 });
 
+// The bin entry refuses to start on Node.js older than 22. The child gets a
+// preload that rewrites process.versions.node, so the real bin script runs the
+// check against the faked version; 22.0.0 pins the lower edge of the range.
+for (const [fakedNode, accepted] of [['21.7.3', false], ['22.0.0', true]]) {
+  it(`${accepted ? 'starts' : 'refuses to start'} when process.versions.node is ${fakedNode}`, async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'claude-rotator-cli-'));
+    const preload = `Object.defineProperty(process, 'versions', { value: { ...process.versions, node: '${fakedNode}' } });`;
+    const result = await runProcess(process.execPath, [
+      '--import', `data:text/javascript,${encodeURIComponent(preload)}`,
+      resolve('bin/claude-rotator.js'), 'help',
+    ], {
+      cwd: resolve('.'),
+      env: isolatedEnv(dir, join(dir, 'config.json')),
+    });
+
+    if (accepted) {
+      assert.equal(result.code, 0, result.stderr);
+      assert.match(result.stdout, /claude-rotator refresh-usage/);
+      assert.doesNotMatch(result.stderr, /requires Node\.js/);
+    } else {
+      assert.equal(result.code, 1);
+      assert.match(result.stderr, /^claude-rotator requires Node\.js 22 or newer\. Current Node\.js is v/);
+      // Stopped before the CLI ran: no help text was printed.
+      assert.equal(result.stdout, '');
+    }
+  });
+}
+
 // 子プロセスの HOME・XDG・Claude 設定を一時ディレクトリへ向け、親から継承した
 // CLAUDE_ROTATOR_*（guard のログ先を除く）を落とす。CLAUDE_ROTATOR_CONFIG だけの差し替えでは
 // 実 HOME の既定パス（~/.config/claude-rotator 等）へ落ちる経路が残る。

@@ -23,10 +23,12 @@
 ## 検証
 
 - 変更中は関連するfocused testを実行する。小修正ごとにfull matrixを繰り返さない。
-- PR前に `npm run check` を1回実行する。macOS／Ubuntu、Node 20／22の全組合せはGitHub Actionsを正本とする。
+- PR前に `npm run check` を1回実行する。macOS／Ubuntu、Node 22／24の全組合せはGitHub Actionsを正本とする（各系列はランナーにある最新版で確かめる）。
 - ローカルでCI相当の隔離が必要な場合はDockerを使う。例:
 
   `docker run --rm --network none -v "$PWD:/app:ro" -w /app node:22-bookworm npm run check`
+
+  Node 24 は同じコマンドの `node:22-bookworm` を `node:24-bookworm` にする。
 
 - `npm run dev` は実行しない。変更が影響しないE2E、複数OS、fault injectionを儀式的に追加しない。
 - 完了報告には実行したコマンド、成功／失敗件数、未実行項目と残リスクを短く記載する。

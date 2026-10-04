@@ -10,7 +10,10 @@ permissions:
   contents: read
 
 concurrency:
-  group: ci-${{ github.workflow }}-${{ github.ref }}
+  # Only outdated pull request runs are cancelled: each PR shares one group, so
+  # a new push supersedes the older run. Every push to main gets a group of its
+  # own, so it is never cancelled and each commit on main keeps its own result.
+  group: ci-${{ github.workflow }}-${{ github.event_name == 'pull_request' && github.ref || github.run_id }}
   cancel-in-progress: true
 
 jobs:
@@ -21,19 +24,24 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
+        # Pinned image labels: a newer runner OS is adopted by a pull request
+        # that changes the label, not by a `-latest` migration.
         os:
-          - ubuntu-latest
-          - macos-latest
+          - ubuntu-24.04
+          - macos-26
+        # CI checks the Node.js 22 and 24 LTS lines only; newer lines such as
+        # 26 are not checked in CI. Each job uses the newest release of its
+        # line available on the runner.
         node:
-          - '20'
           - '22'
+          - '24'
 
     steps:
       - name: Check out repository
-        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Set up Node.js
-        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version: ${{ matrix.node }}
 
@@ -42,5 +50,5 @@ jobs:
           # Only macOS runners get a disposable Keychain; opt in there so the
           # real-Keychain integration tests still run in CI. Left unset (empty)
           # on ubuntu, where `security` doesn't exist, so those tests stay skipped.
-          CLAUDE_ROTATOR_REAL_KEYCHAIN: ${{ matrix.os == 'macos-latest' && '1' || '' }}
+          CLAUDE_ROTATOR_REAL_KEYCHAIN: ${{ runner.os == 'macOS' && '1' || '' }}
         run: npm run check
