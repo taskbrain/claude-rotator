@@ -2,7 +2,7 @@
 
 [![CI](https://github.com/taskbrain/claude-rotator/actions/workflows/ci.yml/badge.svg)](https://github.com/taskbrain/claude-rotator/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](./LICENSE)
-![Node.js >=18.18.0](https://img.shields.io/badge/node-%3E%3D18.18.0-brightgreen)
+![Node.js >=22.0.0](https://img.shields.io/badge/node-%3E%3D22.0.0-brightgreen)
 
 Claude Code の複数アカウントを、リクエストのモデルと利用枠に応じてローカルで自動的に使い分ける非公式プロキシツールです。macOS と Linux で動作します。
 
@@ -134,7 +134,7 @@ flowchart LR
 ## 動作環境
 
 - **複数の Claude アカウントが必要です。** このツールは「枠に達したアカウントから別のアカウントへ切り替える」ことが前提のため、契約しているアカウントが1つしか無い場合はローテーションできず、導入する意味がありません。
-- Node.js 18.18 以上
+- Node.js 22 以上
 - Claude Code 本体がインストール済みであること（`claude-rotator` は Claude Code の認証情報を読み取って中継するプロキシであり、Claude Code 自体の代替にはなりません）
 - macOS: LaunchAgent を使用
 - Ubuntu: systemd user service を使用
@@ -212,7 +212,7 @@ node --version
 npm install -g .
 ```
 
-`node --version` は `v18.18` 以上が必要です。
+`node --version` は `v22` 以上が必要です。それより古い Node では、`claude-rotator` は起動時にエラーを表示して止まります。
 
 まず Claude Code に普段どおりログインし、そのログインを `claude-rotator` へ登録します。
 
@@ -1029,13 +1029,13 @@ node --import ./fixtures/service-command-guard.js --test test/cli.test.js
 
 `fixtures/service-command-shims/systemctl` と `fixtures/service-command-shims/launchctl` は実行ビット（755）が必要です。外れているとガードの PATH 側が黙って無効になります。
 
-ローカル Node は `v18.18` 以上で動作します。開発時は CI と同じ Node 20 / 22 の両方を Docker で確認してください。
+ローカル Node は `v22` 以上で動作します。開発時は CI と同じ Node 22 / 24 の両方を Docker で確認してください。CI で確かめるのは、22 系と 24 系それぞれについて、ランナーにある最新版だけです。それより古い 22 系の版は CI では確かめていません。
 
 Docker での検証:
 
 ```bash
-docker run --rm --network=none -v "$PWD":/app:ro -w /app node:20-alpine npm run check
-docker run --rm --network=none -v "$PWD":/app:ro -w /app node:22-alpine npm run check
+docker run --rm --network=none -v "$PWD":/app:ro -w /app node:22-bookworm npm run check
+docker run --rm --network=none -v "$PWD":/app:ro -w /app node:24-bookworm npm run check
 ```
 
 ---
@@ -1170,7 +1170,7 @@ flowchart LR
 ### Requirements
 
 - **Multiple Claude accounts are required.** This tool exists to switch from an account that has hit its limit to another one; with only a single account under contract there is nothing to rotate to, so there is no point installing it.
-- Node.js 18.18 or later
+- Node.js 22 or later
 - Claude Code itself must already be installed (`claude-rotator` is a proxy that reads and relays Claude Code's own credentials; it is not a replacement for Claude Code)
 - macOS: uses a LaunchAgent
 - Ubuntu: uses a systemd user service
@@ -1284,7 +1284,7 @@ node --version
 npm install -g .
 ```
 
-`node --version` must be `v18.18` or later.
+`node --version` must be `v22` or later. On an older Node, `claude-rotator` prints an error and exits at startup.
 
 First, log in to Claude Code as usual, then register that login with `claude-rotator`.
 
@@ -2020,12 +2020,13 @@ node --import ./fixtures/service-command-guard.js --test test/cli.test.js
 
 `fixtures/service-command-shims/systemctl` and `fixtures/service-command-shims/launchctl` must keep their executable bit (755); without it the guard's PATH belt silently stops working.
 
-Local development works on Node `v18.18` and later. If you want to check macOS/Ubuntu-independent behavior in development, also run the Docker command below to verify against Node 22.
+Local development works on Node `v22` and later. During development, check against both Node 22 and Node 24, the same lines CI uses, with Docker. CI tests only the newest release of each line (22 and 24) available on the runner; older 22.x releases are not tested in CI.
 
 Docker verification:
 
 ```bash
-docker run --rm -v "$PWD":/app -w /app node:22-alpine npm run check
+docker run --rm --network=none -v "$PWD":/app:ro -w /app node:22-bookworm npm run check
+docker run --rm --network=none -v "$PWD":/app:ro -w /app node:24-bookworm npm run check
 ```
 
 `npm run check` runs `npm run lint` followed by `npm test`.

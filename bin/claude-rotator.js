@@ -1,8 +1,8 @@
 #!/usr/bin/env node
 
 const major = Number.parseInt(process.versions.node.split('.')[0], 10);
-if (major < 18) {
-  process.stderr.write(`claude-rotator requires Node.js 18 or newer. Current Node.js is ${process.version}.\n`);
+if (major < 22) {
+  process.stderr.write(`claude-rotator requires Node.js 22 or newer. Current Node.js is ${process.version}.\n`);
   process.exit(1);
 }
 

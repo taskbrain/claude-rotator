@@ -7,7 +7,7 @@ requests are genuinely welcome.
 
 ## Development Setup
 
-- Node.js `>=18.18.0` (see `engines` in [package.json](./package.json)).
+- Node.js `>=22.0.0` (see `engines` in [package.json](./package.json)).
 - Clone the repo and you're ready to go:
 
   ```bash
@@ -60,10 +60,11 @@ that.
 
 ### What CI verifies
 
-GitHub Actions runs `npm run check` on the matrix `ubuntu-latest` /
-`macos-latest` × Node `20` / `22`. That matrix is the source of truth for
-cross-platform correctness — you don't need to reproduce all four
-combinations locally before opening a PR.
+GitHub Actions runs `npm run check` on the matrix `ubuntu-24.04` /
+`macos-26` × Node `22` / `24`. Each job uses the newest release of that Node
+line available on the runner, so older 22.x releases are not tested in CI.
+That matrix is the source of truth for cross-platform correctness — you
+don't need to reproduce all four combinations locally before opening a PR.
 
 ## Submitting a Pull Request
 
