@@ -1,6 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import * as module from '../../src/codex/account-pool.js';
+import { setupCodexIsolation } from './helpers/isolation.js';
 
 const accounts = [{ key: 'a', label: 'A', models: ['astra'] }, { key: 'b', label: 'B', models: ['astra', 'other'] }];
 test('pool: explicit time, model eligibility and forbidden exclusion', () => {
@@ -229,7 +230,7 @@ test('reserve pool: configure swaps thresholds in place, tightening at once and 
   assert.throws(() => pool.configure(httpConfig()), /time/);
 });
 
-// --- passive degrade: the one-generation recovery probe ---
+// --- passive: the helper later reserve tests use (a stopped account gets no trial send) ---
 
 const passiveConfig = (overrides = {}) => ({ accounts: policies, ...overrides });
 function passive(config = passiveConfig()) {
@@ -237,44 +238,6 @@ function passive(config = passiveConfig()) {
   for (const account of reserve) pool.credentials(account.key, true, 0);
   return pool;
 }
-
-test('reserve pool: a passive stop reopens for exactly one probe once its reset passes', () => {
-  const pool = passive();
-  pool.observe('primary', used(80, { primary_reset_at: 5000 }), 10);
-  assert.equal(pool.probe('astra', 4999), null, 'nothing is owed before the advertised reset');
-  assert.equal(pool.select('astra', 5000).key, 'account-b', 'reaching the reset does not unlatch the stop');
-  assert.equal(pool.probe('astra', 5000).key, 'primary');
-  assert.equal(pool.probe('astra', 5000), null, 'one generation only');
-  pool.succeeded('primary', 5001, 5000);
-  assert.equal(pool.snapshot().find(a => a.key === 'primary').capped, undefined, 'a clean probe recovers');
-  assert.equal(pool.select('astra', 5002).key, 'primary');
-});
-
-test('reserve pool: a probe answered above the threshold re-latches instead of recovering', () => {
-  const pool = passive();
-  pool.observe('primary', used(80, { primary_reset_at: 5000 }), 10);
-  assert.equal(pool.probe('astra', 5000).key, 'primary');
-  pool.observe('primary', used(80), 5001); // The probe's own response still reads high.
-  pool.succeeded('primary', 5002, 5000);
-  assert.deepEqual(pool.snapshot().find(a => a.key === 'primary').capped, { primary: true });
-  assert.equal(pool.probe('astra', 3600009), null, 'a spent probe re-arms no sooner than the valve');
-  assert.equal(pool.probe('astra', 3600010).key, 'primary');
-});
-
-test('reserve pool: a reset-less stop waits the safety interval, which the kill switch and http remove', () => {
-  for (const [name, config, at, expected] of [
-    ['passive default', passiveConfig(), 3600009, null],
-    ['passive default', passiveConfig(), 3600010, 'primary'],
-    ['kill switch off', passiveConfig({ rotationRecoveryProbeEnabled: false }), 864000010, null],
-    ['valve disabled', passiveConfig({ rotationUsageCapNoResetProbeMs: 0 }), 864000010, null],
-    ['http never probes', httpConfig(), 864000010, null],
-  ]) {
-    const http = config.usageObservationMode === 'http';
-    const pool = passive(config);
-    pool.observe('primary', used(80), 10, http ? GET : {});
-    assert.equal(pool.probe('astra', at)?.key ?? null, expected, `${name} at ${at}`);
-  }
-});
 
 // --- observation source: http selects on complete GETs alone ---
 
@@ -349,21 +312,6 @@ test('reserve pool: a usage-get observation without a stop epoch never counts as
   assert.equal(named.select('astra', 130).key, 'primary');
 });
 
-test('reserve pool: a probe that is never sent is refunded and the valve still owes one', () => {
-  const pool = passive();
-  pool.observe('primary', used(80, { primary_reset_at: 5000 }), 10);
-  assert.equal(pool.probe('astra', 5000).key, 'primary');
-  assert.equal(pool.probe('astra', 5000), null, 'one generation only');
-  pool.refundProbe('primary');
-  assert.equal(pool.snapshot().find(a => a.key === 'primary').probeUsedAt, undefined);
-  assert.equal(pool.probe('astra', 5000).key, 'primary', 'the refunded generation is owed again');
-  // A refund never returns a probe the caller actually spent earlier.
-  pool.succeeded('primary', 5001, 5000);
-  pool.refundProbe('primary');
-  assert.equal(pool.snapshot().find(a => a.key === 'primary').capped, undefined, 'the spent probe still recovered');
-  pool.refundProbe('missing-account');
-});
-
 // --- reserved accounts: blockWhenUnknown ---
 // 予約した口座（下のテストでは primary）へは、使用率 75% 以上の新鮮な観測がある間と、観測が不明な間は、新しく送らない。
 // 閾値ではないので、観測が 1 つも無い状態は高い観測と同じだけ強く口座を止める。
@@ -397,17 +345,19 @@ test('reserve pool: a reserved account waits for a fresh complete allowed GET an
   assert.equal(pool.select('astra', 125014).key, 'primary');
 });
 
-test('reserve pool: a broken GET never widens the freshness the reserve is judged by', () => {
-  // A degraded account falls back to the passive TTL (150,000ms here) for its window
-  // freshness. The reserve must not inherit that: an account forbidden to guess cannot
-  // gain 25 extra seconds of sending by having its own reader break.
+test('reserve pool: a broken GET has no switch to other rules, so an unread account stays unknown usage under http', () => {
+  // 読取の縮退はプールへ伝えない。口座ごとに受動の規則（使用量不明でも選べる・鮮度を TTL で測る・
+  // 停止を試し打ちで解く）へ落とす経路そのものが無い。
   const pool = reserved(httpConfig({ accounts: withReserve(true, false) }), { seed: false });
+  assert.equal(pool.usageDegraded, undefined, 'there is no per-account degradation switch');
   for (const key of ['primary', 'account-b']) pool.observe(key, used(10), 10, GET);
-  pool.usageDegraded('primary', true);
   assert.equal(pool.select('astra', 125009).key, 'primary');
-  assert.equal(why(pool, 125010), 'usage-unknown-reserved', 'the http ceiling still bounds the reserve evidence');
-  // The window reading itself is still fresh by the passive TTL the degradation grants.
-  assert.equal(pool.inspect(125010).find(a => a.key === 'primary').fresh.primary, true);
+  assert.equal(why(pool, 125010), 'usage-unknown-reserved', 'the http ceiling bounds the reserve evidence');
+  assert.equal(why(pool, 125010, 'account-b'), 'usage-unknown', 'an unreserved account is unknown usage too');
+  const view = pool.inspect(125010).find(a => a.key === 'primary');
+  assert.equal(view.fresh.primary, false, 'the window reading ages by the http freshness, not the 150s TTL');
+  assert.equal(view.freshnessMs, 125000);
+  assert.equal(pool.select('astra', 125010), null);
 });
 
 test('reserve pool: a GET the upstream refuses is no evidence for a reserved account', () => {
@@ -422,21 +372,19 @@ test('reserve pool: a GET the upstream refuses is no evidence for a reserved acc
   assert.equal(pool.select('astra', 130).key, 'primary');
 });
 
-test('reserve pool: a degraded reserved account earns no probe from its reset, the hour or ten days', () => {
-  const pool = reserved(httpConfig({ accounts: withReserve(true, false) }), { seed: false });
-  pool.observe('primary', used(80, { primary_reset_at: 5000 }), 10, GET);
-  pool.usageDegraded('primary', true); // Its own GET has broken: the passive rules would apply.
-  for (const at of [5000, 3600011, 864000010]) {
-    assert.equal(pool.probe('astra', at), null, `no generation is owed at ${at}`);
+test('reserve pool: there is no trial send for a stopped account; its reset, the hour or ten days never open it', () => {
+  // 停止中の口座への試し打ちは無い（関数ごと無い）。停止が解けるのは完全な観測の2回連続（と
+  // 方針を持たない口座の、位置ごとの共通のしきい値（Legacy global thresholds）の経路）だけ。
+  for (const blockWhenUnknown of [true, false]) {
+    const pool = reserved(httpConfig({ accounts: withReserve(blockWhenUnknown, false) }), { seed: false });
+    for (const name of ['probe', 'refundProbe']) assert.equal(pool[name], undefined, `the pool has no ${name}`);
+    pool.observe('primary', used(80, { primary_reset_at: 5000 }), 10, GET);
+    for (const at of [4999, 5000, 3600011, 864000010]) {
+      assert.equal(pool.select('astra', at), null, `blockWhenUnknown=${blockWhenUnknown}: nothing opens at ${at}`);
+      assert.equal(why(pool, at), 'usage-capped', 'the latch is the nearer reason while it holds');
+    }
+    assert.deepEqual(pool.snapshot().find(a => a.key === 'primary').capped, { primary: true });
   }
-  assert.equal(pool.select('astra', 864000010), null);
-  assert.equal(why(pool, 864000010), 'usage-capped', 'the latch is the nearer reason while it holds');
-  // The same account without the reserve keeps the existing passive valve.
-  const open = reserved(httpConfig({ accounts: withReserve(false, false) }), { seed: false });
-  open.observe('primary', used(80, { primary_reset_at: 5000 }), 10, GET);
-  open.usageDegraded('primary', true);
-  assert.equal(open.probe('astra', 4999), null);
-  assert.equal(open.probe('astra', 5000).key, 'primary');
 });
 
 test('reserve pool: under passive a reserved account is unselectable and never rescues a stopped pool', () => {
@@ -452,7 +400,6 @@ test('reserve pool: under passive a reserved account is unselectable and never r
   pool.observe('account-b', used(100), 60011); // Now nothing at all is selectable.
   assert.equal(pool.select('astra', 60011), null);
   assert.equal(pool.terminal('astra', 60011).status, 529);
-  assert.equal(pool.probe('astra', 3660012).key, 'account-b', 'only the unreserved account may be probed');
 });
 
 test('reserve pool: configure turns the reserve on and off without discarding the observation', () => {
@@ -476,4 +423,160 @@ test('reserve pool: without a policy the global window thresholds keep their pas
   assert.equal(pool.select('astra', 10).key, 'account-b');
   pool.observe('primary', used(94.9), 20); // One header reading suffices here.
   assert.equal(pool.select('astra', 20).key, 'primary');
+});
+
+// --- usage GET transitions: usageConfirmed / usageAuthRejected ---
+// 送信の経路が無いので、認証状態を動かすのは使用量の GET とログイン切れの規則（auth-tracker.js）
+// だけ。生成の成功を表す succeeded() とは別の、専用の遷移で動かす。
+
+const zzEntries = [{ key: 'zz-a', label: 'zz-a', models: null }, { key: 'zz-b', label: 'zz-b', models: null }];
+const zzPolicies = zzEntries.map(entry => ({ label: entry.label, usagePolicy: { stopUsedPercent: 75, resumeUsedPercent: 70 } }));
+const zzConfig = (overrides = {}) => ({ usageObservationMode: 'http', usagePollIntervalMs: 60000, usageReadTimeoutMs: 5000,
+  rotationObservationTtlMs: 125000, accounts: zzPolicies, ...overrides });
+const zzEntry = (pool, key = 'zz-a') => pool.snapshot().find(entry => entry.key === key);
+
+test('pool usageConfirmed: a 2xx usage GET moves unknown, no creds, needs login and probing accounts to ready', async t => {
+  await setupCodexIsolation(t);
+  const pool = module.createCodexAccountPool(zzEntries, zzConfig());
+  assert.equal(zzEntry(pool).state, 'unknown');
+  let revision = pool.revision();
+  pool.usageConfirmed('zz-a', 10);
+  assert.equal(zzEntry(pool).state, 'ready');
+  assert.equal(zzEntry(pool).updatedAt, 10);
+  assert.ok(pool.revision() > revision, 'becoming ready is an improvement');
+
+  pool.credentials('zz-b', false, 20);
+  assert.equal(zzEntry(pool, 'zz-b').state, 'credentials-unavailable');
+  pool.usageConfirmed('zz-b', 30);
+  assert.equal(zzEntry(pool, 'zz-b').state, 'ready');
+
+  pool.usageAuthRejected('zz-a', 100, { reason: 'upstream-unauthorized', seenMtime: 7 });
+  pool.usageConfirmed('zz-a', 200, 100);
+  assert.equal(zzEntry(pool).state, 'needs-login', 'a GET begun at or before the rejection does not undo it');
+  revision = pool.revision();
+  pool.usageConfirmed('zz-a', 300, 150);
+  const entry = zzEntry(pool);
+  assert.equal(entry.state, 'ready');
+  for (const field of ['authReason', 'forbiddenAt', 'recheckAt', 'seenMtime']) assert.equal(entry[field], undefined, field);
+  assert.ok(pool.revision() > revision);
+
+  pool.forbidden('zz-b', 400);
+  pool.credentials('zz-b', true, 401, { recover: true });
+  assert.equal(zzEntry(pool, 'zz-b').state, 'probing');
+  pool.usageConfirmed('zz-b', 402);
+  assert.equal(zzEntry(pool, 'zz-b').state, 'ready');
+});
+
+test('pool usageConfirmed: proves the credentials only and never releases a usage stop', async t => {
+  await setupCodexIsolation(t);
+  const pool = module.createCodexAccountPool(zzEntries, zzConfig());
+  for (const { key } of zzEntries) pool.credentials(key, true, 0);
+  pool.observe('zz-a', used(80), 10, GET);
+  pool.observe('zz-b', used(1), 10, { source: 'usage-get', complete: true, ordinaryUsageAllowed: false });
+  for (const key of ['zz-a', 'zz-b']) pool.usageConfirmed(key, 20);
+  assert.deepEqual(zzEntry(pool).capped, { primary: true });
+  assert.equal(zzEntry(pool, 'zz-b').upstreamBlocked, true);
+  assert.equal(pool.select('astra', 20), null);
+});
+
+test('pool usageConfirmed: explicit finite times, and a confirmed generation exhaustion keeps its retry time', async t => {
+  await setupCodexIsolation(t);
+  const pool = module.createCodexAccountPool(zzEntries, zzConfig());
+  const before = pool.snapshot();
+  for (const [nowMs, startedAtMs] of [[undefined, 1], [NaN, 1], [Infinity, 1], ['20', 1], [20, NaN]]) {
+    assert.throws(() => pool.usageConfirmed('zz-a', nowMs, startedAtMs), /time/);
+  }
+  assert.deepEqual(pool.snapshot(), before);
+  pool.exhausted('zz-a', { retryAt: 500 }, 100);
+  pool.usageConfirmed('zz-a', 200);
+  assert.equal(zzEntry(pool).state, 'exhausted');
+  pool.usageConfirmed('zz-a', 600);
+  assert.equal(zzEntry(pool).state, 'ready');
+  assert.equal(zzEntry(pool).retryAt, undefined);
+  pool.usageConfirmed('missing-account', 700);
+});
+
+test('pool usageAuthRejected: needs login with its reason, the credential mtime and the next recheck', async t => {
+  await setupCodexIsolation(t);
+  const pool = module.createCodexAccountPool(zzEntries, zzConfig());
+  for (const { key } of zzEntries) pool.credentials(key, true, 0);
+  pool.observe('zz-a', used(10), 10, GET);
+  pool.observe('zz-b', used(10), 10, GET);
+  assert.equal(pool.select('astra', 10).key, 'zz-a');
+  pool.usageAuthRejected('zz-a', 100, { reason: 'upstream-forbidden', seenMtime: 42 });
+  const entry = zzEntry(pool);
+  assert.equal(entry.state, 'needs-login');
+  assert.equal(entry.authReason, 'upstream-forbidden');
+  assert.equal(entry.seenMtime, 42);
+  assert.equal(entry.forbiddenAt, 100);
+  assert.equal(entry.recheckAt, 100 + 600000, 'the default recheck interval is ten minutes');
+  assert.equal(pool.select('astra', 100).key, 'zz-b');
+  assert.equal(why(pool, 100, 'zz-a'), 'needs-login');
+  pool.credentials('zz-a', true, 110); // A readable local token cannot undo an upstream refusal.
+  assert.equal(zzEntry(pool).state, 'needs-login');
+  // The reason survives a relabel and an identity promotion.
+  pool.reconcile([{ key: 'zz-promoted', previousKey: 'zz-a', label: 'zz-renamed', models: null }, zzEntries[1]], 120);
+  assert.equal(zzEntry(pool, 'zz-promoted').authReason, 'upstream-forbidden');
+  assert.equal(zzEntry(pool, 'zz-promoted').state, 'needs-login');
+
+  const custom = module.createCodexAccountPool(zzEntries, zzConfig({ rotationNeedsLoginRecheckMs: 5000 }));
+  custom.usageAuthRejected('zz-a', 10, { reason: 'access-token-expired' });
+  assert.equal(zzEntry(custom).recheckAt, 5010);
+  assert.equal(zzEntry(custom).seenMtime, null);
+});
+
+test('pool usageAuthRejected: refuses an unknown reason and an implicit time without changing anything', async t => {
+  await setupCodexIsolation(t);
+  const pool = module.createCodexAccountPool(zzEntries, zzConfig());
+  pool.credentials('zz-a', true, 0);
+  const before = pool.snapshot();
+  for (const reason of [undefined, '', 'zz-unknown-reason', 'needs-login']) {
+    assert.throws(() => pool.usageAuthRejected('zz-a', 10, { reason }), /reason/);
+  }
+  assert.throws(() => pool.usageAuthRejected('zz-a', NaN, { reason: 'upstream-unauthorized' }), /time/);
+  assert.deepEqual(pool.snapshot(), before);
+  assert.deepEqual([...module.USAGE_AUTH_REJECTION_REASONS],
+    ['upstream-unauthorized', 'upstream-forbidden', 'access-token-expired']);
+  pool.usageAuthRejected('missing-account', 10, { reason: 'upstream-unauthorized' });
+});
+
+// --- last resort: unknown usage, never a stopped or reserved account ---
+
+const lastResortEntries = ['zz-1', 'zz-2', 'zz-3', 'zz-4', 'zz-5', 'zz-6', 'zz-7']
+  .map(key => ({ key, label: key, models: key === 'zz-5' ? ['other'] : null }));
+const lastResortConfig = () => zzConfig({ accounts: lastResortEntries.map(entry => ({ label: entry.label,
+  usagePolicy: { stopUsedPercent: 75, resumeUsedPercent: 70, blockWhenUnknown: entry.key === 'zz-2' } })) });
+
+test('pool lastResort: the first ready, unstopped, unreserved account of unknown usage in the configured order', async t => {
+  await setupCodexIsolation(t);
+  const pool = module.createCodexAccountPool(lastResortEntries, lastResortConfig());
+  for (const { key } of lastResortEntries) pool.credentials(key, true, 0);
+  pool.observe('zz-1', used(80), 10, GET); // stopped by a window
+  // zz-2 carries blockWhenUnknown and has never been read.
+  pool.usageAuthRejected('zz-3', 10, { reason: 'upstream-unauthorized' }); // needs login
+  pool.observe('zz-4', used(1), 10, { source: 'usage-get', complete: true, ordinaryUsageAllowed: false }); // refused
+  // zz-5 is assigned to another model only; zz-6 and zz-7 are ready and unread.
+  assert.equal(pool.select('astra', 20), null, 'the ordinary rules select nothing');
+  assert.equal(pool.lastResort('astra', 20).key, 'zz-6');
+  assert.equal(pool.lastResort('other', 20).key, 'zz-5');
+  // A stopped account stays out however stale its reading becomes.
+  assert.equal(pool.lastResort('astra', 864000010).key, 'zz-6');
+  pool.observe('zz-6', used(90), 30, { source: 'usage-get', complete: false });
+  assert.equal(pool.lastResort('astra', 30).key, 'zz-7', 'an incomplete reading above the stop still stops it');
+  pool.credentials('zz-7', false, 40);
+  assert.equal(pool.lastResort('astra', 40), null, 'no account qualifies: nothing is chosen');
+  assert.equal(pool.lastResort('astra', 864000010), null, 'and no stopped account is handed out instead, however late');
+});
+
+test('pool lastResort: follows the configured order, not the label, and needs an explicit time', async t => {
+  await setupCodexIsolation(t);
+  const pool = module.createCodexAccountPool(lastResortEntries, lastResortConfig());
+  for (const { key } of lastResortEntries) pool.credentials(key, true, 0);
+  pool.reconcile([...lastResortEntries].reverse(), 1);
+  assert.equal(pool.lastResort('astra', 2).key, 'zz-7');
+  assert.throws(() => pool.lastResort('astra'), /time/);
+  // An account whose fresh reading makes it selectable is select()'s answer, not the last resort's.
+  pool.observe('zz-7', used(10), 3, GET);
+  assert.equal(pool.select('astra', 3).key, 'zz-7');
+  assert.equal(pool.lastResort('astra', 3).key, 'zz-6');
 });
