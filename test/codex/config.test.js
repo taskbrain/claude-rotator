@@ -6,21 +6,27 @@
 // フォルダのもの。User-Agent と originator の値は合成の値（製品名の部分を zz-fake- で始める）。
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { chmod, mkdir, rm, symlink, writeFile } from 'node:fs/promises';
-import { randomBytes } from 'node:crypto';
-import { join } from 'node:path';
+import { chmod, mkdir, open, readFile, readdir, rm, stat, symlink, utimes, writeFile } from 'node:fs/promises';
+import { createHash, randomBytes } from 'node:crypto';
+import { dirname, join } from 'node:path';
 import {
   CODEX_CONFIG_DEFAULTS,
+  CONFIG_SHA256_PATTERN,
   CodexConfigError,
   DEFAULT_DAEMON_PORT,
   USAGE_ORIGINATOR_MAX_LENGTH,
   USAGE_USER_AGENT_MAX_LENGTH,
+  appendCodexAccount,
+  canonicalPath,
+  comparisonKey,
   configSecretValues,
   isCodexRotatorActivated,
   isValidUsageOriginator,
   isValidUsageUserAgent,
   loadCodexConfig,
+  loadCodexConfigSnapshot,
   minimumObservationTtlMs,
+  removeCodexAccount,
   validateCodexConfig,
 } from '../../src/codex/config.js';
 import { codexRotatorConfigPath, shimDir } from '../../src/codex/paths.js';
@@ -232,9 +238,9 @@ test('config: labels have one shape, are unique and are never echoed', async t =
 // パス: accountsDir・口座のフォルダ・~/.codex
 // ---------------------------------------------------------------------------
 
-test('config: paths are absolute or start with ~/, and come back expanded without a trailing slash', async t => {
+test('config: accountsDir is absolute or starts with ~/, and paths come back expanded without a trailing slash', async t => {
   const { validate, refuses, home, account } = await setup(t);
-  const config = validate({ accountsDir: '~/zz-accounts/', accounts: [account('zz-one', { codexHome: '~/zz-accounts/one/' })] });
+  const config = validate({ accountsDir: '~/zz-accounts/', accounts: [account('zz-one', { codexHome: `${join(home, 'zz-accounts', 'one')}/` })] });
   assert.equal(config.accountsDir, join(home, 'zz-accounts'));
   assert.equal(config.accounts[0].codexHome, join(home, 'zz-accounts', 'one'));
   for (const accountsDir of ['zz-accounts', './zz-accounts', '~', '~other/zz', '', 42, null]) {
@@ -243,6 +249,31 @@ test('config: paths are absolute or start with ~/, and come back expanded withou
   for (const codexHome of ['zz-one', './zz-one', '~', null]) {
     refuses({ accounts: [account('zz-one', { codexHome })] }, /accounts\[0\]\.codexHome must be an absolute path/);
   }
+});
+
+// ~ は設定を読むプロセスの HOME で展開されるので、口座のフォルダと codexPath は `~/` の形を受けない
+// （HOME の違うプロセスが、同じ設定から別の場所を求めないように）。accountsDir の `~/` は受ける。
+test('config: codexHome and codexPath must be absolute paths, and a path starting with ~/ is refused', async t => {
+  const { validate, refuses, home, account } = await setup(t);
+  for (const codexHome of ['~/zz-accounts/one', '~/zz-accounts/one/', '~/.codex-accounts/zz-one', 'zz-accounts/one', './zz-one', '../zz-one']) {
+    refuses({ accounts: [account('zz-one', { codexHome })] },
+      /^accounts\[0\]\.codexHome must be an absolute path \(a path starting with ~\/ is not accepted\)$/);
+  }
+  // 2件目の口座でも同じ（どの口座の値かだけを言う）。
+  refuses({ accounts: [account('zz-one'), account('zz-two', { codexHome: '~/zz-two' })] }, /^accounts\[1\]\.codexHome must be an absolute path/);
+  for (const codexPath of ['~/zz-tools/bin/codex', '~/codex', 'zz-tools/bin/codex', './codex']) {
+    refuses({ codexPath }, /^codexPath must be an absolute path \(a path starting with ~\/ is not accepted\)$/);
+  }
+  // 拒否の文に値を入れない。
+  assert.throws(() => validate({ accounts: [account('zz-one', { codexHome: '~/zz-marker-one' })] }),
+    error => error instanceof CodexConfigError && !error.message.includes('zz-marker-one'));
+  // 絶対パスなら通り、そのままの形で返る。accountsDir の `~/` は今までどおり展開して受ける。
+  const one = join(home, 'zz-accounts', 'one');
+  const codexPath = join(home, 'zz-tools', 'bin', 'codex');
+  const config = validate({ accountsDir: '~/zz-accounts', accounts: [account('zz-one', { codexHome: one })], codexPath });
+  assert.equal(config.accountsDir, join(home, 'zz-accounts'));
+  assert.equal(config.accounts[0].codexHome, one);
+  assert.equal(config.codexPath, codexPath);
 });
 
 test('config: accountsDir is refused when it is, is inside or contains ~/.codex', async t => {
@@ -260,7 +291,7 @@ test('config: an account folder is refused when it is, is inside or contains ~/.
   const { refuses, home, account } = await setup(t);
   await mkdir(join(home, '.codex'), { mode: 0o700 });
   await symlink(join(home, '.codex'), join(home, 'zz-alias'));
-  for (const codexHome of ['~/.codex', join(home, '.codex'), '~/.codex/sessions', home, '~/zz-alias', '~/zz-alias/inner']) {
+  for (const codexHome of [join(home, '.codex'), join(home, '.codex', 'sessions'), home, join(home, 'zz-alias'), join(home, 'zz-alias', 'inner')]) {
     refuses({ accounts: [account('zz-one', { codexHome })] }, /accounts\[0\]\.codexHome must be separate from ~\/\.codex/);
   }
 });
@@ -296,14 +327,13 @@ test('config: codexPath is optional, absolute, and never inside accountsDir or t
   assert.equal(validate({}).codexPath, null);
   const external = join(home, 'zz-tools', 'bin', 'codex');
   assert.equal(validate({ codexPath: external }).codexPath, external);
-  assert.equal(validate({ codexPath: '~/zz-tools/bin/codex' }).codexPath, external);
   for (const codexPath of ['codex', 'bin/codex', './codex', '../codex', '', null, 42]) {
     refuses({ codexPath }, /codexPath must be an absolute path/);
   }
   refuses({ codexPath: join(accountsDir, 'zz-one', 'codex') }, /codexPath must not point inside accountsDir/);
   refuses({ codexPath: accountsDir }, /codexPath must not point inside accountsDir/);
   refuses({ codexPath: join(shimDir(env), 'codex') }, /codexPath must not point inside the codex-rotator shim directory/);
-  refuses({ accountsDir: '~/zz-custom-accounts', codexPath: '~/zz-custom-accounts/codex' }, /inside accountsDir/);
+  refuses({ accountsDir: '~/zz-custom-accounts', codexPath: join(home, 'zz-custom-accounts', 'codex') }, /inside accountsDir/);
 });
 
 test('config: codexPath is compared by its real path, so a link into the shim directory is refused', async t => {
@@ -334,12 +364,12 @@ test('config: on darwin, paths that differ only in letter case (or Unicode form)
   const { env, home, account } = await setup(t);
   const cases = [
     [{ accountsDir: '~/.CODEX/accounts' }, /accountsDir must be separate from ~\/\.codex/],
-    [{ accounts: [account('zz-one', { codexHome: '~/.Codex' })] }, /accounts\[0\]\.codexHome must be separate from ~\/\.codex/],
+    [{ accounts: [account('zz-one', { codexHome: join(home, '.Codex') })] }, /accounts\[0\]\.codexHome must be separate from ~\/\.codex/],
     [{ accounts: [account('zz-one', { codexHome: join(home, 'zz-accts', 'One') }),
       account('zz-two', { codexHome: join(home, 'zz-accts', 'one') })] }, /accounts\[1\]\.codexHome overlaps/],
     [{ accounts: [account('zz-one', { codexHome: join(home, 'zz-caf\u00e9') }),
       account('zz-two', { codexHome: join(home, 'zz-cafe\u0301') })] }, /accounts\[1\]\.codexHome overlaps/],
-    [{ accountsDir: '~/zz-Accounts', codexPath: '~/ZZ-ACCOUNTS/codex' }, /codexPath must not point inside accountsDir/],
+    [{ accountsDir: '~/zz-Accounts', codexPath: join(home, 'ZZ-ACCOUNTS', 'codex') }, /codexPath must not point inside accountsDir/],
     [{ codexPath: join(env.XDG_DATA_HOME, 'Codex-Rotator', 'BIN', 'codex') }, /shim directory/],
   ];
   for (const [raw, pattern] of cases) {
@@ -589,4 +619,326 @@ test('config: validation needs an absolute HOME in the env instead of guessing o
   for (const env of [undefined, {}, { HOME: 'relative/home' }]) {
     assert.throws(() => validateCodexConfig({}, { env }), error => error instanceof CodexConfigError && /HOME/.test(error.message));
   }
+});
+
+// ---------------------------------------------------------------------------
+// 読込みの sha256
+// ---------------------------------------------------------------------------
+
+const sha256Hex = bytes => createHash('sha256').update(bytes).digest('hex');
+
+test('config: a snapshot returns the parsed config and the sha256 of the same single read', async t => {
+  const { env, accountsDir, account } = await setup(t);
+  assert.equal(await loadCodexConfigSnapshot({ env }), null, 'no file, no snapshot');
+  // フォルダの名前に ASCII の外の文字を入れ、utf8 で符号化したバイト列で求めた値がファイルと同じことも見る。
+  const first = { enabled: true, acknowledgedMultiAccountRisk: true,
+    accounts: [account('zz-first', { codexHome: join(accountsDir, 'zz-口座-first') })] };
+  const path = await writeConfig(env, first);
+  const firstBytes = await readFile(path);
+  assert.ok(firstBytes.some(byte => byte > 0x7f), 'the file has bytes outside ASCII');
+  const second = { enabled: false, accounts: [account('zz-second')] };
+
+  // 偽の fs: 読み終えて閉じた直後に、別の中身へ書き換える。
+  let opens = 0;
+  const openImpl = async (target, flags) => {
+    opens++;
+    const handle = await open(target, flags);
+    return {
+      stat: () => handle.stat(),
+      read: (...args) => handle.read(...args),
+      close: async () => {
+        await handle.close();
+        await writeFile(path, JSON.stringify(second));
+      },
+    };
+  };
+  const snapshot = await loadCodexConfigSnapshot({ env, openImpl });
+  assert.equal(opens, 1, 'one read');
+  assert.ok(Object.isFrozen(snapshot));
+  assert.match(snapshot.sha256, CONFIG_SHA256_PATTERN);
+  assert.equal(snapshot.sha256, sha256Hex(firstBytes), 'the value is from the bytes that were parsed');
+  assert.equal(snapshot.config.enabled, true);
+  assert.deepEqual(snapshot.config.accounts.map(entry => entry.label), ['zz-first']);
+
+  // ファイルは書き換わっており、次の読込みは新しい中身とその値を返す。
+  const secondBytes = await readFile(path);
+  assert.notEqual(sha256Hex(secondBytes), snapshot.sha256);
+  const again = await loadCodexConfigSnapshot({ env });
+  assert.equal(again.sha256, sha256Hex(secondBytes));
+  assert.deepEqual(again.config.accounts.map(entry => entry.label), ['zz-second']);
+  // loadCodexConfig の戻り値の形（設定そのもの）は変わらない。
+  assert.deepEqual(await loadCodexConfig({ env }), again.config);
+});
+
+test('config: a snapshot is refused on the same conditions as loading', async t => {
+  const { env } = await setup(t);
+  const path = await writeConfig(env, { enabled: false });
+  await chmod(path, 0o644);
+  await assert.rejects(loadCodexConfigSnapshot({ env }), error => error instanceof CodexConfigError
+    && /^the codex-rotator config file must be private/.test(error.message));
+  await chmod(path, 0o600);
+  await writeFile(path, '{"enabled": ');
+  await assert.rejects(loadCodexConfigSnapshot({ env }), error => error instanceof CodexConfigError
+    && /not valid JSON/.test(error.message));
+});
+
+// ---------------------------------------------------------------------------
+// 追記・初回の作成・登録を外す書込み
+// ---------------------------------------------------------------------------
+
+// 更新時刻を過去の固定の時刻にしてから、中身・更新時刻・フォルダの中身が変わらないことを確かめる関数を返す。
+async function pinConfigFile(path) {
+  const past = new Date('2001-02-03T04:05:06Z');
+  await utimes(path, past, past);
+  const bytes = await readFile(path);
+  const { mtimeMs } = await stat(path);
+  return async message => {
+    assert.deepEqual(await readFile(path), bytes, `${message}: content`);
+    assert.equal((await stat(path)).mtimeMs, mtimeMs, `${message}: modification time`);
+    assert.deepEqual(await readdir(dirname(path)), ['config.json'], `${message}: no temporary file is left`);
+  };
+}
+
+test('config: the first append creates the file with both gates off, the folder 0700 and the file 0600', async t => {
+  const { env, account } = await setup(t);
+  const path = codexRotatorConfigPath(env);
+  await assert.rejects(stat(dirname(path)), { code: 'ENOENT' });
+  const result = await appendCodexAccount({ env, account: account('zz-first'), expectedSha256: null });
+
+  assert.equal((await stat(dirname(path))).mode & 0o777, 0o700);
+  assert.equal((await stat(path)).mode & 0o777, 0o600);
+  assert.deepEqual(await readdir(dirname(path)), ['config.json']);
+  const bytes = await readFile(path);
+  assert.deepEqual(JSON.parse(bytes.toString('utf8')),
+    { enabled: false, acknowledgedMultiAccountRisk: false, accounts: [account('zz-first')] });
+  assert.equal(result.sha256, sha256Hex(bytes));
+  const snapshot = await loadCodexConfigSnapshot({ env });
+  assert.equal(snapshot.sha256, result.sha256);
+  assert.deepEqual(snapshot.config, result.config);
+  assert.equal(isCodexRotatorActivated(snapshot.config), false);
+  assert.deepEqual(snapshot.config.accounts.map(entry => entry.label), ['zz-first']);
+});
+
+test('config: the first append writes nothing when the account is refused or the folder is not private', async t => {
+  const { env, account } = await setup(t);
+  const path = codexRotatorConfigPath(env);
+  // 方針の無い口座は、フォルダを作る前に拒否する。
+  await assert.rejects(appendCodexAccount({ env, account: account('zz-first', { usagePolicy: undefined }), expectedSha256: null }),
+    error => error instanceof CodexConfigError && /usagePolicy is required/.test(error.message));
+  await assert.rejects(stat(dirname(path)), { code: 'ENOENT' });
+  // 既にある広いフォルダは広げも狭めもせず、拒否する。
+  await mkdir(dirname(path), { mode: 0o700 });
+  await chmod(dirname(path), 0o755);
+  await assert.rejects(appendCodexAccount({ env, account: account('zz-first'), expectedSha256: null }),
+    error => error instanceof CodexConfigError && /^the codex-rotator config folder must be private/.test(error.message)
+      && !error.message.includes(path));
+  assert.equal((await stat(dirname(path))).mode & 0o777, 0o755);
+  assert.deepEqual(await readdir(dirname(path)), []);
+});
+
+test('config: the first append never replaces a file that appeared, and leaves no temporary file', async t => {
+  const { env, account } = await setup(t);
+  const path = codexRotatorConfigPath(env);
+  // 名前を付ける時点で先にファイルができていた（link が EEXIST）。
+  let links = 0;
+  const fileOps = { link: async () => { links++; throw Object.assign(new Error('zz exists'), { code: 'EEXIST' }); } };
+  await assert.rejects(appendCodexAccount({ env, account: account('zz-first'), expectedSha256: null, fileOps }),
+    error => error instanceof CodexConfigError && /already exists; nothing was written/.test(error.message));
+  assert.equal(links, 1);
+  assert.deepEqual(await readdir(dirname(path)), []);
+  // 読んだときに無かったのに、今はある。
+  await writeConfig(env, { enabled: false, accounts: [account('zz-other')] });
+  const check = await pinConfigFile(path);
+  await assert.rejects(appendCodexAccount({ env, account: account('zz-first'), expectedSha256: null }),
+    error => error instanceof CodexConfigError && /already exists; nothing was written/.test(error.message));
+  await check('a file that appeared is kept');
+});
+
+test('config: appending adds one account with its policy, keeps the other keys, and the result validates', async t => {
+  const { env, account } = await setup(t);
+  const path = await writeConfig(env, { enabled: true, acknowledgedMultiAccountRisk: true, usagePollIntervalMs: 60000,
+    accounts: [account('zz-a')] });
+  const before = await loadCodexConfigSnapshot({ env });
+  const added = account('zz-b', { usagePolicy: policy(80, 60, { blockWhenUnknown: true }) });
+  const result = await appendCodexAccount({ env, account: added, expectedSha256: before.sha256 });
+
+  const bytes = await readFile(path);
+  assert.equal(result.sha256, sha256Hex(bytes));
+  assert.notEqual(result.sha256, before.sha256);
+  assert.deepEqual(JSON.parse(bytes.toString('utf8')), { enabled: true, acknowledgedMultiAccountRisk: true,
+    usagePollIntervalMs: 60000, accounts: [account('zz-a'), added] });
+  assert.equal((await stat(path)).mode & 0o777, 0o600);
+  assert.deepEqual(await readdir(dirname(path)), ['config.json']);
+  const after = await loadCodexConfigSnapshot({ env });
+  assert.equal(after.sha256, result.sha256);
+  assert.deepEqual(after.config, result.config);
+  assert.equal(isCodexRotatorActivated(after.config), true);
+  assert.deepEqual(after.config.accounts.map(entry => [entry.label, entry.usagePolicy]), [
+    ['zz-a', { stopUsedPercent: 75, resumeUsedPercent: 70, blockWhenUnknown: false }],
+    ['zz-b', { stopUsedPercent: 80, resumeUsedPercent: 60, blockWhenUnknown: true }],
+  ]);
+});
+
+test('config: appending refuses before writing when the account does not fit or the file changed since it was read', async t => {
+  const { env, accountsDir, account } = await setup(t);
+  const path = await writeConfig(env, { enabled: false, accounts: [account('zz-a')] });
+  const { sha256 } = await loadCodexConfigSnapshot({ env });
+  const check = await pinConfigFile(path);
+  const refusals = [
+    [account('zz-a', { codexHome: join(accountsDir, 'zz-elsewhere') }), sha256, /label is used by another account/],
+    [account('zz-b', { codexHome: join(accountsDir, 'zz-a') }), sha256, /overlaps the codexHome of another account/],
+    [account('zz-b', { codexHome: join(accountsDir, 'zz-a', 'inner') }), sha256, /overlaps the codexHome of another account/],
+    [account('zz-b', { usagePolicy: undefined }), sha256, /usagePolicy is required/],
+    [account('zz-b', { usagePolicy: policy(70, 70) }), sha256, /resumeUsedPercent/],
+    [account('zz-b'), '0'.repeat(64), /changed since it was read; nothing was written/],
+    [account('zz-b'), sha256.toUpperCase(), /expectedSha256 must be/],
+    [account('zz-b'), undefined, /expectedSha256 must be/],
+  ];
+  for (const [added, expectedSha256, pattern] of refusals) {
+    await assert.rejects(appendCodexAccount({ env, account: added, expectedSha256 }),
+      error => error instanceof CodexConfigError && pattern.test(error.message) && !error.message.includes(path),
+      String(pattern));
+    await check(String(pattern));
+  }
+  // 読んだときにあったファイルが今は無いときも、作らない。
+  await rm(path);
+  await assert.rejects(appendCodexAccount({ env, account: account('zz-b'), expectedSha256: sha256 }),
+    error => error instanceof CodexConfigError && /changed since it was read/.test(error.message));
+  assert.deepEqual(await readdir(dirname(path)), []);
+});
+
+test('config: when rename fails, appending and removing leave the content and the modification time unchanged', async t => {
+  const { env, account } = await setup(t);
+  const path = await writeConfig(env, { enabled: false, accounts: [account('zz-a'), account('zz-b')] });
+  const { sha256 } = await loadCodexConfigSnapshot({ env });
+  const check = await pinConfigFile(path);
+  let renames = 0;
+  const fileOps = { rename: async () => { renames++; throw Object.assign(new Error(`zz rename failed ${path}`), { code: 'EIO' }); } };
+  const refused = error => error instanceof CodexConfigError
+    && /could not be written; the original is unchanged/.test(error.message) && !error.message.includes(path);
+
+  await assert.rejects(appendCodexAccount({ env, account: account('zz-c'), expectedSha256: sha256, fileOps }), refused);
+  assert.equal(renames, 1);
+  await check('append');
+  await assert.rejects(removeCodexAccount({ env, label: 'zz-b', fileOps }), refused);
+  assert.equal(renames, 2);
+  await check('remove');
+  assert.equal((await loadCodexConfigSnapshot({ env })).sha256, sha256);
+});
+
+test('config: a write stops, keeping the other writer, when the file changes between the read and the rename', async t => {
+  const { env, account } = await setup(t);
+  const path = await writeConfig(env, { enabled: false, accounts: [account('zz-a'), account('zz-b')] });
+  const other = `${JSON.stringify({ enabled: false, accounts: [account('zz-other')] })}\n`;
+  // 一時ファイルを開いた時点で、別の書き手が設定を書き換える。
+  const fileOps = {
+    open: async (target, ...rest) => {
+      if (target !== path && target.startsWith(`${path}.`)) await writeFile(path, other);
+      return open(target, ...rest);
+    },
+  };
+  const { sha256 } = await loadCodexConfigSnapshot({ env });
+  await assert.rejects(appendCodexAccount({ env, account: account('zz-c'), expectedSha256: sha256, fileOps }),
+    error => error instanceof CodexConfigError && /changed since it was read; nothing was written/.test(error.message));
+  assert.equal(await readFile(path, 'utf8'), other);
+  assert.deepEqual(await readdir(dirname(path)), ['config.json']);
+
+  await writeConfig(env, { enabled: false, accounts: [account('zz-a'), account('zz-b')] });
+  await assert.rejects(removeCodexAccount({ env, label: 'zz-b', fileOps }),
+    error => error instanceof CodexConfigError && /changed since it was read; nothing was written/.test(error.message));
+  assert.equal(await readFile(path, 'utf8'), other);
+  assert.deepEqual(await readdir(dirname(path)), ['config.json']);
+});
+
+test('config: removing takes out only that label, keeps its folder, and the result validates', async t => {
+  const { env, accountsDir, account } = await setup(t);
+  await mkdir(join(accountsDir, 'zz-b'), { recursive: true, mode: 0o700 });
+  await chmod(accountsDir, 0o700);
+  const path = await writeConfig(env, { enabled: true, acknowledgedMultiAccountRisk: true,
+    accounts: [account('zz-a'), account('zz-b'), account('zz-c')] });
+  const before = await loadCodexConfigSnapshot({ env });
+  const result = await removeCodexAccount({ env, label: 'zz-b' });
+
+  assert.equal(result.removed, true);
+  const bytes = await readFile(path);
+  assert.equal(result.sha256, sha256Hex(bytes));
+  assert.notEqual(result.sha256, before.sha256);
+  assert.deepEqual(JSON.parse(bytes.toString('utf8')), { enabled: true, acknowledgedMultiAccountRisk: true,
+    accounts: [account('zz-a'), account('zz-c')] });
+  assert.equal((await stat(path)).mode & 0o777, 0o600);
+  assert.ok((await stat(join(accountsDir, 'zz-b'))).isDirectory(), 'the account folder is kept');
+  const after = await loadCodexConfigSnapshot({ env });
+  assert.equal(after.sha256, result.sha256);
+  assert.deepEqual(after.config, result.config);
+  assert.deepEqual(after.config.accounts.map(entry => entry.label), ['zz-a', 'zz-c']);
+
+  // もう無いラベルは、何も書かずに removed:false と今の設定を返す。
+  const check = await pinConfigFile(path);
+  const again = await removeCodexAccount({ env, label: 'zz-b' });
+  assert.equal(again.removed, false);
+  assert.equal(again.sha256, sha256Hex(await readFile(path)));
+  await check('an absent label');
+  // ラベルの形でないものは拒否し、値を返さない。
+  const marker = `ZZ-MARKER-${randomBytes(4).toString('hex')}`;
+  for (const label of [marker, '', undefined, 7]) {
+    await assert.rejects(removeCodexAccount({ env, label }),
+      error => error instanceof CodexConfigError && /^label must be/.test(error.message) && !error.message.includes(marker));
+  }
+  await check('an invalid label');
+  // 最後の1件も外せ、外した設定も検証を通る。
+  await removeCodexAccount({ env, label: 'zz-a' });
+  await removeCodexAccount({ env, label: 'zz-c' });
+  assert.deepEqual((await loadCodexConfig({ env })).accounts, []);
+
+  // ファイルが無いときは、何も作らずに removed:false。
+  await rm(path);
+  assert.deepEqual({ ...(await removeCodexAccount({ env, label: 'zz-a' })) }, { removed: false, config: null, sha256: null });
+  assert.deepEqual(await readdir(dirname(path)), []);
+});
+
+// ---------------------------------------------------------------------------
+// 存在しないパスの実パス化
+// ---------------------------------------------------------------------------
+
+test('config: canonicalPath and comparisonKey are exported and resolve paths that do not exist yet', async t => {
+  const { isolation } = await setup(t);
+  const { root } = isolation;
+  const real = join(root, 'zz-real');
+  await mkdir(real, { mode: 0o700 });
+  const linked = join(root, 'zz-linked');
+  await symlink(real, linked);
+
+  assert.equal(canonicalPath(linked), real);
+  // 存在しない部分は、存在する祖先の実パスにそのままつなぐ。
+  assert.equal(canonicalPath(join(linked, 'zz-missing', 'deeper')), join(real, 'zz-missing', 'deeper'));
+  assert.equal(canonicalPath(`${join(linked, 'zz-missing')}/`), join(real, 'zz-missing'));
+  // 行き先の無いリンクの下と相対パスは、where だけを言って拒否する。
+  const dangling = join(root, 'zz-dangling');
+  await symlink(join(root, 'zz-nowhere'), dangling);
+  for (const value of [join(dangling, 'child'), dangling]) {
+    assert.throws(() => canonicalPath(value, { where: 'CODEX_HOME' }),
+      error => error instanceof CodexConfigError && error.message === 'CODEX_HOME cannot be resolved');
+  }
+  for (const value of ['relative/zz', '', undefined, `${root}/zz\0`]) {
+    assert.throws(() => canonicalPath(value, { where: 'CODEX_HOME' }),
+      error => error instanceof CodexConfigError && error.message === 'CODEX_HOME must be an absolute path');
+  }
+  // 差し替えた realpath・lstat を使う。
+  const calls = [];
+  const realpathImpl = path => {
+    calls.push(path);
+    if (path === '/zz-fake/present') return '/zz-fake/REAL';
+    throw Object.assign(new Error('missing'), { code: 'ENOENT' });
+  };
+  const lstatImpl = () => { throw Object.assign(new Error('missing'), { code: 'ENOENT' }); };
+  assert.equal(canonicalPath('/zz-fake/present/a/b', { realpathImpl, lstatImpl }), '/zz-fake/REAL/a/b');
+  assert.deepEqual(calls, ['/zz-fake/present/a/b', '/zz-fake/present/a', '/zz-fake/present']);
+
+  // darwin では大文字小文字と正規化形をそろえ、ほかではそのまま。
+  assert.equal(comparisonKey('/Zz/Café', 'darwin'), '/zz/café');
+  assert.equal(comparisonKey('/Zz/Café', 'linux'), '/Zz/Café');
+  assert.equal(comparisonKey('/Zz/Mixed'), comparisonKey('/Zz/Mixed', process.platform));
+  // 存在しないパスでも、同じ場所の2つの書き方が darwin では同じ形になる。
+  assert.equal(comparisonKey(canonicalPath(join(linked, 'ZZ-New')), 'darwin'),
+    comparisonKey(canonicalPath(join(real, 'zz-new')), 'darwin'));
 });

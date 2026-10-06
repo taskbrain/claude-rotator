@@ -14,8 +14,16 @@
 //     パスの情報だけで、中身は開かない。
 //   - loadCodexConfig は、設定ファイルとその親フォルダが自分だけのものであること、既にある
 //     accountsDir が自分だけのフォルダであることも確かめる（fsguard.js）。
-import { lstatSync, realpathSync } from 'node:fs';
+//   - loadCodexConfigSnapshot は、1回の読込みで得た文字列から、解析の結果とその sha256 を一緒に
+//     返す（設定の世代を照らす側が、別の読込みで求めた値を混ぜないため）。
+//   - 設定を書き換えるのは appendCodexAccount（口座の追記と、ファイルが無いときの初回の作成）と
+//     removeCodexAccount（登録を外す）だけ。どちらも同じフォルダの一時ファイルに書いてから名前を
+//     付け替えるので、途中で失敗しても元のファイルの中身と更新時刻は変わらない。
+import { createHash, randomBytes } from 'node:crypto';
+import { constants as fsConstants, lstatSync, realpathSync } from 'node:fs';
+import { link, open, rename, unlink } from 'node:fs/promises';
 import { basename, dirname, isAbsolute, join, parse, resolve, sep } from 'node:path';
+import { ensureDirectoryDurable } from '../json-file.js';
 import { FSGUARD_REASON, FsGuardError, assertPrivateDirectory, readPrivateFile } from './fsguard.js';
 import {
   CodexPathsError, DEFAULT_ACCOUNTS_DIR, codexRotatorConfigPath, defaultCodexHome, expandHomePath, shimDir,
@@ -133,7 +141,8 @@ function validateDaemon(rawDaemon) {
 /**
  * User-Agent・originator の値として使えない理由を返す。使えるなら null。値そのものは返さない。
  * 条件: 文字列・1〜maxLength 文字・表示可能な ASCII（0x20〜0x7E）だけ・前後に空白が無い
- * （空白だけの値もここで落ちる）。実行時に組み立てる User-Agent・originator の値にも同じ検査を当てる。
+ * （空白だけの値もここで落ちる）。Codex CLI の版から組み立てた値（client-version.js）にも
+ * 同じ検査を当てる。
  */
 export function usageHeaderValueProblem(value, maxLength) {
   if (typeof value !== 'string') return 'must be a string';
@@ -177,15 +186,19 @@ export function pathsOverlap(a, b) {
   return isSameOrInside(a, b) || isSameOrInside(b, a) || a === parse(a).root || b === parse(b).root;
 }
 
-// 比べるための形。darwin のディスクは大文字小文字と正規化形を区別しないので、そろえる。
-// まだ存在しない部分は実パスに直せず、書いたとおりの大文字小文字が残るため、ここでそろえる。
-function comparisonKey(path, platform) {
+/**
+ * 比べるための形。darwin のディスクは大文字小文字と正規化形を区別しないので、そろえる。
+ * まだ存在しない部分は実パスに直せず、書いたとおりの大文字小文字が残るため、ここでそろえる。
+ * @param {string} path canonicalPath が返した実パス
+ * @param {string} [platform]
+ */
+export function comparisonKey(path, platform = process.platform) {
   return platform === 'darwin' ? path.normalize('NFC').toLowerCase() : path;
 }
 
 // 存在する祖先まで実パスに直す。まだ無い部分はそのままつなぐ。行き先の無いシンボリック
 // リンクは、どこを指すか確かめられないので拒否する。
-function canonicalPath(absolutePath, where, fsImpl) {
+function resolveCanonical(absolutePath, where, fsImpl) {
   try {
     return fsImpl.realpath(absolutePath);
   } catch (error) {
@@ -193,8 +206,26 @@ function canonicalPath(absolutePath, where, fsImpl) {
     if (isDanglingLink(absolutePath, fsImpl)) throw new CodexConfigError(`${where} cannot be resolved`);
     const parent = dirname(absolutePath);
     if (parent === absolutePath) throw new CodexConfigError(`${where} cannot be resolved`);
-    return join(canonicalPath(parent, where, fsImpl), basename(absolutePath));
+    return join(resolveCanonical(parent, where, fsImpl), basename(absolutePath));
   }
+}
+
+/**
+ * 絶対パスを、存在しない部分があっても実パスに直す（重なりの検査が使うのと同じ求め方）。
+ * 存在する祖先までを実パスに直し、まだ無い部分はそのままつなぐ。行き先の無いシンボリック
+ * リンク・相対パスは CodexConfigError（メッセージにはパスを入れず、where だけを入れる）。
+ * 比べるときは、返した値を comparisonKey でそろえる。
+ * @param {string} absolutePath
+ * @param {{ where?: string, realpathImpl?: Function, lstatImpl?: Function }} [options]
+ * @returns {string}
+ */
+export function canonicalPath(absolutePath, {
+  where = 'the path', realpathImpl = realpathSync.native, lstatImpl = lstatSync,
+} = {}) {
+  if (typeof absolutePath !== 'string' || absolutePath.includes('\0') || !isAbsolute(absolutePath)) {
+    throw new CodexConfigError(`${where} must be an absolute path`);
+  }
+  return resolveCanonical(resolve(absolutePath), where, { realpath: realpathImpl, lstat: lstatImpl });
 }
 
 function isDanglingLink(path, fsImpl) {
@@ -205,14 +236,19 @@ function isDanglingLink(path, fsImpl) {
   }
 }
 
-// 絶対パスか `~/` で始まるパスだけを受ける。返す path は ~ を展開して正規化した絶対パス
-// （末尾の / なし）、canonical は重なりの比較に使う形（実パスを comparisonKey でそろえたもの）。
-function pathSetting(value, where, context) {
-  if (typeof value !== 'string' || value.includes('\0') || !(isAbsolute(value) || value.startsWith('~/'))) {
-    throw new CodexConfigError(`${where} must be an absolute path or start with ~/`);
+// 絶対パスか `~/` で始まるパスだけを受ける（allowHome が偽なら絶対パスだけ）。返す path は ~ を
+// 展開して正規化した絶対パス（末尾の / なし）、canonical は重なりの比較に使う形（実パスを
+// comparisonKey でそろえたもの）。
+function pathSetting(value, where, context, { allowHome = true } = {}) {
+  const shapeOk = typeof value === 'string' && !value.includes('\0')
+    && (isAbsolute(value) || (allowHome && value.startsWith('~/')));
+  if (!shapeOk) {
+    throw new CodexConfigError(allowHome
+      ? `${where} must be an absolute path or start with ~/`
+      : `${where} must be an absolute path (a path starting with ~/ is not accepted)`);
   }
   const path = resolve(expandHomePath(value, context.env));
-  return { path, canonical: comparisonKey(canonicalPath(path, where, context.fsImpl), context.platform) };
+  return { path, canonical: comparisonKey(resolveCanonical(path, where, context.fsImpl), context.platform) };
 }
 
 function validateAccountsDir(rawValue, context) {
@@ -253,7 +289,9 @@ function validateAccounts(rawAccounts, accountsDir, context) {
     }
     if (labels.has(account.label)) throw new CodexConfigError(`${where}.label is used by another account`);
     labels.add(account.label);
-    const home = pathSetting(account.codexHome, `${where}.codexHome`, context);
+    // 口座のフォルダは絶対パスだけ。~ はこの設定を読むプロセスの HOME で展開されるので、`~/` の形だと
+    // HOME の違うプロセス（常駐とシェルなど）が、同じ設定から別のフォルダを求めうる。
+    const home = pathSetting(account.codexHome, `${where}.codexHome`, context, { allowHome: false });
     // ~/.codex は口座の外。その中・それを含む場所も口座にしない。
     if (pathsOverlap(home.canonical, context.defaultCodexHome)) {
       throw new CodexConfigError(`${where}.codexHome must be separate from ~/.codex (neither inside it nor containing it)`);
@@ -274,7 +312,8 @@ function validateAccounts(rawAccounts, accountsDir, context) {
 
 function validateCodexPath(rawValue, accountsDir, accountHomes, context) {
   if (rawValue === undefined) return null;
-  const codexPath = pathSetting(rawValue, 'codexPath', context);
+  // 口座のフォルダと同じ理由で、絶対パスだけ（読むプロセスによって別の実行ファイルを指さないように）。
+  const codexPath = pathSetting(rawValue, 'codexPath', context, { allowHome: false });
   if (isSameOrInside(codexPath.canonical, accountsDir.canonical)) {
     throw new CodexConfigError('codexPath must not point inside accountsDir');
   }
@@ -330,8 +369,8 @@ export function validateCodexConfig(raw, {
     env,
     fsImpl,
     platform,
-    defaultCodexHome: comparisonKey(canonicalPath(defaultCodexHome(env), '~/.codex', fsImpl), platform),
-    shimDir: comparisonKey(canonicalPath(shimDir(env), 'the shim directory', fsImpl), platform),
+    defaultCodexHome: comparisonKey(resolveCanonical(defaultCodexHome(env), '~/.codex', fsImpl), platform),
+    shimDir: comparisonKey(resolveCanonical(shimDir(env), 'the shim directory', fsImpl), platform),
   }));
   const accountsDir = fromEnv(() => validateAccountsDir(raw.accountsDir, context));
   const { accounts, homes } = fromEnv(() => validateAccounts(raw.accounts, accountsDir, context));
@@ -367,17 +406,42 @@ async function guarded(check) {
  *   - accountsDir が既にあり、自分だけのフォルダでない（リンクも拒否する）。無ければ通す
  * @param {{ env: object, openImpl?: Function, platform?: string, realpathImpl?: Function, lstatImpl?: Function }} options
  */
-export async function loadCodexConfig({ env, openImpl, ...validateOptions } = {}) {
-  const path = fromEnv(() => codexRotatorConfigPath(env));
-  let text;
+export async function loadCodexConfig(options = {}) {
+  return (await readConfigSnapshot(options))?.config ?? null;
+}
+
+/** 設定の sha256 の形（64桁の小文字の16進）。 */
+export const CONFIG_SHA256_PATTERN = /^[0-9a-f]{64}$/;
+
+const CONFIG_FILE_WHAT = 'the codex-rotator config file';
+const CONFIG_FOLDER_WHAT = 'the codex-rotator config folder';
+const CONFIG_CHANGED = 'the codex-rotator config file changed since it was read; nothing was written';
+const CONFIG_EXISTS = 'the codex-rotator config file already exists; nothing was written';
+const CONFIG_NOT_WRITTEN = 'the codex-rotator config file could not be written; the original is unchanged';
+
+// 読んだ文字列を utf8 で符号化したバイト列の sha256。正しい utf8 のファイルなら、ファイルの
+// バイト列の sha256 と同じ値になる。
+function textSha256(text) {
+  return createHash('sha256').update(Buffer.from(text, 'utf8')).digest('hex');
+}
+
+// 設定ファイルを1回読む。無ければ null。
+async function readConfigText(path, openImpl) {
   try {
-    text = await readPrivateFile(path, { what: 'the codex-rotator config file', maxBytes: CONFIG_FILE_MAX_BYTES, openImpl });
+    return await readPrivateFile(path, { what: CONFIG_FILE_WHAT, maxBytes: CONFIG_FILE_MAX_BYTES, openImpl });
   } catch (error) {
     if (error instanceof FsGuardError && error.reason === FSGUARD_REASON.missing) return null;
     if (error instanceof FsGuardError) throw new CodexConfigError(error.message);
     throw error;
   }
-  await guarded(() => assertPrivateDirectory(dirname(path), { what: 'the codex-rotator config folder' }));
+}
+
+// 1回の読込みで、sha256・生の値・検証した設定を同じ文字列から作る。ファイルが無ければ null。
+async function readConfigSnapshot({ env, openImpl, ...validateOptions } = {}) {
+  const path = fromEnv(() => codexRotatorConfigPath(env));
+  const text = await readConfigText(path, openImpl);
+  if (text === null) return null;
+  await guarded(() => assertPrivateDirectory(dirname(path), { what: CONFIG_FOLDER_WHAT }));
   let raw;
   try {
     raw = JSON.parse(text);
@@ -392,7 +456,172 @@ export async function loadCodexConfig({ env, openImpl, ...validateOptions } = {}
       if (!(error instanceof FsGuardError && error.reason === FSGUARD_REASON.missing)) throw error;
     }
   });
-  return config;
+  return { path, raw, config, sha256: textSha256(text) };
+}
+
+/**
+ * loadCodexConfig と同じ検査で設定を読み、解析の結果と、その解析に使ったのと同じ1回の読込みの
+ * 中身の sha256 を一緒に返す。ファイルが無いときだけ null。拒否の条件は loadCodexConfig と同じ。
+ * @param {{ env: object, openImpl?: Function, platform?: string, realpathImpl?: Function, lstatImpl?: Function }} options
+ * @returns {Promise<{ config: object, sha256: string }|null>} sha256 は64桁の小文字の16進
+ */
+export async function loadCodexConfigSnapshot(options = {}) {
+  const snapshot = await readConfigSnapshot(options);
+  return snapshot && Object.freeze({ config: snapshot.config, sha256: snapshot.sha256 });
+}
+
+function serializeConfig(raw) {
+  return `${JSON.stringify(raw, null, 2)}\n`;
+}
+
+// 同じフォルダに 0600 の一時ファイルを新しく作って書き、ディスクへ書き出してから閉じる。
+async function writeTempFile(path, text, fileOps) {
+  const tempPath = `${path}.${process.pid}.${randomBytes(6).toString('hex')}.tmp`;
+  let handle;
+  try {
+    handle = await (fileOps.open ?? open)(tempPath, 'wx', 0o600);
+    await handle.writeFile(text);
+    await handle.chmod(0o600);
+    await handle.sync();
+    await handle.close();
+    handle = null;
+    return tempPath;
+  } catch (error) {
+    await handle?.close().catch(() => {});
+    await (fileOps.unlink ?? unlink)(tempPath).catch(() => {});
+    throw error;
+  }
+}
+
+// 名前を付けた後のフォルダの書き出し。名前の付け替えは済んで見える中身は変わっているので、
+// ここでの失敗（フォルダの書き出しを扱えないファイルシステムなど）で「書けなかった」とは言わない。
+async function syncFolderAfterCommit(folder, fileOps) {
+  let handle;
+  try {
+    handle = await (fileOps.open ?? open)(folder, fsConstants.O_RDONLY);
+    await handle.sync();
+  } catch {
+    // 書込みの結果は変えない。
+  } finally {
+    await handle?.close().catch(() => {});
+  }
+}
+
+// 読んだ時点の中身（snapshot）を nextRaw で置き換える。検証を通らない中身は書かない。置き換える
+// 直前にもう一度読み、読んだ時点から中身が変わっていたら書かない（別の書き手の変更を消さない）。
+async function replaceConfigFile(snapshot, nextRaw, { env, openImpl, fileOps, validateOptions }) {
+  const config = validateCodexConfig(nextRaw, { env, ...validateOptions });
+  const text = serializeConfig(nextRaw);
+  let tempPath = null;
+  try {
+    tempPath = await writeTempFile(snapshot.path, text, fileOps);
+    const current = await readConfigText(snapshot.path, openImpl);
+    if (current === null || textSha256(current) !== snapshot.sha256) throw new CodexConfigError(CONFIG_CHANGED);
+    await (fileOps.rename ?? rename)(tempPath, snapshot.path);
+    tempPath = null;
+  } catch (error) {
+    if (error instanceof CodexConfigError) throw error;
+    throw new CodexConfigError(CONFIG_NOT_WRITTEN);
+  } finally {
+    if (tempPath !== null) await (fileOps.unlink ?? unlink)(tempPath).catch(() => {});
+  }
+  await syncFolderAfterCommit(dirname(snapshot.path), fileOps);
+  return Object.freeze({ config, sha256: textSha256(text) });
+}
+
+// 設定ファイルが無いときの初回の作成。2つのゲートは偽で作る（真にするのは利用者が手で行う）。
+// フォルダは 0700 で作り、既にあれば自分だけのフォルダであることを確かめる（広げも狭めもしない）。
+// 名前は link で付ける（既にファイルがあれば失敗する。rename は黙って置き換えるので使わない）。
+async function createConfigFile(account, { env, fileOps, validateOptions }) {
+  const path = fromEnv(() => codexRotatorConfigPath(env));
+  const raw = { enabled: false, acknowledgedMultiAccountRisk: false, accounts: [account] };
+  const config = validateCodexConfig(raw, { env, ...validateOptions });
+  const text = serializeConfig(raw);
+  const folder = dirname(path);
+  try {
+    await ensureDirectoryDurable(folder, 0o700, fileOps);
+  } catch {
+    throw new CodexConfigError('the codex-rotator config folder could not be created; nothing was written');
+  }
+  await guarded(() => assertPrivateDirectory(folder, { what: CONFIG_FOLDER_WHAT }));
+  let tempPath = null;
+  try {
+    tempPath = await writeTempFile(path, text, fileOps);
+    try {
+      await (fileOps.link ?? link)(tempPath, path);
+    } catch (error) {
+      if (error?.code === 'EEXIST') throw new CodexConfigError(CONFIG_EXISTS);
+      throw error;
+    }
+  } catch (error) {
+    if (error instanceof CodexConfigError) throw error;
+    throw new CodexConfigError('the codex-rotator config file could not be written; nothing was created');
+  } finally {
+    // link の後は同じ中身への2つ目の名前なので、消せなくても設定は作れている。
+    if (tempPath !== null) await (fileOps.unlink ?? unlink)(tempPath).catch(() => {});
+  }
+  await syncFolderAfterCommit(folder, fileOps);
+  return Object.freeze({ config, sha256: textSha256(text) });
+}
+
+function assertExpectedSha256(value) {
+  if (value !== null && !(typeof value === 'string' && CONFIG_SHA256_PATTERN.test(value))) {
+    throw new CodexConfigError('expectedSha256 must be null or 64 lowercase hexadecimal digits');
+  }
+}
+
+/**
+ * 口座を1件、設定の末尾に追記する。expectedSha256 は、呼び出し側が先に loadCodexConfigSnapshot で
+ * 読んだときの sha256（そのときファイルが無かったなら null）。今のファイルがそれと違えば
+ * （null のときはファイルがあれば）何も書かずに CodexConfigError。
+ *   - ファイルがあるとき: 追記した設定が検証を通るときだけ（usagePolicy が無い・ラベルやフォルダが
+ *     ほかの口座と重なる口座は、書く前に拒否する）、同じフォルダの 0600 の一時ファイルに書いて
+ *     rename で置き換える。rename までに失敗しても、元のファイルの中身と更新時刻は変わらない。
+ *   - ファイルが無いとき: enabled と acknowledgedMultiAccountRisk を偽、口座をこの1件にした設定を、
+ *     フォルダ 0700・ファイル 0600 で作る。
+ * 書き直したファイルは JSON を2字下げで並べ直したものになる（キーと値は変えない）。
+ * @param {{ env: object, account: object, expectedSha256: string|null, openImpl?: Function,
+ *   fileOps?: { open?: Function, rename?: Function, link?: Function, unlink?: Function, mkdir?: Function },
+ *   platform?: string, realpathImpl?: Function, lstatImpl?: Function }} options
+ * @returns {Promise<{ config: object, sha256: string }>} 書いた後の設定と、書いた中身の sha256
+ */
+export async function appendCodexAccount({ env, account, expectedSha256, openImpl, fileOps = {}, ...validateOptions } = {}) {
+  assertExpectedSha256(expectedSha256);
+  if (expectedSha256 === null) {
+    const path = fromEnv(() => codexRotatorConfigPath(env));
+    if (await readConfigText(path, openImpl) !== null) throw new CodexConfigError(CONFIG_EXISTS);
+    return createConfigFile(account, { env, fileOps, validateOptions });
+  }
+  const snapshot = await readConfigSnapshot({ env, openImpl, ...validateOptions });
+  if (snapshot === null || snapshot.sha256 !== expectedSha256) throw new CodexConfigError(CONFIG_CHANGED);
+  const nextRaw = { ...snapshot.raw, accounts: [...(snapshot.raw.accounts ?? []), account] };
+  return replaceConfigFile(snapshot, nextRaw, { env, openImpl, fileOps, validateOptions });
+}
+
+/**
+ * そのラベルの口座を設定から外す（口座のフォルダは消さない）。書き方は appendCodexAccount の
+ * 置き換えと同じで、読んでから置き換えるまでに中身が変わったとき・rename までに失敗したときは、
+ * 元のファイルを変えずに CodexConfigError。
+ * @param {{ env: object, label: string, openImpl?: Function,
+ *   fileOps?: { open?: Function, rename?: Function, unlink?: Function },
+ *   platform?: string, realpathImpl?: Function, lstatImpl?: Function }} options
+ * @returns {Promise<{ removed: boolean, config: object|null, sha256: string|null }>}
+ *   removed はそのラベルを外して書いたとき true。ファイルが無い・ラベルが無いときは何も書かずに
+ *   false（config と sha256 は今のファイルのもの。ファイルが無ければ null）。
+ */
+export async function removeCodexAccount({ env, label, openImpl, fileOps = {}, ...validateOptions } = {}) {
+  if (typeof label !== 'string' || !CODEX_ACCOUNT_LABEL.test(label)) {
+    throw new CodexConfigError('label must be 1 to 32 characters of a-z, 0-9, _ and -, starting with a-z or 0-9');
+  }
+  const snapshot = await readConfigSnapshot({ env, openImpl, ...validateOptions });
+  if (snapshot === null) return Object.freeze({ removed: false, config: null, sha256: null });
+  const accounts = snapshot.raw.accounts ?? [];
+  const kept = accounts.filter(account => account.label !== label);
+  if (kept.length === accounts.length) {
+    return Object.freeze({ removed: false, config: snapshot.config, sha256: snapshot.sha256 });
+  }
+  const result = await replaceConfigFile(snapshot, { ...snapshot.raw, accounts: kept }, { env, openImpl, fileOps, validateOptions });
+  return Object.freeze({ removed: true, ...result });
 }
 
 /** 有効化の二重ゲート: enabled と多口座のリスク承認の両方が true のときだけ動かす。 */
