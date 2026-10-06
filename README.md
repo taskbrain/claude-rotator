@@ -1107,10 +1107,11 @@ usage: codex-rotator exec [--account <label>] -- [codex arguments...]
   1. 設定を1回だけ読みます。読めなければ `config unreadable`。
   2. 2つのゲートが両方 `true` でなければ `disabled`。
   3. 起動の型に合わなければ `argument rejected (form)`。
-  4. `--account` のラベルが登録されていなければ `account not registered`。
-  5. 口座を選びます（下）。本物の `codex` が見つからないときは、`--account` ありなら `cannot launch (codex-cli-missing)`、なしなら `no account available` で止まります。
-  6. 選んだ口座のフォルダで、守りの点検を行います。通らなければ `guard unverified (<理由>)`。
-  7. 第1層を先頭に付けて、本物の `codex` を起動します。起動できなければ `launch failed`。標準入出力は受け継ぎ、exec 自身は標準出力に何も書きません。`codex` の終了コードをそのまま返し、`codex` がシグナルで終わったときは同じシグナルを自分へ当て直します。
+  4. 環境に `CODEX_API_KEY` か `CODEX_ACCESS_TOKEN` があれば（空の値でも）、`auth env set (<変数の名前>); unset and run again to use the chosen account`（両方あれば両方の名前を並べます）。値は出しません。`codex` はこれらの変数を口座のフォルダの `auth.json` より先に使うため、あると選んだ口座で動きません。
+  5. `--account` のラベルが登録されていなければ `account not registered`。
+  6. 口座を選びます（下）。本物の `codex` が見つからないときは、`--account` ありなら `cannot launch (codex-cli-missing)`、なしなら `no account available` で止まります。
+  7. 選んだ口座のフォルダで、守りの点検を行います。通らなければ `guard unverified (<理由>)`。
+  8. 第1層を先頭に付けて、本物の `codex` を起動します。起動できなければ `launch failed`。標準入出力は受け継ぎ、exec 自身は標準出力に何も書きません。`codex` の終了コードをそのまま返し、`codex` がシグナルで終わったときは同じシグナルを自分へ当て直します。
 - 口座の選び方（常駐が無いとき。その場で、口座の資格情報で使用量を1回読みます）
   - `--account` なし：設定の並び順に1口座ずつ読み、使用量が全部読めて、使えると答え、申告された全部の窓の使用率が `resumeUsedPercent` 以下の、最初の口座を選びます。使用量が分からない口座は選びません。1つも無ければ `no account available`。
   - `--account` あり：その口座だけを読みます。資格情報が読めなければ `no creds`、どれかの窓の使用率が `stopUsedPercent` 以上（または使えないと答えた）なら `account stopped`、使用量が分からないときは、`blockWhenUnknown` が `true` なら `usage unknown (blockWhenUnknown)`、`false` なら次の警告の1行を出して起動します。
@@ -2441,10 +2442,11 @@ usage: codex-rotator exec [--account <label>] -- [codex arguments...]
   1. Read the config exactly once. If it cannot be read: `config unreadable`.
   2. If the two gates are not both `true`: `disabled`.
   3. If the arguments do not match a launch form: `argument rejected (form)`.
-  4. If the `--account` label is not registered: `account not registered`.
-  5. Select an account (below). If the real `codex` is not found, it stops with `cannot launch (codex-cli-missing)` with `--account`, and with `no account available` without it.
-  6. Run the guard check in the selected account folder. If it does not pass: `guard unverified (<reason>)`.
-  7. Launch the real `codex` with the first layer in front. If it cannot be launched: `launch failed`. Standard input and output are inherited, and `exec` itself writes nothing to standard output. The exit code of `codex` is returned as is; if `codex` ends by a signal, the same signal is raised on `exec` itself.
+  4. If `CODEX_API_KEY` or `CODEX_ACCESS_TOKEN` is in the environment (even with an empty value): `auth env set (<variable names>); unset and run again to use the chosen account` (when both are set, both names are listed). The value is not printed. `codex` uses these variables before the `auth.json` in the account folder, so with either one set it would not run as the selected account.
+  5. If the `--account` label is not registered: `account not registered`.
+  6. Select an account (below). If the real `codex` is not found, it stops with `cannot launch (codex-cli-missing)` with `--account`, and with `no account available` without it.
+  7. Run the guard check in the selected account folder. If it does not pass: `guard unverified (<reason>)`.
+  8. Launch the real `codex` with the first layer in front. If it cannot be launched: `launch failed`. Standard input and output are inherited, and `exec` itself writes nothing to standard output. The exit code of `codex` is returned as is; if `codex` ends by a signal, the same signal is raised on `exec` itself.
 - How the account is selected (without the daemon: usage is read once on the spot, with each account's credentials):
   - Without `--account`: accounts are read one by one in config order, and the first account whose usage is fully read, that is reported as usable, and whose every reported window is at or below `resumeUsedPercent` is selected. Accounts with unknown usage are not selected. If none qualifies: `no account available`.
   - With `--account`: only that account is read. If its credentials cannot be read: `no creds`; if a window is at or above `stopUsedPercent` (or it is reported as not usable): `account stopped`; if its usage is unknown, `usage unknown (blockWhenUnknown)` when `blockWhenUnknown` is `true`, and when it is `false` the following warning line is printed and `codex` is launched:

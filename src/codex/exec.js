@@ -7,7 +7,9 @@
 //      口座のフォルダのすべてに使う。
 //   3. 有効化の二重ゲート（enabled と多口座のリスク承認）。満たさなければ `disabled`。
 //   4. 起動の型の照合（account-config.js）。型に当たらなければ `argument rejected (form)`。拒否は
-//      使用量の読取の送信より前に行う。
+//      使用量の読取の送信より前に行う。続けて、環境に CODEX_API_KEY か CODEX_ACCESS_TOKEN があれば
+//      （値は問わない）、変数の名前と外す案内の1行で止まる。codex はこれらを口座のフォルダの auth.json
+//      より先に使うので、あると選んだ口座で動かない。
 //   5. 口座の選択。先に常駐へ問い合わせる（consultDaemon。既定は consultDaemonSelect で、Codex CLI が
 //      見つからないときは問い合わせない）。常駐が 200 で答えたら、その判定を手順2の設定と照らして
 //      使い（下の「常駐があるとき」）、1回読みはしない。常駐が無い（null）ときは、その場の1回読みで選ぶ。
@@ -96,6 +98,17 @@ export const EXEC_LINE = Object.freeze({
   launchFailed: 'launch failed',
   configStale: 'config stale',
 });
+
+/**
+ * 環境にあると codex が口座のフォルダの auth.json より先に使う認証の変数。あれば起動しない（点検の子も
+ * 起動しない）。値は読まず、出さない。
+ */
+export const CODEX_AUTH_ENV_NAMES = Object.freeze(['CODEX_API_KEY', 'CODEX_ACCESS_TOKEN']);
+
+/** 認証の変数があって止まるときの1行（改行は含めない）。含めるのは変数の名前だけ。 */
+export function formatAuthEnvSet(names) {
+  return `auth env set (${names.join(', ')}); unset and run again to use the chosen account`;
+}
 
 /** 常駐への問い合わせの全体の期限（要求を出してから応答を読み終えるまで）。 */
 export const EXEC_DAEMON_TIMEOUT_MS = 1000;
@@ -621,6 +634,11 @@ export async function runExec(argv = [], io = {}, deps = {}) {
   const form = matchLaunchForm(parsed.codexArgs, { caller: LAUNCH_CALLER.exec });
   if (!form.ok) {
     say(formatArgumentRejected(form.reason));
+    return EXEC_REFUSED_EXIT_CODE;
+  }
+  const authEnvSet = CODEX_AUTH_ENV_NAMES.filter(name => env[name] !== undefined);
+  if (authEnvSet.length > 0) {
+    say(formatAuthEnvSet(authEnvSet));
     return EXEC_REFUSED_EXIT_CODE;
   }
   if (parsed.account !== null && !config.accounts.some(account => account.label === parsed.account)) {
