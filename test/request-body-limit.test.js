@@ -68,9 +68,12 @@ function send(url, { body, chunked = false }) {
   });
 }
 
-async function startProxy({ maxRequestBodyBytes, requestBodyDrain } = {}) {
+async function startProxy({ maxRequestBodyBytes, requestBodyDrain, startupCheckGate = null } = {}) {
   const upstreamBodies = [];
+  // 本文を読み終える前に中継が上流への要求を打ち切っても数えられるよう、届いた時点で数える。
+  const upstreamArrivals = [];
   const upstream = await listen(http.createServer(async (req, res) => {
+    upstreamArrivals.push(req.url);
     const chunks = [];
     for await (const chunk of req) chunks.push(chunk);
     upstreamBodies.push(Buffer.concat(chunks));
@@ -79,6 +82,14 @@ async function startProxy({ maxRequestBodyBytes, requestBodyDrain } = {}) {
   }));
   const secretStore = new MemorySecretStore();
   await secretStore.set('acct_1', { accessToken: 'synthetic-access-token' });
+  if (startupCheckGate) {
+    // 起動時の資格情報の確認を、渡した約束が解けるまで止める。要求はこの確認を待ってから本文を読む。
+    const run = secretStore.runCredentialSetExclusive.bind(secretStore);
+    secretStore.runCredentialSetExclusive = async operation => {
+      await startupCheckGate;
+      return run(operation);
+    };
+  }
   const accountManager = new AccountManager({ accounts: [{ id: 'acct_1', type: 'oauth' }] });
   const logs = [];
   const proxy = await listen(createProxyServer({
@@ -102,7 +113,7 @@ async function startProxy({ maxRequestBodyBytes, requestBodyDrain } = {}) {
     await close(proxy.server);
     await close(upstream.server);
   });
-  return { proxy, upstreamBodies, logs };
+  return { proxy, upstreamBodies, upstreamArrivals, logs };
 }
 
 function jsonBody(totalBytes) {
@@ -262,6 +273,130 @@ describe('request body limit while the client is still sending', () => {
     assert.match(received, /^HTTP\/1\.1 413 /);
     assert.match(received, /request_too_large/);
     assert.ok(logs.some(line => line.includes('request-body-drain aborted reason=timeout')));
+  });
+});
+
+// 413 を返した接続は `Connection: close` で閉じるが、Node は閉じるまでの間に同じ接続で
+// 続けて届いた（パイプライン化された）要求も処理関数へ渡す。その要求を上流へ転送すると、
+// 応答はクライアントへ届かずに捨てられるので、転送しない。
+function rawRequest(head, body = '') {
+  return `${head}\r\nHost: 127.0.0.1\r\nContent-Type: application/json\r\n`
+    + (body === null ? '' : `Content-Length: ${Buffer.byteLength(body)}\r\n`)
+    + `\r\n${body ?? ''}`;
+}
+
+// 生のソケットで1回の write にまとめて送り、サーバが閉じるまでに届いたバイト列を返す。
+function sendOnOneConnection(url, payload) {
+  const { port } = new URL(url);
+  return new Promise((resolve, reject) => {
+    const chunks = [];
+    const socket = net.connect(Number(port), '127.0.0.1', () => socket.write(payload));
+    socket.on('data', chunk => chunks.push(chunk));
+    socket.on('error', () => {});
+    socket.on('close', () => resolve(Buffer.concat(chunks).toString('latin1')));
+    setTimeout(() => reject(new Error('server did not close the connection')), 5_000).unref();
+  });
+}
+
+// 上流へ届かないこと（不在）を確かめるので、接続が閉じた後に一定の時間だけ待つ。
+const ABSENCE_WAIT_MS = 200;
+
+describe('requests sent on the same connection after a 413', () => {
+  const FOLLOWING = rawRequest('POST /v1/messages HTTP/1.1', '{"model":"sonnet"}');
+
+  it('does not forward a request pipelined after a body whose Content-Length exceeds the limit', async () => {
+    const { proxy, upstreamArrivals, upstreamBodies } = await startProxy({ maxRequestBodyBytes: 1024 });
+    const tooLarge = rawRequest('POST /v1/messages HTTP/1.1', 'a'.repeat(2048));
+
+    const received = await sendOnOneConnection(proxy.url, tooLarge + FOLLOWING);
+    await new Promise(resolve => setTimeout(resolve, ABSENCE_WAIT_MS));
+
+    assert.deepEqual(received.match(/^HTTP\/1\.1 \d{3}/gm), ['HTTP/1.1 413']);
+    assert.deepEqual(upstreamArrivals, []);
+    assert.equal(upstreamBodies.length, 0);
+  });
+
+  it('does not forward a request pipelined after a chunked body that exceeds the limit', async () => {
+    const { proxy, upstreamArrivals, upstreamBodies } = await startProxy({ maxRequestBodyBytes: 1024 });
+    const chunk = 'a'.repeat(4096);
+    const tooLarge = rawRequest('POST /v1/messages HTTP/1.1\r\nTransfer-Encoding: chunked', null)
+      + `${chunk.length.toString(16)}\r\n${chunk}\r\n0\r\n\r\n`;
+
+    const received = await sendOnOneConnection(proxy.url, tooLarge + FOLLOWING);
+    await new Promise(resolve => setTimeout(resolve, ABSENCE_WAIT_MS));
+
+    assert.deepEqual(received.match(/^HTTP\/1\.1 \d{3}/gm), ['HTTP/1.1 413']);
+    assert.deepEqual(upstreamArrivals, []);
+    assert.equal(upstreamBodies.length, 0);
+  });
+
+  it('does not forward a pipelined request whose handler started before the 413 was found', async () => {
+    // 起動時の確認が終わるまで、どちらの要求も本文を読み始めない。続く要求の処理関数はその間に
+    // 始まるので、処理関数の先頭では印がまだ無く、本文を読み終えた後の確かめで捨てる。
+    let releaseStartupCheck;
+    const startupCheckGate = new Promise(resolve => { releaseStartupCheck = resolve; });
+    const { proxy, upstreamArrivals, upstreamBodies } = await startProxy({ maxRequestBodyBytes: 1024, startupCheckGate });
+    let started = 0;
+    const bothStarted = new Promise((resolve, reject) => {
+      proxy.server.on('request', () => { started += 1; if (started === 2) resolve(); });
+      setTimeout(() => reject(new Error(`only ${started} request(s) reached the proxy`)), 5_000).unref();
+    });
+    const tooLarge = rawRequest('POST /v1/messages HTTP/1.1', 'a'.repeat(2048));
+
+    const closed = sendOnOneConnection(proxy.url, tooLarge + FOLLOWING);
+    await bothStarted;
+    releaseStartupCheck();
+    const received = await closed;
+    await new Promise(resolve => setTimeout(resolve, ABSENCE_WAIT_MS));
+
+    assert.deepEqual(received.match(/^HTTP\/1\.1 \d{3}/gm), ['HTTP/1.1 413']);
+    assert.deepEqual(upstreamArrivals, []);
+    assert.equal(upstreamBodies.length, 0);
+  });
+});
+
+describe('a client that disconnects while the 413 is discarding its body', () => {
+  it('stops discarding without an exception, a leftover connection or an aborted-drain log line', async () => {
+    const { proxy, logs } = await startProxy({
+      maxRequestBodyBytes: 1024,
+      requestBodyDrain: { maxBytes: 64 * 1024 * 1024, timeoutMs: 100 },
+    });
+    const uncaught = [];
+    const onUncaught = error => uncaught.push(error);
+    process.on('uncaughtException', onUncaught);
+    process.on('unhandledRejection', onUncaught);
+    cleanupCallbacks.push(() => {
+      process.off('uncaughtException', onUncaught);
+      process.off('unhandledRejection', onUncaught);
+    });
+    const { port } = new URL(proxy.url);
+
+    const received = await new Promise((resolve, reject) => {
+      let text = '';
+      const socket = net.connect(Number(port), '127.0.0.1', () => {
+        socket.write(
+          'POST /v1/messages HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Type: application/json\r\n'
+          + `Content-Length: ${1024 * 1024}\r\n\r\n`,
+        );
+        socket.write(Buffer.alloc(4096, 0x61));
+      });
+      socket.on('data', chunk => {
+        text += chunk.toString('latin1');
+        // 413 のヘッダを受け取った時点で、本文を送り切らずに切断する。
+        if (text.includes('\r\n\r\n')) socket.destroy();
+      });
+      socket.on('error', () => {});
+      socket.on('close', () => resolve(text));
+      setTimeout(() => reject(new Error('the 413 did not arrive')), 5_000).unref();
+    });
+    // 読み捨ての打ち切りの時計（100ms）が残っていれば、この間に動いてログを出す。
+    await new Promise(resolve => setTimeout(resolve, 300));
+
+    assert.match(received, /^HTTP\/1\.1 413 /);
+    assert.deepEqual(logs.filter(line => line.includes('request-body-drain aborted')), []);
+    const open = await new Promise(resolve => proxy.server.getConnections((_e, count) => resolve(count)));
+    assert.equal(open, 0);
+    assert.deepEqual(uncaught, []);
   });
 });
 

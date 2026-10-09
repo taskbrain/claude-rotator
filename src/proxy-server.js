@@ -100,6 +100,7 @@ export const DEFAULT_REQUEST_BODY_DRAIN = Object.freeze({
   timeoutMs: 10_000,
 });
 const REQUEST_BODY_TOO_LARGE = 'REQUEST_BODY_TOO_LARGE';
+const REQUEST_AFTER_TOO_LARGE = 'REQUEST_AFTER_TOO_LARGE';
 const REACTIVE_QUOTA_CONFIRM_TIMEOUT_MS = 5_000;
 const REACTIVE_QUOTA_EXHAUSTION_THRESHOLD = 1;
 const REACTIVE_QUOTA_SINGLE_FLIGHT_GRACE_MS = 250;
@@ -166,7 +167,22 @@ export function createProxyServer({
     ?? config.upstreamConnectRetryDelayMs
     ?? DEFAULT_UPSTREAM_CONNECT_RETRY_DELAY_MS;
   const maxRequestBodyBytes = normalizeMaxRequestBodyBytes(config.proxy?.maxRequestBodyBytes, logger);
-  const readBody = req => readRequestBody(req, maxRequestBodyBytes);
+  // 413 を返した接続。応答は `Connection: close` で閉じるが、閉じるまでの間に同じ接続で
+  // 続けて届いた要求も Node は処理関数へ渡すので、それらは上流へ転送せずに捨てる。
+  // 続く要求の処理関数は、先の要求が本文を読み始める前に始まることがある（先の要求が
+  // その前の待ちで止まっているときなど）。そのため印は上限超えを見つけた時点で付け、
+  // 続く要求の側では処理関数の先頭に加えて、本文を読み終えた後にも確かめる。
+  const requestTooLargeSockets = new WeakSet();
+  const readBody = req => readRequestBody(req, maxRequestBodyBytes).then(
+    body => {
+      if (req.socket && requestTooLargeSockets.has(req.socket)) throw requestAfterTooLargeError();
+      return body;
+    },
+    error => {
+      if (error?.code === REQUEST_BODY_TOO_LARGE && req.socket) requestTooLargeSockets.add(req.socket);
+      throw error;
+    },
+  );
   const resolvedTokenRefresher = tokenRefresher || defaultTokenRefresher({
     platform,
     nativeOptions: {
@@ -542,6 +558,11 @@ export function createProxyServer({
   };
 
   const server = http.createServer(async (req, res) => {
+    // 413 を返した接続へ、印が付いた後に届いた要求（本文を読まない要求も含む）。
+    if (req.socket && requestTooLargeSockets.has(req.socket)) {
+      req.resume();
+      return;
+    }
     try {
       if (!isTrustedLocalHttpRequest(req)) {
         sendJson(res, 403, {
@@ -852,6 +873,8 @@ export function createProxyServer({
       });
       await persistState();
     } catch (error) {
+      // 413 を返した接続で続けて届いた要求。応答は接続とともに捨てられるので、何も返さない。
+      if (error?.code === REQUEST_AFTER_TOO_LARGE) return;
       if (error?.code === REQUEST_BODY_TOO_LARGE && !res.headersSent) {
         logger?.(`${new Date().toISOString()} proxy-error method=${req.method} path=${safeRequestPath(req.url)} error=request_too_large limitBytes=${error.limitBytes}`);
         sendRequestTooLarge(req, res, { ...requestBodyDrain, logger });
@@ -4687,6 +4710,12 @@ function requestBodyTooLargeError(limitBytes) {
   const error = new Error(`Request body exceeds ${limitBytes} bytes`);
   error.code = REQUEST_BODY_TOO_LARGE;
   error.limitBytes = limitBytes;
+  return error;
+}
+
+function requestAfterTooLargeError() {
+  const error = new Error('Request arrived on a connection that was answered with 413');
+  error.code = REQUEST_AFTER_TOO_LARGE;
   return error;
 }
 
