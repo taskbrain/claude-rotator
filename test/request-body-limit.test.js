@@ -355,6 +355,71 @@ describe('requests sent on the same connection after a 413', () => {
   });
 });
 
+// 同じ接続に並べた要求を1回の write で送り、すべての処理関数が始まってから本文を読ませる。
+// 起動時の確認が終わるまでどの要求も本文を読み始めないので、上限超えが見つかる時点では
+// 前後の要求の処理関数がすでに始まっている、という順番を毎回同じに起こせる。
+async function sendPipelinedAfterAllStarted(requests) {
+  let releaseStartupCheck;
+  const startupCheckGate = new Promise(resolve => { releaseStartupCheck = resolve; });
+  const started = await startProxy({ maxRequestBodyBytes: 1024, startupCheckGate });
+  let count = 0;
+  const allStarted = new Promise((resolve, reject) => {
+    started.proxy.server.on('request', () => { count += 1; if (count === requests.length) resolve(); });
+    setTimeout(() => reject(new Error(`only ${count} request(s) reached the proxy`)), 5_000).unref();
+  });
+
+  const closed = sendOnOneConnection(started.proxy.url, requests.join(''));
+  await allStarted;
+  releaseStartupCheck();
+  const received = await closed;
+  await new Promise(resolve => setTimeout(resolve, ABSENCE_WAIT_MS));
+  return { ...started, statusLines: received.match(/^HTTP\/1\.1 \d{3}/gm) ?? [] };
+}
+
+describe('requests sent on the same connection before and after a request that exceeds the limit', () => {
+  const BODY_A = '{"model":"sonnet","request":"A"}';
+  const BODY_C = '{"model":"sonnet","request":"C"}';
+  const NORMAL_A = rawRequest('POST /v1/messages HTTP/1.1', BODY_A);
+  const NORMAL_C = rawRequest('POST /v1/messages HTTP/1.1', BODY_C);
+  const TOO_LARGE = rawRequest('POST /v1/messages HTTP/1.1', 'a'.repeat(2048));
+  const chunk = 'a'.repeat(4096);
+  const TOO_LARGE_CHUNKED = rawRequest('POST /v1/messages HTTP/1.1\r\nTransfer-Encoding: chunked', null)
+    + `${chunk.length.toString(16)}\r\n${chunk}\r\n0\r\n\r\n`;
+
+  it('forwards a request that arrived before one whose Content-Length exceeds the limit, then answers 413', async () => {
+    const { statusLines, upstreamArrivals, upstreamBodies } = await sendPipelinedAfterAllStarted([NORMAL_A, TOO_LARGE]);
+
+    assert.deepEqual(statusLines, ['HTTP/1.1 200', 'HTTP/1.1 413']);
+    assert.equal(upstreamArrivals.length, 1);
+    assert.deepEqual(upstreamBodies.map(body => body.toString('utf8')), [BODY_A]);
+  });
+
+  it('forwards a request that arrived before a chunked body that exceeds the limit, then answers 413', async () => {
+    const { statusLines, upstreamArrivals, upstreamBodies } = await sendPipelinedAfterAllStarted([NORMAL_A, TOO_LARGE_CHUNKED]);
+
+    assert.deepEqual(statusLines, ['HTTP/1.1 200', 'HTTP/1.1 413']);
+    assert.equal(upstreamArrivals.length, 1);
+    assert.deepEqual(upstreamBodies.map(body => body.toString('utf8')), [BODY_A]);
+  });
+
+  it('does not forward a request that arrived after the one that exceeds the limit', async () => {
+    const { statusLines, upstreamArrivals, upstreamBodies } = await sendPipelinedAfterAllStarted([NORMAL_A, TOO_LARGE, NORMAL_C]);
+
+    assert.deepEqual(statusLines, ['HTTP/1.1 200', 'HTTP/1.1 413']);
+    assert.equal(upstreamArrivals.length, 1);
+    assert.deepEqual(upstreamBodies.map(body => body.toString('utf8')), [BODY_A]);
+  });
+
+  it('keeps the first request that exceeded the limit as the boundary when a later one also exceeds it', async () => {
+    const { statusLines, upstreamArrivals, upstreamBodies, logs } = await sendPipelinedAfterAllStarted([TOO_LARGE, NORMAL_C, TOO_LARGE]);
+
+    assert.deepEqual(statusLines, ['HTTP/1.1 413']);
+    assert.deepEqual(upstreamArrivals, []);
+    assert.equal(upstreamBodies.length, 0);
+    assert.equal(logs.filter(line => line.includes('error=request_too_large')).length, 1);
+  });
+});
+
 describe('a client that disconnects while the 413 is discarding its body', () => {
   it('stops discarding without an exception, a leftover connection or an aborted-drain log line', async () => {
     const { proxy, logs } = await startProxy({

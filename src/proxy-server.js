@@ -167,19 +167,34 @@ export function createProxyServer({
     ?? config.upstreamConnectRetryDelayMs
     ?? DEFAULT_UPSTREAM_CONNECT_RETRY_DELAY_MS;
   const maxRequestBodyBytes = normalizeMaxRequestBodyBytes(config.proxy?.maxRequestBodyBytes, logger);
-  // 413 を返した接続。応答は `Connection: close` で閉じるが、閉じるまでの間に同じ接続で
-  // 続けて届いた要求も Node は処理関数へ渡すので、それらは上流へ転送せずに捨てる。
-  // 続く要求の処理関数は、先の要求が本文を読み始める前に始まることがある（先の要求が
-  // その前の待ちで止まっているときなど）。そのため印は上限超えを見つけた時点で付け、
-  // 続く要求の側では処理関数の先頭に加えて、本文を読み終えた後にも確かめる。
-  const requestTooLargeSockets = new WeakSet();
+  // 本文が上限を超えた要求には 413 を `Connection: close` で返すが、閉じるまでの間に同じ接続で
+  // 続けて届いた（パイプライン化された）要求も Node は処理関数へ渡す。その要求を上流へ転送しても
+  // 応答はクライアントへ届かないので、転送せずに捨てる。一方、上限を超えた要求より先に届いた要求は
+  // 今までどおり上流へ転送して応答する（Node は応答を要求の届いた順に出すので、先の要求に応答
+  // しないと、後ろの 413 も送られないまま止まる）。
+  // 前後を分けるため、処理関数の最初の文（最初の await より前）で要求に到着の番号を振る。処理関数の
+  // 同期の部分は Node が要求を解釈した順に走るので、番号は同じ接続の中で届いた順になる。接続には
+  // 最初に上限を超えた要求の番号を印として付け（後から上限を超えた要求の番号では上書きしない）、
+  // 番号が印より大きい要求だけを捨てる。各要求の処理関数は、先の要求が本文を読み終える前に始まる
+  // ことがあるので、この比べ方は処理関数の先頭・本文を読み終えた後・413 を返す前の3か所で行う。
+  let requestArrivalCount = 0;
+  const requestArrivalOrder = new WeakMap();
+  const firstTooLargeOrderBySocket = new WeakMap();
+  const arrivedAfterTooLarge = req => {
+    const firstTooLarge = req.socket ? firstTooLargeOrderBySocket.get(req.socket) : undefined;
+    return firstTooLarge !== undefined && requestArrivalOrder.get(req) > firstTooLarge;
+  };
   const readBody = req => readRequestBody(req, maxRequestBodyBytes).then(
     body => {
-      if (req.socket && requestTooLargeSockets.has(req.socket)) throw requestAfterTooLargeError();
+      if (arrivedAfterTooLarge(req)) throw requestAfterTooLargeError();
       return body;
     },
     error => {
-      if (error?.code === REQUEST_BODY_TOO_LARGE && req.socket) requestTooLargeSockets.add(req.socket);
+      const order = requestArrivalOrder.get(req);
+      if (error?.code === REQUEST_BODY_TOO_LARGE && req.socket && order !== undefined) {
+        const firstTooLarge = firstTooLargeOrderBySocket.get(req.socket);
+        if (firstTooLarge === undefined || order < firstTooLarge) firstTooLargeOrderBySocket.set(req.socket, order);
+      }
       throw error;
     },
   );
@@ -558,8 +573,9 @@ export function createProxyServer({
   };
 
   const server = http.createServer(async (req, res) => {
-    // 413 を返した接続へ、印が付いた後に届いた要求（本文を読まない要求も含む）。
-    if (req.socket && requestTooLargeSockets.has(req.socket)) {
+    requestArrivalOrder.set(req, ++requestArrivalCount);
+    // 上限を超えた要求より後に同じ接続で届いた要求（本文を読まない要求も含む）。
+    if (arrivedAfterTooLarge(req)) {
       req.resume();
       return;
     }
@@ -873,8 +889,10 @@ export function createProxyServer({
       });
       await persistState();
     } catch (error) {
-      // 413 を返した接続で続けて届いた要求。応答は接続とともに捨てられるので、何も返さない。
+      // 上限を超えた要求より後に同じ接続で届いた要求（それ自体が上限を超えたものを含む）。
+      // 応答は接続とともに捨てられるので、何も返さない。
       if (error?.code === REQUEST_AFTER_TOO_LARGE) return;
+      if (error?.code === REQUEST_BODY_TOO_LARGE && arrivedAfterTooLarge(req)) return;
       if (error?.code === REQUEST_BODY_TOO_LARGE && !res.headersSent) {
         logger?.(`${new Date().toISOString()} proxy-error method=${req.method} path=${safeRequestPath(req.url)} error=request_too_large limitBytes=${error.limitBytes}`);
         sendRequestTooLarge(req, res, { ...requestBodyDrain, logger });
