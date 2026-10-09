@@ -14282,12 +14282,50 @@ describe('cache observability', () => {
     });
     assert.equal(response.status, 200);
 
+    await waitForStatus(() => accountManager.getStatus().accounts[0].usage.totalRequests, count => count === 1);
     const { usage } = accountManager.getStatus().accounts[0];
     assert.equal(usage.totalCacheReadTokens, 99000);
     assert.equal(usage.totalCacheCreation1hTokens, 1500);
     assert.equal(usage.totalCacheCreation5mTokens, 0);
     assert.equal(usage.totalInputTokens, 10);
     assert.equal(usage.totalOutputTokens, 20);
+  });
+
+  it('流し切った応答は usage を読むための解凍を待たずに終え、その後で usage を足す', async () => {
+    const zlib = await import('node:zlib');
+    const gzipped = zlib.gzipSync(Buffer.from(OBSERVED_SSE, 'utf8'));
+    // proxy 行は解凍の後に書かれる。その時点でクライアントへの応答が終わっていたかを記録する。
+    const serverResponses = [];
+    const endedWhenLogged = [];
+    const logLines = [];
+    logLines.push = line => {
+      if (line.includes(' proxy ')) endedWhenLogged.push(serverResponses.at(-1)?.writableEnded);
+      return Array.prototype.push.call(logLines, line);
+    };
+    const { proxy, accountManager } = await startObservabilityProxy({
+      logLines,
+      upstreamHandler: (req, res) => {
+        res.writeHead(200, { 'Content-Type': 'text/event-stream', 'Content-Encoding': 'gzip', ...QUOTA_HEADERS });
+        res.end(gzipped);
+      },
+    });
+    proxy.server.on('request', (req, res) => serverResponses.push(res));
+
+    const response = await requestRaw(`${proxy.url}/v1/messages`, {
+      method: 'POST', body: JSON.stringify({ model: 'claude-opus-5-1' }),
+    });
+
+    assert.equal(response.status, 200);
+    assert.deepEqual(response.body, gzipped, 'クライアントへ流すバイト列は上流と同じ');
+    const usage = await waitForStatus(
+      () => accountManager.getStatus().accounts[0].usage,
+      current => current.totalRequests === 1,
+    );
+    assert.equal(usage.totalRequests, 1);
+    assert.equal(usage.totalInputTokens, 10);
+    assert.equal(usage.totalOutputTokens, 20);
+    assert.equal(usage.totalCacheReadTokens, 99000);
+    assert.deepEqual(endedWhenLogged, [true], '解凍の前に応答を終えている');
   });
 
   it('1要求で totalRequests が 1 だけ増える（旧実装はストリームで 2 増えた）', async () => {
@@ -14341,6 +14379,7 @@ describe('cache observability', () => {
       headers: { 'x-claude-code-session-id': 'synthetic-session-0001' },
     });
 
+    await waitForStatus(() => proxyLine(logLines), line => line !== undefined);
     assert.match(
       proxyLine(logLines),
       / model=claude-opus-5-1 sid=[0-9a-f]{12} in=10 out=20 cr=99000 cc=1500 c1h=1500 c5m=0 u5h=0\.76 u5hReset=1789012345 u7d=0\.33 u7dReset=1789098765 enc=gzip$/,
@@ -14373,6 +14412,7 @@ describe('cache observability', () => {
       headers: { 'x-claude-code-session-id': 'synthetic-session-0002' },
     });
 
+    await waitForStatus(() => proxyLine(logLines), line => line !== undefined);
     assert.match(
       proxyLine(logLines),
       / u7dReset=1789098765 enc=gzip g5h=0\.02 g7d=0 ustat=allowed_warning ovs=rejected ovu=false$/,
@@ -14398,6 +14438,7 @@ describe('cache observability', () => {
         body: JSON.stringify({ model: 'claude-opus-5-1' }),
         headers: { 'x-claude-code-session-id': 'synthetic-session-0003' },
       });
+      await waitForStatus(() => proxyLine(logLines), line => line !== undefined);
       // 時刻・所要時間は要求ごとに変わるので、比較は outcome= 以降に限る。
       return proxyLine(logLines).replace(/^.* outcome=/, 'outcome=');
     };
@@ -14451,6 +14492,7 @@ describe('cache observability', () => {
       method: 'POST', body: JSON.stringify({ model: 'claude-opus-5-1' }),
     });
 
+    await waitForStatus(() => proxyLine(logLines), line => line !== undefined);
     const line = proxyLine(logLines);
     assert.ok(!line.includes(' model='), line);
     assert.ok(!line.includes(' sid='), line);

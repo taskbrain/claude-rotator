@@ -3844,9 +3844,17 @@ async function forwardOnceInner({
   // 配備前後で遅延の分位点を比べられなくなる（計画書 (d)・リスク R-5）。
   const durationMs = Date.now() - startedAt;
 
+  // 本文を onChunk でクライアントへ流し切った応答は、usage を読むための解凍を待たずに
+  // ここで終える。条件は、下で本文を後から送る経路（上流 529 の書き換え・溜めた本文の
+  // 再生）と、別口座や更新した資格情報で送り直す経路（quota-retry・auth-refresh-retry）の
+  // 否定である。それらの経路は応答をまだ書いていないので、ここでは終えない。
+  const streamedToClient = !upstreamOverloadPending && !bufferedPassthrough
+    && !(!passthroughErrors && (outcome === 'quota-retry' || outcome === 'auth-refresh-retry'));
+  if (streamedToClient && !res.writableEnded) res.end();
+
   // 応答本文の**写し**を読むだけで、クライアントへ流すバイト列には触れない。
-  // 解凍は非同期版を使う（同期版はイベントループを塞ぐ）。本文は既に onChunk で
-  // クライアントへ流れ切っており、遅れるのは終端だけである。
+  // 解凍は非同期版を使う（同期版はイベントループを塞ぐ）。流し切った応答は上で終えて
+  // いるので、解凍の時間はクライアントへの応答の終わりを遅らせない。
   const observation = accountManager.accounts.includes(account) && upstreamResponse.body.length > 0
     ? await parseUsageObservation(upstreamResponse.body, {
       contentEncoding: headerValue(upstreamResponse.headers['content-encoding']),
