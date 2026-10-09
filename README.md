@@ -1158,14 +1158,14 @@ usage: codex-rotator exec [--account <label>] -- [codex arguments...]
   plugins = false
   ```
 
-- **コネクタとプラグインを既定で切る理由**：ChatGPT のアカウントに結び付いたコネクタ（メールなどの外部のサービスとの連携）とプラグインは、`~/.codex` に置いた細かい遮断が口座のセッションでは効かないので、口座の側では丸ごと切っています。資格情報をファイルに保存する指定は、資格情報を口座のフォルダの `auth.json` に置き、口座ごとに分けるためです。
+- **コネクタとプラグインの機能を `false` にする理由**：ChatGPT のアカウントに結び付いたコネクタ（メールなどの外部のサービスとの連携）とプラグインは、`~/.codex` に置いた細かい遮断が口座のセッションでは効かないので、口座の側では、コネクタとプラグインの機能（`apps` と `plugins`）を `false` にする指定を付けています（第1層と第2層）。下の「起動ごとの点検」が確かめるのは、`codex features list` の `apps` と `plugins` の値と、`codex mcp list --json` の MCP サーバの件数です。この指定で、セッションの中のコネクタが必ず止まるとは限りません（下の「守りの対象外」）。資格情報をファイルに保存する指定は、資格情報を口座のフォルダの `auth.json` に置き、口座ごとに分けるためです。
 - **起動の型**：exec が口座を選んで起動するのは、次の3つの並びだけです。語ごとの完全一致で照らし、どれにも当たらなければ `argument rejected (form)` の1行で止まります（値は出しません）。
   1. 非対話の `exec`：最初の語が `exec`、最後の語が単独の `-`（文章を標準入力から読む。1回だけ）。その間に置けるのは、`-s`（`read-only` か `workspace-write`）・`--skip-git-repo-check`・`--json`・`-m <モデルの名前>`・`-c model_reasoning_effort=<英小文字>`・`-c features.image_generation=true`・`--image <ファイル>`・`--`（最後の `-` の直前に1回。`--image` があるときは必須）です。順は問いません。`--image` のほかは、それぞれ1回までです。
   2. 引数の無い対話：語が1つも無い並び。
   3. 版の表示：`--version` の1語。
   - そのため、`resume`・`fork`（過去の会話の再開）・`review`・`login`・`-C`・最初の文章を付けた対話などは、exec では使えません。**口座で始めた会話は、exec では再開できません**（会話の記録は、その口座のフォルダに残ります）。
 - **`--no-daemon`**：引数の無い対話（2つ目の型）でだけ、第1層の直後に Codex CLI の `--no-daemon`（共有の常駐を使わない指定）を1回付けます。利用者が付けた `--no-daemon` は、型に合わないので拒否します。
-- **起動ごとの点検**：`codex` を起動する直前に毎回、選んだ口座のフォルダを `CODEX_HOME` にし、exec を実行したフォルダ（実パス）で、第1層（と、1つ目の型の `-c` の値）を付けた `codex features list` と `codex mcp list --json` を順に起動します。`apps` と `plugins` がどちらも `false` で、MCP サーバが0件のときだけ `codex` を起動します。点検の起動は、1つずつ 3 秒が期限で、標準出力は 64 KiB まで読みます。通らなければ、`codex` を起動せずに `guard unverified (<理由>)` の1行で止まります。
+- **起動ごとの点検**：`codex` を起動する直前に毎回、選んだ口座のフォルダを `CODEX_HOME` にし、exec を実行したフォルダ（実パス）で、第1層（と、1つ目の型の `-c` の値）を付けた `codex features list` と `codex mcp list --json` を順に起動します。`apps` と `plugins` がどちらも `false` で、MCP サーバが0件のときだけ `codex` を起動します。点検の起動は、1つずつ 3 秒が期限で、標準出力は 64 KiB まで読みます。通らなければ、`codex` を起動せずに `guard unverified (<理由>)` の1行で止まります。点検は起動の前の1回だけで、起動の後にセッションの中で効くようになった設定は見ません（下の「守りの対象外」）。
 
   | 理由 | 意味 |
   |---|---|
@@ -1182,6 +1182,8 @@ usage: codex-rotator exec [--account <label>] -- [codex arguments...]
 - **守りの対象外**
   - exec を通らない起動。いつもの `codex`、口座のフォルダを `CODEX_HOME` にして自分で起動した `codex`、口座のセッションの中から起動した `codex`（子は `CODEX_HOME` を受け継ぎます）には、第1層も点検も付きません。後の2つは、その口座のフォルダで、第2層だけで動きます。
   - 信頼済みのプロジェクトの設定は、口座のセッションでも読まれます。点検の `mcp list` は、信頼済みのプロジェクトの MCP サーバへ繋ぎうります。
+  - exec で開いた対話の中で、Codex が作業フォルダを信頼するかを尋ねたときに信頼を選ぶと、そのプロジェクトの設定（MCP サーバを含む）が、点検を経ずにそのセッションで読まれます。口座のセッションでは、まだ信頼していないプロジェクトを信頼せず、終了を選んでください。
+  - 点検を通って起動したセッションの中でも、コネクタがつながることがあります。実機で、そうしたセッションの `/mcp` の一覧に、コネクタ（`codex_apps`）が `connected` と出たのを見ています。どういう条件でつながるかは、まだ確かめている途中です。
   - ホームのフォルダ（`~/.codex` を含むフォルダ）を、口座のセッションで信頼しないでください。信頼すると、`~/.codex` の設定・フック・規則が、プロジェクトの設定として読まれうるためです。
 - **指示書を置く手順**：口座のセッションで使いたい指示書（`AGENTS.md`）は、口座のフォルダに自分で置いてください。codex-rotator は `~/.codex` の中を読まず、写しもしません。
 - **フック**：プロジェクトのフックで守りを掛けているときは、口座のフォルダごとに Codex の `hooks` の機能を有効にし、そのフックを信頼する必要があります（login が作る口座のフォルダの設定は上の3つの設定だけで、`~/.codex` の設定は読まれません）。
@@ -2493,14 +2495,14 @@ Codex launched with an account folder as `CODEX_HOME` does not read the settings
   plugins = false
   ```
 
-- **Why connectors and plugins are off by default:** for connectors tied to the ChatGPT account (links to outside services such as mail) and plugins, fine-grained blocks placed in `~/.codex` do not apply in an account session, so the account side turns them off entirely. Storing credentials in a file keeps them in the account folder's `auth.json`, separate for each account.
+- **Why the connector and plugin features are set to `false`:** for connectors tied to the ChatGPT account (links to outside services such as mail) and plugins, fine-grained blocks placed in `~/.codex` do not apply in an account session, so the account side adds settings that set the connector and plugin features (`apps` and `plugins`) to `false` (the first and second layers). The guard check below looks at the values of `apps` and `plugins` in `codex features list` and at the number of MCP servers in `codex mcp list --json`. These settings do not guarantee that connectors stay disconnected inside the session (see "Outside these guards" below). Storing credentials in a file keeps them in the account folder's `auth.json`, separate for each account.
 - **Launch forms:** `exec` selects an account and launches only for the following three argument lists. Each word must match exactly; anything else stops with the one line `argument rejected (form)` (no values are printed).
   1. Non-interactive `exec`: the first word is `exec` and the last word is a lone `-` (the prompt is read from standard input; only once). Between them only these may appear: `-s` (`read-only` or `workspace-write`), `--skip-git-repo-check`, `--json`, `-m <model name>`, `-c model_reasoning_effort=<lowercase letters>`, `-c features.image_generation=true`, `--image <file>`, and `--` (once, right before the last `-`; required when `--image` is present). Order does not matter. Each may appear at most once, except `--image`.
   2. Interactive session with no arguments: an empty list.
   3. Version: the single word `--version`.
   - As a result, `resume` and `fork` (continuing a past conversation), `review`, `login`, `-C`, an interactive session with a first prompt, and so on cannot be used through `exec`. **A conversation started with an account cannot be resumed through `exec`** (its record stays in that account folder).
 - **`--no-daemon`:** only for the interactive session with no arguments (the second form), the Codex CLI's `--no-daemon` (do not use the shared daemon) is added once, right after the first layer. A `--no-daemon` you add yourself does not match a form and is refused.
-- **Guard check on every launch:** right before every launch, with the selected account folder as `CODEX_HOME` and in the folder where `exec` runs (its real path), `exec` runs `codex features list` and then `codex mcp list --json` with the first layer (and the `-c` values of the first form). `codex` is launched only when `apps` and `plugins` are both `false` and there are no MCP servers. Each check may take at most 3 seconds and reads at most 64 KiB of standard output. If the check does not pass, `codex` is not launched and `exec` stops with the one line `guard unverified (<reason>)`.
+- **Guard check on every launch:** right before every launch, with the selected account folder as `CODEX_HOME` and in the folder where `exec` runs (its real path), `exec` runs `codex features list` and then `codex mcp list --json` with the first layer (and the `-c` values of the first form). `codex` is launched only when `apps` and `plugins` are both `false` and there are no MCP servers. Each check may take at most 3 seconds and reads at most 64 KiB of standard output. If the check does not pass, `codex` is not launched and `exec` stops with the one line `guard unverified (<reason>)`. The check runs once, before launch; it does not cover settings that take effect later in the session (see "Outside these guards" below).
 
   | Reason | Meaning |
   |---|---|
@@ -2517,6 +2519,8 @@ Codex launched with an account folder as `CODEX_HOME` does not read the settings
 - **Outside these guards:**
   - Launches that do not go through `exec`. The usual `codex`, a `codex` you start yourself with the account folder as `CODEX_HOME`, and a `codex` started from inside an account session (the child inherits `CODEX_HOME`) get neither the first layer nor the check. The last two run in that account folder with only the second layer.
   - The settings of trusted projects are read in account sessions too. The check's `mcp list` may connect to the MCP servers of a trusted project.
+  - If, in an interactive session started by `exec`, Codex asks whether to trust the working folder and you choose to trust it, that project's settings, including its MCP servers, are loaded in that session without the check. In an account session, choose to quit rather than trust a project you have not already trusted.
+  - Connectors may be connected even inside a session that passed the check. On a real machine, `/mcp` in such a session has listed the connector entry (`codex_apps`) as `connected`. Under which conditions this happens is still being checked.
   - Do not trust your home folder (the folder that contains `~/.codex`) in an account session. If you do, the settings, hooks and rules in `~/.codex` may be read as project settings.
 - **How to provide instructions:** put the instructions (`AGENTS.md`) you want in account sessions into the account folder yourself. codex-rotator does not read inside `~/.codex` and does not copy from it.
 - **Hooks:** if a project relies on hooks as a guard, enable Codex's `hooks` feature in each account folder and trust those hooks (the settings that login creates in the account folder are only the three settings above, and `~/.codex` is not read).
