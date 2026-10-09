@@ -297,7 +297,7 @@ describe('usage-events.jsonl from forwardOnce', () => {
     assert.equal(events[0].eventId, 'req_paths/1');
   });
 
-  it('treats a multi-stage content-encoding as unsupported instead of garbling usage', async () => {
+  it('does not count usage when the body does not decode as its stacked content-encoding', async () => {
     const dir = await tempDir();
     const body = await gzip(JSON.stringify({
       id: 'msg_2',

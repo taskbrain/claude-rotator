@@ -2136,6 +2136,45 @@ describe('account_switch log line', () => {
     ]);
   });
 
+  it('keeps whitespace in account ids from splitting the account_switch fields', () => {
+    const logger = collectingLogger();
+    const manager = new AccountManager({
+      accounts: [
+        { id: 'acct one', name: 'one@example.com', type: 'oauth' },
+        { id: 'acct two', name: 'two@example.com', type: 'oauth' },
+      ],
+      currentAccountId: 'acct one',
+      switchThreshold: 1,
+      now: () => 1000,
+      logger,
+    });
+    manager.updateQuota('acct one', {
+      'anthropic-ratelimit-unified-5h-utilization': '1',
+      'anthropic-ratelimit-unified-5h-reset': '20',
+    });
+    manager.updateQuota('acct two', {
+      'anthropic-ratelimit-unified-5h-utilization': '0.1',
+      'anthropic-ratelimit-unified-7d-utilization': '0.2',
+    });
+
+    manager.rebalanceActiveAccount();
+
+    const lines = switchLines(logger);
+    assert.equal(lines.length, 1);
+    const tokens = lines[0].split(' ');
+    assert.deepEqual(
+      tokens.filter(token => token.startsWith('from=') || token.startsWith('to=')),
+      ['from=acct_one', 'to=acct_two'],
+    );
+    assert.deepEqual(tokens.slice(1), [
+      'account_switch',
+      'from=acct_one',
+      'to=acct_two',
+      'reason=quota-threshold',
+      'trigger=usage-refresh',
+    ]);
+  });
+
   it('writes one account_switch line for a reactive 429', () => {
     const logger = collectingLogger();
     const manager = new AccountManager({
@@ -2921,6 +2960,56 @@ describe('selectForNewAssignment (D-56-1 / D-60-4 / 設計書 §4.2)', () => {
       { min: null, complete: false },
       '口座が無いときは「読めなかった」として返す（利用率 0 と誤読させない）',
     );
+  });
+
+  // 結び付け先は選択の対象から外されるので、台帳の窓が古いまま残りうる。読みだけで、
+  // リセットを過ぎた窓を refreshQuotaState が消した後と同じに扱う。
+  it('reads a 5h window whose reset has passed as refreshQuotaState would leave it, without writing the ledger', () => {
+    const clock = { ms: NOW };
+    const manager = new AccountManager({
+      accounts: [{ id: 'bound', type: 'oauth' }],
+      switchThreshold: 1,
+      now: () => clock.ms,
+    });
+    manager.applyUsage('bound', {
+      five_hour: { utilization: 0.9, resets_at: new Date(NOW + 30_000).toISOString() },
+      seven_day: { utilization: 0.3, resets_at: LATE_WEEKLY },
+    });
+    clock.ms = NOW + 60_000;
+    const account = manager.find('bound');
+    const quotaBefore = structuredClone(account.quota);
+
+    const read = manager.assignmentHeadroomFor(account, null);
+
+    assert.deepEqual(account.quota, quotaBefore, '読むだけで台帳は書き換えない');
+    assert.deepEqual(read, { min: 0.7, complete: false }, 'リセット済みの 5h は読めなかった窓として扱う');
+    manager.refreshQuotaState(account);
+    assert.deepEqual(manager.assignmentHeadroomFor(account, null), read, '更新した後の読みと同じ');
+  });
+
+  it('leaves a Fable weekly sub-cap whose reset has passed out of the Fable reading', () => {
+    const clock = { ms: NOW };
+    const manager = new AccountManager({
+      accounts: [{ id: 'bound', type: 'oauth' }],
+      switchThreshold: 1,
+      now: () => clock.ms,
+    });
+    manager.applyUsage('bound', {
+      five_hour: { utilization: 0.2, resets_at: FIVE_HOUR_RESET },
+      seven_day: { utilization: 0.3, resets_at: LATE_WEEKLY },
+      scoped_weekly: [
+        { key: 'fable', label: 'Fable', utilization: 0.95, resets_at: new Date(NOW + 30_000).toISOString() },
+      ],
+    });
+    clock.ms = NOW + 60_000;
+    const account = manager.find('bound');
+
+    const read = manager.assignmentHeadroomFor(account, 'fable');
+
+    assert.equal(account.quota.weeklyScoped.length, 1, '読むだけで台帳の系統別の枠は消さない');
+    assert.deepEqual(read, { min: 0.7, complete: true }, 'リセット済みの系統別の枠は数えない');
+    manager.refreshQuotaState(account);
+    assert.deepEqual(manager.assignmentHeadroomFor(account, 'fable'), read, '更新した後の読みと同じ');
   });
 
   it('does not multiply quota-exhausted events when the selector evaluates the same account repeatedly', () => {

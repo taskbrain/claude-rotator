@@ -100,6 +100,7 @@ export const DEFAULT_REQUEST_BODY_DRAIN = Object.freeze({
   timeoutMs: 10_000,
 });
 const REQUEST_BODY_TOO_LARGE = 'REQUEST_BODY_TOO_LARGE';
+const REQUEST_AFTER_TOO_LARGE = 'REQUEST_AFTER_TOO_LARGE';
 const REACTIVE_QUOTA_CONFIRM_TIMEOUT_MS = 5_000;
 const REACTIVE_QUOTA_EXHAUSTION_THRESHOLD = 1;
 const REACTIVE_QUOTA_SINGLE_FLIGHT_GRACE_MS = 250;
@@ -166,7 +167,37 @@ export function createProxyServer({
     ?? config.upstreamConnectRetryDelayMs
     ?? DEFAULT_UPSTREAM_CONNECT_RETRY_DELAY_MS;
   const maxRequestBodyBytes = normalizeMaxRequestBodyBytes(config.proxy?.maxRequestBodyBytes, logger);
-  const readBody = req => readRequestBody(req, maxRequestBodyBytes);
+  // 本文が上限を超えた要求には 413 を `Connection: close` で返すが、閉じるまでの間に同じ接続で
+  // 続けて届いた（パイプライン化された）要求も Node は処理関数へ渡す。その要求を上流へ転送しても
+  // 応答はクライアントへ届かないので、転送せずに捨てる。一方、上限を超えた要求より先に届いた要求は
+  // 今までどおり上流へ転送して応答する（Node は応答を要求の届いた順に出すので、先の要求に応答
+  // しないと、後ろの 413 も送られないまま止まる）。
+  // 前後を分けるため、処理関数の最初の文（最初の await より前）で要求に到着の番号を振る。処理関数の
+  // 同期の部分は Node が要求を解釈した順に走るので、番号は同じ接続の中で届いた順になる。接続には
+  // 最初に上限を超えた要求の番号を印として付け（後から上限を超えた要求の番号では上書きしない）、
+  // 番号が印より大きい要求だけを捨てる。各要求の処理関数は、先の要求が本文を読み終える前に始まる
+  // ことがあるので、この比べ方は処理関数の先頭・本文を読み終えた後・413 を返す前の3か所で行う。
+  let requestArrivalCount = 0;
+  const requestArrivalOrder = new WeakMap();
+  const firstTooLargeOrderBySocket = new WeakMap();
+  const arrivedAfterTooLarge = req => {
+    const firstTooLarge = req.socket ? firstTooLargeOrderBySocket.get(req.socket) : undefined;
+    return firstTooLarge !== undefined && requestArrivalOrder.get(req) > firstTooLarge;
+  };
+  const readBody = req => readRequestBody(req, maxRequestBodyBytes).then(
+    body => {
+      if (arrivedAfterTooLarge(req)) throw requestAfterTooLargeError();
+      return body;
+    },
+    error => {
+      const order = requestArrivalOrder.get(req);
+      if (error?.code === REQUEST_BODY_TOO_LARGE && req.socket && order !== undefined) {
+        const firstTooLarge = firstTooLargeOrderBySocket.get(req.socket);
+        if (firstTooLarge === undefined || order < firstTooLarge) firstTooLargeOrderBySocket.set(req.socket, order);
+      }
+      throw error;
+    },
+  );
   const resolvedTokenRefresher = tokenRefresher || defaultTokenRefresher({
     platform,
     nativeOptions: {
@@ -542,6 +573,12 @@ export function createProxyServer({
   };
 
   const server = http.createServer(async (req, res) => {
+    requestArrivalOrder.set(req, ++requestArrivalCount);
+    // 上限を超えた要求より後に同じ接続で届いた要求（本文を読まない要求も含む）。
+    if (arrivedAfterTooLarge(req)) {
+      req.resume();
+      return;
+    }
     try {
       if (!isTrustedLocalHttpRequest(req)) {
         sendJson(res, 403, {
@@ -852,6 +889,10 @@ export function createProxyServer({
       });
       await persistState();
     } catch (error) {
+      // 上限を超えた要求より後に同じ接続で届いた要求（それ自体が上限を超えたものを含む）。
+      // 応答は接続とともに捨てられるので、何も返さない。
+      if (error?.code === REQUEST_AFTER_TOO_LARGE) return;
+      if (error?.code === REQUEST_BODY_TOO_LARGE && arrivedAfterTooLarge(req)) return;
       if (error?.code === REQUEST_BODY_TOO_LARGE && !res.headersSent) {
         logger?.(`${new Date().toISOString()} proxy-error method=${req.method} path=${safeRequestPath(req.url)} error=request_too_large limitBytes=${error.limitBytes}`);
         sendRequestTooLarge(req, res, { ...requestBodyDrain, logger });
@@ -1873,23 +1914,25 @@ function createSessionAffinityRequest({
 }
 
 /**
- * 冷えた固定の解放先（設計書 v1.7 §4.3・P-b。2026-09-18 判断6 案(a)）。
+ * 冷えた固定の移し先。
  *
- * v1.6 の要件 R2 は「口座が枯れるまで動かさない」だった。枯れるまで動かさないと、
- * 一度混んだ口座に集まったセッションは、そのセッションが二度と来なくなっても
- * その口座の「重さ」として残り続ける。とはいえ温かいセッションを動かすのは、
- * 上流のプロンプトキャッシュを捨てて作り直させるという実費の伴う操作である。
- * そこで**キャッシュが失効したセッションだけ**を動かす:
+ * 口座が枯れるまで固定を動かさないと、一度混んだ口座に集まったセッションは、
+ * そのセッションが二度と来なくなってもその口座の「重さ」として残り続ける。
+ * とはいえ温かいセッションを動かすのは、上流のプロンプトキャッシュを捨てて
+ * 作り直させるという実費の伴う操作である。そこで**キャッシュが失効したセッションだけ**を、
+ * 次のすべてが揃ったときだけ動かす:
  *
- *   ①表に行があり ②最後の要求から `warmTtlMs` 以上空いていて
- *   ③結び付け先の利用率が `drainStartUtilization` 以上で ④別の行き先がある
+ *   ①表に行がある ②最後の要求から `warmTtlMs` 以上空いた
+ *   ③結び付け先の利用率が `drainStartUtilization` 以上
+ *   ④別の行き先があり、その利用率が結び付け先より低いと読める
  *
- * の4つが揃ったときだけ。①〜③のどれかが欠ければ `null` を返し、呼び出し側は v1.6 と
- * 同じ枝へ落ちる。**温かいセッションはこの線では1本も動かない。**
+ * どれかが欠ければ `null` を返し、呼び出し側はこの線が無いときと同じ枝へ落ちる。
+ * **温かいセッションはこの線では1本も動かない。** ④で比べるのは、同じ混み具合の
+ * 口座の間で、冷えるたびにセッションを行き来させないためである。
  *
- * 利用率は台帳の `assignmentHeadroomFor` から読む——選択側（`selectForNewAssignment`）と
- * 同じ読み方でなければ、窓が1つ増えた日に判定と選択がずれる。読めなかった窓を
- * 「空いている」とは読まない（`min == null` なら動かさない・D-60-4 と同じ構え）。
+ * 利用率は台帳の `assignmentHeadroomFor` から読む。選択側（`selectForNewAssignment`）と
+ * 同じ読み方でなければ、窓が1つ増えた日に判定と選択がずれる。利用率が読めない口座は、
+ * 結び付け先でも行き先でも「空いている」とは読まない（`min == null` なら動かさない）。
  *
  * @returns {object|null} 移す先の口座。移さないときは `null`。
  */
@@ -1905,7 +1948,10 @@ function coldReassignTarget({ entry, bound, accountManager, settings, modelFamil
   if (1 - headroom.min < drainStart) return null;
 
   const target = assign([bound.id]);
-  return target && target.id !== bound.id ? target : null;
+  if (!target || target.id === bound.id) return null;
+  const targetHeadroom = accountManager.assignmentHeadroomFor(target, modelFamily);
+  if (targetHeadroom.min == null || targetHeadroom.min <= headroom.min) return null;
+  return target;
 }
 
 /**
@@ -3839,9 +3885,17 @@ async function forwardOnceInner({
   // 配備前後で遅延の分位点を比べられなくなる（計画書 (d)・リスク R-5）。
   const durationMs = Date.now() - startedAt;
 
+  // 本文を onChunk でクライアントへ流し切った応答は、usage を読むための解凍を待たずに
+  // ここで終える。条件は、下で本文を後から送る経路（上流 529 の書き換え・溜めた本文の
+  // 再生）と、別口座や更新した資格情報で送り直す経路（quota-retry・auth-refresh-retry）の
+  // 否定である。それらの経路は応答をまだ書いていないので、ここでは終えない。
+  const streamedToClient = !upstreamOverloadPending && !bufferedPassthrough
+    && !(!passthroughErrors && (outcome === 'quota-retry' || outcome === 'auth-refresh-retry'));
+  if (streamedToClient && !res.writableEnded) res.end();
+
   // 応答本文の**写し**を読むだけで、クライアントへ流すバイト列には触れない。
-  // 解凍は非同期版を使う（同期版はイベントループを塞ぐ）。本文は既に onChunk で
-  // クライアントへ流れ切っており、遅れるのは終端だけである。
+  // 解凍は非同期版を使う（同期版はイベントループを塞ぐ）。流し切った応答は上で終えて
+  // いるので、解凍の時間はクライアントへの応答の終わりを遅らせない。
   const observation = accountManager.accounts.includes(account) && upstreamResponse.body.length > 0
     ? await parseUsageObservation(upstreamResponse.body, {
       contentEncoding: headerValue(upstreamResponse.headers['content-encoding']),
@@ -4674,6 +4728,12 @@ function requestBodyTooLargeError(limitBytes) {
   const error = new Error(`Request body exceeds ${limitBytes} bytes`);
   error.code = REQUEST_BODY_TOO_LARGE;
   error.limitBytes = limitBytes;
+  return error;
+}
+
+function requestAfterTooLargeError() {
+  const error = new Error('Request arrived on a connection that was answered with 413');
+  error.code = REQUEST_AFTER_TOO_LARGE;
   return error;
 }
 

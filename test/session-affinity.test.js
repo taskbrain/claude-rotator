@@ -416,6 +416,20 @@ describe('SessionAffinity ttl and capacity', () => {
     ]);
   });
 
+  it('treats an entry whose last-used time is not a number as expired and cold', () => {
+    const { affinity, clock, logger } = createAffinity({ idleTtlMs: 21_600_000 });
+    reserve(affinity, SESSION_ID, 'acct-a');
+    // 公開の書き込み口は時計の値しか入れないので、表の行を直接書き換えて壊れた値を作る。
+    const entry = affinity.entries.get(sidHash(SESSION_ID));
+    entry.lastSeen = 'not-a-number';
+
+    assert.equal(affinity.cold(entry, clock.ms), true, '数でない時刻は冷えているとみなす');
+    assert.equal(affinity.get(SESSION_ID), null, '数でない時刻は期限切れとみなす');
+    const evicts = linesOf(logger, 'affinity_evict');
+    assert.equal(evicts.length, 1);
+    assert.match(evicts[0], / reason=ttl /);
+  });
+
   it('evicts the idle entries on prune and leaves the fresh ones alone', () => {
     const { affinity, clock, logger } = createAffinity({ idleTtlMs: 60_000 });
     reserve(affinity, 'session-old', 'acct-a');

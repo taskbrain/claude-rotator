@@ -14001,6 +14001,7 @@ describe('session affinity cold reassign (R-S18 / 設計書 v1.7 P-b)', () => {
 
     // 結び付け先は 90% まで使われているが、まだ枯れてはいない（要求は通る）。
     setUtilization(accountManager, 'acct_a', { fiveHour: 0.90, weekly: 0.10 });
+    setUtilization(accountManager, 'acct_b', { fiveHour: 0.10, weekly: 0.10 });
     assert.equal(accountManager.isAvailable(accountManager.find('acct_a')), true);
     // キャッシュが失効するまで放置する。
     clock.ms += 60_001;
@@ -14076,6 +14077,86 @@ describe('session affinity cold reassign (R-S18 / 設計書 v1.7 P-b)', () => {
 
     assert.deepEqual(seen, ['Bearer token-acct_a', 'Bearer token-acct_a']);
     assert.deepEqual(eventLines(logLines, 'affinity_switch'), []);
+  });
+
+  // 行き先が結び付け先より空いていると読めるときだけ移す。同じ混み具合の口座の間で、
+  // 冷えるたびに行き来させないため。
+  async function coldAfterUtilization({ bound, target }) {
+    const started = await startCold();
+    const { ask, accountManager, clock } = started;
+    assert.equal((await ask({ sid: 'session-one' })).status, 200);
+    setUtilization(accountManager, 'acct_a', bound);
+    if (target) setUtilization(accountManager, 'acct_b', target);
+    clock.ms += 60_001;
+    assert.equal((await ask({ sid: 'session-one' })).status, 200);
+    return started;
+  }
+
+  it('keeps a cold session where it is when every account is equally used', async () => {
+    const { seen, logLines } = await coldAfterUtilization({
+      bound: { fiveHour: 0.90, weekly: 0.10 },
+      target: { fiveHour: 0.90, weekly: 0.10 },
+    });
+
+    assert.deepEqual(seen, ['Bearer token-acct_a', 'Bearer token-acct_a']);
+    assert.deepEqual(eventLines(logLines, 'affinity_switch'), []);
+  });
+
+  it('keeps a cold session where it is when the only other account is more used', async () => {
+    const { seen, logLines } = await coldAfterUtilization({
+      bound: { fiveHour: 0.88, weekly: 0.10 },
+      target: { fiveHour: 0.95, weekly: 0.10 },
+    });
+
+    assert.deepEqual(seen, ['Bearer token-acct_a', 'Bearer token-acct_a']);
+    assert.deepEqual(eventLines(logLines, 'affinity_switch'), []);
+  });
+
+  it('keeps a cold session where it is when the utilisation of the other account cannot be read', async () => {
+    const { seen, logLines } = await coldAfterUtilization({
+      bound: { fiveHour: 0.90, weekly: 0.10 },
+      target: null,
+    });
+
+    assert.deepEqual(seen, ['Bearer token-acct_a', 'Bearer token-acct_a']);
+    assert.deepEqual(eventLines(logLines, 'affinity_switch'), [], '読めない口座を空いているとは読まない');
+  });
+
+  it('moves a cold session to a less used account even when both are above drainStartUtilization', async () => {
+    const { seen, logLines } = await coldAfterUtilization({
+      bound: { fiveHour: 0.95, weekly: 0.10 },
+      target: { fiveHour: 0.86, weekly: 0.10 },
+    });
+
+    assert.deepEqual(seen, ['Bearer token-acct_a', 'Bearer token-acct_b']);
+    const switches = eventLines(logLines, 'affinity_switch');
+    assert.equal(switches.length, 1);
+    assert.match(switches[0], / from=acct_a to=acct_b reason=cold_reassign /);
+  });
+
+  it('does not move a cold session because of a 5h reading whose reset has already passed', async () => {
+    const { ask, seen, logLines, accountManager, clock } = await startCold();
+
+    assert.equal((await ask({ sid: 'session-one' })).status, 200);
+    assert.equal(seen.at(-1), 'Bearer token-acct_a');
+
+    // 結び付け先の 5h は 90% だが、30 秒後にリセットされる。
+    accountManager.applyUsage('acct_a', {
+      five_hour: { utilization: 0.90, resets_at: new Date(clock.ms + 30_000).toISOString() },
+      seven_day: { utilization: 0.10, resets_at: new Date(clock.ms + 86_400_000).toISOString() },
+    });
+    setUtilization(accountManager, 'acct_b', { fiveHour: 0.10, weekly: 0.10 });
+    // 冷えるまで放置する間に、5h のリセットも過ぎる。
+    clock.ms += 60_001;
+
+    assert.equal((await ask({ sid: 'session-one' })).status, 200);
+
+    assert.deepEqual(seen, ['Bearer token-acct_a', 'Bearer token-acct_a']);
+    assert.deepEqual(
+      eventLines(logLines, 'affinity_switch'),
+      [],
+      'リセット済みの窓の古い値では、結び付け先を混んでいるとは読まない',
+    );
   });
 
   it('keeps the cold session on its account when there is nowhere better to go', async () => {
@@ -14201,12 +14282,50 @@ describe('cache observability', () => {
     });
     assert.equal(response.status, 200);
 
+    await waitForStatus(() => accountManager.getStatus().accounts[0].usage.totalRequests, count => count === 1);
     const { usage } = accountManager.getStatus().accounts[0];
     assert.equal(usage.totalCacheReadTokens, 99000);
     assert.equal(usage.totalCacheCreation1hTokens, 1500);
     assert.equal(usage.totalCacheCreation5mTokens, 0);
     assert.equal(usage.totalInputTokens, 10);
     assert.equal(usage.totalOutputTokens, 20);
+  });
+
+  it('流し切った応答は usage を読むための解凍を待たずに終え、その後で usage を足す', async () => {
+    const zlib = await import('node:zlib');
+    const gzipped = zlib.gzipSync(Buffer.from(OBSERVED_SSE, 'utf8'));
+    // proxy 行は解凍の後に書かれる。その時点でクライアントへの応答が終わっていたかを記録する。
+    const serverResponses = [];
+    const endedWhenLogged = [];
+    const logLines = [];
+    logLines.push = line => {
+      if (line.includes(' proxy ')) endedWhenLogged.push(serverResponses.at(-1)?.writableEnded);
+      return Array.prototype.push.call(logLines, line);
+    };
+    const { proxy, accountManager } = await startObservabilityProxy({
+      logLines,
+      upstreamHandler: (req, res) => {
+        res.writeHead(200, { 'Content-Type': 'text/event-stream', 'Content-Encoding': 'gzip', ...QUOTA_HEADERS });
+        res.end(gzipped);
+      },
+    });
+    proxy.server.on('request', (req, res) => serverResponses.push(res));
+
+    const response = await requestRaw(`${proxy.url}/v1/messages`, {
+      method: 'POST', body: JSON.stringify({ model: 'claude-opus-5-1' }),
+    });
+
+    assert.equal(response.status, 200);
+    assert.deepEqual(response.body, gzipped, 'クライアントへ流すバイト列は上流と同じ');
+    const usage = await waitForStatus(
+      () => accountManager.getStatus().accounts[0].usage,
+      current => current.totalRequests === 1,
+    );
+    assert.equal(usage.totalRequests, 1);
+    assert.equal(usage.totalInputTokens, 10);
+    assert.equal(usage.totalOutputTokens, 20);
+    assert.equal(usage.totalCacheReadTokens, 99000);
+    assert.deepEqual(endedWhenLogged, [true], '解凍の前に応答を終えている');
   });
 
   it('1要求で totalRequests が 1 だけ増える（旧実装はストリームで 2 増えた）', async () => {
@@ -14260,6 +14379,7 @@ describe('cache observability', () => {
       headers: { 'x-claude-code-session-id': 'synthetic-session-0001' },
     });
 
+    await waitForStatus(() => proxyLine(logLines), line => line !== undefined);
     assert.match(
       proxyLine(logLines),
       / model=claude-opus-5-1 sid=[0-9a-f]{12} in=10 out=20 cr=99000 cc=1500 c1h=1500 c5m=0 u5h=0\.76 u5hReset=1789012345 u7d=0\.33 u7dReset=1789098765 enc=gzip$/,
@@ -14292,6 +14412,7 @@ describe('cache observability', () => {
       headers: { 'x-claude-code-session-id': 'synthetic-session-0002' },
     });
 
+    await waitForStatus(() => proxyLine(logLines), line => line !== undefined);
     assert.match(
       proxyLine(logLines),
       / u7dReset=1789098765 enc=gzip g5h=0\.02 g7d=0 ustat=allowed_warning ovs=rejected ovu=false$/,
@@ -14317,6 +14438,7 @@ describe('cache observability', () => {
         body: JSON.stringify({ model: 'claude-opus-5-1' }),
         headers: { 'x-claude-code-session-id': 'synthetic-session-0003' },
       });
+      await waitForStatus(() => proxyLine(logLines), line => line !== undefined);
       // 時刻・所要時間は要求ごとに変わるので、比較は outcome= 以降に限る。
       return proxyLine(logLines).replace(/^.* outcome=/, 'outcome=');
     };
@@ -14370,6 +14492,7 @@ describe('cache observability', () => {
       method: 'POST', body: JSON.stringify({ model: 'claude-opus-5-1' }),
     });
 
+    await waitForStatus(() => proxyLine(logLines), line => line !== undefined);
     const line = proxyLine(logLines);
     assert.ok(!line.includes(' model='), line);
     assert.ok(!line.includes(' sid='), line);
