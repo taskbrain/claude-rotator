@@ -14078,6 +14078,31 @@ describe('session affinity cold reassign (R-S18 / 設計書 v1.7 P-b)', () => {
     assert.deepEqual(eventLines(logLines, 'affinity_switch'), []);
   });
 
+  it('does not move a cold session because of a 5h reading whose reset has already passed', async () => {
+    const { ask, seen, logLines, accountManager, clock } = await startCold();
+
+    assert.equal((await ask({ sid: 'session-one' })).status, 200);
+    assert.equal(seen.at(-1), 'Bearer token-acct_a');
+
+    // 結び付け先の 5h は 90% だが、30 秒後にリセットされる。
+    accountManager.applyUsage('acct_a', {
+      five_hour: { utilization: 0.90, resets_at: new Date(clock.ms + 30_000).toISOString() },
+      seven_day: { utilization: 0.10, resets_at: new Date(clock.ms + 86_400_000).toISOString() },
+    });
+    setUtilization(accountManager, 'acct_b', { fiveHour: 0.10, weekly: 0.10 });
+    // 冷えるまで放置する間に、5h のリセットも過ぎる。
+    clock.ms += 60_001;
+
+    assert.equal((await ask({ sid: 'session-one' })).status, 200);
+
+    assert.deepEqual(seen, ['Bearer token-acct_a', 'Bearer token-acct_a']);
+    assert.deepEqual(
+      eventLines(logLines, 'affinity_switch'),
+      [],
+      'リセット済みの窓の古い値では、結び付け先を混んでいるとは読まない',
+    );
+  });
+
   it('keeps the cold session on its account when there is nowhere better to go', async () => {
     const { ask, seen, logLines, accountManager, clock } = await startCold({
       accounts: ['acct_a'],

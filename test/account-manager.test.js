@@ -2923,6 +2923,56 @@ describe('selectForNewAssignment (D-56-1 / D-60-4 / 設計書 §4.2)', () => {
     );
   });
 
+  // 結び付け先は選択の対象から外されるので、台帳の窓が古いまま残りうる。読みだけで、
+  // リセットを過ぎた窓を refreshQuotaState が消した後と同じに扱う。
+  it('reads a 5h window whose reset has passed as refreshQuotaState would leave it, without writing the ledger', () => {
+    const clock = { ms: NOW };
+    const manager = new AccountManager({
+      accounts: [{ id: 'bound', type: 'oauth' }],
+      switchThreshold: 1,
+      now: () => clock.ms,
+    });
+    manager.applyUsage('bound', {
+      five_hour: { utilization: 0.9, resets_at: new Date(NOW + 30_000).toISOString() },
+      seven_day: { utilization: 0.3, resets_at: LATE_WEEKLY },
+    });
+    clock.ms = NOW + 60_000;
+    const account = manager.find('bound');
+    const quotaBefore = structuredClone(account.quota);
+
+    const read = manager.assignmentHeadroomFor(account, null);
+
+    assert.deepEqual(account.quota, quotaBefore, '読むだけで台帳は書き換えない');
+    assert.deepEqual(read, { min: 0.7, complete: false }, 'リセット済みの 5h は読めなかった窓として扱う');
+    manager.refreshQuotaState(account);
+    assert.deepEqual(manager.assignmentHeadroomFor(account, null), read, '更新した後の読みと同じ');
+  });
+
+  it('leaves a Fable weekly sub-cap whose reset has passed out of the Fable reading', () => {
+    const clock = { ms: NOW };
+    const manager = new AccountManager({
+      accounts: [{ id: 'bound', type: 'oauth' }],
+      switchThreshold: 1,
+      now: () => clock.ms,
+    });
+    manager.applyUsage('bound', {
+      five_hour: { utilization: 0.2, resets_at: FIVE_HOUR_RESET },
+      seven_day: { utilization: 0.3, resets_at: LATE_WEEKLY },
+      scoped_weekly: [
+        { key: 'fable', label: 'Fable', utilization: 0.95, resets_at: new Date(NOW + 30_000).toISOString() },
+      ],
+    });
+    clock.ms = NOW + 60_000;
+    const account = manager.find('bound');
+
+    const read = manager.assignmentHeadroomFor(account, 'fable');
+
+    assert.equal(account.quota.weeklyScoped.length, 1, '読むだけで台帳の系統別の枠は消さない');
+    assert.deepEqual(read, { min: 0.7, complete: true }, 'リセット済みの系統別の枠は数えない');
+    manager.refreshQuotaState(account);
+    assert.deepEqual(manager.assignmentHeadroomFor(account, 'fable'), read, '更新した後の読みと同じ');
+  });
+
   it('does not multiply quota-exhausted events when the selector evaluates the same account repeatedly', () => {
     const manager = makeManager(['exhausted', 'healthy']);
     setWindows(manager, 'exhausted', { fiveHour: 0, weekly: 0.90 });

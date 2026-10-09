@@ -1129,7 +1129,10 @@ export class AccountManager {
    * added. `1 - min` is the utilisation; a `min` of null means it could not be
    * read, and the caller must NOT read that as "idle".
    *
-   * Pure: it does not refresh the quota state and does not touch the ledger.
+   * Pure: it does not refresh the quota state and does not touch the ledger. A
+   * window whose reset has already passed is read the way `refreshQuotaState`
+   * would leave it, because a bound account is kept out of the selector and so
+   * may still carry the reading from before its reset.
    *
    * @param {object|null} account
    * @param {string|null} modelFamily
@@ -1137,7 +1140,7 @@ export class AccountManager {
    */
   assignmentHeadroomFor(account, modelFamily = null) {
     if (!account) return { min: null, complete: false };
-    return assignmentHeadroom(account.quota || {}, modelFamily);
+    return assignmentHeadroom(account.quota || {}, modelFamily, this.now());
   }
 
   /** One ranking row for `selectForNewAssignment`. Reads the ledger, never writes it. */
@@ -1153,7 +1156,7 @@ export class AccountManager {
     return {
       account,
       index,
-      headroom: assignmentHeadroom(quota, modelFamily),
+      headroom: assignmentHeadroom(quota, modelFamily, now),
       // K1 (design v1.7 P-a): how much of the 5h window this account has actually
       // burned, not how much is left on its tightest window. `headroom.min` can be
       // dominated by the WEEKLY window, so an account that has barely touched its
@@ -1573,12 +1576,20 @@ function compareRoutingAvailabilityCandidates(left, right) {
  * A window that could not be read is NOT treated as 100% free: it is left out of
  * `min` and reported through `complete: false`, so the caller can rank those
  * candidates behind the fully known ones instead of trusting a flattering value.
+ *
+ * A window whose reset has passed at `now` is read as `refreshQuotaState` would
+ * leave it: a 5h or 7d window counts as not read, and a scoped weekly limit is
+ * dropped. Nothing is written back.
  */
-function assignmentHeadroom(quota, modelFamily) {
-  const utilizations = [finiteNumberOrNull(quota?.unified5h), finiteNumberOrNull(quota?.unified7d)];
+function assignmentHeadroom(quota, modelFamily, now) {
+  const utilizations = [
+    quota?.unified5hReset && now >= quota.unified5hReset ? null : finiteNumberOrNull(quota?.unified5h),
+    quota?.unified7dReset && now >= quota.unified7dReset ? null : finiteNumberOrNull(quota?.unified7d),
+  ];
   if (modelFamily === 'fable' && Array.isArray(quota?.weeklyScoped)) {
     for (const limit of quota.weeklyScoped) {
       if (!scopeMatchesModelFamily(limit, modelFamily)) continue;
+      if (limit.resetAt && now >= limit.resetAt) continue;
       utilizations.push(finiteNumberOrNull(limit.utilization));
     }
   }
