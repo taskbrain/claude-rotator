@@ -14001,6 +14001,7 @@ describe('session affinity cold reassign (R-S18 / 設計書 v1.7 P-b)', () => {
 
     // 結び付け先は 90% まで使われているが、まだ枯れてはいない（要求は通る）。
     setUtilization(accountManager, 'acct_a', { fiveHour: 0.90, weekly: 0.10 });
+    setUtilization(accountManager, 'acct_b', { fiveHour: 0.10, weekly: 0.10 });
     assert.equal(accountManager.isAvailable(accountManager.find('acct_a')), true);
     // キャッシュが失効するまで放置する。
     clock.ms += 60_001;
@@ -14076,6 +14077,61 @@ describe('session affinity cold reassign (R-S18 / 設計書 v1.7 P-b)', () => {
 
     assert.deepEqual(seen, ['Bearer token-acct_a', 'Bearer token-acct_a']);
     assert.deepEqual(eventLines(logLines, 'affinity_switch'), []);
+  });
+
+  // 行き先が結び付け先より空いていると読めるときだけ移す。同じ混み具合の口座の間で、
+  // 冷えるたびに行き来させないため。
+  async function coldAfterUtilization({ bound, target }) {
+    const started = await startCold();
+    const { ask, accountManager, clock } = started;
+    assert.equal((await ask({ sid: 'session-one' })).status, 200);
+    setUtilization(accountManager, 'acct_a', bound);
+    if (target) setUtilization(accountManager, 'acct_b', target);
+    clock.ms += 60_001;
+    assert.equal((await ask({ sid: 'session-one' })).status, 200);
+    return started;
+  }
+
+  it('keeps a cold session where it is when every account is equally used', async () => {
+    const { seen, logLines } = await coldAfterUtilization({
+      bound: { fiveHour: 0.90, weekly: 0.10 },
+      target: { fiveHour: 0.90, weekly: 0.10 },
+    });
+
+    assert.deepEqual(seen, ['Bearer token-acct_a', 'Bearer token-acct_a']);
+    assert.deepEqual(eventLines(logLines, 'affinity_switch'), []);
+  });
+
+  it('keeps a cold session where it is when the only other account is more used', async () => {
+    const { seen, logLines } = await coldAfterUtilization({
+      bound: { fiveHour: 0.88, weekly: 0.10 },
+      target: { fiveHour: 0.95, weekly: 0.10 },
+    });
+
+    assert.deepEqual(seen, ['Bearer token-acct_a', 'Bearer token-acct_a']);
+    assert.deepEqual(eventLines(logLines, 'affinity_switch'), []);
+  });
+
+  it('keeps a cold session where it is when the utilisation of the other account cannot be read', async () => {
+    const { seen, logLines } = await coldAfterUtilization({
+      bound: { fiveHour: 0.90, weekly: 0.10 },
+      target: null,
+    });
+
+    assert.deepEqual(seen, ['Bearer token-acct_a', 'Bearer token-acct_a']);
+    assert.deepEqual(eventLines(logLines, 'affinity_switch'), [], '読めない口座を空いているとは読まない');
+  });
+
+  it('moves a cold session to a less used account even when both are above drainStartUtilization', async () => {
+    const { seen, logLines } = await coldAfterUtilization({
+      bound: { fiveHour: 0.95, weekly: 0.10 },
+      target: { fiveHour: 0.86, weekly: 0.10 },
+    });
+
+    assert.deepEqual(seen, ['Bearer token-acct_a', 'Bearer token-acct_b']);
+    const switches = eventLines(logLines, 'affinity_switch');
+    assert.equal(switches.length, 1);
+    assert.match(switches[0], / from=acct_a to=acct_b reason=cold_reassign /);
   });
 
   it('does not move a cold session because of a 5h reading whose reset has already passed', async () => {

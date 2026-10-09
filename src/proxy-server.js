@@ -1873,23 +1873,25 @@ function createSessionAffinityRequest({
 }
 
 /**
- * 冷えた固定の解放先（設計書 v1.7 §4.3・P-b。2026-09-18 判断6 案(a)）。
+ * 冷えた固定の移し先。
  *
- * v1.6 の要件 R2 は「口座が枯れるまで動かさない」だった。枯れるまで動かさないと、
- * 一度混んだ口座に集まったセッションは、そのセッションが二度と来なくなっても
- * その口座の「重さ」として残り続ける。とはいえ温かいセッションを動かすのは、
- * 上流のプロンプトキャッシュを捨てて作り直させるという実費の伴う操作である。
- * そこで**キャッシュが失効したセッションだけ**を動かす:
+ * 口座が枯れるまで固定を動かさないと、一度混んだ口座に集まったセッションは、
+ * そのセッションが二度と来なくなってもその口座の「重さ」として残り続ける。
+ * とはいえ温かいセッションを動かすのは、上流のプロンプトキャッシュを捨てて
+ * 作り直させるという実費の伴う操作である。そこで**キャッシュが失効したセッションだけ**を、
+ * 次のすべてが揃ったときだけ動かす:
  *
- *   ①表に行があり ②最後の要求から `warmTtlMs` 以上空いていて
- *   ③結び付け先の利用率が `drainStartUtilization` 以上で ④別の行き先がある
+ *   ①表に行がある ②最後の要求から `warmTtlMs` 以上空いた
+ *   ③結び付け先の利用率が `drainStartUtilization` 以上
+ *   ④別の行き先があり、その利用率が結び付け先より低いと読める
  *
- * の4つが揃ったときだけ。①〜③のどれかが欠ければ `null` を返し、呼び出し側は v1.6 と
- * 同じ枝へ落ちる。**温かいセッションはこの線では1本も動かない。**
+ * どれかが欠ければ `null` を返し、呼び出し側はこの線が無いときと同じ枝へ落ちる。
+ * **温かいセッションはこの線では1本も動かない。** ④で比べるのは、同じ混み具合の
+ * 口座の間で、冷えるたびにセッションを行き来させないためである。
  *
- * 利用率は台帳の `assignmentHeadroomFor` から読む——選択側（`selectForNewAssignment`）と
- * 同じ読み方でなければ、窓が1つ増えた日に判定と選択がずれる。読めなかった窓を
- * 「空いている」とは読まない（`min == null` なら動かさない・D-60-4 と同じ構え）。
+ * 利用率は台帳の `assignmentHeadroomFor` から読む。選択側（`selectForNewAssignment`）と
+ * 同じ読み方でなければ、窓が1つ増えた日に判定と選択がずれる。利用率が読めない口座は、
+ * 結び付け先でも行き先でも「空いている」とは読まない（`min == null` なら動かさない）。
  *
  * @returns {object|null} 移す先の口座。移さないときは `null`。
  */
@@ -1905,7 +1907,10 @@ function coldReassignTarget({ entry, bound, accountManager, settings, modelFamil
   if (1 - headroom.min < drainStart) return null;
 
   const target = assign([bound.id]);
-  return target && target.id !== bound.id ? target : null;
+  if (!target || target.id === bound.id) return null;
+  const targetHeadroom = accountManager.assignmentHeadroomFor(target, modelFamily);
+  if (targetHeadroom.min == null || targetHeadroom.min <= headroom.min) return null;
+  return target;
 }
 
 /**
