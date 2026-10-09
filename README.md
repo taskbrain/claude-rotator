@@ -545,7 +545,7 @@ claude-rotator status
     ```
 - **`upstreamOverloadTo429: true` のときだけ変わること**（`false` の既定では何も変わりません）:
   - **Anthropic 上流が 529 `overloaded_error` を返したとき**、claude-rotator がそれを **429 `rate_limit_error` ＋ `Retry-After: 30`**（秒数は `upstreamOverloadRetryAfterSeconds`）に書き換えて Claude Code へ返します。Claude Code は 529 を3回受けると `fallbackModel` の次の要素へ移りますが、429 なら**同じモデルのまま待って再試行**します。**画面にエラーは出ますが、モデルは切り替わりません。**
-  - 書き換えるのは **Anthropic 上流が返した 529 のうち、本文の `error.type` が `overloaded_error` のものだけ**です。同じ 529 でも `api_error` などの本文、空の本文、壊れた本文は**そのまま素通し**します（本文が `gzip` / `deflate` / `br` で圧縮されている場合は展開してから判定し、展開できなければ素通しします）。
+  - 書き換えるのは **Anthropic 上流が返した 529 のうち、本文の `error.type` が `overloaded_error` のものだけ**です。同じ 529 でも `api_error` などの本文、空の本文、壊れた本文は**そのまま素通し**します（本文が `gzip` / `deflate` / `br` / `zstd`（Node が展開できる場合）で圧縮されている場合は、4段までの重ねがけも含めて展開してから判定し、展開できなければ素通しします）。
   - **claude-rotator 自身が作る 529**（全アカウント枠切れの `All Claude accounts are exhausted.`）と、**ブリッジ経由の 529** は対象外で、従来どおりの挙動のままです。
   - 合成した 429 からは、上流の `Retry-After` と `anthropic-ratelimit-*`（`anthropic-ratelimit-unified-reset` を含む）を**すべて除去**し、`Retry-After` を1つだけ付けます。除去しないと、Claude Code がそのリセット時刻まで（最大6時間）無言で待つことがあります。`request-id` などの診断用ヘッダは残します。
   - **アカウントの状態は一切変えません。** 上流の 529（過負荷）はモデル全体の混雑であってアカウント固有の事象ではないため、枠切れ・一時停止（throttle）として学習せず、アカウントの切り替えも行いません。同じ 529 が続いても、同じアカウントのまま返し続けます。
@@ -1601,7 +1601,7 @@ How it behaves:
   - Log lines gain `cached=` (whether the bridge answered from its cache; `none` when the header is absent) and `retryAfter=`.
 - **What changes only when `upstreamOverloadTo429: true`** (nothing changes with the default `false`):
   - When the Anthropic upstream answers **529 `overloaded_error`**, claude-rotator rewrites it into **429 `rate_limit_error` with `Retry-After: 30`** (the seconds come from `upstreamOverloadRetryAfterSeconds`). Claude Code moves to the next `fallbackModel` entry after three 529s, but on a 429 it **waits and retries on the same model**. **An error is still shown, but the model does not change.**
-  - Only a 529 **from the Anthropic upstream whose body `error.type` is `overloaded_error`** is rewritten. A 529 carrying any other body (`api_error`, an empty body, a truncated body) is **forwarded unchanged**. A body compressed with `gzip` / `deflate` / `br` is decompressed before the check, and is forwarded unchanged if it cannot be decompressed.
+  - Only a 529 **from the Anthropic upstream whose body `error.type` is `overloaded_error`** is rewritten. A 529 carrying any other body (`api_error`, an empty body, a truncated body) is **forwarded unchanged**. A body compressed with `gzip` / `deflate` / `br` / `zstd` (where Node can decompress it), including up to four stacked encodings, is decompressed before the check, and is forwarded unchanged if it cannot be decompressed.
   - **A 529 synthesized by claude-rotator itself** (`All Claude accounts are exhausted.`) and **a 529 coming from the bridge** are out of scope and behave exactly as before.
   - The synthesized 429 **drops every** upstream `Retry-After` and `anthropic-ratelimit-*` header (including `anthropic-ratelimit-unified-reset`) and carries exactly one `Retry-After`. Without that, Claude Code can sleep silently until the advertised reset (up to six hours). Diagnostic headers such as `request-id` are kept.
   - **Account state is never touched.** An upstream overload is a model-wide condition rather than an account-specific one, so it is never learned as an exhausted quota or a throttle, and it never rotates accounts: repeated 529s keep being answered from the same account.
