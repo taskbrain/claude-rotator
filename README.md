@@ -708,7 +708,7 @@ Codex Rotator                          sendable 0/2  (held 1, capped 1)
 | `enc` | 上流応答の `content-encoding`（`gzip` / `br` / `deflate` / 無圧縮は `-`）。 |
 | `usageParse` | **usage を数えられなかったときだけ**出ます。`ok` のときは出ません。 |
 
-`usageParse` の値は `unsupported-encoding`（この Node では解けない符号化）、`too-large`（`maxBodyBytes` 超）、`unparsable`（JSON でも SSE でもない）、`no-usage`（429 / 401 など usage を含まない応答）です。**黙って 0 件にせず、必ず理由が行に残ります。**
+`usageParse` の値は `unsupported-encoding`（この Node では解けない符号化・知らない符号化が1段でも混じったとき・5段以上の重ねがけ）、`too-large`（`maxBodyBytes` 超）、`unparsable`（解凍に失敗したとき、または JSON でも SSE でもない）、`no-usage`（429 / 401 など usage を含まない応答）です。**黙って 0 件にせず、必ず理由が行に残ります。**
 
 値が無いところは `-` になります。`totalRequests` は **usage を読めた応答だけ**を 1 件として数えます（読めなかった件数は `usageParse=` の分布から数えてください）。
 
