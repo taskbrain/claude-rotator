@@ -2136,6 +2136,45 @@ describe('account_switch log line', () => {
     ]);
   });
 
+  it('keeps whitespace in account ids from splitting the account_switch fields', () => {
+    const logger = collectingLogger();
+    const manager = new AccountManager({
+      accounts: [
+        { id: 'acct one', name: 'one@example.com', type: 'oauth' },
+        { id: 'acct two', name: 'two@example.com', type: 'oauth' },
+      ],
+      currentAccountId: 'acct one',
+      switchThreshold: 1,
+      now: () => 1000,
+      logger,
+    });
+    manager.updateQuota('acct one', {
+      'anthropic-ratelimit-unified-5h-utilization': '1',
+      'anthropic-ratelimit-unified-5h-reset': '20',
+    });
+    manager.updateQuota('acct two', {
+      'anthropic-ratelimit-unified-5h-utilization': '0.1',
+      'anthropic-ratelimit-unified-7d-utilization': '0.2',
+    });
+
+    manager.rebalanceActiveAccount();
+
+    const lines = switchLines(logger);
+    assert.equal(lines.length, 1);
+    const tokens = lines[0].split(' ');
+    assert.deepEqual(
+      tokens.filter(token => token.startsWith('from=') || token.startsWith('to=')),
+      ['from=acct_one', 'to=acct_two'],
+    );
+    assert.deepEqual(tokens.slice(1), [
+      'account_switch',
+      'from=acct_one',
+      'to=acct_two',
+      'reason=quota-threshold',
+      'trigger=usage-refresh',
+    ]);
+  });
+
   it('writes one account_switch line for a reactive 429', () => {
     const logger = collectingLogger();
     const manager = new AccountManager({

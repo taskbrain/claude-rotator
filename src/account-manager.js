@@ -811,7 +811,9 @@ export class AccountManager {
     if (from === to) return;
     const at = new Date(this.now()).toISOString();
     const normalizedTrigger = ACCOUNT_SWITCH_TRIGGERS.has(trigger) ? trigger : 'unknown';
-    this.logger(`${at} account_switch from=${from ?? 'none'} to=${to ?? 'none'} reason=${reason} trigger=${normalizedTrigger}`);
+    // Whitespace would split one field into two; every other character is kept as is.
+    const field = value => String(value).replace(/\s/g, '_');
+    this.logger(`${at} account_switch from=${field(from ?? 'none')} to=${field(to ?? 'none')} reason=${field(reason)} trigger=${normalizedTrigger}`);
   }
 
   resumeTarget({
