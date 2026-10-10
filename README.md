@@ -35,6 +35,7 @@ npm レジストリでは配布していません（`package.json` は `"private
   - [キャッシュ観測（`observability`）](#キャッシュ観測observability)
   - [使用量イベント（`usage-events.jsonl`）](#使用量イベントusage-eventsjsonl)
 - [Codex の口座の切り替え（codex-rotator）](#codex-の口座の切り替えcodex-rotator)
+  - [状態の JSON（codex-rotator status）](#状態の-jsoncodex-rotator-status)
   - [口座のフォルダで起動したときの守り](#口座のフォルダで起動したときの守り)
   - [複数の口座を使うリスク](#複数の口座を使うリスク)
 - [主なコマンド](#主なコマンド)
@@ -514,8 +515,6 @@ claude-rotator status
 | `degradeMapping.upstreamOverloadRetryAfterSeconds` | `30` | 上記で付け直す `Retry-After` の秒数。`1`〜`3600` の整数だけを受け付け、それ以外（小数・文字列・範囲外）はすべて `30` になります |
 | `degradeMapping.claudeExhaustedTo529` | `true` | **Claude の全口座が枠切れになったときに、claude-rotator が返す 429 を 529 `overloaded_error` へ書き換えるかどうか。** 既定の `true` は従来どおりの写像（529。`bothUnusableStatus` / `recoveryWaitEnabled` によっては 403 / 429）で、Claude Code を `fallbackModel` の次のモデルへ退避させるための書き換えです。`false` にすると、429 を `anthropic-ratelimit-unified-*` ヘッダと本文のまま**そのまま返します**——Claude Code はこれを「プランの使用量上限」と認識し、`fallbackModel` を使わずに**同じモデルのままリセットまで待って再試行**します（`fallbackModel` を設定しない運用ではこちらが目的の挙動です）。**このキーだけは既定が `true` なので、無効化として受け付けるのは真偽値の `false` だけ**です（`"false"` や `0` を含むそれ以外の値はすべて既定の `true` になります）。**このキーが効くのは `degradeMapping.enabled` が `true`（529 への写像が有効）のときだけです。** `degradeMapping.enabled` が `false`（既定）なら、この 429 はもともと書き換えられずにそのまま返るので、`true` でも `false` でも応答は変わりません（`false` にしたときの `config-notice` が出るだけです）。ただし `openaiBridge.enabled` が `true` で、その `url` / `modelPattern` が不正（`url` がループバックでない場合を含む）なときは、このキーを含む `degradeMapping` 全体が無効になります。`false` にしたときは起動時と `POST /internal/reload` のときに `config-notice` が1行出ます |
 | `degradeMapping.gptPoolUnusableTtlMs` | `60000`（60秒） | 「GPT 側は使えない」という学習を、状態不明へ戻すまでの時間。`recoveryWaitEnabled` が `false` のときは**回復見込み時刻を伴わない学習にだけ**効き、`true` のときは回復見込み時刻を伴う学習にも `min(回復見込み時刻, 学習時刻 + この値)` として効きます |
-| `degradeMapping.codexStatusUrl` | `null` | `status` にブリッジ側の枠状況を表示するための取得先（loopback のみ）。`null` なら表示しません |
-| `degradeMapping.codexStatusTimeoutMs` | `1500` | 上記取得のタイムアウト（必ず有限値） |
 
 **既定は無効です。** `degradeMapping` を書かなければ挙動は現行とまったく同じで、新規インストール時に生成される `config.json` にもこのセクションは書き出されません。claude-rotator を単体で使う場合、何もする必要はありません。転送先のブリッジも任意であり、無くても claude-rotator は完全に動作します。
 
@@ -584,56 +583,6 @@ claude-rotator status
 - 529 は Anthropic が本当に過負荷のときと同じ経路です。`fallbackModel` を設定していない利用者からは、通常の過負荷エラーと区別が付きません。次の要素へ切り替わるのは Claude Code が 529 を3回再試行した後で、これは `fallbackModel` に次の要素がある場合の挙動です。
 - `fallbackModel` の最終要素も同じ枯渇したプールに当たる構成では、Claude Code は指数バックオフ（約0.6秒→約74秒）で再試行を続けます。当リポジトリの実測では、150秒の観測窓内で終端せず、エラー表示も出ませんでした。`bothUnusableStatus` の既定を `403`（明示停止）にしているのはこのためで、`529` にすると同じ無言待ちが起こり得ます。`openaiBridge.enabled` が `false` のまま `degradeMapping.enabled` を `true` にする構成でも同じ限界があるため、起動時とリロード時に警告を1行出します（禁止はしません）。
 - ログには token を書かず、アカウントはアカウント ID（`account=`）で表します。`--id` を省いて登録した場合、このアカウント ID はメールアドレスの記号をハイフンに置き換えたものなので、元のアドレスがほぼ読み取れます。`status` のアカウント表示には登録時の表示名（`--name`。省略時はログイン中のメールアドレス）がそのまま出ます。
-
-#### `status` の Codex 節（`codexStatusUrl` を設定したとき）
-
-`degradeMapping.codexStatusUrl` を設定すると、`status` / `monitor` の末尾に転送先ブリッジ（Codex）側の枠状況が表示されます。Claude 側の表示は1行も変わらず、未設定なら節そのものが出ません。
-
-```text
-Codex Rotator                          sendable 0/2  (held 1, capped 1)
-  reading  usage GET, startup check passed   raw pool state: exhausted
-  primary  held      7d █████████░  98%  stop 75%   reset in 5d5h -> 09/21 20:59 JST
-    clears   not at that reset - needs 2 clean usage reads at 70% or less
-    read     09/16 15:32 JST usage GET, ordinary use allowed, stops when unread
-  pro2     capped    7d ██████████ 100%  stop 100%  reset in 3d1h -> 09/19 17:10 JST
-    clears   not at that reset - needs 2 clean usage reads at 99% or less
-    read     09/16 15:32 JST usage GET, ordinary use allowed, sends when unread
-  note: held = stopped at our own line, capped = the plan limit itself
-  note: held / capped read as "cooldown" in /healthz
-  note: second window on pro2 is stale - last read 0% on 09/16 06:23 JST
-  note: percentages cover the whole account - ChatGPT app, Codex CLI, and this bridge
-  note: the CLI's own share cannot be separated out
-  note: accounts are shown by label
-```
-
-**停止はリセット時刻では解けません。** 行末の `reset in ... -> ... JST` は使用率の窓が初期化される時刻であって、その口座が送れるようになる時刻ではありません。解除の条件は必ずその直下の `clears` 行に書かれています。
-
-状態語の意味:
-
-| 語 | 意味 | 何で解けるか |
-|---|---|---|
-| `ready` | 送れる | — |
-| `held` | 当方の停止線（`stop` 欄が100%未満）で止めた＝枠の温存 | 条件を満たす使用率の観測が2回 |
-| `capped` | 上流の枠そのものに到達した（`stop 100%`） | 同上 |
-| `stopped` | 個別の停止線を持たない口座が、全体の既定線で止まった | 条件を満たす観測が1回 |
-| `reserved` | 観測を失っており、読めるまで送らない設定の口座 | 完全な観測が1回 |
-| `unread` | 使用率の観測がまだ無い | 同上 |
-| `exhausted` | 429 を観測した | リセット後の再確認 |
-| `blocked` | 上流が通常利用を拒否している | 通常利用可と読める観測 |
-| `needs login` | ログインが切れている | 再ログイン |
-
-`held` と `capped` の解除条件には、使用率のほかに**上流が通常利用を許可していると読める観測であること**が含まれます。上流が拒否している間は使用率が下がっても解けないため、そのときは `clears` 行の直下に `refused` 行を出します。停止線（`stop` 欄）を緩めても、拒否が続くかぎりその口座は1本も送れません。
-
-読み方の補足:
-
-- `/healthz` の `state` と画面の状態語は1対1ではありません。停止ラッチの掛かった口座（`held` / `capped` / `stopped` / `blocked`）だけが `cooldown` と出て、ラッチを持たない `reserved` / `unread` は `ready` のまま出ます（送れないのは選択側の判断のため）。画面はこの対応を**そのときのペイロードから起こして** `note:` 行に出すので、`/healthz` と突き合わせるときはその行を見てください。
-- ラベル欄は画面に出る最長のラベルに合わせて広がります（契約の上限は32文字）。ラベルが20文字を超える構成では、行はその分だけ長くなります。ラベルを切り詰めると `/healthz` と突き合わせられなくなるため、切り詰めません。
-- `read` 行が観測の出所（`usage GET` など）を併記するのは、それがその読み取りのものだと確かめられるときだけです（ブリッジは口座ごとに1つの出所しか報告せず、それは主窓・副窓のうち最後に読んだ方のものです）。
-- 使用率は主窓（`7d` など）のものだけを表示します。副窓は観測が現在のものであるときだけ主窓の真下へ1行足し、鮮度が切れた副窓は `note` で開示します。
-- `*` は「最後に取れた値であり、現在の観測は途切れている」という印です。このときバーは `----------` になります。
-- 既に過ぎたリセット時刻は表示しません。
-- ブリッジが選択理由（`selectionEligible` など）を報告しない旧版のときは、推測せず従来の `pool: <状態> (N/M available)` 形式のまま表示します。
-- 表示される数字は ChatGPT アプリ・Codex CLI・本ブリッジを含む口座全体の消費であり、CLI 単独の取り分は切り出せません。
 
 ### セッション単位のアカウント固定（`sessionAffinity`）
 
@@ -859,16 +808,17 @@ claude-rotator prepare-resume --refresh --json
 
 `codex-rotator` は、このリポジトリに同梱しているもう1つのコマンドです（`npm install -g .` で `claude-rotator` と一緒に入ります）。Codex CLI（`codex`）を、登録した複数の ChatGPT アカウント（以下「口座」）のどれかで起動します。口座ごとに専用のフォルダ（以下「口座のフォルダ」）を作り、そのフォルダを `CODEX_HOME` にして本物の `codex` を起動することで、口座を切り替えます。
 
-この版の副コマンドは次の3つです（`codex-rotator` を引数なしで実行したときに出る使い方の1行）。
+この版の副コマンドは次の4つです（`codex-rotator` を引数なしで実行したときに出る使い方の1行）。
 
 ```text
-usage: codex-rotator <exec|login|accounts> [args...]
+usage: codex-rotator <exec|login|accounts|status> [args...]
 ```
 
 | 副コマンド | 何をするか |
 |---|---|
 | `login` | 新しい口座を口座のフォルダへログインさせ、設定に登録する。`--relogin` で、登録済みの口座にログインし直す |
 | `accounts` | 登録した口座の一覧を出す。`--json` で機械向けの形 |
+| `status` | 口座ごとの使用量と状態を出す。`--json` で機械向けの形、`--json --section` は見張りから使う形 |
 | `exec` | 口座を1つ選び、その口座のフォルダで `codex` を起動する |
 
 - **今は `codex-rotator exec` を通した起動だけが口座を切り替えます。** いつもの `codex` の直接の起動は、この版では切り替わらず、これまでどおり `~/.codex`（または利用者が指定した `CODEX_HOME`）で動きます。
@@ -1026,6 +976,114 @@ usage: codex-rotator accounts [--json]
 
 - 読むのは設定ファイルだけで、資格情報は読まず、常駐にも問い合わせません。設定が検証を通らないときは、標準出力に何も出さずに 1 で終わり、理由を標準エラーに出します。
 
+### 状態の JSON（codex-rotator status）
+
+```text
+usage: codex-rotator status [--json [--section]]
+```
+
+- 引数なし：人向けの表示です。口座ごとに、状態語・使用率のバー・停止の線（`stop`）・窓のリセット時刻と、停止が解ける条件や直し方（`clears` の行。ログインが切れた口座には `run codex-rotator login --label <ラベル> --relogin`、資格情報が読めない口座には `run codex-rotator remove --label <ラベル>, then log in again with codex-rotator login`）を出します。停止は窓のリセットでは解けず、条件を満たした使用量の読取でだけ解けます。出来事（`events`）は、新しい方から8件だけを出します。
+- `--json`：機械向けの形（固定のスキーマ）を、標準出力へ1行で出します。
+- `--json --section`：`--json` と同じスキーマ・同じ検査です。違いは、起動から JSON を書き終えるまでの全体の期限（6000 ms）を守ることだけです。期限までに読めなかった口座は、`stateWord` が `unread`（`blockWhenUnknown` が真なら `reserved`）、`reason` が `read-deadline` として入ります。
+- 読み方：codex-rotator の常駐（口座の使用量を見張るバックグラウンドのプロセス）が設定の `daemon.port` で答えれば、その状態を出します（`source` は `daemon`）。1000 ms のうちに使える答えが無ければ、口座ごとにその場で使用量を1回読みます（`source` は `direct`）。常駐が接続を断ったときや、答えが正しい形でないときは、1000 ms を待たずにすぐその場の読取へ移ります。常駐が無いときは停止（ラッチ）の状態が分からないので、`latchKnown` は `false` で、人向けの表示の `latch` の行は `unknown (no daemon)` です。
+- 設定ファイルが無いとき、または `enabled` と `acknowledgedMultiAccountRisk` の両方が `true` でないときは、資格情報を読まず、使用量も読まずに、`enabled` が `false`・`accounts` が空・`next.reason` が `disabled` の形を出します（人向けの表示は `disabled (requires enabled and acknowledgedMultiAccountRisk)` の1行）。設定が読めないときは、標準出力に何も出さずに、標準エラーに `config unreadable` を出して 1 で終わります。読む途中で予期しない失敗が起きたときも、標準出力に何も出さずに、標準エラーに `status unavailable` を出して 1 で終わります。
+- 口座はラベルだけで指します。口座のフォルダのパス・メールアドレス・トークン・User-Agent の値は出しません。
+- `claude-rotator status` と `monitor` の画面にも、同じ Codex の節が出ます。`claude-rotator` は `codex-rotator status --json --section` を子プロセスとして起動し（PATH は探さず、同じ Node の実行ファイルと同梱の入口の絶対パスで起動します）、その JSON を引数なしの表示と同じ形で描きます。codex-rotator の設定ファイルが無いと確かめられたとき（ファイルか、その途中のフォルダが無いとき）は子を起動せず、画面は Codex の節の無いものと1バイトも変わりません。権限が無いなどで有無を確かめられないときは子を起動し、子が設定を読めなければ、次に書く `codex: display error` の1行になります。子の出力を使えないとき（8000 ms を過ぎた・0 以外で終わった・シグナルで終わった・起動できなかった・JSON として読めない・スキーマの検査を通らない・256 KiB を超えた）は、節が `codex: display error (<理由>)` の1行だけになり、`claude-rotator status` の終了コードは変わりません。理由は `timeout 8000ms`・`exit N`・`signal <名前>`・`spawn failed`・`invalid json`・`schema`・`too large` のどれかです。子の標準エラーは画面に出しません。`monitor` は画面を1秒ごとに描き直しますが、子を起動するのは、前の起動から、常駐の答えを描いているときは5秒、それ以外のときは60秒が過ぎたときだけです（その間は最後に読めた節を描きます）。
+- 実際の出力は1行で、例は読みやすく改行しています（口座1つ・常駐あり）。
+
+  ```json
+  {
+    "schemaVersion": 1,
+    "provider": "codex",
+    "enabled": true,
+    "generatedAt": "2026-01-01T00:00:00Z",
+    "source": "daemon",
+    "latchKnown": true,
+    "daemon": { "reachable": true, "startedAt": "2025-12-31T23:00:00Z" },
+    "pool": { "state": "ok", "resetAt": null },
+    "observation": { "method": "usage-get", "startupCheck": "passed", "accountUsageIncludesExternalClients": true,
+      "cliConsumptionVisible": false, "userAgentSource": "codex-version" },
+    "next": { "label": "work", "reason": "selectable" },
+    "accounts": [
+      { "label": "work", "order": 1, "state": "available", "stateWord": "ready", "selectable": true, "reason": null,
+        "resetAt": null, "ordinaryUsageAllowed": true, "nextObservationAt": "2026-01-01T00:01:00Z",
+        "policy": { "stopUsedPercent": 85, "resumeUsedPercent": 80, "blockWhenUnknown": true },
+        "latch": null,
+        "windows": {
+          "fiveHour": { "usedPercent": 40, "resetAt": "2026-01-01T02:00:00Z", "windowMinutes": 300, "fresh": true,
+            "observedAt": "2025-12-31T23:59:30Z", "lengthSource": "reported" },
+          "weekly": { "usedPercent": 60, "resetAt": "2026-01-04T00:00:00Z", "windowMinutes": 10080, "fresh": true,
+            "observedAt": "2025-12-31T23:59:30Z", "lengthSource": "reported" }
+        },
+        "otherWindows": [], "observedAt": "2025-12-31T23:59:30Z", "headroomPercent": 25 }
+    ],
+    "aggregate": { "effectiveRemainingPercent": 25, "lowerBoundPercent": 25, "fiveHourRemainingPercent": 45,
+      "weeklyRemainingPercent": 25, "accountsTotal": 1, "accountsAvailable": 1, "accountsSelectable": 1,
+      "accountsUnknown": 0, "unit": "percent-points-of-one-account" },
+    "events": [ { "at": "2025-12-31T23:30:00Z", "type": "selected", "label": "work" } ]
+  }
+  ```
+
+  | キー | 中身 |
+  |---|---|
+  | `schemaVersion` | スキーマの版（今は `1`） |
+  | `provider` | 常に `codex` |
+  | `enabled` | 2つのゲートが両方 `true` か |
+  | `generatedAt` | 出した時刻（UTC、秒まで） |
+  | `source` | `daemon`（常駐の状態）か `direct`（その場で読んだ） |
+  | `latchKnown` | 停止の状態が分かるか（常駐があるときだけ `true`） |
+  | `daemon` | `reachable`（常駐が答えたか）と `startedAt`（常駐の起動時刻） |
+  | `pool` | `state`（`ok`・`degraded`・`exhausted`・`mixed`・`needs-login`・`credentials-unavailable`・`no-account`・`unknown`）と `resetAt`（全体のリセット時刻） |
+  | `observation` | `method`（常に `usage-get`）・`startupCheck`（常駐の起動の後の確かめ：`passed`・`failed`・`pending`、常駐が無ければ `null`）・`accountUsageIncludesExternalClients`（使用率は口座全体の値）・`cliConsumptionVisible`（Codex CLI だけの分は分けられない）・`userAgentSource`（`codex-version`・`config`。作れなかったとき、または使用量の読取を1つも送らなかったときは `null`） |
+  | `next` | 次に自動で選ばれる口座の `label` と、`reason`（`selectable`・`last-resort`・`none`・`disabled`） |
+  | `accounts` | 口座ごとの状態（下の表） |
+  | `aggregate` | 全口座の実効残量と件数（下の表） |
+  | `events` | 常駐が覚えている出来事（メモリだけ・50件まで）の `at`・`type`（`stopped`・`released`・`window-cap-dropped`・`needs-login`・`recovered`・`reloaded`・`selected`）・`label` |
+
+  口座（`accounts` の各要素）のキーです。
+
+  | キー | 中身 |
+  |---|---|
+  | `label` | 口座のラベル |
+  | `order` | 設定の並び順（1から。1 が主口座で、自動で選ぶときはこの順に見ます） |
+  | `state` | 4つの状態：`available`・`exhausted`・`login_required`・`unknown` |
+  | `stateWord` | 人向けの表示の状態語（下の対応表の12語） |
+  | `selectable` | 今、自動で選べるか（スキーマは `null` を許します。今の版は常に真偽値を出します） |
+  | `reason` | 選べない理由の語（選べれば `null`）。ログイン切れは `access-token-expired`・`upstream-unauthorized`・`upstream-forbidden`、使用量を読めなかった原因は `codex-cli-missing`・`codex-version-unreadable`・`read-deadline` |
+  | `resetAt` | 口座のリセット時刻 |
+  | `ordinaryUsageAllowed` | 上流が通常の利用を許していると答えたか（答えを読めていなければ `null`） |
+  | `nextObservationAt` | 次に使用量を読む予定（常駐が無ければ `null`） |
+  | `policy` | `stopUsedPercent`・`resumeUsedPercent`・`blockWhenUnknown` |
+  | `latch` | 停止中のときの `stopped`・`cappedWindows`（`fiveHour`・`weekly`・`other`）・`upstreamBlocked`・`cleanReadsDone`・`cleanReadsNeeded`・`since`（停止していなければ `null`） |
+  | `windows` | `fiveHour`（5時間窓）と `weekly`（週次窓）。無ければ `null` |
+  | `otherWindows` | ほかの長さの窓の並び |
+  | `observedAt` | 最後に使用量を読んだ時刻 |
+  | `headroomPercent` | この口座の実効残量（停止の線までの残り。分からなければ `null`） |
+
+  窓（`windows.fiveHour`・`windows.weekly`・`otherWindows` の各要素）のキーは、`usedPercent`・`resetAt`・`windowMinutes`・`fresh`（新しい値か）・`observedAt`・`lengthSource`（長さを上流が申告した `reported` か、並び順で決めた `position`）です。`aggregate` のキーは、`effectiveRemainingPercent`（全口座の実効残量の合計。1つでも分からなければ `null`）・`lowerBoundPercent`（分かった分の合計）・`fiveHourRemainingPercent`・`weeklyRemainingPercent`・`accountsTotal`・`accountsAvailable`・`accountsSelectable`・`accountsUnknown`・`unit`（常に `percent-points-of-one-account`）です。
+
+  状態語と4つの状態の対応です。
+
+  | `state` | `stateWord` |
+  |---|---|
+  | `available` | `ready` |
+  | `exhausted` | `held`（自分の停止の線で止めた）・`capped`（枠そのものの上限）・`exhausted`・`stopped`・`blocked`（上流が通常の利用を断っている） |
+  | `login_required` | `needs login`・`no creds`（資格情報が読めない） |
+  | `unknown` | `no models`・`reserved`（使用量が分かるまで送らない）・`unread`・`starting` |
+
+#### 見張りから使う（status --json --section）
+
+`codex` を起動する前に口座の状態を確かめる見張りの仕組みからは、次の口を使ってください。
+
+```text
+codex-rotator status --json --section
+```
+
+- 起動から JSON を書き終えるまでの全体の期限は 6000 ms です。待ち時間の目安は 8000 ms です（Node の起動と受け渡しの余裕を足した、呼ぶ側が待つ期限）。終了コード 0 のときだけ、標準出力に上の JSON が1行あります。
+- 見張りは、`next.label` が `null` のとき、または `source` が `daemon` でないときに、起動を断ってください。口座の選び方は codex-rotator と同じで、常駐が無いときだけ、見張りのほうが意図して厳しくなります（常駐が無いと、呼ぶたびに上流へ使用量を読みに行き、頻度の制限に当たりうるためです。常駐が動いているのが正しい状態です）。
+- 有料クレジットの有無は出しません。有料クレジットで動く口も作りません（使用量の応答のクレジットの欄は、欄があるかどうかだけを見て、選択にも表示にも使いません）。
+- 口座は起動（セッション）の単位で選びます。会話の途中で停止の線を越えても、その会話の口座は切り替えません。
+
 ### 口座を選んで起動する（codex-rotator exec）
 
 ```text
@@ -1049,10 +1107,11 @@ usage: codex-rotator exec [--account <label>] -- [codex arguments...]
   1. 設定を1回だけ読みます。読めなければ `config unreadable`。
   2. 2つのゲートが両方 `true` でなければ `disabled`。
   3. 起動の型に合わなければ `argument rejected (form)`。
-  4. `--account` のラベルが登録されていなければ `account not registered`。
-  5. 口座を選びます（下）。本物の `codex` が見つからないときは、`--account` ありなら `cannot launch (codex-cli-missing)`、なしなら `no account available` で止まります。
-  6. 選んだ口座のフォルダで、守りの点検を行います。通らなければ `guard unverified (<理由>)`。
-  7. 第1層を先頭に付けて、本物の `codex` を起動します。起動できなければ `launch failed`。標準入出力は受け継ぎ、exec 自身は標準出力に何も書きません。`codex` の終了コードをそのまま返し、`codex` がシグナルで終わったときは同じシグナルを自分へ当て直します。
+  4. 環境に `CODEX_API_KEY` か `CODEX_ACCESS_TOKEN` があれば（空の値でも）、`auth env set (<変数の名前>); unset and run again to use the chosen account`（両方あれば両方の名前を並べます）。値は出しません。`codex` はこれらの変数を口座のフォルダの `auth.json` より先に使うため、あると選んだ口座で動きません。
+  5. `--account` のラベルが登録されていなければ `account not registered`。
+  6. 口座を選びます（下）。本物の `codex` が見つからないときは、`--account` ありなら `cannot launch (codex-cli-missing)`、なしなら `no account available` で止まります。
+  7. 選んだ口座のフォルダで、守りの点検を行います。通らなければ `guard unverified (<理由>)`。
+  8. 第1層を先頭に付けて、本物の `codex` を起動します。起動できなければ `launch failed`。標準入出力は受け継ぎ、exec 自身は標準出力に何も書きません。`codex` の終了コードをそのまま返し、`codex` がシグナルで終わったときは同じシグナルを自分へ当て直します。
 - 口座の選び方（常駐が無いとき。その場で、口座の資格情報で使用量を1回読みます）
   - `--account` なし：設定の並び順に1口座ずつ読み、使用量が全部読めて、使えると答え、申告された全部の窓の使用率が `resumeUsedPercent` 以下の、最初の口座を選びます。使用量が分からない口座は選びません。1つも無ければ `no account available`。
   - `--account` あり：その口座だけを読みます。資格情報が読めなければ `no creds`、どれかの窓の使用率が `stopUsedPercent` 以上（または使えないと答えた）なら `account stopped`、使用量が分からないときは、`blockWhenUnknown` が `true` なら `usage unknown (blockWhenUnknown)`、`false` なら次の警告の1行を出して起動します。
@@ -1099,14 +1158,14 @@ usage: codex-rotator exec [--account <label>] -- [codex arguments...]
   plugins = false
   ```
 
-- **コネクタとプラグインを既定で切る理由**：ChatGPT のアカウントに結び付いたコネクタ（メールなどの外部のサービスとの連携）とプラグインは、`~/.codex` に置いた細かい遮断が口座のセッションでは効かないので、口座の側では丸ごと切っています。資格情報をファイルに保存する指定は、資格情報を口座のフォルダの `auth.json` に置き、口座ごとに分けるためです。
+- **コネクタとプラグインの機能を `false` にする理由**：ChatGPT のアカウントに結び付いたコネクタ（メールなどの外部のサービスとの連携）とプラグインは、`~/.codex` に置いた細かい遮断が口座のセッションでは効かないので、口座の側では、コネクタとプラグインの機能（`apps` と `plugins`）を `false` にする指定を付けています（第1層と第2層）。下の「起動ごとの点検」が確かめるのは、`codex features list` の `apps` と `plugins` の値と、`codex mcp list --json` の MCP サーバの件数です。この指定で、セッションの中のコネクタが必ず止まるとは限りません（下の「守りの対象外」）。資格情報をファイルに保存する指定は、資格情報を口座のフォルダの `auth.json` に置き、口座ごとに分けるためです。
 - **起動の型**：exec が口座を選んで起動するのは、次の3つの並びだけです。語ごとの完全一致で照らし、どれにも当たらなければ `argument rejected (form)` の1行で止まります（値は出しません）。
   1. 非対話の `exec`：最初の語が `exec`、最後の語が単独の `-`（文章を標準入力から読む。1回だけ）。その間に置けるのは、`-s`（`read-only` か `workspace-write`）・`--skip-git-repo-check`・`--json`・`-m <モデルの名前>`・`-c model_reasoning_effort=<英小文字>`・`-c features.image_generation=true`・`--image <ファイル>`・`--`（最後の `-` の直前に1回。`--image` があるときは必須）です。順は問いません。`--image` のほかは、それぞれ1回までです。
   2. 引数の無い対話：語が1つも無い並び。
   3. 版の表示：`--version` の1語。
   - そのため、`resume`・`fork`（過去の会話の再開）・`review`・`login`・`-C`・最初の文章を付けた対話などは、exec では使えません。**口座で始めた会話は、exec では再開できません**（会話の記録は、その口座のフォルダに残ります）。
 - **`--no-daemon`**：引数の無い対話（2つ目の型）でだけ、第1層の直後に Codex CLI の `--no-daemon`（共有の常駐を使わない指定）を1回付けます。利用者が付けた `--no-daemon` は、型に合わないので拒否します。
-- **起動ごとの点検**：`codex` を起動する直前に毎回、選んだ口座のフォルダを `CODEX_HOME` にし、exec を実行したフォルダ（実パス）で、第1層（と、1つ目の型の `-c` の値）を付けた `codex features list` と `codex mcp list --json` を順に起動します。`apps` と `plugins` がどちらも `false` で、MCP サーバが0件のときだけ `codex` を起動します。点検の起動は、1つずつ 3 秒が期限で、標準出力は 64 KiB まで読みます。通らなければ、`codex` を起動せずに `guard unverified (<理由>)` の1行で止まります。
+- **起動ごとの点検**：`codex` を起動する直前に毎回、選んだ口座のフォルダを `CODEX_HOME` にし、exec を実行したフォルダ（実パス）で、第1層（と、1つ目の型の `-c` の値）を付けた `codex features list` と `codex mcp list --json` を順に起動します。`apps` と `plugins` がどちらも `false` で、MCP サーバが0件のときだけ `codex` を起動します。点検の起動は、1つずつ 3 秒が期限で、標準出力は 64 KiB まで読みます。通らなければ、`codex` を起動せずに `guard unverified (<理由>)` の1行で止まります。点検は起動の前の1回だけで、起動の後にセッションの中で効くようになった設定は見ません（下の「守りの対象外」）。
 
   | 理由 | 意味 |
   |---|---|
@@ -1123,6 +1182,8 @@ usage: codex-rotator exec [--account <label>] -- [codex arguments...]
 - **守りの対象外**
   - exec を通らない起動。いつもの `codex`、口座のフォルダを `CODEX_HOME` にして自分で起動した `codex`、口座のセッションの中から起動した `codex`（子は `CODEX_HOME` を受け継ぎます）には、第1層も点検も付きません。後の2つは、その口座のフォルダで、第2層だけで動きます。
   - 信頼済みのプロジェクトの設定は、口座のセッションでも読まれます。点検の `mcp list` は、信頼済みのプロジェクトの MCP サーバへ繋ぎうります。
+  - exec で開いた対話の中で、Codex が作業フォルダを信頼するかを尋ねたときに信頼を選ぶと、そのプロジェクトの設定（MCP サーバを含む）が、点検を経ずにそのセッションで読まれます。口座のセッションでは、まだ信頼していないプロジェクトを信頼せず、終了を選んでください。
+  - 点検を通って起動したセッションの中でも、コネクタがつながることがあります。実機で、そうしたセッションの `/mcp` の一覧に、コネクタ（`codex_apps`）が `connected` と出たのを見ています。どういう条件でつながるかは、まだ確かめている途中です。
   - ホームのフォルダ（`~/.codex` を含むフォルダ）を、口座のセッションで信頼しないでください。信頼すると、`~/.codex` の設定・フック・規則が、プロジェクトの設定として読まれうるためです。
 - **指示書を置く手順**：口座のセッションで使いたい指示書（`AGENTS.md`）は、口座のフォルダに自分で置いてください。codex-rotator は `~/.codex` の中を読まず、写しもしません。
 - **フック**：プロジェクトのフックで守りを掛けているときは、口座のフォルダごとに Codex の `hooks` の機能を有効にし、そのフックを信頼する必要があります（login が作る口座のフォルダの設定は上の3つの設定だけで、`~/.codex` の設定は読まれません）。
@@ -1359,6 +1420,7 @@ This package is not published to the npm registry (`package.json` sets `"private
 - [Logs and Rotation Diagnostics](#logs-and-rotation-diagnostics)
   - [Per-Request Usage Events (usage-events.jsonl)](#per-request-usage-events-usage-eventsjsonl)
 - [Switching Codex Accounts (codex-rotator)](#switching-codex-accounts-codex-rotator)
+  - [Status JSON (codex-rotator status)](#status-json-codex-rotator-status)
   - [Guards When Codex Runs in an Account Folder](#guards-when-codex-runs-in-an-account-folder)
   - [The risks of using several accounts](#the-risks-of-using-several-accounts)
 - [Commands](#commands)
@@ -1868,8 +1930,6 @@ Configuration keys (the whole section may be omitted):
 | `degradeMapping.upstreamOverloadRetryAfterSeconds` | `30` | Seconds put into that `Retry-After`. Only integers from `1` to `3600` are accepted; anything else (fractions, strings, out-of-range values) becomes `30` |
 | `degradeMapping.claudeExhaustedTo529` | `true` | **Whether a 429 returned while every Claude account is out of quota is rewritten into 529 `overloaded_error`.** This covers every 429 the proxy answers with in that state — both the one it synthesises locally and one passed through from upstream — because they all reach the same mapping point. The default `true` is the existing mapping (529, or 403 / 429 depending on `bothUnusableStatus` / `recoveryWaitEnabled`): the rewrite is what makes Claude Code move on to the next `fallbackModel` entry. With `false` each of those 429s is **returned unchanged**, keeping its `anthropic-ratelimit-unified-*` headers and body — Claude Code then recognises it as a plan usage limit and **waits for the reset and retries on the same model** instead of falling back (this is what you want when no `fallbackModel` is configured). **This is the one key whose default is `true`, so only the boolean `false` turns it off** (everything else, `"false"` and `0` included, leaves the default `true` in place). **It only applies while `degradeMapping.enabled` is `true` (that is, while the 529 mapping is on).** With `degradeMapping.enabled` set to `false` (the default) that 429 is already returned unchanged, so `true` and `false` give the same response (`false` only adds the `config-notice` line). However, if `openaiBridge.enabled` is `true` and its `url` / `modelPattern` is invalid (including a non-loopback `url`), the whole `degradeMapping`, this key included, is disabled. Turning it off prints one `config-notice` line at startup and on `POST /internal/reload` |
 | `degradeMapping.gptPoolUnusableTtlMs` | `60000` (60 sec) | How long a "GPT side is unusable" observation is kept before it reverts to unknown. With `recoveryWaitEnabled: false` it only applies to observations **without** a recovery time; with `true` it also caps observations that carry one, as `min(recovery time, learned at + this value)` |
-| `degradeMapping.codexStatusUrl` | `null` | Endpoint used to show the bridge's quota state in `status` (loopback only). `null` shows nothing |
-| `degradeMapping.codexStatusTimeoutMs` | `1500` | Timeout for that fetch (always finite) |
 
 **Disabled by default.** If you do not write `degradeMapping`, behavior is exactly as before, and the `config.json` generated on a fresh install does not contain this section either. Users running claude-rotator on its own need to do nothing. The bridge is optional too: claude-rotator works fully without it.
 
@@ -1927,56 +1987,6 @@ Caveats:
 - A 529 travels the same path as a genuine Anthropic overload. To a user with no `fallbackModel`, it is indistinguishable from an ordinary overload error. Claude Code moves to the next entry after retrying a 529 three times, and that behavior applies only while `fallbackModel` still has a next entry.
 - If the last entry of `fallbackModel` lands in the same exhausted pool, Claude Code keeps retrying with exponential backoff (about 0.6 sec growing to about 74 sec). In our measurements it neither terminated nor surfaced an error within the 150-second observation window. That is why `bothUnusableStatus` defaults to `403` (explicit stop); setting `529` can reproduce the same silent wait. Leaving `openaiBridge.enabled` at `false` while turning `degradeMapping.enabled` on has the same limitation, so a single warning line is logged at startup and on reload (the combination is not forbidden).
 - Tokens are never logged, and accounts appear in the logs by account ID (`account=`). If you registered an account without `--id`, that ID is the email address with symbols replaced by hyphens, so the address is effectively readable. The account cards in `status` show the display name given at registration (`--name`; the logged-in email address when omitted) as is.
-
-#### The Codex Block in `status` (when `codexStatusUrl` is set)
-
-Setting `degradeMapping.codexStatusUrl` appends the forwarding bridge's (Codex) quota state to `status` / `monitor`. Not one line of the Claude side changes, and without the setting the block is not drawn at all.
-
-```text
-Codex Rotator                          sendable 0/2  (held 1, capped 1)
-  reading  usage GET, startup check passed   raw pool state: exhausted
-  primary  held      7d █████████░  98%  stop 75%   reset in 5d5h -> 09/21 20:59 JST
-    clears   not at that reset - needs 2 clean usage reads at 70% or less
-    read     09/16 15:32 JST usage GET, ordinary use allowed, stops when unread
-  pro2     capped    7d ██████████ 100%  stop 100%  reset in 3d1h -> 09/19 17:10 JST
-    clears   not at that reset - needs 2 clean usage reads at 99% or less
-    read     09/16 15:32 JST usage GET, ordinary use allowed, sends when unread
-  note: held = stopped at our own line, capped = the plan limit itself
-  note: held / capped read as "cooldown" in /healthz
-  note: second window on pro2 is stale - last read 0% on 09/16 06:23 JST
-  note: percentages cover the whole account - ChatGPT app, Codex CLI, and this bridge
-  note: the CLI's own share cannot be separated out
-  note: accounts are shown by label
-```
-
-**A reset instant does not lift a stop.** The trailing `reset in ... -> ... JST` is when the usage window starts over, not when the account can send again. What actually clears the stop is always written on the `clears` line directly underneath it.
-
-What each state word means:
-
-| Word | Meaning | What clears it |
-|---|---|---|
-| `ready` | Can send | — |
-| `held` | Stopped at our own line (the `stop` column is below 100%), i.e. quota held back | 2 qualifying usage readings |
-| `capped` | The plan limit itself was reached (`stop 100%`) | Same |
-| `stopped` | An account with no per-account stop line hit the global default | 1 qualifying reading |
-| `reserved` | The reading was lost and this account is configured not to send while unread | 1 complete reading |
-| `unread` | No usage reading yet | Same |
-| `exhausted` | A 429 was observed | A recheck after that reset |
-| `blocked` | The upstream refuses ordinary use | A reading that says otherwise |
-| `needs login` | The login expired | Signing in again |
-
-Clearing `held` or `capped` takes more than the percentages: the same readings must also say the upstream allows ordinary use. While it refuses, no drop in usage will lift the stop, so a `refused` line is printed directly under `clears`. Relaxing the stop line (the `stop` column) changes nothing for as long as the refusal stands.
-
-Reading the rest of it:
-
-- The `state` in `/healthz` does not map one to one onto the words on this screen. Only an account a stop latch is holding (`held`, `capped`, `stopped`, `blocked`) reads as `cooldown` there; `reserved` and `unread`, which carry no latch and are withheld by the selection rules instead, read as `ready`. The screen derives this mapping **from the payload it was handed** and prints it on a `note:` line, so use that line when matching a row against `/healthz`.
-- The label column stretches to the longest label on screen (the contract allows 32 characters). With labels longer than 20 the rows grow by the difference; they are never truncated, because a truncated label can no longer be matched against `/healthz`.
-- The `read` line names the source of a reading (`usage GET` and the like) only when that source can be shown to be this reading's. The bridge reports one source per account, taken from whichever of the two windows was read last.
-- The percentage is the primary window's (`7d` and the like) only. A second window adds one row directly beneath the primary one while its own reading is current; a stale second window is disclosed in a `note` instead.
-- `*` marks a value that is the last one obtained while the current reading is interrupted. The bar is drawn as `----------` in that case.
-- A reset instant that has already passed is never drawn.
-- An older bridge that reports no selection fields (`selectionEligible` and friends) keeps the previous `pool: <state> (N/M available)` layout rather than having the details guessed at.
-- The percentages cover the whole account - the ChatGPT app, the Codex CLI, and this bridge - and the CLI's own share cannot be separated out.
 
 #### Per-Session Account Pinning (`sessionAffinity`)
 
@@ -2135,16 +2145,17 @@ The resident server appends **one JSON Lines entry per upstream attempt** of `PO
 
 `codex-rotator` is a second command shipped in this repository (`npm install -g .` installs it together with `claude-rotator`). It launches the Codex CLI (`codex`) with one of several registered ChatGPT accounts (below, "accounts"). It creates a dedicated folder for each account (below, "the account folder") and switches accounts by launching the real `codex` with that folder as `CODEX_HOME`.
 
-This version has three subcommands (the usage line printed when `codex-rotator` is run without arguments):
+This version has four subcommands (the usage line printed when `codex-rotator` is run without arguments):
 
 ```text
-usage: codex-rotator <exec|login|accounts> [args...]
+usage: codex-rotator <exec|login|accounts|status> [args...]
 ```
 
 | Subcommand | What it does |
 |---|---|
 | `login` | Logs a new account in to its account folder and registers it in the config. With `--relogin`, logs a registered account in again |
 | `accounts` | Lists the registered accounts. `--json` gives the machine-readable form |
+| `status` | Shows the usage and state of each account. `--json` gives the machine-readable form, and `--json --section` is the form for a watcher |
 | `exec` | Selects one account and launches `codex` in that account folder |
 
 - **Only launches through `codex-rotator exec` switch accounts at present.** Launching the usual `codex` directly does not switch accounts in this version; it keeps running with `~/.codex` (or the `CODEX_HOME` you set).
@@ -2302,6 +2313,114 @@ usage: codex-rotator accounts [--json]
 
 - It reads only the config file: no credentials, and no query to the daemon. When the config does not pass validation, it prints nothing to standard output, exits with 1 and prints the reason to standard error.
 
+#### Status JSON (codex-rotator status)
+
+```text
+usage: codex-rotator status [--json [--section]]
+```
+
+- Without arguments: a view for people. Per account it shows the state word, a usage bar, the stop line (`stop`), the reset time of the window, and what clears a stop or how to fix the account (the `clears` line: `run codex-rotator login --label <label> --relogin` for an account whose login expired, `run codex-rotator remove --label <label>, then log in again with codex-rotator login` for an account whose credentials cannot be read). A stop is not cleared by a window reset; only usage reads that meet the conditions clear it. Of the events (`events`), only the eight newest are shown.
+- `--json`: the machine-readable form (a fixed schema), one line on standard output.
+- `--json --section`: the same schema and the same check as `--json`. The only difference is that it keeps an overall deadline of 6000 ms from start until the JSON is written. An account not read by then is included with `stateWord` `unread` (`reserved` when `blockWhenUnknown` is true) and `reason` `read-deadline`.
+- How it reads: when the codex-rotator daemon (the background process that watches the usage of the accounts) answers on the config's `daemon.port`, it prints the daemon's state (`source` is `daemon`). When no usable answer comes within 1000 ms, it reads the usage of each account once on the spot (`source` is `direct`). When the daemon refuses the connection or its answer is not of the right form, it moves to the on-the-spot read at once, without waiting for the 1000 ms. Without the daemon the stop (latch) state is not known, so `latchKnown` is `false` and the `latch` line of the view reads `unknown (no daemon)`.
+- Without a config file, or unless both `enabled` and `acknowledgedMultiAccountRisk` are `true`, it reads no credentials and no usage, and prints the form with `enabled` `false`, empty `accounts` and `next.reason` `disabled` (the view prints the one line `disabled (requires enabled and acknowledgedMultiAccountRisk)`). When the config cannot be read, it prints nothing to standard output, prints `config unreadable` to standard error and exits with 1. When an unexpected failure happens while reading, it likewise prints nothing to standard output, prints `status unavailable` to standard error and exits with 1.
+- Accounts are named by their labels only. Account folder paths, email addresses, tokens and the User-Agent value are never printed.
+- The screens of `claude-rotator status` and `monitor` show the same Codex section. `claude-rotator` starts `codex-rotator status --json --section` as a child process (with the same Node binary and the absolute path of the bundled entry point, without a PATH search) and draws its JSON the same way as the form without arguments. When the codex-rotator config file is known to be absent (the file, or a folder on its path, does not exist), no child is started, and the screen is byte for byte the one without a Codex section. When its presence cannot be checked (for example, for lack of permission), the child is started, and if it cannot read the config, the section becomes the `codex: display error` line described next. When the child's output cannot be used (it ran past 8000 ms, exited non-zero, ended on a signal, could not start, was not JSON, failed the schema check, or was over 256 KiB), the section is the single line `codex: display error (<reason>)`, and the exit code of `claude-rotator status` does not change. The reason is one of `timeout 8000ms`, `exit N`, `signal <name>`, `spawn failed`, `invalid json`, `schema` and `too large`. The child's standard error is not shown. `monitor` redraws every second, but starts the child only once 5 seconds (while it is drawing an answer from the daemon) or 60 seconds (otherwise) have passed since the previous start; in between it draws the last section it read.
+- The real output is a single line; the example is wrapped for reading (one account, with the daemon).
+
+  ```json
+  {
+    "schemaVersion": 1,
+    "provider": "codex",
+    "enabled": true,
+    "generatedAt": "2026-01-01T00:00:00Z",
+    "source": "daemon",
+    "latchKnown": true,
+    "daemon": { "reachable": true, "startedAt": "2025-12-31T23:00:00Z" },
+    "pool": { "state": "ok", "resetAt": null },
+    "observation": { "method": "usage-get", "startupCheck": "passed", "accountUsageIncludesExternalClients": true,
+      "cliConsumptionVisible": false, "userAgentSource": "codex-version" },
+    "next": { "label": "work", "reason": "selectable" },
+    "accounts": [
+      { "label": "work", "order": 1, "state": "available", "stateWord": "ready", "selectable": true, "reason": null,
+        "resetAt": null, "ordinaryUsageAllowed": true, "nextObservationAt": "2026-01-01T00:01:00Z",
+        "policy": { "stopUsedPercent": 85, "resumeUsedPercent": 80, "blockWhenUnknown": true },
+        "latch": null,
+        "windows": {
+          "fiveHour": { "usedPercent": 40, "resetAt": "2026-01-01T02:00:00Z", "windowMinutes": 300, "fresh": true,
+            "observedAt": "2025-12-31T23:59:30Z", "lengthSource": "reported" },
+          "weekly": { "usedPercent": 60, "resetAt": "2026-01-04T00:00:00Z", "windowMinutes": 10080, "fresh": true,
+            "observedAt": "2025-12-31T23:59:30Z", "lengthSource": "reported" }
+        },
+        "otherWindows": [], "observedAt": "2025-12-31T23:59:30Z", "headroomPercent": 25 }
+    ],
+    "aggregate": { "effectiveRemainingPercent": 25, "lowerBoundPercent": 25, "fiveHourRemainingPercent": 45,
+      "weeklyRemainingPercent": 25, "accountsTotal": 1, "accountsAvailable": 1, "accountsSelectable": 1,
+      "accountsUnknown": 0, "unit": "percent-points-of-one-account" },
+    "events": [ { "at": "2025-12-31T23:30:00Z", "type": "selected", "label": "work" } ]
+  }
+  ```
+
+  | Key | Content |
+  |---|---|
+  | `schemaVersion` | Schema version (currently `1`) |
+  | `provider` | Always `codex` |
+  | `enabled` | Whether both gates are `true` |
+  | `generatedAt` | When it was produced (UTC, to the second) |
+  | `source` | `daemon` (the daemon's state) or `direct` (read on the spot) |
+  | `latchKnown` | Whether the stop state is known (`true` only with the daemon) |
+  | `daemon` | `reachable` (whether the daemon answered) and `startedAt` (when the daemon started) |
+  | `pool` | `state` (`ok`, `degraded`, `exhausted`, `mixed`, `needs-login`, `credentials-unavailable`, `no-account`, `unknown`) and `resetAt` (the reset time of the whole pool) |
+  | `observation` | `method` (always `usage-get`), `startupCheck` (the check after the daemon starts: `passed`, `failed`, `pending`, or `null` without the daemon), `accountUsageIncludesExternalClients` (the percentages are those of the whole account), `cliConsumptionVisible` (the Codex CLI's own share cannot be separated) and `userAgentSource` (`codex-version`, `config`, or `null` when it could not be built or when no usage read was sent at all) |
+  | `next` | The `label` of the account picked next and its `reason` (`selectable`, `last-resort`, `none`, `disabled`) |
+  | `accounts` | The state of each account (table below) |
+  | `aggregate` | The effective headroom of all accounts and the counts (below) |
+  | `events` | Events the daemon remembers (in memory only, up to 50): `at`, `type` (`stopped`, `released`, `window-cap-dropped`, `needs-login`, `recovered`, `reloaded`, `selected`) and `label` |
+
+  The keys of an account (each element of `accounts`):
+
+  | Key | Content |
+  |---|---|
+  | `label` | The account label |
+  | `order` | The place in the configured list (from 1; 1 is the main account, and automatic selection looks at accounts in this order) |
+  | `state` | One of four states: `available`, `exhausted`, `login_required`, `unknown` |
+  | `stateWord` | The state word of the view (the twelve words in the table below) |
+  | `selectable` | Whether it can be picked automatically now (the schema allows `null`; this version always gives `true` or `false`) |
+  | `reason` | Why it cannot be picked (`null` when it can). An expired login is `access-token-expired`, `upstream-unauthorized` or `upstream-forbidden`; usage that could not be read is `codex-cli-missing`, `codex-version-unreadable` or `read-deadline` |
+  | `resetAt` | The reset time of the account |
+  | `ordinaryUsageAllowed` | Whether the upstream said ordinary use is allowed (`null` when no such answer has been read) |
+  | `nextObservationAt` | When the usage is read next (`null` without the daemon) |
+  | `policy` | `stopUsedPercent`, `resumeUsedPercent`, `blockWhenUnknown` |
+  | `latch` | While stopped: `stopped`, `cappedWindows` (`fiveHour`, `weekly`, `other`), `upstreamBlocked`, `cleanReadsDone`, `cleanReadsNeeded`, `since` (`null` when not stopped) |
+  | `windows` | `fiveHour` (the five-hour window) and `weekly` (the weekly window); `null` when absent |
+  | `otherWindows` | The windows of other lengths |
+  | `observedAt` | When the usage was last read |
+  | `headroomPercent` | The effective headroom of this account (what is left up to the stop line; `null` when unknown) |
+
+  A window (`windows.fiveHour`, `windows.weekly`, each element of `otherWindows`) has `usedPercent`, `resetAt`, `windowMinutes`, `fresh` (whether the value is current), `observedAt` and `lengthSource` (`reported` when the upstream reported the length, `position` when it was decided by position). `aggregate` has `effectiveRemainingPercent` (the sum over all accounts; `null` when any one is unknown), `lowerBoundPercent` (the sum of the known ones), `fiveHourRemainingPercent`, `weeklyRemainingPercent`, `accountsTotal`, `accountsAvailable`, `accountsSelectable`, `accountsUnknown` and `unit` (always `percent-points-of-one-account`).
+
+  The state words and the four states:
+
+  | `state` | `stateWord` |
+  |---|---|
+  | `available` | `ready` |
+  | `exhausted` | `held` (stopped at our own stop line), `capped` (the plan limit itself), `exhausted`, `stopped`, `blocked` (the upstream refuses ordinary use) |
+  | `login_required` | `needs login`, `no creds` (the credentials cannot be read) |
+  | `unknown` | `no models`, `reserved` (sends nothing until its usage is known), `unread`, `starting` |
+
+##### Using It from a Watcher (status --json --section)
+
+A watcher that checks the accounts before `codex` starts should use this entry point:
+
+```text
+codex-rotator status --json --section
+```
+
+- The overall deadline from start until the JSON is written is 6000 ms. Allow about 8000 ms when waiting for it (the deadline plus a margin for starting Node and handing over the output). Standard output holds the JSON above on one line only when the exit code is 0.
+- The watcher should refuse to start `codex` when `next.label` is `null` or when `source` is not `daemon`. The way an account is picked is the same as in codex-rotator; only without the daemon is the watcher deliberately stricter (without the daemon every call reads the usage from the upstream, which can run into its rate limits; the daemon running is the expected state).
+- Whether paid credits exist is not reported, and there is no entry point that runs on paid credits (the credits field of the usage response is only checked for being there, and is used neither for selection nor for display).
+- Accounts are picked per launch (per session). Crossing the stop line in the middle of a conversation does not switch that conversation to another account.
+
 #### Launching with an Account (codex-rotator exec)
 
 ```text
@@ -2325,10 +2444,11 @@ usage: codex-rotator exec [--account <label>] -- [codex arguments...]
   1. Read the config exactly once. If it cannot be read: `config unreadable`.
   2. If the two gates are not both `true`: `disabled`.
   3. If the arguments do not match a launch form: `argument rejected (form)`.
-  4. If the `--account` label is not registered: `account not registered`.
-  5. Select an account (below). If the real `codex` is not found, it stops with `cannot launch (codex-cli-missing)` with `--account`, and with `no account available` without it.
-  6. Run the guard check in the selected account folder. If it does not pass: `guard unverified (<reason>)`.
-  7. Launch the real `codex` with the first layer in front. If it cannot be launched: `launch failed`. Standard input and output are inherited, and `exec` itself writes nothing to standard output. The exit code of `codex` is returned as is; if `codex` ends by a signal, the same signal is raised on `exec` itself.
+  4. If `CODEX_API_KEY` or `CODEX_ACCESS_TOKEN` is in the environment (even with an empty value): `auth env set (<variable names>); unset and run again to use the chosen account` (when both are set, both names are listed). The value is not printed. `codex` uses these variables before the `auth.json` in the account folder, so with either one set it would not run as the selected account.
+  5. If the `--account` label is not registered: `account not registered`.
+  6. Select an account (below). If the real `codex` is not found, it stops with `cannot launch (codex-cli-missing)` with `--account`, and with `no account available` without it.
+  7. Run the guard check in the selected account folder. If it does not pass: `guard unverified (<reason>)`.
+  8. Launch the real `codex` with the first layer in front. If it cannot be launched: `launch failed`. Standard input and output are inherited, and `exec` itself writes nothing to standard output. The exit code of `codex` is returned as is; if `codex` ends by a signal, the same signal is raised on `exec` itself.
 - How the account is selected (without the daemon: usage is read once on the spot, with each account's credentials):
   - Without `--account`: accounts are read one by one in config order, and the first account whose usage is fully read, that is reported as usable, and whose every reported window is at or below `resumeUsedPercent` is selected. Accounts with unknown usage are not selected. If none qualifies: `no account available`.
   - With `--account`: only that account is read. If its credentials cannot be read: `no creds`; if a window is at or above `stopUsedPercent` (or it is reported as not usable): `account stopped`; if its usage is unknown, `usage unknown (blockWhenUnknown)` when `blockWhenUnknown` is `true`, and when it is `false` the following warning line is printed and `codex` is launched:
@@ -2375,14 +2495,14 @@ Codex launched with an account folder as `CODEX_HOME` does not read the settings
   plugins = false
   ```
 
-- **Why connectors and plugins are off by default:** for connectors tied to the ChatGPT account (links to outside services such as mail) and plugins, fine-grained blocks placed in `~/.codex` do not apply in an account session, so the account side turns them off entirely. Storing credentials in a file keeps them in the account folder's `auth.json`, separate for each account.
+- **Why the connector and plugin features are set to `false`:** for connectors tied to the ChatGPT account (links to outside services such as mail) and plugins, fine-grained blocks placed in `~/.codex` do not apply in an account session, so the account side adds settings that set the connector and plugin features (`apps` and `plugins`) to `false` (the first and second layers). The guard check below looks at the values of `apps` and `plugins` in `codex features list` and at the number of MCP servers in `codex mcp list --json`. These settings do not guarantee that connectors stay disconnected inside the session (see "Outside these guards" below). Storing credentials in a file keeps them in the account folder's `auth.json`, separate for each account.
 - **Launch forms:** `exec` selects an account and launches only for the following three argument lists. Each word must match exactly; anything else stops with the one line `argument rejected (form)` (no values are printed).
   1. Non-interactive `exec`: the first word is `exec` and the last word is a lone `-` (the prompt is read from standard input; only once). Between them only these may appear: `-s` (`read-only` or `workspace-write`), `--skip-git-repo-check`, `--json`, `-m <model name>`, `-c model_reasoning_effort=<lowercase letters>`, `-c features.image_generation=true`, `--image <file>`, and `--` (once, right before the last `-`; required when `--image` is present). Order does not matter. Each may appear at most once, except `--image`.
   2. Interactive session with no arguments: an empty list.
   3. Version: the single word `--version`.
   - As a result, `resume` and `fork` (continuing a past conversation), `review`, `login`, `-C`, an interactive session with a first prompt, and so on cannot be used through `exec`. **A conversation started with an account cannot be resumed through `exec`** (its record stays in that account folder).
 - **`--no-daemon`:** only for the interactive session with no arguments (the second form), the Codex CLI's `--no-daemon` (do not use the shared daemon) is added once, right after the first layer. A `--no-daemon` you add yourself does not match a form and is refused.
-- **Guard check on every launch:** right before every launch, with the selected account folder as `CODEX_HOME` and in the folder where `exec` runs (its real path), `exec` runs `codex features list` and then `codex mcp list --json` with the first layer (and the `-c` values of the first form). `codex` is launched only when `apps` and `plugins` are both `false` and there are no MCP servers. Each check may take at most 3 seconds and reads at most 64 KiB of standard output. If the check does not pass, `codex` is not launched and `exec` stops with the one line `guard unverified (<reason>)`.
+- **Guard check on every launch:** right before every launch, with the selected account folder as `CODEX_HOME` and in the folder where `exec` runs (its real path), `exec` runs `codex features list` and then `codex mcp list --json` with the first layer (and the `-c` values of the first form). `codex` is launched only when `apps` and `plugins` are both `false` and there are no MCP servers. Each check may take at most 3 seconds and reads at most 64 KiB of standard output. If the check does not pass, `codex` is not launched and `exec` stops with the one line `guard unverified (<reason>)`. The check runs once, before launch; it does not cover settings that take effect later in the session (see "Outside these guards" below).
 
   | Reason | Meaning |
   |---|---|
@@ -2399,6 +2519,8 @@ Codex launched with an account folder as `CODEX_HOME` does not read the settings
 - **Outside these guards:**
   - Launches that do not go through `exec`. The usual `codex`, a `codex` you start yourself with the account folder as `CODEX_HOME`, and a `codex` started from inside an account session (the child inherits `CODEX_HOME`) get neither the first layer nor the check. The last two run in that account folder with only the second layer.
   - The settings of trusted projects are read in account sessions too. The check's `mcp list` may connect to the MCP servers of a trusted project.
+  - If, in an interactive session started by `exec`, Codex asks whether to trust the working folder and you choose to trust it, that project's settings, including its MCP servers, are loaded in that session without the check. In an account session, choose to quit rather than trust a project you have not already trusted.
+  - Connectors may be connected even inside a session that passed the check. On a real machine, `/mcp` in such a session has listed the connector entry (`codex_apps`) as `connected`. Under which conditions this happens is still being checked.
   - Do not trust your home folder (the folder that contains `~/.codex`) in an account session. If you do, the settings, hooks and rules in `~/.codex` may be read as project settings.
 - **How to provide instructions:** put the instructions (`AGENTS.md`) you want in account sessions into the account folder yourself. codex-rotator does not read inside `~/.codex` and does not copy from it.
 - **Hooks:** if a project relies on hooks as a guard, enable Codex's `hooks` feature in each account folder and trust those hooks (the settings that login creates in the account folder are only the three settings above, and `~/.codex` is not read).

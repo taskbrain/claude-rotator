@@ -4,6 +4,7 @@
 //   exec     → ./exec.js          の runExec(argv, io)
 //   login    → ./login.js         の runLogin(argv, io)
 //   accounts → ./accounts-json.js の runAccounts(argv, io)
+//   status   → ./direct-read.js   の runStatus(argv, io)
 // - 本体のモジュールは、その副コマンドが呼ばれたときだけ、表の load の関数で読む。
 // - argv は副コマンドの後ろの引数の配列（副コマンドの語そのものは含まない）。
 // - io は { stdout, stderr, env }。省いた欄は process.stdout・process.stderr・process.env。
@@ -16,12 +17,13 @@
 // 文字列リテラルで書く。行き先を静的に追えるようにするためで、変数や組み立てた文字列を渡すと
 // test/invariance.test.js の import の境界の検査が違反として止める。
 
-export const USAGE = 'usage: codex-rotator <exec|login|accounts> [args...]';
+export const USAGE = 'usage: codex-rotator <exec|login|accounts|status> [args...]';
 
 export const SUBCOMMANDS = Object.freeze({
   exec: Object.freeze({ load: () => import('./exec.js'), run: 'runExec' }),
   login: Object.freeze({ load: () => import('./login.js'), run: 'runLogin' }),
   accounts: Object.freeze({ load: () => import('./accounts-json.js'), run: 'runAccounts' }),
+  status: Object.freeze({ load: () => import('./direct-read.js'), run: 'runStatus' }),
 });
 
 const USAGE_EXIT_CODE = 2;
