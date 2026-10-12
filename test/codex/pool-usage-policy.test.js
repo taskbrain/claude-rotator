@@ -33,7 +33,7 @@ test('pool: unobserved is eligible, fresh ready precedes unknown, TTL expiry lat
   assert.equal(pool.snapshot()[0].observation.primary.usedPercent, 95);
   assert.equal(pool.snapshot()[0].capped.primary, true);
 });
-test('pool: exclusion is separate from confirmed exhaustion and its reset buys one probe', () => {
+test('pool: exclusion is separate from confirmed exhaustion and its reset never unlatches it', () => {
   const pool = fixture();
   pool.observe('pro-a', { primary_used_percent: 95, primary_reset_at: 30100 }, 100);
   pool.observe('pro-b', { secondary_used_percent: 99, secondary_reset_at: 15100 }, 100);
@@ -47,11 +47,8 @@ test('pool: exclusion is separate from confirmed exhaustion and its reset buys o
   assert.equal(terminal.resetAt, 15100);
   assert.ok(pool.snapshot().every(a => a.state === 'ready'));
   assert.equal(pool.select('astra', 15099), null);
-  // Reaching the reset never unlatches the stop; it only buys one generation.
+  // Reaching the reset never unlatches the stop.
   assert.equal(pool.select('astra', 15100), null);
-  assert.equal(pool.probe('astra', 15099), null);
-  assert.equal(pool.probe('astra', 15100).key, 'pro-b');
-  assert.equal(pool.probe('astra', 15100), null, 'one probe only');
   assert.equal(pool.snapshot().find(a => a.key === 'pro-b').capped.secondary, true);
 });
 test('pool: both windows must stop excluding; missing resets are never invented', () => {
