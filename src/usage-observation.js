@@ -2,11 +2,11 @@
 //
 // 設計上の一線: **本文を書き換えない。** ここが受け取るのは `Buffer.concat` 済みの
 // 写しであり、クライアントへ流すバイト列とは別物である。解凍も解析用の写しに対して
-// だけ行う（計画書 Architecture・リスク R-6）。
+// だけ行う。
 //
 // `src/config.js` は触らない。`createDefaultConfig()` へキーを足すと既存 config.json との
 // 浅いマージ事故を起こすため、`session-affinity.js` / `openai-bridge.js` と同じく
-// 自前モジュールで正規化して `Object.freeze` した値を返す（計画書「設定」節）。
+// 自前モジュールで正規化して `Object.freeze` した値を返す。
 
 import zlib from 'node:zlib';
 import { promisify } from 'node:util';
@@ -17,25 +17,25 @@ const MIB = 1024 * 1024;
 
 export const DEFAULT_OBSERVABILITY = Object.freeze({
   requestLog: Object.freeze({
-    // U-3（母艦の即決）: 既定 on。観測は「すべての対策の効果測定の前提」であり、
-    // 既定 off だと本番で誰も有効化しないまま次の設計判断へ進むことになる。
+    // 既定 on。観測は「すべての対策の効果測定の前提」であり、
+    // 既定 off だと誰も有効化せず、測った値の無いまま次の改善を決めることになる。
     enabled: true,
-    // 要求本文の `metadata.user_id` へのフォールバック。既定 off（PII とコストの両面。
-    // リスク R-7）。ヘッダ付与率を測ってから U-5 で決める。
+    // 要求本文の `metadata.user_id` へのフォールバック。既定 off（PII とコストの両面）。
+    // ヘッダ付与率を測ってから決める。
     sessionFromBody: false,
     maxBodyBytes: 16 * MIB,
   }),
   upstream: Object.freeze({
-    // Task 1 Step 0 の実測: Claude Code 2.1.275 は `gzip, deflate, br, zstd` を送る。
+    // 実測: Claude Code 2.1.275 は `gzip, deflate, br, zstd` を送る。
     // zstd は Node 22.15 以降にしか解凍 API が無いので、持たない版で動かしたときだけ
     // 上流向けの一覧から落とす。
     //
-    // **本番の rotator は Node 22.22.2 で動いており zstdDecompress を持つため、
+    // **Node 22.15 以降は zstdDecompress を持つため、
     // この書き換えは発動せず要求ヘッダは現行とバイト同一のままになる。** 実質的には
     // 古い Node へ載せ替えたときの安全網である。false にすれば完全な素通しに戻る。
     dropUndecodableAcceptEncoding: true,
   }),
-  // U-4（母艦の即決）: 32 MiB。2世代で 64 MiB ＝ 約 4.1 日となり現行（約 2.4 日）より広い。
+  // 既定 32 MiB。2世代で 64 MiB まで残す。
   // 値の定義は src/log-rotation.js の LOG_MAX_BYTES の1か所だけ（ここは参照するだけ）。
   logMaxBytes: LOG_MAX_BYTES,
 });
@@ -176,8 +176,8 @@ function contentEncodingLayers(raw) {
 /**
  * 上流へ送る `accept-encoding` から、この実行環境が解けない符号化を落とす。
  *
- * Global Constraints「要求ヘッダを変えない」に対する**唯一の例外**である
- * （計画書 Task 1 Step 0 の帰結2）。落とすのは「知っているが解けない」トークンだけで、
+ * 「要求ヘッダを変えない」という原則に対する**唯一の例外**である。
+ * 落とすのは「知っているが解けない」トークンだけで、
  * 未知のトークンは残す。落とすものが無ければ受け取った文字列をそのまま返すので、
  * zstd を解ける環境では要求ヘッダは現行とバイト同一のままになる。
  *
@@ -358,7 +358,7 @@ function parseJson(text) {
 // ---------------------------------------------------------------------------
 
 /**
- * `proxy` 行の末尾へ足すフィールド（計画書 (b) の順序と語彙）。
+ * `proxy` 行の末尾へ足すフィールド。
  *
  * `observationLog` が `null` なら空文字列を返すので、観測が無効な構成では
  * 行が現行とバイト単位で同一になる（`degradeLogFields` と同じ規律）。
@@ -367,7 +367,7 @@ function parseJson(text) {
  * 呼び出し側で 1000 で割る）。
  *
  * @param {object|null} observationLog
- * @param {{sid?: string|null}|null} affinityLog sticky R-S7 の追記情報。
+ * @param {{sid?: string|null}|null} affinityLog sticky の追記情報。
  *   **`sid` を持っているときだけ** こちらは `sid=` を譲る。`affinityLog` の有無で
  *   判定すると、鍵なし要求（`affinityLog` はあるが `sid` が無い）で `sid=-` が消え、
  *   セッション付与率が測れなくなる。

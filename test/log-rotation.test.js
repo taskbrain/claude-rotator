@@ -61,7 +61,7 @@ function errorWithCode(code) {
 }
 
 describe('LOG_MAX_BYTES', () => {
-  it('is 32 MiB, the production effective default', () => {
+  it('is 32 MiB, the effective default', () => {
     assert.equal(LOG_MAX_BYTES, 32 * 1024 * 1024);
   });
 
@@ -340,7 +340,7 @@ describe('createServerLogWriter', () => {
 });
 
 // ---------------------------------------------------------------------------
-// createServerLogWriter の maxBytes（計画書 Task 4）
+// createServerLogWriter の maxBytes
 // ---------------------------------------------------------------------------
 
 describe('createServerLogWriter の maxBytes', () => {

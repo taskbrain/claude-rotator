@@ -1,4 +1,4 @@
-// セッション鍵の純関数テスト（計画書 Task 2 Step 1）。
+// セッション鍵の純関数テスト。
 //
 // **sticky（`feat/session-affinity`）の `test/session-affinity.test.js` の該当ケースと
 // 同じ入力・同じ期待値にしてある。** 将来 sticky と統合するときに挙動の差が出ないよう、

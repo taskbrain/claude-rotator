@@ -2,7 +2,7 @@
 //
 // 出所: sticky（`feat/session-affinity` の `src/session-affinity.js:52-160`）から
 // **純関数だけ**を意味を変えずに切り出したもの。sticky が後から同じ実装を持ち込むと
-// 同じ行に桁数の違う `sid=` が2つ並ぶので、実装は1箇所に置く（計画書リスク R-4）。
+// 同じ行に桁数の違う `sid=` が2つ並ぶので、実装は1箇所に置く。
 // `test/session-key.test.js` は sticky の `test/session-affinity.test.js` と
 // 同じ入力・同じ期待値にしてある。将来の統合で差が出ないようにするためである。
 //

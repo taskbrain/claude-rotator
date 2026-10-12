@@ -15,12 +15,12 @@ export const DEFAULT_WEEKLY_RESET_PRIORITY_WINDOW_MS = 36 * 60 * 60 * 1000;
 const MAX_DATE_TIMESTAMP_MS = 8_640_000_000_000_000;
 
 /**
- * Affinity-only selector constants (design 4.2, D-56-1).
+ * Affinity-only selector constants.
  * `DEFAULT_ASSIGN_STOP_UTILIZATION` stops NEW assignments at 90% - it is not an
  * eviction line: a session already bound to a 90% account stays there until the
- * account actually runs out (R2). `ASSIGN_BAND_WIDTH` is the 5-point band below
+ * account actually runs out. `ASSIGN_BAND_WIDTH` is the 5-point band below
  * the best headroom inside which the load keys are allowed to decide; the width
- * itself is an authoring judgement that has not been measured (U15).
+ * itself is an authoring judgement that has not been measured.
  * `ASSIGN_BAND_EPSILON` only absorbs binary floating point error. It is NOT the
  * subtraction of the width that needs it - `0.9 - 0.05` is exactly `0.85`. The
  * error is in the residuals themselves, which are read back as `1 - utilization`
@@ -61,14 +61,14 @@ export class AccountManager {
     now = () => Date.now(),
     rotationPolicy = null,
     logger = null,
-    // Keep `events` as a bounded, persisted history (design 5.2(b), D-56-6).
+    // Keep `events` as a bounded, persisted history.
     // The ledger is told nothing about session affinity - not the instance, not
-    // the mode string (D-182): the caller that knows the mode passes this one
+    // the mode string: the caller that knows the mode passes this one
     // boolean. While it is false the array behaves exactly as it does today -
     // unbounded, never exported, never restored - so the default configuration
     // keeps runtime-state.json, /internal/status and `claude-rotator status`
-    // byte-identical (R7). The unbounded growth that leaves behind is a separate
-    // follow-up (U14), deliberately not fixed here.
+    // byte-identical. The unbounded growth that leaves behind is a separate
+    // follow-up, deliberately not fixed here.
     eventHistory = false,
   } = {}) {
     this.now = now;
@@ -381,7 +381,7 @@ export class AccountManager {
    * Rebuild the ledger from a reloaded configuration.
    *
    * @returns {string[]} the ids of the accounts that stayed in the ledger but
-   *   whose credential identity changed (D-60-3, design 8.1). The row keeps its
+   *   whose credential identity changed. The row keeps its
    *   id, so nothing downstream can tell on its own that the upstream cache
    *   behind it is gone; session affinity uses this list to drop the home and
    *   family bindings of those accounts. Accounts that were added, and accounts
@@ -440,7 +440,7 @@ export class AccountManager {
   }
 
   /**
-   * Turn the bounded, persisted event history on or off (design 5.2(b)).
+   * Turn the bounded, persisted event history on or off.
    * Called by the wiring that owns the session-affinity mode - at startup and
    * again on POST /internal/reload, so a mode change takes effect immediately.
    *
@@ -542,7 +542,7 @@ export class AccountManager {
       savedAt: new Date(this.now()).toISOString(),
       currentAccount: active?.id || null,
       // The key itself is absent while the history is off, so the saved file of
-      // a default configuration stays byte-identical (design 5.2(b), D-56-6).
+      // a default configuration stays byte-identical.
       ...(this.eventHistoryEnabled
         ? { events: this.events.slice(0, EVENT_HISTORY_LIMIT) }
         : {}),
@@ -564,10 +564,10 @@ export class AccountManager {
    * Restore the ledger from the saved runtime state.
    *
    * @returns {string[]} the same credential-identity report as
-   *   `replaceAccounts` (D-60-3, design 8.1). EVERY return path returns an
+   *   `replaceAccounts`. EVERY return path returns an
    *   array, the early return for a broken saved state included: a bare
-   *   `return` would hand `undefined` to session affinity exactly in the F1
-   *   case (unreadable saved state), where it is least likely to be noticed.
+   *   `return` would hand `undefined` to session affinity exactly in the
+   *   case of an unreadable saved state, where it is least likely to be noticed.
    */
   restoreState(state) {
     if (!state || typeof state !== 'object') return [];
@@ -579,7 +579,7 @@ export class AccountManager {
     for (const account of this.accounts) {
       const saved = savedById.get(account.id);
       if (!saved) {
-        // FU-64 / D-183: 保存側に使える行が無い口座（行が壊れていて id で引けない、
+        // 保存側に使える行が無い口座（行が壊れていて id で引けない、
         // または保存より後に足された）は、資格情報が同じである証拠が無いので
         // 「変わった」側へ倒す。表にバインドが無ければ evictAccounts は何も落とさない
         // ので、安全側へ倒しても副作用は無い。
@@ -619,7 +619,7 @@ export class AccountManager {
     }
 
     // A saved state written before this key existed (or with a broken value) is
-    // not an error: the history simply starts empty (design 5.2(b)).
+    // not an error: the history simply starts empty.
     if (this.eventHistoryEnabled) {
       this.events = (Array.isArray(state.events) ? state.events : [])
         .filter(event => event && typeof event === 'object' && !Array.isArray(event))
@@ -798,8 +798,8 @@ export class AccountManager {
   }
 
   /**
-   * The single counting source for a move of the globally active account
-   * (D-54-13(a) / D-54-14). Callers that forget to pass a trigger produce
+   * The single counting source for a move of the globally active account.
+   * Callers that forget to pass a trigger produce
    * `trigger=unknown` rather than an exception, so a missed hand-off shows up
    * in the log instead of failing a live request.
    */
@@ -807,7 +807,7 @@ export class AccountManager {
     if (!this.logger) return;
     // The switch helpers still run their status/event bookkeeping when the
     // chosen candidate is the account already in use; that is not a move of
-    // the active account, so it must not reach the counting source (D-54-14).
+    // the active account, so it must not reach the counting source.
     if (from === to) return;
     const at = new Date(this.now()).toISOString();
     const normalizedTrigger = ACCOUNT_SWITCH_TRIGGERS.has(trigger) ? trigger : 'unknown';
@@ -1039,23 +1039,23 @@ export class AccountManager {
   }
 
   /**
-   * Picks the account a NEW session should be bound to (design 4.2, D-56-1).
+   * Picks the account a NEW session should be bound to.
    *
    * This is the affinity-only selector. It deliberately does NOT reuse
    * `switchTargetScore` / `compareSwitchTargetScores`: that comparator ranks
    * `weeklyResetPriority` first, reads only the unified 5h/7d windows into
    * `maxUtilization` and always settles ties on ledger order, so it does not
-   * pick the account with the most headroom (design 4.2 (a)-(c)). Requests
+   * pick the account with the most headroom. Requests
    * without a session key keep going through the existing comparator.
    *
    * Ranking inside the band, after the assign-stop gate and the missing-window
-   * split (design v1.7 P-a, 2026-09-18 judgement 6 (a)). The band, the gate, the
-   * split and the R1 gate release are unchanged from v1.6; only the ORDER inside
+   * split. The band, the gate, the split and the gate release are unchanged
+   * from the earlier version; only the ORDER inside
    * the band moved:
    *   K1 smallest real 5h load (`load5h`, an unreadable window sorts last)
-   *   K2 fewest WARM sessions already bound (R4)
+   *   K2 fewest WARM sessions already bound
    *   K3 weekly reset priority, then the earliest weekly reset - both were K1/K2
-   *      in v1.6 and are now tie-breakers: spreading the load across accounts
+   *      in the earlier version and are now tie-breakers: spreading the load across accounts
    *      beats draining an account whose weekly window is about to reset
    *   K4 largest headroom, then account priority, then ledger order
    *
@@ -1066,7 +1066,7 @@ export class AccountManager {
    * the quota state of every account it looks at. That is wanted - an expired
    * reset is applied, so a recovered account comes back as a candidate - and it
    * does not inflate the event log, because `recordQuotaExhausted` dedupes on
-   * the exhaustion reason (invariant I-3).
+   * the exhaustion reason.
    *
    * @param {string|null} modelFamily 'fable' for a Fable request, null otherwise.
    *   Only a Fable request counts the Fable weekly sub-cap as one of its windows.
@@ -1075,16 +1075,16 @@ export class AccountManager {
    *   and, for a sub-binding, the account that just failed.
    * @param {number} assignStopUtilization Utilization at which an account stops
    *   accepting NEW sessions. The gate is dropped entirely when it would leave
-   *   no candidate at all (R1).
+   *   no candidate at all.
    * @param {Map<string,number>|Record<string,number>|null} sessionCounts WARM
-   *   sessions already bound per account id - `SessionAffinity.warmSessionCounts()`
-   *   (design v1.7 P-c). A session that has gone cold no longer holds a cache on
+   *   sessions already bound per account id - `SessionAffinity.warmSessionCounts()`.
+   *   A session that has gone cold no longer holds a cache on
    *   its account, so counting it here would keep steering new sessions away from
    *   an account that is in fact free. The caller used to pass the total
    *   (`summary().sessionsByAccount`); a total still works, it is just a coarser
    *   signal.
    * @returns {object|null} The chosen account, or null when nothing is usable -
-   *   the caller then falls through to the existing exhausted-response path (R1).
+   *   the caller then falls through to the existing exhausted-response path.
    */
   selectForNewAssignment({
     modelFamily = null,
@@ -1107,7 +1107,7 @@ export class AccountManager {
     ));
     const candidates = admitted.length > 0 ? admitted : pool;
 
-    // D-60-4: split the candidates with a missing window out BEFORE the band is
+    // Split the candidates with a missing window out BEFORE the band is
     // computed. A window that could not be read must not look like headroom and
     // push a fully known candidate out of the band.
     const known = candidates.filter(candidate => candidate.headroom.complete);
@@ -1124,8 +1124,8 @@ export class AccountManager {
   }
 
   /**
-   * The headroom `selectForNewAssignment` would give this account (design v1.7
-   * P-b). The reservation stage needs the SAME reading to decide whether a bound
+   * The headroom `selectForNewAssignment` would give this account. The
+   * reservation stage needs the SAME reading to decide whether a bound
    * account is utilised enough to drain a cold session off it; re-deriving it from
    * `quota` in the proxy would let the two drift apart the first time a window is
    * added. `1 - min` is the utilisation; a `min` of null means it could not be
@@ -1159,12 +1159,12 @@ export class AccountManager {
       account,
       index,
       headroom: assignmentHeadroom(quota, modelFamily, now),
-      // K1 (design v1.7 P-a): how much of the 5h window this account has actually
+      // K1: how much of the 5h window this account has actually
       // burned, not how much is left on its tightest window. `headroom.min` can be
       // dominated by the WEEKLY window, so an account that has barely touched its
       // 5h window can lose to one that is halfway through it.
       load5h: fiveHourLoad(quota, now),
-      // K2: only the WARM bindings (design v1.7 P-c).
+      // K2: only the WARM bindings.
       warm: sessionCountFor(sessionCounts, account.id),
       weeklyResetPriority,
       // The reset instant only separates two priority accounts, so everything else
@@ -1177,7 +1177,7 @@ export class AccountManager {
   /**
    * Same lookup as `find`, but returns null instead of throwing when the id is
    * unknown. A session binding can outlive its account (a reload that drops an
-   * account), and that case has to be detectable rather than fatal (design 4.3).
+   * account), and that case has to be detectable rather than fatal.
    */
   findOrNull(accountId) {
     if (typeof accountId !== 'string' || accountId === '') return null;
@@ -1391,8 +1391,8 @@ export function isCredentialRefreshCooldown(reason) {
 }
 
 /**
- * Routing availability state used for an account whose login has expired
- * (design ruling D-72). It ranks exactly like `unknown` - neither carries a
+ * Routing availability state used for an account whose login has expired.
+ * It ranks exactly like `unknown` - neither carries a
  * recovery time - so the ordering of the recovery list is unchanged; only the
  * word the screen prints differs, because "unknown" wrongly suggests the
  * account might come back on its own.
@@ -1416,7 +1416,7 @@ export function isAuthExpiredReason(reason) {
  * This evaluates every window directly (never a single classified "the" reason)
  * so a model-scoped exhaustion can never mask a concurrent common-quota
  * exhaustion, and so a scoped exhaustion buried behind an earlier non-matching
- * scoped entry is never missed (Blockers B1/B2).
+ * scoped entry is never missed.
  *
  * Common windows (5h / 7d / token / request rate limits) gate every family.
  * Every entry in `weeklyScoped` is scanned independently via
@@ -1456,7 +1456,7 @@ function commonQuotaExhausted(quota, threshold) {
 }
 
 /**
- * Public form of the module-private `commonQuotaExhausted` (design §5, D-56-3).
+ * Public form of the module-private `commonQuotaExhausted`.
  * True when a family-independent window of THIS account is at or over the
  * threshold: unified 5h/7d, or the token/request rate limit. A model-scoped
  * weekly window is never "common", so it never makes this true.
@@ -1471,7 +1471,7 @@ export function isCommonQuotaExhausted(account, threshold) {
 }
 
 /**
- * True only for the "sub-cap only" case of design §5.1 / D-56-3: a model-scoped
+ * True only for the "sub-cap only" case: a model-scoped
  * weekly window blocks `modelFamily` while every common window is still below
  * the threshold. This is the one case where the account stays perfectly usable
  * for every other family, so the reactive 429 path must not move `currentIndex`.
@@ -1482,13 +1482,13 @@ export function isCommonQuotaExhausted(account, threshold) {
  * credential-refresh cooldown (`rateLimitedUntil` in the future) - are false
  * here even when a scoped window happens to be over the threshold as well.
  * Those belong to the existing retry path, which must keep its current
- * behaviour (§4.3). `refreshQuotaState` can rewrite `status` to `'exhausted'`
+ * behaviour. `refreshQuotaState` can rewrite `status` to `'exhausted'`
  * while a back-off is still running, which is why the back-off is read from
  * `rateLimitedUntil` rather than from `status` alone.
  *
  * Reads the ledger without touching it: unlike `isAvailable` it never calls
  * `refreshQuotaState`, so evaluating it cannot add a `quota-exhausted` event
- * or move an account's status (invariant I-3).
+ * or move an account's status.
  *
  * @param {number} [now] Clock used for the back-off comparison, in ms. Callers
  *   holding an `AccountManager` pass `accountManager.now()` so a test clock is
@@ -1505,7 +1505,7 @@ export function familyQuotaExhaustedOnly(account, threshold, modelFamily, now = 
 function futureAvailabilityForModelFamily(account, threshold, modelFamily, now) {
   if (!account) return { state: 'unknown', availableAt: null };
   if (account.status === 'error') {
-    // D-72: an expired login is reported as such so the screen can tell the
+    // An expired login is reported as such so the screen can tell the
     // operator to run `claude-rotator login`. Every other error stays `unknown`.
     return {
       state: isAuthExpiredReason(account.errorReason) ? NEEDS_LOGIN_AVAILABILITY_STATE : 'unknown',
@@ -1568,7 +1568,7 @@ function compareRoutingAvailabilityCandidates(left, right) {
 }
 
 /**
- * Headroom of an account for `selectForNewAssignment` (design 4.2).
+ * Headroom of an account for `selectForNewAssignment`.
  *
  * `min` is the residual (1 - utilization) of the tightest window that could be
  * read, so the account is ranked by the window that will run out first. A Fable
@@ -1605,7 +1605,7 @@ function assignmentHeadroom(quota, modelFamily, now) {
 }
 
 /**
- * The real 5h load of an account (design v1.7 P-a, K1).
+ * The real 5h load of an account (the K1 key of `selectForNewAssignment`).
  *
  * A 5h window whose reset instant has already passed is zero load, not a missing
  * reading - the window has simply started over. (`refreshQuotaState` normally
@@ -1616,7 +1616,7 @@ function assignmentHeadroom(quota, modelFamily, now) {
  * A window that could NOT be read stays `null` and the comparator sorts it last.
  * Reading it as 0 would make an account nobody has measured look like the idlest
  * account there is, which is the same trap `assignmentHeadroom` avoids for the
- * residuals (D-60-4).
+ * residuals.
  */
 function fiveHourLoad(quota, now) {
   const resetAt = finiteNumberOrNull(quota?.unified5hReset);
@@ -1625,10 +1625,10 @@ function fiveHourLoad(quota, now) {
 }
 
 /**
- * The band comparator (design v1.7 P-a). Used for BOTH a brand-new session and a
+ * The band comparator. Used for BOTH a brand-new session and a
  * rebind target, because both go through `selectForNewAssignment`.
  *
- * The v1.6 order led with the weekly-reset priority, so a single account that
+ * The earlier order led with the weekly-reset priority, so a single account that
  * happened to be closest to its weekly reset collected every new session in the
  * band until it ran out. Leading with the real 5h load spreads the sessions and
  * leaves the weekly-reset preference as a tie-breaker.
@@ -1661,7 +1661,7 @@ function compareNewAssignmentCandidates(left, right) {
 }
 
 /**
- * The exclusion set is addressed by account id (FU-60). An earlier version put
+ * The exclusion set is addressed by account id. An earlier version put
  * every element of any iterable straight into a Set, so an account OBJECT was
  * accepted silently and then never matched an id - the caller believed it had
  * excluded an account while the selector could still return it. Only strings

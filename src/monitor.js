@@ -31,7 +31,7 @@ export function renderStatus(status, options = {}) {
   // output stays byte-identical.
   lines.push(...codexSectionLines(options.codex, now));
 
-  // Session affinity section (sticky design 7.3). Drawn only when the status JSON
+  // Session affinity section. Drawn only when the status JSON
   // carries the section, which /internal/status omits entirely while the mode is
   // "off" - so the default configuration prints exactly what it prints today.
   lines.push(...renderAffinitySection(status.sessionAffinity));
@@ -87,8 +87,8 @@ function availabilitySummary(schedule, noAccounts) {
 function renderAvailability(entry, now, includeDate = false) {
   if (!entry) return 'no data';
   if (entry.state === 'available') return 'now';
-  // An expired login never recovers on its own, so "unknown" would be misleading
-  // (design ruling D-72): say what is actually wrong and leave the how-to-fix
+  // An expired login never recovers on its own, so "unknown" would be misleading:
+  // say what is actually wrong and leave the how-to-fix
   // line to the account card, which knows the account id.
   if (entry.state === NEEDS_LOGIN_AVAILABILITY_STATE) return 'needs login';
   if (entry.state !== 'waiting') return 'unknown';
@@ -195,7 +195,7 @@ function renderEvent(event) {
 
 function renderUnavailableReason(reason, accountId = null) {
   if (!reason) return null;
-  // Design ruling D-72: an expired login is the one unavailable reason a human
+  // An expired login is the one unavailable reason a human
   // has to clear, so the screen says what to run instead of leaking the internal
   // reason type (`oauth_refresh_failed` / `authentication_error`).
   if (isAuthExpiredReason(reason)) {
@@ -274,11 +274,11 @@ function codexSectionLines(codex, now) {
 }
 
 // ---------------------------------------------------------------------------
-// Session affinity section of `claude-rotator status` (sticky design 7.3).
+// Session affinity section of `claude-rotator status`.
 //
 // `status.sessionAffinity` is written by src/proxy-server.js and is absent while
 // the mode is "off"; nothing is drawn then, so the screen stays byte-identical to
-// the one operators see today (R7). Same shape as the Codex section above: a
+// the one operators see today. Same shape as the Codex section above: a
 // header line in the `current:` column, indented detail rows, one trailing blank
 // line. Every field is optional as far as this renderer is concerned - a status
 // JSON from an older or newer proxy can only cost this section detail, never the
@@ -314,7 +314,7 @@ function affinityHeadline(affinity) {
   return `mode: ${mode}  sessions: ${sessions}${of}  sid: ${affinitySidCoverage(affinity)}`;
 }
 
-// The share of forwarded requests that carried a session key (design 7.3). It is
+// The share of forwarded requests that carried a session key. It is
 // counted per request, so it cannot be derived from the session counts above.
 function affinitySidCoverage(affinity) {
   const proxied = affinityNumber(affinity.requests?.proxied) ?? 0;

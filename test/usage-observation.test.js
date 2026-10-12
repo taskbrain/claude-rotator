@@ -1,7 +1,7 @@
-// 応答本文から usage を読む純関数のテスト（計画書 Task 1・Task 2）。
+// 応答本文から usage を読む純関数のテスト。
 //
 // このファイルは HTTP を一切使わない。偽上流も実サービスも立てないので、
-// `~/.claude/rules/02-verification.md` §3 の到達防止は構造的に満たされる。
+// 実サービスへ届かないことは構造的に満たされる。
 //
 // fixture には実在の資格情報・実セッション id・実メールアドレスを書かない。
 // セッション id は本ファイルで生成した合成文字列である。
@@ -138,8 +138,8 @@ describe('parseUsageObservation / content-encoding', () => {
     assertUsage(await parseUsageObservation(body, { contentEncoding: null }));
   });
 
-  it('zstd は Node が解ける版でだけ解く（本番実体は Node 22 系なので解ける）', async (t) => {
-    // 本番の rotator は Node 22.22.2 で動いており zstdDecompress を持つ。
+  it('zstd は Node が解ける版でだけ解く（Node 22.15 以降なら解ける）', async (t) => {
+    // Node 22.15 以降は zstdDecompress を持つ。
     // 開発機の既定 node が 20 系だとこの分岐は走らないので、skip を明示して
     // 「通ったつもり」にならないようにする。
     if (typeof zlib.zstdCompress !== 'function') {
@@ -359,14 +359,14 @@ describe('parseUsageObservation / 本文の読み方', () => {
 });
 
 // ---------------------------------------------------------------------------
-// upstreamAcceptEncoding: 解けない符号化を上流向けに落とす（Task 1 Step 0 の帰結）
+// upstreamAcceptEncoding: 解けない符号化を上流向けに落とす
 // ---------------------------------------------------------------------------
 
 describe('upstreamAcceptEncoding', () => {
   const ZSTD_OK = typeof zlib.zstdDecompress === 'function';
 
   it('Claude Code の実測値から、解けない符号化だけを落とす', () => {
-    // Task 1 Step 0 の実測値（Claude Code 2.1.275 / Bun 1.4.3）。
+    // 実測値（Claude Code 2.1.275 / Bun 1.4.3）。
     const observed = 'gzip, deflate, br, zstd';
     const rewritten = upstreamAcceptEncoding(observed);
     if (ZSTD_OK) {
@@ -408,7 +408,7 @@ describe('upstreamAcceptEncoding', () => {
 });
 
 // ---------------------------------------------------------------------------
-// normalizeObservability（計画書「設定」節）
+// normalizeObservability
 // ---------------------------------------------------------------------------
 
 describe('normalizeObservability', () => {
@@ -477,7 +477,7 @@ describe('normalizeObservability', () => {
 });
 
 // ---------------------------------------------------------------------------
-// observationLogFields（計画書 (b)）
+// observationLogFields
 // ---------------------------------------------------------------------------
 
 describe('observationLogFields', () => {
@@ -500,7 +500,7 @@ describe('observationLogFields', () => {
     assert.equal(observationLogFields(undefined), '');
   });
 
-  it('計画書の順序どおりに追記する', () => {
+  it('決まった順序どおりに追記する', () => {
     assert.equal(
       observationLogFields(observationLog),
       ' model=claude-opus-5-1 sid=ab12cd34ef56 in=10 out=20 cr=99000 cc=1500 c1h=1500 c5m=0'
@@ -535,7 +535,7 @@ describe('observationLogFields', () => {
   });
 
   it('sticky の affinityLog が sid を持つときだけ sid= を譲る（!affinityLog?.sid）', () => {
-    // sticky R-S7 が sid= を出す行では二重に出さない。
+    // sticky が sid= を出す行では二重に出さない。
     assert.ok(!observationLogFields(observationLog, { sid: 'ffffffffffff' }).includes('sid='));
     // affinityLog はあるが鍵なしの要求（sid が無い）では、こちらが sid=- を出す。
     // ここを「affinityLog が null のときだけ」にすると sid=- が消え、付与率が測れなくなる。
@@ -564,7 +564,7 @@ describe('observationLogFields', () => {
 });
 
 // ---------------------------------------------------------------------------
-// observationLogFields / 猶予（usage-limit grace）の追記（差分案 3章 (b)・案A）
+// observationLogFields / 猶予（usage-limit grace）の追記
 // ---------------------------------------------------------------------------
 
 describe('observationLogFields / 猶予（grace）', () => {
@@ -581,7 +581,7 @@ describe('observationLogFields / 猶予（grace）', () => {
     encoding: 'gzip',
     parse: 'ok',
   };
-  // grace を持たない現行の材料で出る文字列（既存テスト「計画書の順序どおりに追記する」と同じ）。
+  // grace を持たない現行の材料で出る文字列（既存テスト「決まった順序どおりに追記する」と同じ）。
   const WITHOUT_GRACE = ' model=claude-opus-5-1 sid=ab12cd34ef56 in=10 out=20 cr=99000 cc=1500 c1h=1500 c5m=0'
     + ' u5h=0.76 u5hReset=1789012345 u7d=0.33 u7dReset=1789098765 enc=gzip';
 

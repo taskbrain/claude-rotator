@@ -22,7 +22,7 @@ import {
 // model をそのまま forwardToOpenAiBridge へ渡す。ここでも同じ経路を再現する。
 
 // ---------------------------------------------------------------------------
-// Task 25: 設定セクションと判定ロジック
+// 設定セクションと判定ロジック
 // ---------------------------------------------------------------------------
 
 describe('openaiBridge defaults', () => {
@@ -91,7 +91,7 @@ describe('shouldRouteToOpenAiBridge', () => {
   });
 
   it('falls back to the Anthropic path when modelPattern does not compile (fail-safe)', () => {
-    // 仕様書 4.2.2 節 b（v3 で拡張）: JSON パース失敗**または** modelPattern コンパイル失敗のときは
+    // JSON パース失敗**または** modelPattern コンパイル失敗のときは
     // forwardWithRotation() へ進み、outcome=parse-error-fallback を記録する。
     const settingsBad = resolveOpenAiBridgeSettings({
       openaiBridge: { enabled: true, url: 'http://127.0.0.1:18765', modelPattern: '([unclosed', connectTimeoutMs: 1000, idleTimeoutMs: 1000 },
@@ -136,7 +136,7 @@ describe('shouldRouteToOpenAiBridge', () => {
 });
 
 // ---------------------------------------------------------------------------
-// Task 26: forwardToOpenAiBridge（SSE 透過・タイムアウト・abort 伝播）
+// forwardToOpenAiBridge（SSE 透過・タイムアウト・abort 伝播）
 // ---------------------------------------------------------------------------
 
 function startFakeBridge(handler) {
@@ -297,10 +297,9 @@ describe('forwardToOpenAiBridge', () => {
     assert.ok(text.indexOf('message_start') < text.indexOf('message_stop'));
   });
 
-  it('returns 403 permission_error when the bridge refuses the connection (追試4b確定)', async () => {
+  it('returns 403 permission_error when the bridge refuses the connection', async () => {
     // bridge不達（接続拒否）は403 permission_errorで即座に返す。502/504は
-    // Claude Codeが最大301回・指数バックオフで再試行し続けるため採用しない
-    // （docs/research/11b_spike4b-nonretryable-status.md）。
+    // Claude Codeが最大301回・指数バックオフで再試行し続けるため採用しない。
     const settings = resolveOpenAiBridgeSettings({
       openaiBridge: { enabled: true, url: 'http://127.0.0.1:1', modelPattern: '^gpt-', connectTimeoutMs: 500, idleTimeoutMs: 500, connectRetries: 0 },
     });
@@ -323,7 +322,7 @@ describe('forwardToOpenAiBridge', () => {
     assert.ok(lines.some(l => /outcome=bridge-unreachable/.test(l)), lines.join('\n'));
   });
 
-  it('returns 403 permission_error when the bridge accepts but never answers (idleTimeoutMs、追試4b確定)', async () => {
+  it('returns 403 permission_error when the bridge accepts but never answers (idleTimeoutMs)', async () => {
     const { response, text, lines } = await callThroughRotator({
       requestBody: '{"model":"gpt-6-astra"}',
       settingsOverride: { idleTimeoutMs: 150 },
@@ -336,7 +335,7 @@ describe('forwardToOpenAiBridge', () => {
   });
 
   it('unifies the HTTP status to 403 but keeps connect failure and idle timeout distinguishable via outcome', async () => {
-    // 仕様書 4.2.1 節・4.2.4 節（v3、追試4b・2026-09-07反映）: 接続確立前と確立後は
+    // 接続確立前と確立後は
     // 別障害であり、設定キーは分かれている。HTTPステータスは403で統一するが、
     // ログの outcome（bridge-unreachable / bridge-idle-timeout）で両者を取り違えないことを固定する。
     const { response, lines } = await callThroughRotator({
@@ -468,12 +467,12 @@ describe('forwardToOpenAiBridge', () => {
 
   it('does not retry a connection reset that arrives after the request was accepted, even immediately (double-send risk, regression)', async () => {
     // 旧テストは「接続直後の即時リセットなら安全に再試行できる」
-    // という前提で connectionCount>=2・200 を期待していたが、実測（/tmp/dbg.js 相当の
+    // という前提で connectionCount>=2・200 を期待していたが、実測（再現用の小さな
     // 検証）で、小さな本文はローカルループバック上では socket の 'connect' →
     // ClientRequest の 'finish'（全データをOSへ渡し終えた合図）が、RST由来の
     // 'error' より必ず先に発火することを確認した。つまり「応答がまだ何も届いて
     // いない」ことは「本文がまだ bridge に渡っていない」ことを一切保証しない。
-    // このため再検証指摘1でこの再試行経路自体を閉じており、本テストは
+    // このため再検証でこの再試行経路自体を閉じており、本テストは
     // 「即時リセットでも再試行しない・403で統一される」ことを固定する内容へ更新した。
     let connectionCount = 0;
     const bridge = http.createServer((req, res) => {
@@ -722,7 +721,7 @@ describe('forwardToOpenAiBridge', () => {
 });
 
 // ---------------------------------------------------------------------------
-// Task 27: POST /internal/reload の openaiBridge 対応（V-9）
+// POST /internal/reload の openaiBridge 対応
 // ---------------------------------------------------------------------------
 
 describe('POST /internal/reload with openaiBridge', () => {
@@ -828,7 +827,7 @@ describe('POST /internal/reload with openaiBridge', () => {
 
     const lines = [];
     // modelPattern が不正 → resolveOpenAiBridgeSettings のフェイルセーフで無効化され、
-    // warning が立つ（仕様書 4.2.2 節 b）。
+    // warning が立つ。
     const badOpenaiBridgeConfig = {
       enabled: true,
       url: 'http://127.0.0.1:18765',
@@ -920,7 +919,7 @@ describe('POST /internal/reload with openaiBridge', () => {
     }));
 
     try {
-      // 本文なしの GET は無ログ（HEAD/GET相当。仕様書のテスト対象そのもの）。
+      // 本文なしの GET は無ログ（HEAD/GET相当）。
       const getResponse = await requestJson(`${proxy.url}/v1/models`, {
         method: 'GET',
         headers: { authorization: `Bearer ${LOCAL_GATEWAY_AUTH_TOKEN}` },
@@ -1036,10 +1035,10 @@ describe('POST /internal/reload with openaiBridge', () => {
 });
 
 // ---------------------------------------------------------------------------
-// R3-2: openaiBridge.degradeMapping の設定解決（設計書 §7.1〜§7.3・§14.1〜§14.4）
+// openaiBridge.degradeMapping の設定解決
 // ---------------------------------------------------------------------------
 
-// 既存の import 文（ファイル冒頭）は1行も書き換えない（受入条件: 本ファイルの削除行が0）。
+// 既存の import 文（ファイル冒頭）は1行も書き換えない。
 // ESM の import 宣言は位置に関係なく巻き上げられるため、追加分は別の import 文にする。
 import {
   DEFAULT_OPENAI_BRIDGE,
@@ -1052,9 +1051,9 @@ const enabledBridgeConfig = extra => ({
   openaiBridge: { ...createDefaultConfig().openaiBridge, enabled: true, ...extra },
 });
 
-describe('normalizeDegradeMapping (R3-2 / 設計書 §7.3)', () => {
+describe('normalizeDegradeMapping', () => {
   it('falls back to the disabled defaults when the section is absent or is not an object', () => {
-    // セクションが無い／型が違う、のいずれでも「無効」に倒れる（§7.3-3）。
+    // セクションが無い／型が違う、のいずれでも「無効」に倒れる。
     for (const raw of [undefined, null, false, 0, '', 'degradeMapping', 42, [], [{ enabled: true }]]) {
       assert.equal(
         normalizeDegradeMapping(raw),
@@ -1077,16 +1076,16 @@ describe('normalizeDegradeMapping (R3-2 / 設計書 §7.3)', () => {
         recoveryWaitEnabled: false,
         upstreamOverloadTo429: false,
         upstreamOverloadRetryAfterSeconds: 30,
-        // D-261: 既定 true のキー（全枯渇の 529 写像は現行どおり続ける）。
+        // 既定 true のキー（全枯渇の 529 写像は現行どおり続ける）。
         claudeExhaustedTo529: true,
         gptPoolUnusableTtlMs: 30000,
       },
     );
   });
 
-  it('keeps the remaining defaults when only enabled is written (R-14 の浅いマージの罠)', () => {
+  it('keeps the remaining defaults when only enabled is written (浅いマージの罠)', () => {
     // DEFAULT_OPENAI_BRIDGE へ既定を置いていたら、この部分指定で他のキーが
-    // すべて undefined になる。専用の正規化関数を通すことでそれを避ける（§7.3-1 理由A）。
+    // すべて undefined になる。専用の正規化関数を通すことでそれを避ける。
     assert.deepEqual(normalizeDegradeMapping({ enabled: true }), {
       enabled: true,
       bothUnusableStatus: 403,
@@ -1099,7 +1098,7 @@ describe('normalizeDegradeMapping (R3-2 / 設計書 §7.3)', () => {
   });
 
   it('falls back to the safe side for wrong types and out-of-range values', () => {
-    // enabled は真偽値の true だけを受け付ける（判定式を1つに保つ＝§7.3-3）。
+    // enabled は真偽値の true だけを受け付ける（判定式を1つに保つ）。
     for (const value of ['true', 1, 'yes', {}, [], null]) {
       assert.equal(normalizeDegradeMapping({ enabled: value }).enabled, false, `enabled:${JSON.stringify(value)}`);
     }
@@ -1108,7 +1107,7 @@ describe('normalizeDegradeMapping (R3-2 / 設計書 §7.3)', () => {
       assert.equal(normalizeDegradeMapping({ enabled: true, bothUnusableStatus: value }).bothUnusableStatus, 403);
     }
     assert.equal(normalizeDegradeMapping({ enabled: true, bothUnusableStatus: 529 }).bothUnusableStatus, 529);
-    // recoveryWaitEnabled も真偽値の true だけを受け付ける（統合設計 v2.1 §3.1）。
+    // recoveryWaitEnabled も真偽値の true だけを受け付ける。
     // 429 は設定値ではなく新経路がコードで返すので、bothUnusableStatus の値域（403/529）
     // と既定 403 は上の行のとおり1つも変えていない。
     for (const value of ['true', 1, 'yes', {}, [], null, undefined, 0, false]) {
@@ -1129,7 +1128,7 @@ describe('normalizeDegradeMapping (R3-2 / 設計書 §7.3)', () => {
     }
     assert.equal(normalizeDegradeMapping({ upstreamOverloadTo429: true }).upstreamOverloadTo429, true,
       'degradeMapping.enabled に依存せず単独で有効にできる');
-    // (h) D-261: claudeExhaustedTo529 は既定が true なので向きが逆になる。非 boolean を
+    // (h) claudeExhaustedTo529 は既定が true なので向きが逆になる。非 boolean を
     // 受理せず既定（写像する＝現行）へ倒し、無効化は真偽値の false だけで成立させる。
     for (const value of ['false', 0, 'no', {}, [], null, undefined, 1, true]) {
       assert.equal(
@@ -1162,7 +1161,7 @@ describe('normalizeDegradeMapping (R3-2 / 設計書 §7.3)', () => {
   });
 
   it('ignores the two keys an earlier version read for the Codex block of status', () => {
-    // 以前の版が status の Codex の節の取得先と期限に読んでいたキー。本番の設定に残っていても、読まずに
+    // 以前の版が status の Codex の節の取得先と期限に読んでいたキー。利用者の設定に残っていても、読まずに
     // 無視し、正規化の結果にも出さない。名前は組み立てて書く（以前の版のキーの名前が src・test・README に
     // 1つも残っていないことを grep で確かめるため）。
     const retiredUrlKey = ['codexStatus', 'Url'].join('');
@@ -1188,7 +1187,7 @@ describe('normalizeDegradeMapping (R3-2 / 設計書 §7.3)', () => {
   });
 });
 
-describe('resolveOpenAiBridgeSettings degradeMapping (R3-2 / 設計書 §7.3-2)', () => {
+describe('resolveOpenAiBridgeSettings degradeMapping', () => {
   it('exposes the normalized section on the enabled path', () => {
     const settings = resolveOpenAiBridgeSettings(enabledBridgeConfig({
       degradeMapping: { enabled: true, bothUnusableStatus: 529 },
@@ -1216,7 +1215,7 @@ describe('resolveOpenAiBridgeSettings degradeMapping (R3-2 / 設計書 §7.3-2)'
 describe('OSS 独立性', () => {
   it('degradeMapping 未指定なら無効になる', () => {
     // 新規インストールの config.json（createDefaultConfig）にはセクションが無い。
-    // 生成物を1バイトも変えないため、既定側にキーを足していないことも固定する（§7.3-1 理由B）。
+    // 生成物を1バイトも変えないため、既定側にキーを足していないことも固定する。
     assert.equal(createDefaultConfig().openaiBridge.degradeMapping, undefined);
     assert.equal(DEFAULT_OPENAI_BRIDGE.degradeMapping, undefined);
     assert.equal(Object.prototype.hasOwnProperty.call(DEFAULT_OPENAI_BRIDGE, 'degradeMapping'), false);
@@ -1236,7 +1235,7 @@ describe('OSS 独立性', () => {
   });
 
   it('fail-safe 3経路では degradeMapping も無効になる', () => {
-    // 設定を解釈できなかったのだから、隣接する新機能も信用しない（§7.3-2）。
+    // 設定を解釈できなかったのだから、隣接する新機能も信用しない。
     const degradeMapping = { enabled: true, bothUnusableStatus: 529, gptPoolUnusableTtlMs: 1000 };
     const failSafeCases = [
       ['modelPattern', { modelPattern: '([unclosed' }, /modelPattern/],
@@ -1253,7 +1252,7 @@ describe('OSS 独立性', () => {
   });
 
   it('openaiBridge 無効でも degradeMapping は正規化される', () => {
-    // 構成①（ClaudeRotator 単体）の成立。(b) の 529 写像は bridge を必要としない（§14.2）。
+    // ClaudeRotator 単体の構成でも成り立つ。529 写像は bridge を必要としない。
     const settings = resolveOpenAiBridgeSettings({
       openaiBridge: {
         enabled: false,
@@ -1274,7 +1273,7 @@ describe('OSS 独立性', () => {
   });
 });
 
-describe('degradeMapping の config-notice (設計書 §7.3-4)', () => {
+describe('degradeMapping の config-notice', () => {
   it('logs exactly one notice line when degradeMapping is enabled without openaiBridge', () => {
     const settings = resolveOpenAiBridgeSettings({
       openaiBridge: { enabled: false, degradeMapping: { enabled: true } },
@@ -1332,7 +1331,7 @@ describe('degradeMapping の config-notice (設計書 §7.3-4)', () => {
     }
   });
 
-  it('(D-261) announces the exhaustion passthrough only when claudeExhaustedTo529 is turned off', () => {
+  it('announces the exhaustion passthrough only when claudeExhaustedTo529 is turned off', () => {
     // 既定（true）では1行も出ない。運用者が明示的に false を書いたときだけ、
     // 「なぜ全枯渇で 529 が出なくなったのか」を起動ログと reload ログに残す。
     const off = resolveOpenAiBridgeSettings({
@@ -1397,7 +1396,7 @@ describe('POST /internal/reload と degradeMapping', () => {
   // src/proxy-server.js:327-336 の再読込手順（config.openaiBridge を差し替えてから
   // resolveOpenAiBridgeSettings を呼び直す）をそのまま再現する。degradeMapping は
   // openaiBridge セクションの下にあるので、src/cli.js:370 の reloadOpenAiBridge にも
-  // reload の配線にも1行も足さずに反映される（§7.1）。解決済みの settings は
+  // reload の配線にも1行も足さずに反映される。解決済みの settings は
   // createProxyServer の外へ露出しないため、HTTP 経由ではなくこの単位で固定する。
   const applyReload = (config, nextOpenaiBridge) => {
     config.openaiBridge = nextOpenaiBridge !== undefined ? nextOpenaiBridge : { ...DEFAULT_OPENAI_BRIDGE };
@@ -1416,14 +1415,14 @@ describe('POST /internal/reload と degradeMapping', () => {
     assert.equal(enabled.degradeMapping.bothUnusableStatus, 529);
     assert.equal(enabled.degradeMapping.gptPoolUnusableTtlMs, 60000);
 
-    // 制約3（可逆性）: プロセスを止めずに1分以内で現行挙動へ戻せること。
+    // 可逆性: プロセスを止めずに1分以内で現行挙動へ戻せること。
     const reverted = applyReload(config, { ...config.openaiBridge, degradeMapping: { enabled: false } });
     assert.equal(reverted.degradeMapping.enabled, false, 'reload で即座に無効へ戻せる');
   });
 
   it('(g) toggles upstreamOverloadTo429 off -> on -> off across reloads', () => {
     // 上流 529 の写像キーも degradeMapping の下にあるので、cli / reload の配線には
-    // 1行も足さずにプロセス再起動なしで反映される（要件①）。
+    // 1行も足さずにプロセス再起動なしで反映される。
     const config = { openaiBridge: { ...createDefaultConfig().openaiBridge, enabled: true } };
     const start = resolveOpenAiBridgeSettings(config);
     assert.equal(start.degradeMapping.upstreamOverloadTo429, false, '起動時は無効');
@@ -1445,8 +1444,8 @@ describe('POST /internal/reload と degradeMapping', () => {
     assert.equal(off.degradeMapping.upstreamOverloadRetryAfterSeconds, 30, '秒数も既定へ戻る');
   });
 
-  it('(D-261) toggles claudeExhaustedTo529 on -> off -> on across reloads', () => {
-    // 切戻し手順（37 番 §6）の裏づけ: config.json のキー1つを戻して reload するだけで、
+  it('toggles claudeExhaustedTo529 on -> off -> on across reloads', () => {
+    // 切り戻しの裏づけ: config.json のキー1つを戻して reload するだけで、
     // プロセスを止めずに現行（529 写像）へ戻る。
     const config = { openaiBridge: { ...createDefaultConfig().openaiBridge, enabled: true } };
     const start = resolveOpenAiBridgeSettings(config);
@@ -1530,9 +1529,9 @@ async function requestJson(url, options = {}) {
 }
 
 // ---------------------------------------------------------------------------
-// R3-3: outcome の分岐（設計書 §9.4）とログ meta の併記（§9.3）
+// outcome の分岐とログ meta の併記
 //
-// 既存ケースは1件も削除・書換しない（§14.4）。以下はすべて新規追加である。
+// 既存ケースは1件も削除・書換しない。以下はすべて新規追加である。
 // ---------------------------------------------------------------------------
 
 // 接続確立前で止まったままの upstream。socket は 'connecting' のまま 'connect' を
@@ -1566,7 +1565,7 @@ function bridgeSettings(overrides = {}) {
       connectTimeoutMs: 2000,
       idleTimeoutMs: 2000,
       connectRetries: 0,
-      // §9.3 の追記は写像機能を有効にした構成だけの挙動（§14.4）。既定は無効なので、
+      // ログ meta の追記は写像機能を有効にした構成だけの挙動。既定は無効なので、
       // 追記を検証するケースではここで明示的に有効化する。
       degradeMapping: { enabled: true },
       ...overrides,
@@ -1581,9 +1580,9 @@ function metaTail(line, outcome) {
   return at === -1 ? null : line.slice(at + marker.length);
 }
 
-describe('forwardToOpenAiBridge outcome branches (設計書 §9.4)', () => {
+describe('forwardToOpenAiBridge outcome branches', () => {
   it('reports bridge-unreachable with the real error code when the connection is refused', async () => {
-    // 接続そのものが確立できない＝codex-rotator のプロセスが動いていない（§9.4）。
+    // 接続そのものが確立できない＝codex-rotator のプロセスが動いていない。
     const settings = bridgeSettings({ connectTimeoutMs: 500, idleTimeoutMs: 500 });
     const lines = [];
     const front = http.createServer(async (req, res) => {
@@ -1598,11 +1597,11 @@ describe('forwardToOpenAiBridge outcome branches (設計書 §9.4)', () => {
     const body = await response.json();
     front.close();
 
-    assert.equal(response.status, 403, 'HTTP 応答は現行のまま（§8.9）');
+    assert.equal(response.status, 403, 'HTTP 応答は現行のまま');
     assert.match(body.error.message, /openai-bridge unreachable: connection refused/, '応答本文の文言は変えない');
     const line = lines.find(l => /outcome=bridge-unreachable/.test(l));
     assert.ok(line, lines.join('\n'));
-    assert.match(line, /degradeReason=bridge_unreachable/, '不達のときは rotator 自身が degradeReason を入れる（§9.3）');
+    assert.match(line, /degradeReason=bridge_unreachable/, '不達のときは rotator 自身が degradeReason を入れる');
     assert.match(line, /errorCode=ECONNREFUSED/, 'ログにはエラー種別を残す');
     assert.match(line, /errorMessage=connect_ECONNREFUSED/, 'message も残す（空白は _ に潰す）');
   });
@@ -1631,7 +1630,7 @@ describe('forwardToOpenAiBridge outcome branches (設計書 §9.4)', () => {
   });
 
   it('reports bridge-connect-timeout when the socket never finishes connecting', async () => {
-    // ポートは開いているが受け付けられていない状態（§9.4）。bridge-unreachable から分離する。
+    // ポートは開いているが受け付けられていない状態。bridge-unreachable から分離する。
     const stalled = createStalledUpstream();
     const req = fakeIncomingRequest();
     const res = fakeServerResponse();
@@ -1643,7 +1642,7 @@ describe('forwardToOpenAiBridge outcome branches (設計書 §9.4)', () => {
     });
 
     assert.equal(result.outcome, 'bridge-connect-timeout');
-    assert.equal(result.status, 403, 'HTTP 応答は現行のまま 403（§8.9）');
+    assert.equal(result.status, 403, 'HTTP 応答は現行のまま 403');
     assert.equal(stalled.getUpstream().destroyed, true);
     const line = lines.find(l => /outcome=bridge-connect-timeout/.test(l));
     assert.ok(line, lines.join('\n'));
@@ -1652,7 +1651,7 @@ describe('forwardToOpenAiBridge outcome branches (設計書 §9.4)', () => {
     assert.ok(lines.every(l => !/outcome=bridge-unreachable/.test(l)), '接続拒否と取り違えない');
   });
 
-  it('reports bridge-idle-timeout when the bridge goes silent after starting a 200 (§8.10)', async () => {
+  it('reports bridge-idle-timeout when the bridge goes silent after starting a 200', async () => {
     // 「200 を受け取った後にチャンクが 30,000ms 来ない」ケース。ここでは注入した
     // idleTimeoutMs=25ms が本番の 30,000ms の役を務める（タイマーは設定注入で短縮する）。
     const manual = createManualUpstream();
@@ -1667,7 +1666,7 @@ describe('forwardToOpenAiBridge outcome branches (設計書 §9.4)', () => {
     manual.getCallback()(fakeUpstreamResponse(200, { 'content-type': 'text/event-stream' }));
     const result = await done;
 
-    assert.equal(result.outcome, 'bridge-idle-timeout', '無音は stream-error ではなく idle-timeout（§8.10）');
+    assert.equal(result.outcome, 'bridge-idle-timeout', '無音は stream-error ではなく idle-timeout');
     assert.equal(result.status, null, 'ヘッダ送出後は 403 を合成できず切断するだけになる');
     assert.equal(res.destroyed, true);
     const line = lines.find(l => /outcome=bridge-idle-timeout/.test(l));
@@ -1693,7 +1692,7 @@ describe('forwardToOpenAiBridge outcome branches (設計書 §9.4)', () => {
   });
 
   it('reports bridge-stream-error when the upstream response breaks mid-stream', async () => {
-    // ストリーム途中の実障害（ECONNRESET 等）。無音（idle-timeout）とは別物である（§9.4）。
+    // ストリーム途中の実障害（ECONNRESET 等）。無音（idle-timeout）とは別物である。
     const manual = createManualUpstream();
     const req = fakeIncomingRequest();
     const res = fakeServerResponse();
@@ -1738,8 +1737,8 @@ describe('forwardToOpenAiBridge outcome branches (設計書 §9.4)', () => {
   });
 });
 
-describe('forwardToOpenAiBridge log meta (設計書 §9.3)', () => {
-  it('appends the x-ombr-* meta in the §9.3 order, for keys that have a value only', async () => {
+describe('forwardToOpenAiBridge log meta', () => {
+  it('appends the x-ombr-* meta in a fixed order, for keys that have a value only', async () => {
     const { response, lines } = await callThroughRotator({
       requestBody: '{"model":"gpt-6-astra"}',
       settingsOverride: { degradeMapping: { enabled: true } },
@@ -1769,7 +1768,7 @@ describe('forwardToOpenAiBridge log meta (設計書 §9.3)', () => {
       ' bridgeContract=1 degradeReason=codex_pool_exhausted poolState=exhausted degradeScope=pool'
       + ' upstreamStatus=429 upstreamSent=yes bridgeCached=no accountLabel=pro-b'
       + ' resetAt=2026-09-08T13:00:00Z primaryUsedPercent=97.5 secondaryUsedPercent=12.5',
-      '§9.3 の表の順序どおりに、値があるキーだけを末尾へ追記する',
+      '決まった順序どおりに、値があるキーだけを末尾へ追記する',
     );
     assert.match(line, /status=529 durationMs=\d+ outcome=forwarded /, '既存フィールドの順序・名前・書式は変えない');
   });
@@ -1787,7 +1786,7 @@ describe('forwardToOpenAiBridge log meta (設計書 §9.3)', () => {
   });
 
   it('drops values outside the contract enumeration instead of logging them verbatim', async () => {
-    // bridge 側の不具合で識別子が混入しても状態にもログにも残さない（契約 §C3.4）。
+    // bridge 側の不具合で識別子が混入しても状態にもログにも残さない。
     const { lines } = await callThroughRotator({
       requestBody: '{"model":"gpt-6-astra"}',
       settingsOverride: { degradeMapping: { enabled: true } },
@@ -1806,7 +1805,7 @@ describe('forwardToOpenAiBridge log meta (設計書 §9.3)', () => {
   });
 
   it('logs a line identical to the current format when the bridge sends no x-ombr-* header (不変性)', async () => {
-    // §9.2: 値が1つも無ければ行は現行とバイト単位で同一になる。
+    // 値が1つも無ければ行は現行とバイト単位で同一になる。
     const { lines } = await callThroughRotator({
       requestBody: '{"model":"gpt-6-astra"}',
       bridgeHandler: (req, res) => res.writeHead(200, { 'Content-Type': 'application/json' }).end('{}'),
@@ -1840,7 +1839,7 @@ describe('forwardToOpenAiBridge log meta (設計書 §9.3)', () => {
   });
 });
 
-describe('OSS 独立性 > degradeMapping 無効時に openai-bridge のログ行が現行と同一である (§14.4)', () => {
+describe('OSS 独立性 > degradeMapping 無効時に openai-bridge のログ行が現行と同一である', () => {
   // 現行（3ae4aeb 時点）のログ行の形。差分は outcome 名の改名だけであること。
   const CURRENT_FORMAT = /^\d{4}-\d{2}-\d{2}T[\d:.]+Z openai-bridge model=gpt-6-astra method=POST path=\/v1\/messages status=\d+ durationMs=\d+ outcome=forwarded$/;
 
@@ -1865,7 +1864,7 @@ describe('OSS 独立性 > degradeMapping 無効時に openai-bridge のログ行
 
   it('appends nothing for a failure outcome either when degradeMapping is disabled', async () => {
     // degradeReason=bridge_* / errorCode / errorMessage も追記であり、無効時は出さない
-    // （§9.3 は無効時にも出すとは定めていないので安全側へ倒す）。
+    // （安全側へ倒す）。
     const manual = createManualUpstream();
     const req = fakeIncomingRequest();
     const res = fakeServerResponse();
@@ -1887,7 +1886,7 @@ describe('OSS 独立性 > degradeMapping 無効時に openai-bridge のログ行
     );
   });
 
-  it('appends nothing when x-ombr-contract is missing, even with degradeMapping enabled (契約 §C3.7-1)', async () => {
+  it('appends nothing when x-ombr-contract is missing, even with degradeMapping enabled', async () => {
     const { lines } = await callThroughRotator({
       requestBody: '{"model":"gpt-6-astra"}',
       settingsOverride: { degradeMapping: { enabled: true } },
@@ -1917,10 +1916,10 @@ describe('OSS 独立性 > degradeMapping 無効時に openai-bridge のログ行
 });
 
 // ---------------------------------------------------------------------------
-// R3-4: GPT プール状態の学習を配線する（設計書 §11.1 R3-4・§8.6、契約 v1.4 §C10.3）
+// GPT プール状態の学習を配線する
 //
-// 学習は応答ヘッダの受領点で完結し、**応答は1バイトも変えない**（403 書換は R4-1）。
-// 既存ケースは1件も削除・書換しない（§14.4）。以下はすべて新規追加である。
+// 学習は応答ヘッダの受領点で完結し、**応答は1バイトも変えない**（403 書換は後述）。
+// 既存ケースは1件も削除・書換しない。以下はすべて新規追加である。
 // 既存の import 文は書き換えず、追加分は別の import 文にする（ESM は巻き上げられる）。
 // ---------------------------------------------------------------------------
 
@@ -1969,7 +1968,7 @@ async function callWithPoolState({ bridgeHandler, requestBody, settingsOverride 
   return { response, text, lines };
 }
 
-// bridge が「契約ヘッダを1つも付けない」応答を返すハンドラ。契約 §C10.3 T9 により
+// bridge が「契約ヘッダを1つも付けない」応答を返すハンドラ。この応答からは
 // 学習は起きないので、この応答を挟むと「そのとき保持している状態」をログで観測できる。
 function respondWithoutContract(req, res) {
   req.resume();
@@ -1983,7 +1982,7 @@ function contractHandler(status, headers, body = '{"type":"error"}') {
   };
 }
 
-describe('forwardToOpenAiBridge > GPT プール状態の学習 (R3-4 / 契約 §C10.3)', () => {
+describe('forwardToOpenAiBridge > GPT プール状態の学習', () => {
   it('T2: learns available for both keys from a 200 with pool-state ok', async () => {
     const gptPoolState = createGptPoolState({ now: () => 1000 });
     const { response, text, lines } = await callWithPoolState({
@@ -2016,7 +2015,7 @@ describe('forwardToOpenAiBridge > GPT プール状態の学習 (R3-4 / 契約 §
       }),
     });
 
-    assert.equal(response.status, 529, 'この段階では書き換えない（403 書換は R4-1）');
+    assert.equal(response.status, 529, '学習するだけで、応答は書き換えない');
     assert.equal(text, '{"type":"error"}', '本文もそのまま素通しする');
     const view = gptPoolState.read('gpt-6-astra');
     assert.deepEqual(
@@ -2141,7 +2140,7 @@ describe('forwardToOpenAiBridge > GPT プール状態の学習 (R3-4 / 契約 §
     });
     assert.equal(gptPoolState.read('gpt-6-astra').pool.state, 'unusable');
 
-    // 不達（S1・S2a・S2b）は状態を変えない。ログには保持中の値が載る（§9.5(d)）。
+    // 不達は状態を変えない。ログには保持中の値が載る。
     const manual = createManualUpstream();
     const req = fakeIncomingRequest();
     const res = fakeServerResponse();
@@ -2224,7 +2223,7 @@ describe('forwardToOpenAiBridge > GPT プール状態の学習 (R3-4 / 契約 §
   });
 
   it('learns nothing while degradeMapping is disabled, even when a pool state instance is passed', async () => {
-    // 設計書 §14.4: 未指定なら現行と完全に同一。生成も観測も行わないのが既定である。
+    // 未指定なら現行と完全に同一。生成も観測も行わないのが既定である。
     const gptPoolState = createGptPoolState({ now: () => 1000 });
     const { response, lines } = await callWithPoolState({
       gptPoolState,
@@ -2247,10 +2246,10 @@ describe('forwardToOpenAiBridge > GPT プール状態の学習 (R3-4 / 契約 §
   });
 });
 
-describe('OSS 独立性 > gptPoolState を渡さない forwardToOpenAiBridge が現行と同一に振る舞う (§14.4)', () => {
+describe('OSS 独立性 > gptPoolState を渡さない forwardToOpenAiBridge が現行と同一に振る舞う', () => {
   it('appends no gptPoolState/gptModelState field when no instance is passed', async () => {
     // degradeMapping を有効にし、bridge が契約ヘッダを full で返しても、状態を保持して
-    // いない呼び出しでは追記は R3-3 時点のフィールドだけになる（1フィールドも増えない）。
+    // いない呼び出しでは追記は従来のフィールドだけになる（1フィールドも増えない）。
     const { response, lines } = await callThroughRotator({
       requestBody: '{"model":"gpt-6-astra"}',
       settingsOverride: { degradeMapping: { enabled: true } },
@@ -2270,17 +2269,16 @@ describe('OSS 独立性 > gptPoolState を渡さない forwardToOpenAiBridge が
     assert.equal(
       metaTail(lines.find(l => /outcome=forwarded/.test(l)), 'forwarded'),
       ' bridgeContract=1 degradeReason=codex_pool_exhausted poolState=exhausted degradeScope=pool upstreamStatus=429',
-      'gptPoolState / gptModelState は保持しているときだけ載る（§9.3）',
+      'gptPoolState / gptModelState は保持しているときだけ載る',
     );
   });
 });
 
 // ---------------------------------------------------------------------------
-// R4-1: (c) 両プール利用不可のときだけ bridge の 529 を 403 へ書き換える
-//        （設計書 §8.7 / 契約 v1.4 §C10.5 の4条件・§C10.7）
+// 両プール利用不可のときだけ bridge の 529 を 403 へ書き換える
 //
-// 既存ケースは1件も削除・書換しない（§14.4）。以下はすべて新規追加である。
-// 偽 bridge は契約 v1.4 の状態表をそのまま返す test/helpers/fake-bridge.js を使う。
+// 既存ケースは1件も削除・書換しない。以下はすべて新規追加である。
+// 偽 bridge は状態表をそのまま返す test/helpers/fake-bridge.js を使う。
 // ---------------------------------------------------------------------------
 
 import { startFakeBridge as startContractBridge } from './helpers/fake-bridge.js';
@@ -2290,8 +2288,8 @@ import { buildDegradeBody, parseBridgeContract } from '../src/degrade-state.js';
 const FAR_FUTURE_RESET_AT = '2099-01-01T00:00:00Z';
 
 /**
- * 契約 v1.4 のモードを返す偽 bridge を立て、forwardToOpenAiBridge を1回だけ通す。
- * Claude 側の台帳は「関数」で注入する（応答ヘッダ受領時点で評価される＝設計書 §11.1 R4-1 補足）。
+ * fake-bridge.js のモードを返す偽 bridge を立て、forwardToOpenAiBridge を1回だけ通す。
+ * Claude 側の台帳は「関数」で注入する（応答ヘッダ受領時点で評価される）。
  */
 async function callWithLedger({
   mode,
@@ -2347,20 +2345,20 @@ async function callWithLedger({
 const allClaudeExhausted = () => true;
 const someClaudeAvailable = () => false;
 
-describe('forwardToOpenAiBridge > 529 → 403 の書換 (R4-1 / 設計書 §8.7)', () => {
+describe('forwardToOpenAiBridge > 529 → 403 の書換', () => {
   it('(a) rewrites the exhausted 529 to 403 permission_error when every Claude account is unusable', async () => {
     const { response, text, bridgeLine } = await callWithLedger({
       mode: 'exhausted',
       claudeAllUnusable: allClaudeExhausted,
     });
 
-    assert.equal(response.status, 403, '両プール利用不可なので明示停止する（M-5）');
+    assert.equal(response.status, 403, '両プール利用不可なので明示停止する');
     const body = JSON.parse(text);
     assert.equal(body.error.type, 'permission_error');
     assert.equal(
       body.error.message,
       `All Claude accounts and the Codex pool are unavailable. Earliest recovery: ${FAR_FUTURE_RESET_AT}.`,
-      '本文に「両方とも使えないこと」と最も早い回復見込みを入れる（§8.7）',
+      '本文に「両方とも使えないこと」と最も早い回復見込みを入れる',
     );
     assert.equal(
       response.headers.get('content-length'),
@@ -2377,12 +2375,12 @@ describe('forwardToOpenAiBridge > 529 → 403 の書換 (R4-1 / 設計書 §8.7)
       metaTail(bridgeLine, 'forwarded-mapped'),
       ' bridgeContract=1 degradeReason=codex_pool_exhausted poolState=exhausted degradeScope=pool'
       + ` upstreamStatus=429 upstreamSent=yes accountLabel=acct-a resetAt=${FAR_FUTURE_RESET_AT}`
-      // D-150: 写像した行にだけ effectiveResetAt=（本文へ実際に載った最早回復時刻）が
+      // 写像した行にだけ effectiveResetAt=（本文へ実際に載った最早回復時刻）が
       // 並ぶ。resetAt= は契約ヘッダの生値のまま残す（この事例では両者が同じ値になる）。
       + ` effectiveResetAt=${FAR_FUTURE_RESET_AT}`
       + ' gptPoolState=unusable gptModelState=unknown claudePoolState=all-exhausted'
       + ' mappedFrom=529 mappedFromType=overloaded_error mappedTo=403 mapReason=both_pools_unusable',
-      '実際の上流ステータス（529・429）を必ず同じ行に残す（§9.1・受入条件7）',
+      '実際の上流ステータス（529・429）を必ず同じ行に残す',
     );
   });
 
@@ -2436,13 +2434,13 @@ describe('forwardToOpenAiBridge > 529 → 403 の書換 (R4-1 / 設計書 §8.7)
     assert.equal(/mapped(From|To)=/.test(bridgeLine), false, '写像していないので mapped* は出さない');
   });
 
-  it('(c) rewrites the mixed 529 to 403 as well (§C10.7 規則2・境界の反対側)', async () => {
+  it('(c) rewrites the mixed 529 to 403 as well (境界の反対側)', async () => {
     const { response, text, bridgeLine } = await callWithLedger({
       mode: 'mixed',
       claudeAllUnusable: allClaudeExhausted,
     });
 
-    assert.equal(response.status, 403, 'pool-state: mixed も書換の対象（§8.7 条件①）');
+    assert.equal(response.status, 403, 'pool-state: mixed も書換の対象');
     assert.equal(JSON.parse(text).error.type, 'permission_error');
     assert.match(bridgeLine, /degradeReason=codex_pool_mixed poolState=mixed/);
     assert.match(bridgeLine, /mapReason=both_pools_unusable/);
@@ -2454,7 +2452,7 @@ describe('forwardToOpenAiBridge > 529 → 403 の書換 (R4-1 / 設計書 §8.7)
       claudeAllUnusable: allClaudeExhausted,
     });
 
-    assert.equal(response.status, 529, '未試行の口座が残っているので止めない（§C10.5 の「根拠にならないもの」）');
+    assert.equal(response.status, 529, '未試行の口座が残っているので止めない');
     assert.match(text, /codex attempt limit/);
     assert.equal(gptPoolState.snapshot().pool.state, 'unknown', 'T5: 学習もしない');
     assert.match(bridgeLine, /outcome=forwarded /);
@@ -2475,11 +2473,11 @@ describe('forwardToOpenAiBridge > 529 → 403 の書換 (R4-1 / 設計書 §8.7)
     assert.equal(/mapped(From|To)=/.test(bridgeLine), false);
   });
 
-  // 母艦裁定 D-72（坂根氏の判断③）で期待を反転した。旧版は
-  // 「(f) forwards the needs-login 403 untouched (§8.8)」として 403 の素通しを固定していたが、
+  // 期待を反転した。旧版は
+  // 「(f) forwards the needs-login 403 untouched」として 403 の素通しを固定していたが、
   // 「ログインが切れたら自動でローテーションして止まらないように」という方針へ変わった。
-  // 学習（T3）と (pool) の扱いは1ビットも変えていない。
-  it('(f) rewrites the needs-login 403 into a 529 so Claude Code falls back instead of stopping (D-72)', async () => {
+  // (pool) を unusable と覚える学習と、(pool) の扱いは1ビットも変えていない。
+  it('(f) rewrites the needs-login 403 into a 529 so Claude Code falls back instead of stopping', async () => {
     const { response, text, gptPoolState, bridgeLine } = await callWithLedger({
       mode: 'needs-login',
       claudeAllUnusable: allClaudeExhausted,
@@ -2505,7 +2503,7 @@ describe('forwardToOpenAiBridge > 529 → 403 の書換 (R4-1 / 設計書 §8.7)
       + ' upstreamStatus=none upstreamSent=no'
       + ' gptPoolState=unusable gptModelState=unknown claudePoolState=all-exhausted'
       + ' mappedFrom=403 mappedFromType=permission_error mappedTo=529 mapReason=codex_auth_expired',
-      '既存の mappedFrom/mappedTo と同じ形式で記録し、識別子は載せない（D-72 の 7）',
+      '既存の mappedFrom/mappedTo と同じ形式で記録し、識別子は載せない',
     );
   });
 
@@ -2520,25 +2518,25 @@ describe('forwardToOpenAiBridge > 529 → 403 の書換 (R4-1 / 設計書 §8.7)
     assert.match(
       JSON.parse(text).error.message,
       /credential/i,
-      '「ログインし直せ」ではなく「資格情報を読めない」と書く（契約 §C3.4 が理由を分けた目的）',
+      '「ログインし直せ」ではなく「資格情報を読めない」と書く（bridge が needs-login と理由を分けて返す目的）',
     );
     assert.equal(gptPoolState.snapshot().pool.state, 'unusable', 'T3 の学習は needs-login と同じ');
     assert.match(bridgeLine, /degradeReason=codex_credentials_unavailable poolState=credentials-unavailable/);
     assert.match(bridgeLine, /mappedFrom=403 mappedFromType=permission_error mappedTo=529 mapReason=codex_auth_expired/);
   });
 
-  it('(f3) rewrites a model-scoped needs-login 403 without touching (pool) (§D2 S7b-m)', async () => {
+  it('(f3) rewrites a model-scoped needs-login 403 without touching (pool)', async () => {
     const { response, text, gptPoolState, bridgeLine } = await callWithLedger({
       mode: 'needs-login-model',
       claudeAllUnusable: allClaudeExhausted,
     });
 
-    assert.equal(response.status, 529, 'scope が model でも「止めない」方針は同じ（D-72 の 1）');
+    assert.equal(response.status, 529, 'scope が model でも「止めない」方針は同じ');
     assert.equal(JSON.parse(text).error.type, 'overloaded_error');
     assert.equal(
       gptPoolState.snapshot().pool.state,
       'unknown',
-      'scope=model は (pool) を絶対に汚さない（契約 §C10.3 T3 は effectiveScope=pool の分岐）',
+      'scope=model は (pool) を絶対に汚さない（(pool) を学習するのは effectiveScope=pool のときだけ）',
     );
     assert.equal(gptPoolState.read('gpt-6-astra').model.state, 'unknown', 'needs-login は T4 にも当たらない');
     assert.match(bridgeLine, /degradeScope=model /);
@@ -2576,7 +2574,7 @@ describe('forwardToOpenAiBridge > 529 → 403 の書換 (R4-1 / 設計書 §8.7)
       },
     });
 
-    assert.equal(response.status, 403, '契約ヘッダの無い 403 は対象外（D-72 の 2）');
+    assert.equal(response.status, 403, '契約ヘッダの無い 403 は対象外');
     assert.equal(JSON.parse(text).error.type, 'permission_error');
     assert.equal(
       /mapped(From|To)=/.test(lines.find(l => / openai-bridge model=/.test(l))),
@@ -2585,7 +2583,7 @@ describe('forwardToOpenAiBridge > 529 → 403 の書換 (R4-1 / 設計書 §8.7)
     );
   });
 
-  it('(g) forwards a legacy 429 without contract headers untouched (§C3.7-1)', async () => {
+  it('(g) forwards a legacy 429 without contract headers untouched', async () => {
     const { response, text, gptPoolState, bridgeLine } = await callWithLedger({
       mode: 'legacy',
       claudeAllUnusable: allClaudeExhausted,
@@ -2598,7 +2596,7 @@ describe('forwardToOpenAiBridge > 529 → 403 の書換 (R4-1 / 設計書 §8.7)
     assert.equal(/mapped(From|To)=/.test(bridgeLine), false);
   });
 
-  it('(h) changes nothing at all while degradeMapping is disabled (§14.4)', async () => {
+  it('(h) changes nothing at all while degradeMapping is disabled', async () => {
     // 既定の構成。gptPoolState と claudeAllUnusable を渡しても、写像機能が無効なら
     // 観測も評価も書換もログ追記も起きない。
     const { response, text, bridgeLine, gptPoolState } = await callWithLedger({
@@ -2626,14 +2624,14 @@ describe('forwardToOpenAiBridge > 529 → 403 の書換 (R4-1 / 設計書 §8.7)
       claudeAllUnusable: allClaudeExhausted,
     });
 
-    assert.equal(response.status, 529, '設定で 529 を選んだ構成では書換そのものを行わない（§8.7）');
+    assert.equal(response.status, 529, '設定で 529 を選んだ構成では書換そのものを行わない');
     assert.match(text, /codex pool exhausted/, '本文も上流のまま（自作の本文へ差し替えない）');
     assert.match(bridgeLine, /outcome=forwarded /);
     assert.equal(/mapped(From|To)=/.test(bridgeLine), false);
   });
 });
 
-describe('forwardToOpenAiBridge > 書換後のイベント順序 (R4-1 / 設計書 §8.7 手順5〜7)', () => {
+describe('forwardToOpenAiBridge > 書換後のイベント順序', () => {
   // 上流応答を手で駆動して、書換の「後」に届くイベントを1つずつ確かめる。
   function driveRewrite({ upstreamHeaders, claudeAllUnusable = () => true } = {}) {
     const manual = createManualUpstream();
@@ -2680,7 +2678,7 @@ describe('forwardToOpenAiBridge > 書換後のイベント順序 (R4-1 / 設計�
     assert.equal(
       res.headers['Content-Length'],
       String(Buffer.byteLength(expected)),
-      '上流 529 の Content-Length（999）が残るとクライアントが本文を待ち続ける（§8.7 手順2）',
+      '上流 529 の Content-Length（999）が残るとクライアントが本文を待ち続ける',
     );
     assert.equal(res.writableEnded, true);
     assert.equal(manual.getUpstream().destroyed, true, '上流本文は読まずに接続を畳む');
@@ -2693,10 +2691,10 @@ describe('forwardToOpenAiBridge > 書換後のイベント順序 (R4-1 / 設計�
     manual.getCallback()(upstreamRes);
     const result = await done;
 
-    // 破棄由来の 'error' を誰も受けないと未捕捉例外になり、rotator ごと落ちる（§8.7 手順6）。
+    // 破棄由来の 'error' を誰も受けないと未捕捉例外になり、rotator ごと落ちる。
     upstreamRes.emit('error', Object.assign(new Error('aborted'), { code: 'ECONNRESET' }));
     // 'data' / 'end' を装着していないので、遅れて届くチャンクは
-    // ERR_STREAM_WRITE_AFTER_END を起こす経路そのものが無い（§8.7 手順7）。
+    // ERR_STREAM_WRITE_AFTER_END を起こす経路そのものが無い。
     upstreamRes.emit('data', Buffer.from('late chunk'));
     upstreamRes.emit('end');
     manual.getUpstream().emit('error', Object.assign(new Error('socket hang up'), { code: 'ECONNRESET' }));
@@ -2729,13 +2727,13 @@ describe('forwardToOpenAiBridge > 書換後のイベント順序 (R4-1 / 設計�
 });
 
 // ---------------------------------------------------------------------------
-// R4-1 の再検証で見つかった2件の回帰テスト（2026-09-08）
+// 529 → 403 の書換の再検証で見つかった2件の回帰テスト
 //   ① x-ombr-contract が無い・不正な応答は、過去に学習した (pool)=unusable が
-//      残っていても書き換えない（契約 §C3.7-1 の後方互換原則）
+//      残っていても書き換えない（後方互換の原則）
 //   ② 403 の本文の「最早回復時刻」は GPT 側と Claude 側の早いほうを出す
 // ---------------------------------------------------------------------------
 
-// 学習済みの (pool)=unusable を持つ状態を作る（契約 §C10.3 T3）。
+// 学習済みの (pool)=unusable を持つ状態を作る。
 function poolStateLearnedAsUnusable() {
   const gptPoolState = createGptPoolState();
   gptPoolState.observe(
@@ -2813,7 +2811,7 @@ function exhaustedHandlerWithContract(contractHeaderValue) {
   };
 }
 
-describe('forwardToOpenAiBridge > 契約ヘッダの無い応答は書き換えない (R4-1 再検証①)', () => {
+describe('forwardToOpenAiBridge > 契約ヘッダの無い応答は書き換えない (再検証①)', () => {
   for (const [label, contractHeaderValue] of [
     ['x-ombr-contract が無い', null],
     ['x-ombr-contract が不正値（abc）', 'abc'],
@@ -2827,7 +2825,7 @@ describe('forwardToOpenAiBridge > 契約ヘッダの無い応答は書き換え�
         claudeAllUnusable: allClaudeExhausted,
       });
 
-      assert.equal(response.status, 529, '契約前 bridge の応答は現行とまったく同じ意味に扱う（§C3.7-1）');
+      assert.equal(response.status, 529, '契約前 bridge の応答は現行とまったく同じ意味に扱う');
       assert.equal(JSON.parse(text).error.type, 'overloaded_error', '本文も上流のまま');
       assert.equal(/mapped(From|To)=/.test(bridgeLine), false, '過去の学習だけを根拠に書き換えない');
       assert.equal(/bridgeContract=/.test(bridgeLine), false, '契約由来の値は1つも載せない');
@@ -2835,7 +2833,7 @@ describe('forwardToOpenAiBridge > 契約ヘッダの無い応答は書き換え�
   }
 });
 
-describe('forwardToOpenAiBridge > 403 本文の最早回復時刻 (R4-1 再検証②)', () => {
+describe('forwardToOpenAiBridge > 403 本文の最早回復時刻 (再検証②)', () => {
   const CLAUDE_RESET_AT = '2026-09-08T13:00:00Z';
 
   it('prefers the Claude side reset time when it is earlier than the Codex one', async () => {
@@ -2867,8 +2865,7 @@ describe('forwardToOpenAiBridge > 403 本文の最早回復時刻 (R4-1 再検�
 });
 
 // ---------------------------------------------------------------------------
-// R6-2: 非 SSE 要求の生存通知（HTTP 102 Processing）
-// 契約 §C4.6（非 SSE 要求の生存通知）／§C13.4 テスト30。
+// 非 SSE 要求の生存通知（HTTP 102 Processing）
 //
 // 非 SSE の応答には SSE の開始マーカーに相当する「流すもの」が無いため、bridge が上流
 // 応答ヘッダを待っている間、rotator には1バイトも届かない。放置すると bridge も上流も
@@ -2881,14 +2878,14 @@ describe('forwardToOpenAiBridge > 403 本文の最早回復時刻 (R4-1 再検�
 
 // 実寸（アイドル 30,000ms・102 は 12,000ms ごと・生成 90,000ms）と同じ比のまま縮めた値。
 const PROCESSING_IDLE_MS = 400;
-const PROCESSING_INTERVAL_MS = PROCESSING_IDLE_MS / 2; // §C4.6 の 2「idleTimeoutMs の 1/2 以下」
+const PROCESSING_INTERVAL_MS = PROCESSING_IDLE_MS / 2; // idleTimeoutMs の 1/2 以下
 const PROCESSING_HEAD_DELAY_MS = PROCESSING_IDLE_MS * 3; // アイドルの3倍だけ応答ヘッダを遅らせる
 const PROCESSING_OK_BODY = JSON.stringify({ type: 'message', content: 'ok' });
 const PROCESSING_ERROR_BODY = JSON.stringify({ type: 'error', error: { type: 'api_error', message: 'upstream failed' } });
 
 /**
  * 偽 bridge が 102 Processing を送る。ServerResponse#writeProcessing() は
- * "HTTP/1.1 102 Processing\r\n\r\n" だけを書き、最終応答ヘッダを確定させない（§C4.6 の 1）。
+ * "HTTP/1.1 102 Processing\r\n\r\n" だけを書き、最終応答ヘッダを確定させない。
  * 返す counter で「実際に何回送ったか」をテスト側から確認する。
  */
 function start102Heartbeat(res, { intervalMs = null, counter }) {
@@ -2931,7 +2928,7 @@ function processingBridge({ heartbeat = 'none', first102DelayMs = 0, headDelayMs
     if (ending === 'silence') return; // 102 のあとは無音のまま保持する（対照）
     const timer = setTimeout(() => {
       pending.delete(timer);
-      stopHeartbeat(); // §C4.6 の 3: 上流応答ヘッダを受領した時点で送出を止める
+      stopHeartbeat(); // 上流応答ヘッダを受領した時点で送出を止める
       if (ending === 'destroy') {
         res.socket?.destroy();
         return;
@@ -3062,7 +3059,7 @@ async function callWith102Bridge({ bridge: bridgeSpec, idleTimeoutMs = PROCESSIN
   };
 }
 
-describe('forwardToOpenAiBridge > 非 SSE の生存通知 102 Processing (R6-2 / 契約 §C4.6)', () => {
+describe('forwardToOpenAiBridge > 非 SSE の生存通知 102 Processing', () => {
   it('(a) keeps the request alive while 102 keeps arriving, and never forwards 102 downstream', async () => {
     // アイドルの3倍だけ応答ヘッダを遅らせる。102 が届かなければ必ず切られる長さである。
     const bridge = processingBridge({ heartbeat: 'periodic', headDelayMs: PROCESSING_HEAD_DELAY_MS });
@@ -3077,7 +3074,7 @@ describe('forwardToOpenAiBridge > 非 SSE の生存通知 102 Processing (R6-2 /
     assert.equal(
       lines.filter(line => / openai-bridge /.test(line)).length,
       1,
-      '102 の受信でログ行を増やさない（§C4.6 の「ログ書式は不変」）',
+      '102 の受信でログ行を増やさない',
     );
   });
 
@@ -3171,7 +3168,7 @@ describe('forwardToOpenAiBridge > 非 SSE の生存通知 102 Processing (R6-2 /
 
   it('(d) behaves the same whether degradeMapping is off (default) or on', async () => {
     // 102 の消費は degradeMapping と無関係な rotator の基本挙動である
-    // （§C4.6 は bridge 側の設定フラグで制御する）。
+    // （102 を送るかは bridge 側の設定フラグで制御する）。
     const off = processingBridge({ heartbeat: 'periodic', headDelayMs: PROCESSING_HEAD_DELAY_MS });
     const offRun = await callWith102Bridge({ bridge: off, degradeMapping: null });
     const on = processingBridge({ heartbeat: 'periodic', headDelayMs: PROCESSING_HEAD_DELAY_MS });
@@ -3183,7 +3180,7 @@ describe('forwardToOpenAiBridge > 非 SSE の生存通知 102 Processing (R6-2 /
       assert.deepEqual(JSON.parse(run.text), JSON.parse(PROCESSING_OK_BODY));
       assert.ok(run.processingSent >= 3);
     }
-    // 契約ヘッダの無い 200 では追記フィールドが1つも出ない（§14.4）。102 でも増えない。
+    // 契約ヘッダの無い 200 では追記フィールドが1つも出ない。102 でも増えない。
     assert.match(offRun.bridgeLine, /outcome=forwarded$/);
     assert.match(onRun.bridgeLine, /outcome=forwarded$/);
   });
@@ -3246,7 +3243,7 @@ describe('forwardToOpenAiBridge > 非 SSE の生存通知 102 Processing (R6-2 /
 });
 
 // ---------------------------------------------------------------------------
-// R6-4: rotator → bridge の要求ヘッダ（契約 §C4.6 の生存通知の周期を決める値の受け渡しと、
+// rotator → bridge の要求ヘッダ（生存通知の周期を決める値の受け渡しと、
 // 利用者が名乗った契約ヘッダの除去）。どちらも degradeMapping の有無に依存しない。
 // ---------------------------------------------------------------------------
 
@@ -3325,7 +3322,7 @@ function contractHeaderNames(headers) {
   return Object.keys(headers).filter(name => name.toLowerCase().startsWith('x-ombr-')).sort();
 }
 
-describe('forwardToOpenAiBridge > R6-4 契約ヘッダの送出と利用者ヘッダの除去', () => {
+describe('forwardToOpenAiBridge > 契約ヘッダの送出と利用者ヘッダの除去', () => {
   it('(a) sends the rotator idle timeout as x-ombr-idle-timeout-ms with the default settings', async () => {
     const { seen, response } = await forwardWithClientHeaders();
     assert.equal(response.status, 200);
@@ -3384,14 +3381,14 @@ describe('forwardToOpenAiBridge > R6-4 契約ヘッダの送出と利用者ヘ�
 });
 
 // ---------------------------------------------------------------------------
-// R7-2: proxy 統合（母艦裁定 D-72）
+// proxy 統合
 //
 // 純関数と forwardToOpenAiBridge の単体では「実際のクライアントが 529 を受け取る」
 // ことまでは固定できない。createProxyServer の gpt-* 分岐を実 TCP で1往復通して、
 // bridge の 403（認証失効）が 529 としてクライアントへ届くことを確かめる。
 // ---------------------------------------------------------------------------
 
-describe('proxy 統合 > 認証失効の 403 が 529 としてクライアントへ届く (D-72)', () => {
+describe('proxy 統合 > 認証失効の 403 が 529 としてクライアントへ届く', () => {
   async function callProxy({ mode, degradeMapping = { enabled: true } }) {
     const bridge = await startContractBridge({ port: 0, mode });
     const secretStore = new MemorySecretStore();
@@ -3461,9 +3458,9 @@ describe('proxy 統合 > 認証失効の 403 が 529 としてクライアント
 });
 
 // ---------------------------------------------------------------------------
-// 接続前リトライの硬化（2026-09-14）
+// 接続前リトライの硬化
 //
-// 12:07 の ECONNREFUSED ×4／12:32 の ECONNRESET ×3（いずれも bridge の再起動と対応）
+// bridge の再起動と重なって起きた ECONNREFUSED／ECONNRESET
 // の調査で、接続前リトライ経路に次の穴が見つかった。
 //   (a) 再試行の可否を 'finish'（requestFullySent）だけで判定しており、TCP 接続が
 //       確立していても 'finish' 前なら再送してしまう（二重送信の危険）。
@@ -3472,7 +3469,7 @@ describe('proxy 統合 > 認証失効の 403 が 529 としてクライアント
 //   (c) connectRetries が有限整数か検証されず、Infinity や巨大値がそのまま上限になる。
 //   (d) 再試行が即時で、待機も総予算も無い。
 //   (e) ECONNRESET は拒否（ECONNREFUSED）と原因が違うが、**応答本文は変えない**
-//       （§8.9「HTTP 応答は不変」）。区別はログの errorCode だけが担う。
+//       （HTTP 応答は不変）。区別はログの errorCode だけが担う。
 // ---------------------------------------------------------------------------
 
 // 試行ごとの upstream を全部records として保持するフェイク。createManualUpstream は
@@ -3645,12 +3642,12 @@ describe('openai-bridge connect retry hardening', () => {
 
     it('never re-attempts a reset before finish and keeps the response body rounded', async () => {
       // (b)(e): ECONNRESET は「一度は接続できた」証拠なので再試行対象から外す。
-      // ただし **応答本文は拒否と同じ固定文言のまま**にし（§8.9「HTTP 応答は不変」）、
+      // ただし **応答本文は拒否と同じ固定文言のまま**にし（HTTP 応答は不変）、
       // 拒否との区別はログの errorCode だけで行う。
       const factory = createAttemptRecordingUpstream();
       const lines = [];
       const { res, done } = startForward({
-        // errorCode の追記は degradeMapping を有効にした構成だけの挙動なので（§14.4）、
+        // errorCode の追記は degradeMapping を有効にした構成だけの挙動なので、
         // ログ側の区別まで見るこのケースだけ有効にする。
         settings: retrySettings({ connectRetries: 2, degradeMapping: { enabled: true } }),
         factory,
@@ -3666,14 +3663,14 @@ describe('openai-bridge connect retry hardening', () => {
       assert.equal(result.outcome, 'bridge-unreachable');
       assert.equal(res.statusCode, 403);
       assert.equal(factory.attempts.length, 1, 'リセットは再試行しない');
-      assert.equal(syntheticMessage(res), 'openai-bridge unreachable: connection refused', '応答本文の文言は変えない（§8.9）');
+      assert.equal(syntheticMessage(res), 'openai-bridge unreachable: connection refused', '応答本文の文言は変えない');
       assert.match(lines.find(l => /outcome=bridge-unreachable/.test(l)), /errorCode=ECONNRESET/);
     });
 
     it('keeps the 403 body byte-identical to 385dace for a reset after accept under the default config', async () => {
       // 回帰固定: 既定構成（connectRetries を設定しない）で、bridge が accept 後・
       // ヘッダ送出前に RST を返したときの 403 本文が 385dace と一字一句同じであることを
-      // 固定する。種別（refused / reset）の区別はログの errorCode だけが担う（§8.9）。
+      // 固定する。種別（refused / reset）の区別はログの errorCode だけが担う。
       const settings = resolveOpenAiBridgeSettings({
         openaiBridge: {
           enabled: true,
@@ -3682,7 +3679,7 @@ describe('openai-bridge connect retry hardening', () => {
           connectTimeoutMs: 2000,
           idleTimeoutMs: 2000,
           // connectRetries は書かない（＝既定構成。DEFAULT_OPENAI_BRIDGE の 0 が採用される）。
-          // errorCode の追記は degradeMapping を有効にした構成だけの振る舞いなので（§14.4）、
+          // errorCode の追記は degradeMapping を有効にした構成だけの振る舞いなので、
           // ログ側の区別まで見るためにここだけ有効化する。
           degradeMapping: { enabled: true },
         },
@@ -3903,7 +3900,7 @@ describe('openai-bridge connect retry hardening', () => {
 });
 
 // ---------------------------------------------------------------------------
-// 段階①: 上流全滅・一時障害で Claude Code を止めない（統合設計 v2.1 §3）
+// 上流全滅・一時障害で Claude Code を止めない
 // recoveryWaitEnabled が真のときだけ 429 ＋ Retry-After: 30 を返し、偽なら現行と同一。
 // ---------------------------------------------------------------------------
 
@@ -3956,10 +3953,10 @@ async function runRecoveryWait(options) {
   return { ...driven, bridgeLine: driven.lines.find(l => / openai-bridge model=/.test(l)) };
 }
 
-describe('forwardToOpenAiBridge > recoveryWait の 429 待機 (統合設計 v2.1 §3.2)', () => {
+describe('forwardToOpenAiBridge > recoveryWait の 429 待機', () => {
   it('answers 429 rate_limit_error with Retry-After 30 instead of stopping with 403', async () => {
     const { res, bridgeLine } = await runRecoveryWait();
-    assert.equal(res.statusCode, 429, '403 では Claude Code がその場で停止する（M-5）');
+    assert.equal(res.statusCode, 429, '403 では Claude Code がその場で停止する');
     assert.equal(res.headers['Retry-After'], '30');
     const body = JSON.parse(res.endPayload.toString('utf8'));
     assert.equal(body.error.type, 'rate_limit_error');
@@ -3969,7 +3966,7 @@ describe('forwardToOpenAiBridge > recoveryWait の 429 待機 (統合設計 v2.1
     assert.match(bridgeLine, /retryAfter=30/);
   });
 
-  it('V1: strips retry-after and anthropic-ratelimit-* so the client never sleeps on a 5-day reset', async () => {
+  it('strips retry-after and anthropic-ratelimit-* so the client never sleeps on a 5-day reset', async () => {
     const { res } = await runRecoveryWait({
       upstreamHeaders: {
         'retry-after': '3600',
@@ -4005,7 +4002,7 @@ describe('forwardToOpenAiBridge > recoveryWait の 429 待機 (統合設計 v2.1
     assert.equal(/mappedTo=/.test(bridgeLine), false, '書換なしなので痕跡も出ない');
   });
 
-  it('keeps the auth-expired 403 on the R7 path (429 へ再変換しない)', async () => {
+  it('keeps the auth-expired 403 on the 403→529 path (429 へ再変換しない)', async () => {
     const { res, bridgeLine } = await runRecoveryWait({
       upstreamStatus: 403,
       upstreamHeaders: {
@@ -4015,7 +4012,7 @@ describe('forwardToOpenAiBridge > recoveryWait の 429 待機 (統合設計 v2.1
         'x-ombr-upstream-sent': 'no',
       },
     });
-    assert.equal(res.statusCode, 529, 'D-72 / R7 の 403→529 を維持する');
+    assert.equal(res.statusCode, 529, '認証切れの 403→529 を維持する');
     assert.equal(res.headers['Retry-After'], undefined);
     assert.match(bridgeLine, /mapReason=codex_auth_expired/);
   });
@@ -4045,7 +4042,7 @@ describe('forwardToOpenAiBridge > recoveryWait の 429 待機 (統合設計 v2.1
     assert.equal(/ cached=/.test(bridgeLine), false, 'フラグ off ではログ行も1フィールド増えない');
   });
 
-  it('emits cached= on every contract response so T2b の第3条件を本番で監査できる', async () => {
+  it('emits cached= on every contract response so T2b の条件 (4)（cached が yes でない）をログで監査できる', async () => {
     const withoutHeader = await runRecoveryWait();
     assert.match(withoutHeader.bridgeLine, / cached=none /, 'ヘッダが無いことを none として残す');
     const withHeader = await runRecoveryWait({ upstreamHeaders: { 'x-ombr-cached': 'yes' } });
@@ -4081,7 +4078,7 @@ async function driveUnreachable({ claudeQuotaState = () => 'none', degradeMappin
   return { res, bridgeLine: lines.find(l => / openai-bridge model=/.test(l)) };
 }
 
-describe('forwardToOpenAiBridge > bridge 不達の帰結 (統合設計 v2.1 §3.2 の8行目)', () => {
+describe('forwardToOpenAiBridge > bridge 不達の帰結', () => {
   it('waits with 429 + Retry-After when no Claude account is available', async () => {
     const { res, bridgeLine } = await driveUnreachable();
     assert.equal(res.statusCode, 429, '不達は恒久拒否ではないので 403 で止めない');
@@ -4109,12 +4106,12 @@ describe('forwardToOpenAiBridge > bridge 不達の帰結 (統合設計 v2.1 §3.
   });
 });
 
-describe('forwardToOpenAiBridge > V12: 上流回復後に T2b へ到達する (統合設計 v2.1 §6)', () => {
+describe('forwardToOpenAiBridge > 上流回復後に T2b へ到達する', () => {
   it('returns gptPoolState to unknown on the request that follows a successful 200', async () => {
     const gptPoolState = createGptPoolState({ recoveryWaitEnabled: true });
     const settingsOverride = { degradeMapping: RECOVERY_WAIT_ON };
 
-    // 1) 週次 resetAt 付きの全滅を学習する（本番で 21 時間固着した形）。
+    // 1) 週次 resetAt 付きの全滅を学習する（長時間固着する形）。
     await callWithPoolState({
       gptPoolState,
       requestBody: '{"model":"gpt-6-astra"}',

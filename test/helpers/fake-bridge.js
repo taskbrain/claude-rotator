@@ -13,7 +13,7 @@
 //   SIGINT / SIGTERM で終了する。起動時に標準出力へ1行だけ出す。
 //
 //   --mode unreachable は「listen しない」モードであり、--port を占有しない。
-//   受入検証 (1)（bridge 不達 → 403 ＋ outcome=bridge-unreachable）を再現するときは、
+//   bridge 不達（→ 403 ＋ outcome=bridge-unreachable）を再現するときは、
 //   このモードで起動する（プロセスは1行出力してすぐ終了する）か、そもそも何も起動しない。
 //   どちらでも rotator から見た結果は同じ（接続拒否）である。
 //
@@ -35,19 +35,19 @@ import { fileURLToPath } from 'node:url';
 /** 契約の版（応答ヘッダ x-ombr-contract と /healthz の contract に載る）。 */
 export const CONTRACT_VERSION = 1;
 
-/** --account の既定値。契約 §C3.1 の表示名パターンに適合する。 */
+/** --account の既定値。表示名のパターン（ACCOUNT_LABEL_PATTERN）に適合する。 */
 export const DEFAULT_ACCOUNT_LABEL = 'acct-a';
 
 /** --reset-at の既定値（現在時刻 + 60 秒）。 */
 export const DEFAULT_RESET_AT_OFFSET_MS = 60_000;
 
-/** 契約 §C3.1: 表示名はこのパターンに限る（メールアドレス・氏名は禁止）。 */
+/** 表示名はこのパターンに限る（メールアドレス・氏名は禁止）。 */
 const ACCOUNT_LABEL_PATTERN = /^[a-z0-9][a-z0-9_-]{0,31}$/;
 
-/** 契約 §C3.2: x-ombr-reset-at は RFC3339 の UTC 表記。 */
+/** x-ombr-reset-at は RFC3339 の UTC 表記。 */
 const RESET_AT_PATTERN = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$/;
 
-// 契約 §C4.4: 開始マーカーは「上流ステータス確定の直後に何らかのバイト列が届くこと」
+// 開始マーカーは「上流ステータス確定の直後に何らかのバイト列が届くこと」
 // だけを要求しており、形は bridge 側が決めてよい。ここでは既存テスト
 // （test/openai-bridge.test.js の SSE 最小応答）と同じ message_start / message_stop を使う。
 const SSE_START_MARKER = 'event: message_start\ndata: {"type":"message_start"}\n\n';
@@ -57,8 +57,8 @@ const SSE_STOP_EVENT = 'event: message_stop\ndata: {"type":"message_stop"}\n\n';
 const STREAM_RESET_DELAY_MS = 20;
 
 /**
- * モード表。契約 §D2（Part 2a の状態表）・§C3.4（degrade-reason の列挙）・
- * §C10.5（403 書換の4条件）と、設計書 §13.2（CR-L〜CR-S）に対応する。
+ * モード表。bridge が状態ごとに返す応答（status・error.type・x-ombr-degrade-reason の値）を
+ * 1モード1項目で並べる。
  *
  * kind:
  *   'json'      … ステータスと JSON 本文を返して終わる
@@ -67,7 +67,7 @@ const STREAM_RESET_DELAY_MS = 20;
  *   'sse-reset' … 200 ＋ 開始マーカーの後、ソケットを切る（ストリーム障害の再現）
  *   'none'      … listen しない（不達の再現）
  *
- * ombr が null のモードは x-ombr-* を1つも付けない（契約前 bridge ＝ §C3.7-1 の再現）。
+ * ombr が null のモードは x-ombr-* を1つも付けない（契約前 bridge の再現）。
  */
 const MODE_TABLE = Object.freeze({
   ok: {
@@ -81,7 +81,7 @@ const MODE_TABLE = Object.freeze({
     summary: '200 SSE (contract=1, pool-state=ok)',
   },
   exhausted: {
-    // §D2 S5b / CR-L: 全口座が枠切れ。rotator は (pool) を unusable にする。
+    // 全口座が枠切れ。rotator は (pool) を unusable にする。
     kind: 'json',
     status: 529,
     errorType: 'overloaded_error',
@@ -98,7 +98,7 @@ const MODE_TABLE = Object.freeze({
     summary: '529 overloaded_error / codex_pool_exhausted / scope=pool / pool-state=exhausted',
   },
   mixed: {
-    // §D2 S8 / §C10.7 規則1 / CR-O: 失効と枠切れの混在。生成側は 529 のままとする。
+    // 失効と枠切れの混在。生成側は 529 のままとする。
     kind: 'json',
     status: 529,
     errorType: 'overloaded_error',
@@ -115,8 +115,8 @@ const MODE_TABLE = Object.freeze({
     summary: '529 overloaded_error / codex_pool_mixed / scope=pool / pool-state=mixed',
   },
   'attempt-limit': {
-    // §D2 S6 / CR-M: 未試行の口座が残っている。rotator は学習してはいけない。
-    // pool-state=degraded は §C10.5 の「403 の根拠にならないもの」に明示されている。
+    // 未試行の口座が残っている。rotator は学習してはいけない。
+    // pool-state=degraded は 403 への書き換えの根拠にならない。
     // reset-at は付けない（回復見込み時刻という概念が当たらない）。
     kind: 'json',
     status: 529,
@@ -134,7 +134,7 @@ const MODE_TABLE = Object.freeze({
     summary: '529 overloaded_error / codex_attempt_limit / pool-state=degraded / reset-at なし',
   },
   'needs-login': {
-    // §D2 S7b / CR-N: 全口座が失効。運用方針: 全口座の認証失効時は 403 で停止する。
+    // 全口座が失効。全口座の認証失効時は 403 で停止する。
     // ローカルの認証情報が無い状態を再現するので上流へは送っていない（none / no）。
     kind: 'json',
     status: 403,
@@ -152,7 +152,7 @@ const MODE_TABLE = Object.freeze({
     summary: '403 permission_error / codex_needs_login / pool-state=needs-login',
   },
   'credentials-unavailable': {
-    // §D2 S7c / 契約 v1.5: 資格情報そのものを読めない（auth.json が消えた・保存方式が非対応）。
+    // 資格情報そのものを読めない（auth.json が消えた・保存方式が非対応）。
     // rotator の学習・素通しの扱いは needs-login と完全に同一だが、理由コードだけが違う。
     kind: 'json',
     status: 403,
@@ -170,7 +170,7 @@ const MODE_TABLE = Object.freeze({
     summary: '403 permission_error / codex_credentials_unavailable / pool-state=credentials-unavailable',
   },
   'needs-login-model': {
-    // §D2 S7b-m（契約 v1.6.4）: そのモデル向けの口座だけが全失効。プールには他モデル用の
+    // そのモデル向けの口座だけが全失効。プールには他モデル用の
     // 健全な口座が残っているため scope=model であり、(pool) は絶対に汚さない。
     kind: 'json',
     status: 403,
@@ -188,7 +188,7 @@ const MODE_TABLE = Object.freeze({
     summary: '403 permission_error / codex_needs_login / scope=model（(pool) を汚さない）',
   },
   'no-account': {
-    // §D2 S9 / CR-P: そのモデルに割り当てられた口座がゼロ。scope=model なので
+    // そのモデルに割り当てられた口座がゼロ。scope=model なので
     // rotator は (pool) を汚さない（403 書換の根拠にもならない）。
     kind: 'json',
     status: 403,
@@ -206,7 +206,7 @@ const MODE_TABLE = Object.freeze({
     summary: '403 permission_error / codex_no_account_for_model / scope=model',
   },
   idle: {
-    // 設計書 §11.4 (4): 開始マーカーを送った後は無音。rotator 側は
+    // 開始マーカーを送った後は無音。rotator 側は
     // outcome=bridge-idle-timeout になり、403 は合成されない（ヘッダ送出済みのため）。
     kind: 'sse-idle',
     status: 200,
@@ -216,7 +216,7 @@ const MODE_TABLE = Object.freeze({
     summary: '200 SSE、開始マーカーの後は無音のまま保持',
   },
   'stream-error': {
-    // 設計書 §11.4 (4b): 開始マーカーの後にソケットを切る。
+    // 開始マーカーの後にソケットを切る。
     // rotator 側は outcome=bridge-stream-error になる。
     kind: 'sse-reset',
     status: 200,
@@ -226,12 +226,12 @@ const MODE_TABLE = Object.freeze({
     summary: '200 SSE、開始マーカーの後にソケットを破壊',
   },
   unreachable: {
-    // 設計書 §11.4 (1): 不達。listen しないので --port は占有されない。
+    // 不達。listen しないので --port は占有されない。
     kind: 'none',
     summary: 'listen しない（接続拒否）',
   },
   legacy: {
-    // 契約 §C3.7-1: x-ombr-* が1つも無い応答は現行とまったく同じ意味に解釈する。
+    // x-ombr-* が1つも無い応答は現行とまったく同じ意味に解釈する。
     // 契約前 bridge が返していた 429 rate_limit_error を再現する。
     kind: 'json',
     status: 429,
@@ -281,7 +281,7 @@ export function normalizeOptions({ port, mode = 'ok', account = DEFAULT_ACCOUNT_
     throw new Error(`--port must be an integer between 0 and 65535, got: ${String(port)}`);
   }
   if (!ACCOUNT_LABEL_PATTERN.test(account)) {
-    // 契約 §C3.1（絶対禁止）: メールアドレス・氏名・トークンをヘッダへ載せない。
+    // メールアドレス・氏名・トークンをヘッダへ載せない（絶対禁止）。
     // 表示名パターンに合わない値はここで止める。値そのものはメッセージへ出さない。
     throw new Error('--account must match ^[a-z0-9][a-z0-9_-]{0,31}$ (labels only; never an email address)');
   }
@@ -307,7 +307,7 @@ export function buildOmbrHeaders({ mode, account, resetAt }) {
   headers['x-ombr-upstream-status'] = descriptor.ombr.upstreamStatus;
   headers['x-ombr-upstream-sent'] = descriptor.ombr.upstreamSent;
   if (descriptor.withResetAt) headers['x-ombr-reset-at'] = resetAt;
-  // x-ombr-account は「実際に使ったアカウントの表示名」（§C3.2）なので、
+  // x-ombr-account は「実際に使ったアカウントの表示名」なので、
   // 上流へ1度も送っていないモード（needs-login / no-account）では付けない。
   if (descriptor.withAccount) headers['x-ombr-account'] = account;
   return headers;
@@ -327,7 +327,7 @@ export function buildErrorBody({ mode, resetAt }) {
 }
 
 /**
- * GET /healthz の本文。ラベルだけを出し、メールアドレスは出さない（§13.3・CR-I）。
+ * GET /healthz の本文。ラベルだけを出し、メールアドレスは出さない。
  * @param {{ mode: string, account: string }} options
  * @returns {string} JSON 文字列。
  */
@@ -374,7 +374,7 @@ export async function startFakeBridge(input = {}) {
 
     if (descriptor.kind === 'json') {
       const body = buildErrorBody(options);
-      // Content-Length を明示する（chunked にしない）。設計書 §11.4 (3) の
+      // Content-Length を明示する（chunked にしない）。
       // 「529 の長い本文を 403 へ書き換えたときに Content-Length が一致すること」
       // を rotator 側で確認できるようにするため。
       res.writeHead(descriptor.status, {
@@ -386,7 +386,7 @@ export async function startFakeBridge(input = {}) {
       return;
     }
 
-    // 200 SSE 系。契約 §C4 の義務2により、上流ステータス確定の直後に開始マーカーを送る。
+    // 200 SSE 系。上流ステータス確定の直後に開始マーカーを送る。
     res.writeHead(200, { 'content-type': 'text/event-stream', 'cache-control': 'no-cache', ...ombr });
     res.write(SSE_START_MARKER);
 

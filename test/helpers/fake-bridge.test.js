@@ -14,10 +14,10 @@ import {
   startFakeBridge,
 } from './fake-bridge.js';
 
-// 偽 bridge（test/helpers/fake-bridge.js）が、契約 v1.4 §C3/§C4/§D2 の
+// 偽 bridge（test/helpers/fake-bridge.js）が、bridge の応答ヘッダの取り決めにある
 // 「状態ごとの status ／ error.type ／ x-ombr-* の組」を実 TCP で返すことを固定する。
 // ここで検証しているのは偽 bridge 自身の応答であって、rotator の写像ではない。
-// rotator 側の写像は R4-1 の統合テストが本ファイルを require して確認する。
+// rotator 側の写像は、統合テスト（test/openai-bridge.test.js）が fake-bridge.js を import して確かめる。
 
 const delay = ms => new Promise(resolve => setTimeout(resolve, ms));
 
@@ -94,10 +94,10 @@ describe('fake-bridge argument handling', () => {
 });
 
 // ---------------------------------------------------------------------------
-// 契約 §D2 / §C3: 状態ごとの status ・ error.type ・ x-ombr-* の組
+// 状態ごとの status ・ error.type ・ x-ombr-* の組
 // ---------------------------------------------------------------------------
 
-// 期待値の表。契約 v1.4 §C3.4（reason の列挙と推奨ステータス）と §D2（S5b・S6・S7b・S8・S9）に対応する。
+// 期待値の表。状態ごとの degrade-reason の値と status に対応する。
 const EXPECTED = [
   {
     mode: 'exhausted',
@@ -194,11 +194,11 @@ describe('fake-bridge degraded modes', () => {
           expected.resetAt ? '2026-09-08T13:00:00Z' : null,
           `${expected.mode}: x-ombr-reset-at`,
         );
-        // 上流へ送っていないモードでは「実際に使ったアカウント」が存在しない（§C3.2）。
+        // 上流へ送っていないモードでは「実際に使ったアカウント」が存在しない。
         if (!('x-ombr-account' in expected.headers)) {
           assert.equal(response.headers.get('x-ombr-account'), null, `${expected.mode}: x-ombr-account`);
         }
-        // Content-Length を明示している（chunked にしない）。設計書 §11.4 (3) が
+        // Content-Length を明示している（chunked にしない）。rotator 側の試験が
         // 529 の本文長と 403 書換後の本文長の一致を確認するのに要る。
         assert.equal(Number(response.headers.get('content-length')), Buffer.byteLength(text));
       });
@@ -223,7 +223,7 @@ describe('fake-bridge degraded modes', () => {
 });
 
 // ---------------------------------------------------------------------------
-// 契約 §C3.7-1: 契約前 bridge の再現
+// 契約前 bridge の再現
 // ---------------------------------------------------------------------------
 
 describe('fake-bridge legacy mode', () => {
@@ -239,7 +239,7 @@ describe('fake-bridge legacy mode', () => {
 });
 
 // ---------------------------------------------------------------------------
-// 契約 §C4: 200 の SSE と開始マーカー
+// 200 の SSE と開始マーカー
 // ---------------------------------------------------------------------------
 
 describe('fake-bridge streaming modes', () => {
@@ -266,7 +266,7 @@ describe('fake-bridge streaming modes', () => {
       let received = '';
       res.on('data', chunk => { received += chunk.toString('utf8'); });
 
-      // 開始マーカーは届く（契約 §C4 の義務2）。
+      // 開始マーカーは届く。
       await delay(120);
       assert.equal(res.statusCode, 200);
       assert.equal(res.headers['x-ombr-pool-state'], 'ok');
@@ -301,7 +301,7 @@ describe('fake-bridge streaming modes', () => {
 });
 
 // ---------------------------------------------------------------------------
-// 設計書 §11.4 (1): 不達
+// 不達
 // ---------------------------------------------------------------------------
 
 describe('fake-bridge unreachable mode', () => {
@@ -341,27 +341,27 @@ describe('fake-bridge /healthz', () => {
       const text = await response.text();
       assert.equal(response.status, 200, text);
       assert.deepEqual(JSON.parse(text), { ok: true, contract: CONTRACT_VERSION, mode: 'exhausted', account: 'acct-b' });
-      // 契約 §C3.1・§13.3: ラベル以外の識別子（メールアドレス等）を出さない。
+      // ラベル以外の識別子（メールアドレス等）を出さない。
       assert.ok(!text.includes('@'), 'health body must not contain an email address');
     });
   });
 });
 
 // ---------------------------------------------------------------------------
-// 純関数（R4-1 が期待値を組み立てるのに使う）
+// 純関数（統合テストは startFakeBridge だけを import する）
 // ---------------------------------------------------------------------------
 
 describe('fake-bridge pure helpers', () => {
   it('exposes every documented mode', () => {
     assert.deepEqual([...MODE_NAMES].sort(), [
       'attempt-limit', 'credentials-unavailable', 'exhausted', 'idle', 'legacy', 'mixed',
-      // R7-2（母艦裁定 D-72）で credentials-unavailable（§D2 S7c）と
-      // needs-login-model（§D2 S7b-m）を追加した。
+      // credentials-unavailable と
+      // needs-login-model は後から追加した。
       'needs-login', 'needs-login-model', 'no-account', 'ok', 'stream-error', 'unreachable',
     ]);
   });
 
-  it('builds header sets whose values are ASCII with no whitespace or comma (§C3.1)', () => {
+  it('builds header sets whose values are ASCII with no whitespace or comma', () => {
     for (const mode of MODE_NAMES) {
       if (mode === 'unreachable') continue;
       const headers = buildOmbrHeaders({ mode, account: DEFAULT_ACCOUNT_LABEL, resetAt: '2026-09-08T13:00:00Z' });
