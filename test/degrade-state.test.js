@@ -1,6 +1,6 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
-import { brotliCompressSync, deflateSync, gzipSync } from 'node:zlib';
+import zlib, { brotliCompressSync, deflateRawSync, deflateSync, gzipSync } from 'node:zlib';
 
 import {
   applyRecoveryWaitHeaders,
@@ -2107,6 +2107,53 @@ describe('decideUpstreamOverloadedWait / mapUpstreamOverloaded (上流 529 overl
         undefined,
         `${encoding}: 合成した非圧縮本文に上流の content-encoding を残さない`,
       );
+    }
+  });
+
+  const encoded529 = (encoding, body) => ({
+    statusCode: 529,
+    headers: { 'content-type': 'application/json', 'content-encoding': encoding },
+    body,
+  });
+
+  it('reads an overloaded body under stacked content-encodings, undoing the last one first', () => {
+    // `gzip, br` は gzip をかけた後に br をかけた本文である。
+    const response = encoded529('gzip, br', brotliCompressSync(gzipSync(Buffer.from(OVERLOADED))));
+    assert.equal(decide(response).rewrite, true);
+    assert.equal(mapUpstreamOverloaded(response, { enabled: true }).statusCode, 429);
+  });
+
+  it('leaves the body alone when a stacked content-encoding includes one it cannot decode', () => {
+    const response = encoded529('gzip, snappy', gzipSync(Buffer.from(OVERLOADED)));
+    assert.deepEqual(decide(response), { rewrite: false, reason: 'body-not-overloaded' });
+    assert.equal(mapUpstreamOverloaded(response, { enabled: true }), null);
+  });
+
+  it('leaves the body alone when more than four content-encodings are stacked', () => {
+    let four = Buffer.from(OVERLOADED);
+    for (let i = 0; i < 4; i += 1) four = gzipSync(four);
+    assert.equal(decide(encoded529('gzip, gzip, gzip, gzip', four)).rewrite, true, '4段までは解く');
+    assert.deepEqual(
+      decide(encoded529('gzip, gzip, gzip, gzip, gzip', gzipSync(four))),
+      { rewrite: false, reason: 'body-not-overloaded' },
+      '段の数にも上限を置く',
+    );
+  });
+
+  it('reads an overloaded body sent as raw deflate under content-encoding: deflate', () => {
+    // Content-Encoding: deflate には zlib 形式と raw 形式の両方が実在する。
+    const response = encoded529('deflate', deflateRawSync(Buffer.from(OVERLOADED)));
+    assert.equal(decide(response).rewrite, true);
+  });
+
+  it('reads a zstd overloaded body when this Node can decode zstd, and leaves it alone otherwise', () => {
+    const ZSTD_OK = typeof zlib.zstdCompressSync === 'function';
+    const body = ZSTD_OK ? zlib.zstdCompressSync(Buffer.from(OVERLOADED)) : Buffer.from('not decodable here');
+    const decision = decide(encoded529('zstd', body));
+    if (ZSTD_OK) {
+      assert.equal(decision.rewrite, true);
+    } else {
+      assert.deepEqual(decision, { rewrite: false, reason: 'body-not-overloaded' });
     }
   });
 

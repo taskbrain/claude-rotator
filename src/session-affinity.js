@@ -632,7 +632,9 @@ export class SessionAffinity {
 
   // F4: 時計が逆行したらエントリを捨てず `lastSeen` を now へ丸め、経過時間は
   // Math.max(0, …) で測る（負の経過時間で全消ししない）。
+  // 数でない最後の使用時刻は、比べると常に偽になって行が残り続けるので、期限切れかつ冷えているとみなす。
   expired(entry, now) {
+    if (!Number.isFinite(entry.lastSeen)) return true;
     if (entry.lastSeen > now) entry.lastSeen = now;
     return now - entry.lastSeen > this.idleTtlMs;
   }
@@ -646,7 +648,7 @@ export class SessionAffinity {
   // `removeWarm` → 書き換え → `refreshWarm` の順にする。
 
   cold(entry, now) {
-    return Math.max(0, now - entry.lastSeen) > this.warmTtlMs;
+    return !Number.isFinite(entry.lastSeen) || Math.max(0, now - entry.lastSeen) > this.warmTtlMs;
   }
 
   addWarm(entry) {

@@ -155,6 +155,24 @@ function normalizeEncoding(raw) {
   return token;
 }
 
+// 重ねがけの段の数の上限。各段の解凍後の大きさには上限があっても、段の数に上限が無いと
+// 段を重ねるだけで CPU を使わせられる。実際に使われる重ねがけは2段まで。
+const MAX_CONTENT_ENCODING_LAYERS = 4;
+
+/**
+ * `Content-Encoding` を、かけた順の段の並びに分ける（`gzip, br` は gzip の後に br）。
+ * 解くときは後ろの段からになる。空の要素と `identity` は段として数えない。
+ *
+ * @param {unknown} raw
+ * @returns {string[]}
+ */
+function contentEncodingLayers(raw) {
+  if (typeof raw !== 'string') return [];
+  return raw.split(',')
+    .map(token => token.trim().toLowerCase())
+    .filter(token => token !== '' && token !== 'identity');
+}
+
 /**
  * 上流へ送る `accept-encoding` から、この実行環境が解けない符号化を落とす。
  *
@@ -236,17 +254,19 @@ export async function parseUsageObservation(body, { contentEncoding = null, maxB
   // 小さな圧縮本文でメモリを食い尽くせてしまう（解凍爆弾）。
   if (body.length > maxBytes) return emptyObservation('too-large', encoding);
 
-  let decoder = null;
-  if (encoding !== null) {
-    decoder = DECODERS.get(encoding);
-    // 知らない符号化、または知っているが解けない符号化（Node に API が無い zstd）。
-    if (decoder == null) return emptyObservation('unsupported-encoding', encoding);
-  }
+  const layers = contentEncodingLayers(contentEncoding);
+  if (layers.length > MAX_CONTENT_ENCODING_LAYERS) return emptyObservation('unsupported-encoding', encoding);
+  const decoders = layers.map(token => DECODERS.get(token));
+  // 知らない符号化、または知っているが解けない符号化（Node に API が無い zstd）が
+  // 1段でも混じれば、どの段も解かない。
+  if (decoders.some(decoder => decoder == null)) return emptyObservation('unsupported-encoding', encoding);
 
   // 解凍だけでなく `toString` と `readUsage` も同じ try の中に入れる。`toString` は
   // 解凍後が MAX_STRING_LENGTH を超えると投げるため、外に出すと上の欠陥が再発する。
   try {
-    const raw = decoder === null ? body : await decoder(body, { maxOutputLength: maxBytes });
+    let raw = body;
+    // 上限（`maxOutputLength`）は段ごとに渡す。外側の段が小さくても内側で膨らみうる。
+    for (const decoder of decoders.reverse()) raw = await decoder(raw, { maxOutputLength: maxBytes });
     return readUsage(raw.toString('utf8'), encoding);
   } catch (error) {
     return emptyObservation(isSizeError(error) ? 'too-large' : 'unparsable', encoding);

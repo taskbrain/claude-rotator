@@ -166,6 +166,45 @@ describe('parseUsageObservation / content-encoding', () => {
     assert.equal(result.inputTokens, 0);
   });
 
+  it('重ねがけの圧縮は後ろの段から順に解く', async () => {
+    // `Content-Encoding: gzip, br` は gzip をかけた後に br をかけた本文である。
+    const stacked = zlib.brotliCompressSync(zlib.gzipSync(Buffer.from(SSE, 'utf8')));
+    const result = await parseUsageObservation(stacked, { contentEncoding: 'gzip, br' });
+    assertUsage(result);
+    assert.equal(result.encoding, 'gzip, br', 'ログに出す符号化名は今のまま');
+  });
+
+  it('重ねがけの段に解けない符号化が1つでも混じると unsupported-encoding になる', async () => {
+    const gzipped = zlib.gzipSync(Buffer.from(SSE, 'utf8'));
+    const result = await parseUsageObservation(gzipped, { contentEncoding: 'gzip, snappy' });
+    assert.equal(result.parse, 'unsupported-encoding');
+    assert.equal(result.inputTokens, 0);
+  });
+
+  it('重ねがけは4段まで解き、5段以上は unsupported-encoding にする', async () => {
+    let body = Buffer.from(SSE, 'utf8');
+    for (let i = 0; i < 4; i += 1) body = zlib.gzipSync(body);
+    assertUsage(await parseUsageObservation(body, { contentEncoding: 'gzip, gzip, gzip, gzip' }));
+
+    const fifth = zlib.gzipSync(body);
+    const result = await parseUsageObservation(fifth, { contentEncoding: 'gzip, gzip, gzip, gzip, gzip' });
+    assert.equal(result.parse, 'unsupported-encoding', '段の数にも上限を置く');
+  });
+
+  it('重ねがけの中の identity は段として数えない', async () => {
+    const gzipped = zlib.gzipSync(Buffer.from(SSE, 'utf8'));
+    assertUsage(await parseUsageObservation(gzipped, { contentEncoding: 'identity, gzip' }));
+  });
+
+  it('内側の段の解凍後が maxBytes を超えると too-large になる', async () => {
+    // 外側の br を解いた後（gzip の本文）は小さいが、内側の gzip を解くと上限を超える。
+    const large = Buffer.from(SSE + ' '.repeat(64 * 1024), 'utf8');
+    const stacked = zlib.brotliCompressSync(zlib.gzipSync(large));
+    const result = await parseUsageObservation(stacked, { contentEncoding: 'gzip, br', maxBytes: 16 * 1024 });
+    assert.ok(stacked.length < 16 * 1024 && zlib.gzipSync(large).length < 16 * 1024, '圧縮後と外側の段は上限より小さい');
+    assert.equal(result.parse, 'too-large');
+  });
+
   it('encoding フィールドに正規化した符号化名を返す', async () => {
     const gzipped = zlib.gzipSync(Buffer.from(SSE, 'utf8'));
     assert.equal((await parseUsageObservation(gzipped, { contentEncoding: 'GZIP' })).encoding, 'gzip');

@@ -4,7 +4,7 @@
 //
 // zlib の同期展開だけは例外的に使う。I/O ではなく入力だけで決まる変換であり、上流の
 // 応答本文が圧縮されていると error.type を読めないためである（下の decodedBodyErrorType）。
-import { brotliDecompressSync, gunzipSync, inflateSync } from 'node:zlib';
+import zlib from 'node:zlib';
 
 // 設計書 §6.6 規律1: この形に合致しない値はログへ落とさない（メールアドレス混入の遮断）。
 const ACCOUNT_LABEL_PATTERN = /^[a-z0-9][a-z0-9_-]{0,31}$/;
@@ -822,12 +822,28 @@ function buildUpstreamOverloadedBody() {
 // 上流が制御する本文をイベントループ上で無制限に展開しないための上限（1 MiB）。
 const MAX_DECODED_BODY_BYTES = 1048576;
 
+// 解ける符号化は `usage-observation.js` の `DECODERS` とそろえる。zstd は解凍の API を
+// 持つ Node でだけ足す（名前付きの import にすると、持たない版では読み込みで落ちる）。
 const BODY_DECODERS = new Map([
-  ['gzip', gunzipSync],
-  ['x-gzip', gunzipSync],
-  ['deflate', inflateSync],
-  ['br', brotliDecompressSync],
+  ['gzip', zlib.gunzipSync],
+  ['x-gzip', zlib.gunzipSync],
+  // Content-Encoding: deflate には zlib 形式と raw 形式の両方が実在するので、zlib 形式で
+  // 失敗したら raw で読み直す。上限を超えた失敗は読み直しても同じなので、そのまま上げる。
+  ['deflate', (buffer, options) => {
+    try {
+      return zlib.inflateSync(buffer, options);
+    } catch (error) {
+      if (error?.code === 'ERR_BUFFER_TOO_LARGE') throw error;
+      return zlib.inflateRawSync(buffer, options);
+    }
+  }],
+  ['br', zlib.brotliDecompressSync],
+  ...(typeof zlib.zstdDecompressSync === 'function' ? [['zstd', zlib.zstdDecompressSync]] : []),
 ]);
+
+// 重ねがけの段の数の上限。分け方は `usage-observation.js` の `contentEncodingLayers` と同じ
+// （`,` で分け、空の要素と identity を落とす）。
+const MAX_CONTENT_ENCODING_LAYERS = 4;
 
 function headerValueOf(headers, name) {
   for (const [key, value] of Object.entries(headers || {})) {
@@ -838,17 +854,23 @@ function headerValueOf(headers, name) {
 
 /**
  * 本文の error.type を読む。クライアントの accept-encoding はそのまま上流へ転送される
- * ため、529 の本文が gzip / deflate / br で返ることが実際にある。展開せずに JSON.parse
- * すると型判定が空振りし、機能が黙って効かなくなる。未知の符号化・展開失敗は
- * undefined を返して安全側（＝写像せず透過）へ倒す。
+ * ため、529 の本文が圧縮されて（重ねがけも含めて）返ることが実際にある。展開せずに
+ * JSON.parse すると型判定が空振りし、機能が黙って効かなくなる。未知の符号化・段の数の
+ * 上限超え・展開失敗は undefined を返して安全側（＝写像せず透過）へ倒す。
  */
 function decodedBodyErrorType(body, headers) {
-  const encoding = String(headerValueOf(headers, 'content-encoding') || '').trim().toLowerCase();
-  if (encoding === '' || encoding === 'identity') return bodyErrorType(body);
-  const decode = BODY_DECODERS.get(encoding);
-  if (!decode) return undefined;
+  const layers = String(headerValueOf(headers, 'content-encoding') || '').split(',')
+    .map(token => token.trim().toLowerCase())
+    .filter(token => token !== '' && token !== 'identity');
+  if (layers.length === 0) return bodyErrorType(body);
+  if (layers.length > MAX_CONTENT_ENCODING_LAYERS) return undefined;
+  const decoders = layers.map(token => BODY_DECODERS.get(token));
+  if (decoders.some(decode => !decode)) return undefined;
   try {
-    return bodyErrorType(decode(Buffer.from(body || ''), { maxOutputLength: MAX_DECODED_BODY_BYTES }));
+    let decoded = Buffer.from(body || '');
+    // 上限は段ごとに渡す。外側の段が小さくても内側で膨らみうる。
+    for (const decode of decoders.reverse()) decoded = decode(decoded, { maxOutputLength: MAX_DECODED_BODY_BYTES });
+    return bodyErrorType(decoded);
   } catch {
     return undefined;
   }
