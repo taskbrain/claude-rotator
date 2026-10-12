@@ -209,12 +209,14 @@ function checkLatch(value, where) {
   nullable(value.since, `${where}.since`, isoTime);
 }
 
-const ACCOUNT_KEYS = ['label', 'state', 'stateWord', 'selectable', 'reason', 'resetAt', 'ordinaryUsageAllowed',
+const ACCOUNT_KEYS = ['label', 'order', 'state', 'stateWord', 'selectable', 'reason', 'resetAt', 'ordinaryUsageAllowed',
   'nextObservationAt', 'policy', 'latch', 'windows', 'otherWindows', 'observedAt', 'headroomPercent'];
 
-function checkAccount(value, where) {
+// order は設定の口座の並び順（1から）。口座の数を超えず、同じ値が2つ無い（重なりは checkStatus で見る）。
+function checkAccount(value, where, accountCount) {
   exactObject(value, ACCOUNT_KEYS, where);
   label(value.label, `${where}.label`);
+  integer(value.order, `${where}.order`, { min: 1, max: accountCount });
   oneOf(value.stateWord, CODEX_STATE_WORDS, `${where}.stateWord`);
   oneOf(value.state, CODEX_ACCOUNT_STATES, `${where}.state`);
   if (CODEX_STATE_OF_WORD[value.stateWord] !== value.state) fail(`${where}.state`, 'does not match stateWord');
@@ -289,7 +291,10 @@ function checkStatus(value) {
   nullable(value.next.reason, 'status.next.reason', (v, w) => oneOf(v, CODEX_NEXT_REASONS, w));
 
   const accounts = array(value.accounts, 'status.accounts');
-  accounts.forEach((account, index) => checkAccount(account, `status.accounts[${index}]`));
+  accounts.forEach((account, index) => checkAccount(account, `status.accounts[${index}]`, accounts.length));
+  if (new Set(accounts.map(account => account.order)).size !== accounts.length) {
+    fail('status.accounts', 'must not repeat an order');
+  }
   checkAggregate(value.aggregate, 'status.aggregate', accounts.length);
 
   const events = array(value.events, 'status.events');

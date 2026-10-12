@@ -73,12 +73,6 @@ export const DISABLED_DEGRADE_MAPPING = Object.freeze({
   // （'false' や 0 は既定のまま）。判定式を1つに保つ規律は他キーと同じで、向きだけが逆。
   claudeExhaustedTo529: true,
   gptPoolUnusableTtlMs: 60000,
-  codexStatusUrl: null,
-  codexStatusTimeoutMs: 1500,
-  // 正規化の過程で捨てた設定の理由。値そのものは載せない（設定由来の文字列を
-  // ログへ流さない）。起動時と reload 時に logDegradeMappingConfigNotice() が
-  // 1件1行で出す（設計書 §7.2「非ループバックは警告つきで null と同じ扱い」）。
-  notices: Object.freeze([]),
 });
 
 // bothUnusableStatus は「明示停止（403）」か「退避を試み続ける（529）」の二択のみ。
@@ -92,10 +86,6 @@ const BOTH_UNUSABLE_STATUSES = new Set([403, 529]);
 const DEGRADE_MAPPING_WITHOUT_BRIDGE_NOTICE =
   'degradeMapping enabled without openaiBridge; 529 mapping applies to Claude-internal fallback only';
 
-// codexStatusUrl を捨てたときの理由（設計書 §7.2）。openaiBridge.url の fail-safe と
-// 同じ言い回しに揃える（'openaiBridge.url must be loopback; branch disabled'）。
-// 設定値そのものは載せない: この行は運用ログへ出るため、利用者が書いた URL を
-// そのまま転記しない。
 // 03 §4.1: recoveryWait が有効な構成では、両プール全滅の帰結を決めるのは
 // bothUnusableStatus ではなく本機能の応答表（429 ＋ Retry-After）である。設定を読んだ人が
 // 取り違えないよう、起動と reload のときだけ1行残す（要求ごとには出さない）。
@@ -116,15 +106,6 @@ const UPSTREAM_OVERLOAD_NOTICE =
 const CLAUDE_EXHAUSTED_PASSTHROUGH_NOTICE =
   'degradeMapping.claudeExhaustedTo529 is off; an all-accounts-exhausted 429 is returned '
   + 'unchanged instead of being mapped to 529';
-
-const CODEX_STATUS_URL_NOT_LOOPBACK_NOTICE =
-  'degradeMapping.codexStatusUrl must be loopback; codex status section disabled';
-const CODEX_STATUS_URL_INVALID_NOTICE =
-  'degradeMapping.codexStatusUrl is not a usable url; codex status section disabled';
-// http.request() は http: 以外のスキームを扱えず、同期 throw する。
-// 取得時に落とすのではなく設定解決の時点で捨て、理由を notice で残す。
-const CODEX_STATUS_URL_SCHEME_NOTICE =
-  'degradeMapping.codexStatusUrl must use http: scheme; codex status section disabled';
 
 function positiveNumber(value, fallback) {
   return typeof value === 'number' && Number.isFinite(value) && value > 0 ? value : fallback;
@@ -151,47 +132,13 @@ function idleTimeoutRequestHeaderValue(settings) {
   return idleTimeoutMs === null ? null : String(Math.trunc(idleTimeoutMs));
 }
 
-// new URL().hostname は IPv6 リテラルを角括弧つき（'[::1]'）で返すため、
-// LOOPBACK_HOSTS（素の '::1'）と突き合わせる前に角括弧を外す。
-// WHATWG URL は '[0:0:0:0:0:0:0:1]' を '[::1]' へ正規化するので、展開形も同じ経路で
-// 許可される。IPv4 射影（'::ffff:127.0.0.1' → '[::ffff:7f00:1]'）と未指定アドレス
-// （'[::]'）は許可リストに無いので拒否側へ倒れる（安全側）。
-function unbracketHostname(hostname) {
-  return hostname.startsWith('[') && hostname.endsWith(']') ? hostname.slice(1, -1) : hostname;
-}
-
-// codexStatusUrl は openaiBridge.url と同じくループバックに限る（設計書 §7.2）。
-// 非ループバック・解析不能・型違いはいずれも null（＝Codex 節を出さない）へ倒したうえで、
-// 「なぜ捨てたか」を notice として返す（黙って捨てない）。
-// 未指定（null / undefined）は既定そのものなので notice を出さない。
-function normalizeCodexStatusUrl(value) {
-  if (value === null || value === undefined) return { value: null, notice: null };
-  if (typeof value !== 'string' || value === '') {
-    return { value: null, notice: CODEX_STATUS_URL_INVALID_NOTICE };
-  }
-  let hostname;
-  try {
-    hostname = new URL(value).hostname;
-  } catch {
-    return { value: null, notice: CODEX_STATUS_URL_INVALID_NOTICE };
-  }
-  if (!LOOPBACK_HOSTS.has(unbracketHostname(hostname))) {
-    return { value: null, notice: CODEX_STATUS_URL_NOT_LOOPBACK_NOTICE };
-  }
-  // ループバック判定の後に置く: 非ループバックの https を「まずループバックでない」と
-  // 説明する既存の規律を変えないため。ここまで来た値は解析済みなので再解析は投げない。
-  if (new URL(value).protocol !== 'http:') {
-    return { value: null, notice: CODEX_STATUS_URL_SCHEME_NOTICE };
-  }
-  return { value, notice: null };
-}
-
 // セクションが無い／キーが無い／型が違う、のいずれでも「無効」に倒れる（設計書 §7.3-3）。
 // 判定式は settings.degradeMapping.enabled === true の1つだけにするため、
 // enabled は真偽値の true だけを受け付ける（'true' や 1 は無効）。
+// 下に挙げないキーは読まない。以前の版が status の Codex の節の取得先と期限のために読んでいた
+// 2つのキーが設定に残っていても、読まずに無視し、通知も出さない。
 export function normalizeDegradeMapping(raw) {
   if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return DISABLED_DEGRADE_MAPPING;
-  const codexStatusUrl = normalizeCodexStatusUrl(raw.codexStatusUrl);
   return Object.freeze({
     enabled: raw.enabled === true,
     bothUnusableStatus: BOTH_UNUSABLE_STATUSES.has(raw.bothUnusableStatus)
@@ -212,9 +159,6 @@ export function normalizeDegradeMapping(raw) {
       3600,
     ),
     gptPoolUnusableTtlMs: positiveNumber(raw.gptPoolUnusableTtlMs, DISABLED_DEGRADE_MAPPING.gptPoolUnusableTtlMs),
-    codexStatusUrl: codexStatusUrl.value,
-    codexStatusTimeoutMs: positiveNumber(raw.codexStatusTimeoutMs, DISABLED_DEGRADE_MAPPING.codexStatusTimeoutMs),
-    notices: Object.freeze(codexStatusUrl.notice ? [codexStatusUrl.notice] : []),
   });
 }
 
@@ -248,12 +192,6 @@ export function logDegradeMappingConfigNotice(settings, logger) {
   if (degradeMapping.claudeExhaustedTo529 === false) {
     reasons.push(CLAUDE_EXHAUSTED_PASSTHROUGH_NOTICE);
   }
-  // (3) 正規化で捨てた設定（非ループバック等の codexStatusUrl。設計書 §7.2）。
-  // fail-safe 3経路では degradeMapping ごと DISABLED_DEGRADE_MAPPING に倒れており
-  // notices は空なので、ここでも1行も出ない。
-  // notices が欠けた settings（正規化を通っていない手組みの値）でも投げない。
-  // この関数は起動経路で呼ばれるため、例外はプロセス起動そのものを壊す。
-  if (Array.isArray(degradeMapping.notices)) reasons.push(...degradeMapping.notices);
   const lines = reasons.map(
     reason => `${new Date().toISOString()} openai-bridge config-notice ${reason}`,
   );

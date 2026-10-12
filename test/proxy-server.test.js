@@ -9107,7 +9107,9 @@ describe('openai-bridge degradeMapping config-notice の配線', () => {
     assert.match(notices[0], /degradeMapping enabled without openaiBridge/);
   });
 
-  it('emits the notice at startup when a non-loopback codexStatusUrl is dropped', async () => {
+  it('starts and stays silent when the config still has the two keys an earlier version read for the Codex block of status', async () => {
+    // 本番の設定と同じ形の合成の設定（旧い2つのキーが残ったもの）。名前は組み立てて書く（以前の版の
+    // キーの名前が src・test・README に1つも残っていないことを grep で確かめるため）。
     const logLines = [];
     const proxy = await startProxy({
       logLines,
@@ -9115,16 +9117,20 @@ describe('openai-bridge degradeMapping config-notice の配線', () => {
         openaiBridge: {
           enabled: true,
           url: 'http://127.0.0.1:18765',
-          degradeMapping: { enabled: true, codexStatusUrl: 'http://evil.example.com/healthz' },
+          degradeMapping: {
+            enabled: true,
+            [['codexStatus', 'Url'].join('')]: 'http://evil.example.com/healthz',
+            [['codexStatus', 'TimeoutMs'].join('')]: 1500,
+          },
         },
       },
     });
     cleanupAfterTest(async () => close(proxy.server));
 
-    const notices = logLines.filter(line => line.includes(CONFIG_NOTICE));
-    assert.equal(notices.length, 1);
-    assert.match(notices[0], /degradeMapping\.codexStatusUrl must be loopback/);
-    assert.equal(notices[0].includes('evil.example.com'), false, '設定値そのものは転記しない');
+    const health = await requestJson(`${proxy.url}/internal/health`, { timeoutMs: 1_000 });
+    assert.equal(health.status, 200, 'the proxy starts and answers');
+    assert.deepEqual(logLines.filter(line => line.includes(CONFIG_NOTICE)), [], 'the keys are ignored without a notice');
+    assert.equal(logLines.some(line => line.includes('evil.example.com')), false);
   });
 
   it('stays silent for configurations that do not use degradeMapping', async () => {

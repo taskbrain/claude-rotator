@@ -1,0 +1,43 @@
+Claude Rotator                         current: zz-golden-two
+
+Routing availability
+Fable (1 now)
+  1. zz-golden-two  now
+  2. zz-golden-one  in 1h -> 06/04 19:00 JST
+  3. zz-golden-three  needs login
+
+Other (Sonnet / Opus / Haiku) (1 now)
+  1. zz-golden-two  now
+  2. zz-golden-one  in 1h -> 06/04 19:00 JST
+  3. zz-golden-three  needs login
+
+zz-golden-one              exhausted
+routes Fable: 1h | Other: 1h
+reason: 5h quota exhausted; reset -> 06/04 19:00 JST
+5h ██████████ 100%  reset in 1h -> 06/04 19:00 JST
+7d ███████░░░  76%  reset in 2d9h -> 06/07 03:00 JST
+requests: 12
+
+zz-golden-two              active
+routes Fable: now | Other: now
+5h ░░░░░░░░░░   8%  reset in 4h40m -> 06/04 22:40 JST
+7d ██░░░░░░░░  21%  reset in 5d1h -> 06/09 19:00 JST
+requests: 7
+
+zz-golden-three            error
+routes Fable: needs login | Other: needs login
+reason: login expired (cause=http-401; detected 06/04 15:00 JST) - run: claude-rotator login --id acct_3
+5h ----------  --%  no data yet
+7d ----------  --%  no data yet
+requests: 0
+
+Session Affinity                       mode: on  sessions: 2/10000  sid: 67% (2/3)
+  by account: acct_1 1, acct_2 1
+  switches: common_exhausted 1
+  evictions: ttl 3
+
+Events
+06/04 17:59 JST manual switch -> acct_2
+06/04 17:53 JST fallback acct_1 -> acct_2 reason=shortest-quota-reset
+06/04 17:52 JST quota exhausted acct_1 (5h quota exhausted; reset -> 06/04 19:00 JST)
+06/04 15:00 JST account error acct_3 (login expired - run: claude-rotator login --id acct_3)

@@ -648,6 +648,58 @@ test('does not launch and says guard unverified when the guard check sees apps e
     'the verdict line is printed before the guard check');
 });
 
+test('refuses without spawning anything when CODEX_API_KEY or CODEX_ACCESS_TOKEN is in the environment, and never prints the value', async t => {
+  const f = await fixture(t);
+  const keyValue = `sk-zz-${TOKEN_MARKER}`;
+  const accessValue = `at-zz-${TOKEN_MARKER}`;
+  const cases = [
+    [{ CODEX_API_KEY: keyValue }, 'auth env set (CODEX_API_KEY); unset and run again to use the chosen account'],
+    [{ CODEX_ACCESS_TOKEN: accessValue }, 'auth env set (CODEX_ACCESS_TOKEN); unset and run again to use the chosen account'],
+    [{ CODEX_API_KEY: '', CODEX_ACCESS_TOKEN: accessValue },
+      'auth env set (CODEX_API_KEY, CODEX_ACCESS_TOKEN); unset and run again to use the chosen account'],
+  ];
+  for (const [vars, line] of cases) {
+    for (const argv of [['--account', 'alpha', '--', 'exec', '--json', '-'], ['--', 'exec', '--json', '-']]) {
+      Object.assign(f.env, vars);
+      const fetch = fakeFetch(() => jsonResponse(usageBody()));
+      const result = await f.run(argv, { fetchImpl: fetch.impl });
+      for (const name of Object.keys(vars)) delete f.env[name];
+      assert.equal(result.code, 1);
+      assert.deepEqual(result.lines, [line]);
+      assert.equal(f.spawnCalls.length, 0, 'neither the guard check nor the launch is spawned');
+      assert.equal(fetch.calls.length, 0);
+      assert.ok(!result.stderr.text().includes(TOKEN_MARKER), 'the value is not printed');
+      assertNoLeaks(result, ['alpha']);
+    }
+  }
+});
+
+// 常駐ありでも、認証の変数があれば常駐へ select を送らない。--version の型と引数の無い型でも同じく止まる。
+test('with a daemon, refuses on CODEX_API_KEY or CODEX_ACCESS_TOKEN before asking the daemon, for --version and no arguments too', async t => {
+  const f = await fixture(t, { daemon: ({ sha256 }) => ({ body: selectAnswer(sha256) }) });
+  const cases = [
+    [{ CODEX_API_KEY: `sk-zz-${TOKEN_MARKER}` }, 'auth env set (CODEX_API_KEY); unset and run again to use the chosen account'],
+    [{ CODEX_ACCESS_TOKEN: '' }, 'auth env set (CODEX_ACCESS_TOKEN); unset and run again to use the chosen account'],
+  ];
+  for (const [vars, line] of cases) {
+    for (const argv of [['--', '--version'], ['--account', 'alpha', '--', '--version'], [], ['--account', 'alpha'],
+      ['--', 'exec', '--json', '-']]) {
+      Object.assign(f.env, vars);
+      const fetch = fakeFetch(() => jsonResponse(usageBody()));
+      const result = await f.run(argv, { fetchImpl: fetch.impl });
+      for (const name of Object.keys(vars)) delete f.env[name];
+      assert.equal(result.code, 1);
+      assert.deepEqual(result.lines, [line]);
+      assert.equal(f.spawnCalls.length, 0, 'neither the guard check nor the launch is spawned');
+      assert.equal(fetch.calls.length, 0);
+      assert.ok(!result.stderr.text().includes(TOKEN_MARKER), 'the value is not printed');
+      assertNoLeaks(result, ['alpha']);
+    }
+  }
+  assert.equal(f.daemonRequests.length, 0, 'the daemon is not asked');
+  assert.equal(f.isolation.connections.length, 0, 'no connection to the daemon');
+});
+
 // --- シグナルと終了コード -----------------------------------------------------------------------
 
 test('passes the child exit code through', async t => {

@@ -33,17 +33,17 @@ function sample() {
       cliConsumptionVisible: false, userAgentSource: 'codex-version' },
     next: { label: 'zz-a', reason: 'selectable' },
     accounts: [
-      { label: 'zz-a', state: 'available', stateWord: 'ready', selectable: true, reason: null, resetAt: null,
+      { label: 'zz-a', order: 1, state: 'available', stateWord: 'ready', selectable: true, reason: null, resetAt: null,
         ordinaryUsageAllowed: true, nextObservationAt: '2027-01-15T08:01:00Z', policy: policyOf(), latch: null,
         windows: { fiveHour: windowOf(), weekly: windowOf({ usedPercent: 60, windowMinutes: 10080 }) },
         otherWindows: [], observedAt: T0, headroomPercent: 15 },
-      { label: 'zz-b', state: 'exhausted', stateWord: 'held', selectable: false, reason: 'usage-capped', resetAt: null,
+      { label: 'zz-b', order: 2, state: 'exhausted', stateWord: 'held', selectable: false, reason: 'usage-capped', resetAt: null,
         ordinaryUsageAllowed: true, nextObservationAt: null, policy: policyOf(),
         latch: { stopped: true, cappedWindows: ['fiveHour'], upstreamBlocked: false, cleanReadsDone: 1,
           cleanReadsNeeded: 2, since: T0 },
         windows: { fiveHour: windowOf({ usedPercent: 80 }), weekly: null },
         otherWindows: [windowOf({ windowMinutes: 120 })], observedAt: T0, headroomPercent: 0 },
-      { label: 'zz-c', state: 'login_required', stateWord: 'needs login', selectable: false,
+      { label: 'zz-c', order: 3, state: 'login_required', stateWord: 'needs login', selectable: false,
         reason: 'upstream-unauthorized', resetAt: null, ordinaryUsageAllowed: null, nextObservationAt: null,
         policy: policyOf(), latch: null, windows: { fiveHour: null, weekly: null }, otherWindows: [],
         observedAt: null, headroomPercent: 0 },
@@ -159,6 +159,21 @@ test('schema: values of the wrong type or out of range are refused', () => {
     [v => { v.daemon.reachable = null; }, 'status.daemon.reachable must be true or false'],
   ];
   for (const [change, problem] of cases) assert.equal(codexStatusProblem(mutated(change)), problem);
+});
+
+test('schema: order is the place in the configured list, from 1, within the account count and never repeated', () => {
+  assert.equal(codexStatusProblem(mutated(v => { delete v.accounts[0].order; })), 'status.accounts[0].order is missing');
+  const cases = [
+    [v => { v.accounts[0].order = 0; }, 'status.accounts[0].order must be an integer in its range'],
+    [v => { v.accounts[0].order = 4; }, 'status.accounts[0].order must be an integer in its range'],
+    [v => { v.accounts[0].order = 1.5; }, 'status.accounts[0].order must be an integer in its range'],
+    [v => { v.accounts[0].order = '1'; }, 'status.accounts[0].order must be an integer in its range'],
+    [v => { v.accounts[0].order = null; }, 'status.accounts[0].order must be an integer in its range'],
+    [v => { v.accounts[2].order = 2; }, 'status.accounts must not repeat an order'],
+  ];
+  for (const [change, problem] of cases) assert.equal(codexStatusProblem(mutated(change)), problem);
+  // 並びの位置と違っても、1から口座の数までの重ならない値なら通る（並びの順は order で表す）。
+  assert.equal(codexStatusProblem(mutated(v => { v.accounts[0].order = 3; v.accounts[2].order = 1; })), null);
 });
 
 test('schema: times must be UTC seconds without milliseconds and must exist', () => {

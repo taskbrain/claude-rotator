@@ -22,6 +22,9 @@ import {
   SERVICE_COMMAND_LOG_ENV,
   SERVICE_COMMAND_SHIM_DIR,
 } from '../fixtures/service-command-guard.js';
+import { runCli } from '../src/cli.js';
+import { createCodexSectionReader } from '../src/codex-status-child.js';
+import { codexRotatorConfigFile, codexRotatorEntryPath } from '../src/shared/codex-locator.js';
 
 const SHELL_FAKE = '#!/bin/sh\n: > "$0.ran"\n';
 const NODE_FAKE = "require('node:fs').writeFileSync(`${__filename}.ran`, '');\n";
@@ -161,6 +164,50 @@ test('guard: a bare codex or codex-rotator reaches its recording stand-in throug
     ...await expectRefusedEverywhere('codex-rotator', ['--version'], 'codex-rotator'),
   ];
   assert.deepEqual(box.logLines(), expected);
+});
+
+// The status screen of claude-rotator. The Claude side is a fixed status, so only the
+// Codex section can reach a child process.
+async function statusScreen(deps) {
+  let out = '';
+  const code = await runCli(['status'], {
+    readStatus: async () => ({ currentAccount: null, accounts: [], events: [] }),
+    write: text => { out += text; },
+    error: text => { out += text; },
+    ...deps,
+  });
+  return { code, out };
+}
+
+test('guard: the real Codex section reader, given the real spawn, is refused and recorded, and status draws one display error line', async t => {
+  // Without the child_process belt this test would start the entry point for real, so it
+  // stops here instead of running anything.
+  assert.equal(childProcess[Symbol.for('claude-rotator.service-command-guard.armed')], true,
+    'run with --import ./fixtures/service-command-guard.js');
+  const box = await sandbox(t);
+  const env = { HOME: box.root, XDG_CONFIG_HOME: join(box.root, 'zz-config') };
+  const configFile = codexRotatorConfigFile(env);
+  await mkdir(dirname(configFile), { recursive: true });
+  await writeFile(configFile, '{}');
+
+  const { code, out } = await statusScreen({
+    readCodexSection: createCodexSectionReader({ env, spawnImpl: childProcess.spawn }),
+  });
+
+  assert.equal(code, 0);
+  assert.deepEqual(box.logLines(), [`${process.execPath} ${codexRotatorEntryPath()} status --json --section`]);
+  assert.deepEqual(out.split('\n').filter(line => line.startsWith('Codex Rotator')),
+    [`${'Codex Rotator'.padEnd(39)}codex: display error (spawn failed)`]);
+});
+
+test('guard: status without a Codex section reader looks for no config and starts no child', async t => {
+  const box = await sandbox(t);
+
+  const { code, out } = await statusScreen({});
+
+  assert.equal(code, 0);
+  assert.doesNotMatch(out, /Codex Rotator/);
+  assert.deepEqual(box.logLines(), [], 'nothing was recorded');
 });
 
 test('guard: the service manager is still refused as before, and a fixture launchctl in a temp dir still runs', async t => {

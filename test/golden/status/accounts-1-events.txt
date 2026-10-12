@@ -1,0 +1,17 @@
+Claude Rotator                         current: zz-golden-one
+
+Routing availability
+Fable (1 now)             Other (Sonnet / Opus / Haiku) (1 now)
+  1. zz-golden-one  now     1. zz-golden-one  now
+
+zz-golden-one              active
+routes Fable: now | Other: now
+5h ███░░░░░░░  31%  reset in 2h12m -> 06/04 20:12 JST
+7d █████░░░░░  54%  reset in 3d16h -> 06/08 10:00 JST
+7d Fable █████░░░░░  50%  reset in 2d -> 06/06 18:00 JST
+requests: 3
+
+Events
+06/04 17:58 JST request acct_1 POST /v1/messages -> 200 812ms outcome=success req=zz-request-1
+06/04 17:55 JST upstream error acct_1 (temporary throttle; retry -> 06/04 17:56 JST)
+06/04 17:51 JST switched (none) -> acct_1 reason=quota-threshold

@@ -22,14 +22,15 @@
 //     ポートが衝突しない。固定ポートは1つも使わない。
 //   - 時刻依存の判定を持ち込まない（AccountManager の now は固定値）。唯一の時間比較は
 //     テスト2の「health が期限より十分早く返る」だが、判定の決め手は時間ではなく
-//     「codexStatusUrl へ接続すらしない」「点検側は実際に止まったまま」という観測であり、
-//     経過時間は補助的な上限にすぎない。閾値は絶対値ではなく設定値との相対で取り、
+//     「Codex の節の子は実際に止まったまま」「点検側は実際に止まったまま」という観測であり、
+//     経過時間は補助的な上限にすぎない。閾値は十分に大きな絶対値にして、
 //     CI の遅い環境で誤って落ちないようにしてある（HEALTH_ELAPSED_CEILING_MS）。
 //   - fixture には実在の資格情報・実ラベル・実メールアドレスを一切書かない。
 //     `.codex/auth.json` の中身は本ファイルで生成する合成の目印文字列である。
 
 import { afterEach, describe, it } from 'node:test';
 import assert from 'node:assert/strict';
+import { EventEmitter } from 'node:events';
 import http from 'node:http';
 import net from 'node:net';
 import { mkdir, mkdtemp, readFile, readdir, rm, stat, symlink, writeFile } from 'node:fs/promises';
@@ -40,12 +41,14 @@ import { fileURLToPath } from 'node:url';
 import { AccountManager } from '../src/account-manager.js';
 import { createGptPoolState, parseBridgeContract } from '../src/degrade-state.js';
 import { runCli } from '../src/cli.js';
+import { createCodexSectionReader } from '../src/codex-status-child.js';
 import { LOCAL_GATEWAY_AUTH_TOKEN } from '../src/config.js';
 import { writeJsonFileDurable } from '../src/json-file.js';
 import { renderStatus } from '../src/monitor.js';
 import { createProxyServer } from '../src/proxy-server.js';
 import { MemorySecretStore } from '../src/secret-store.js';
 import { normalizeSessionAffinity, sidHash } from '../src/session-affinity.js';
+import { codexRotatorConfigFile } from '../src/shared/codex-locator.js';
 import { startFakeBridge } from './helpers/fake-bridge.js';
 
 const cleanupCallbacks = [];
@@ -549,7 +552,7 @@ const BOUNDARY_ALLOWED_SAMPLES = Object.freeze([
 
 // 拾いたいのは「Codex の資格情報へ触れるコード」だけなので、パターンは文脈まで見る。
 //   - `.codex` は引用符かスラッシュに続くとき（＝パスの一部）だけ拾い、`options.codex` /
-//     `raw.codexStatusUrl` のようなプロパティ名は拾わない。
+//     `deps.readCodexSection` のようなプロパティ名は拾わない。
 //   - `auth.json` も同じくパス文脈のときだけ拾う（散文での言及は違反ではない）。
 //   - `CODEX_HOME` は環境変数として読むとき（`process.env.CODEX_HOME` / `env['CODEX_HOME']`）
 //     だけ拾う。
@@ -572,9 +575,9 @@ const CODEX_CREDENTIAL_VIOLATIONS = Object.freeze([
 
 // 逆に、拾ってはいけない現行コードの見本（プロパティ名・設定キー名）。
 const CODEX_CREDENTIAL_NON_VIOLATIONS = Object.freeze([
-  'lines.push(...renderCodexSection(options.codex, now));',
-  'const codexStatusUrl = normalizeCodexStatusUrl(raw.codexStatusUrl);',
-  "  'degradeMapping.codexStatusUrl must be loopback; codex status section disabled';",
+  'lines.push(...codexSectionLines(options.codex, now));',
+  'const codex = deps.readCodexSection ? await deps.readCodexSection() : null;',
+  'readCodexSection: createCodexSectionReader({ env: process.env, spawnImpl: spawn }),',
 ]);
 
 function findCodexCredentialHits(text, label) {
@@ -794,34 +797,115 @@ describe('never-reads-codex-credentials-in-claude-process (設計書 §5.1・§1
 // ---------------------------------------------------------------------------
 // 2. health-does-not-wait-for-codex-or-refresh
 //
-// 設計書 §9.6 の理由①②: /internal/health は「安価な生存確認」であり、
-// codex-rotator への取得も資格情報の点検も待たない。codex-rotator の統合表示は
-// CLI 側だけの機能であり、proxy-server には1行も入っていない（それをここで固定する）。
+// /internal/health は「安価な生存確認」であり、Codex の節の読取も資格情報の点検も待たない。
+// Codex の節を読む子プロセスを起動するのは CLI だけ（bin/claude-rotator.js が作って runCli へ渡す
+// 読取関数。src/codex-status-child.js）で、proxy-server はその部品と、子の入口と設定の場所を決める部品
+// （src/shared/codex-locator.js）を import のつながりに持たず、Codex の節の子を1回も起動しない（それを
+// ここで固定する）。
 // ---------------------------------------------------------------------------
 
 // 経過時間は判定の決め手ではなく「待っていたら絶対に超える」ことを示す補助的な上限。
-// 遅い CI でも誤失敗しないよう、設定値との相対（timeout の半分）とこの絶対上限の
-// 小さいほうを使う。
+// 遅い CI でも誤失敗しないよう、絶対値で十分に大きく取る。
 const HEALTH_ELAPSED_CEILING_MS = 2000;
 
+// Codex の節を読む子プロセスを起動する部品と、その子の入口と codex-rotator の設定の場所を決める部品
+// （リポジトリの根からの相対パス）。
+const CODEX_SECTION_CHILD_MODULE = 'src/codex-status-child.js';
+const CODEX_LOCATOR_MODULE = 'src/shared/codex-locator.js';
+
+// 以前の版が status の Codex の節の取得先と期限に読んでいた設定のキー（今は読まない）。名前は組み立てて
+// 書く（以前の版のキーの名前が src・test・README に1つも残っていないことを grep で確かめるため）。
+const RETIRED_CODEX_STATUS_KEYS = Object.freeze([['codexStatus', 'Url'].join(''), ['codexStatus', 'TimeoutMs'].join('')]);
+
+// fromRel から import のつながりをたどって届く src/ と bin/ のファイル（リポジトリの根からの相対パス）。
+async function importClosure(fromRel) {
+  const seen = new Set();
+  const queue = [fromRel];
+  while (queue.length > 0) {
+    const rel = queue.shift();
+    if (seen.has(rel)) continue;
+    seen.add(rel);
+    const { edges } = scanModuleImports(await readFile(join(REPO_ROOT, rel), 'utf8'));
+    for (const { specifier } of edges) {
+      const target = resolveImportTarget(rel, specifier);
+      if (target.kind === 'file') queue.push(target.rel);
+    }
+  }
+  return seen;
+}
+
+// Codex の設定ファイルを置いた一時フォルダの env（HOME と XDG_CONFIG_HOME だけを持つ）。
+async function envWithCodexConfig() {
+  const home = await mkdtemp(join(tmpdir(), 'rotator-invariance-codex-'));
+  cleanupAfterTest(async () => rm(home, { recursive: true, force: true }));
+  const env = { HOME: home, XDG_CONFIG_HOME: join(home, 'config') };
+  const configFile = codexRotatorConfigFile(env);
+  await mkdir(dirname(configFile), { recursive: true });
+  await writeFile(configFile, '{}');
+  return env;
+}
+
+// 子の代わり（stdout と kill を持つだけ）。
+function stubChild() {
+  const child = new EventEmitter();
+  child.stdout = new EventEmitter();
+  child.kill = () => true;
+  return child;
+}
+
 describe('health-does-not-wait-for-codex-or-refresh (設計書 §9.6・§14.4)', () => {
-  it('answers well before the codex status timeout while that socket never replies', async () => {
-    // 接続は受けるが1バイトも返さないサーバ（fake-bridge の idle 相当を TCP だけで作る）。
+  it('keeps the modules that start the Codex child and locate its entry out of the import graph of the proxy, so the proxy starts no Codex child', async () => {
+    const fromProxy = await importClosure('src/proxy-server.js');
+    assert.ok(fromProxy.size > 5, `the walk follows the imports of the proxy (${fromProxy.size} files)`);
+    assert.equal(fromProxy.has(CODEX_SECTION_CHILD_MODULE), false, 'the proxy cannot start the Codex child');
+    assert.equal(fromProxy.has(CODEX_LOCATOR_MODULE), false, 'the proxy cannot find the Codex entry or its config');
+    // runCli も自分では読取関数を作らない（入口から渡されたものを呼ぶだけ）。
+    const fromCli = await importClosure('src/cli.js');
+    assert.equal(fromCli.has(CODEX_SECTION_CHILD_MODULE), false);
+    assert.equal(fromCli.has(CODEX_LOCATOR_MODULE), false);
+    // 陽性対照: 入口からたどると届く（たどり方が壊れて「届かない」と言っているのではない）。
+    const fromEntry = await importClosure('bin/claude-rotator.js');
+    assert.equal(fromEntry.has(CODEX_SECTION_CHILD_MODULE), true);
+    assert.equal(fromEntry.has(CODEX_LOCATOR_MODULE), true);
+  });
+
+  it('answers health while the Codex section child the CLI started is stuck', async () => {
+    // 旧い版の2つのキーが残った設定。取得先は、接続は受けるが1バイトも返さないサーバ。
     const silent = await startSilentServer();
     cleanupAfterTest(async () => silent.close());
     const bridge = await startFakeBridge({ port: 0, mode: 'ok' });
     cleanupAfterTest(async () => bridge.close());
-
-    const codexStatusTimeoutMs = 30_000;
+    const [urlKey, timeoutKey] = RETIRED_CODEX_STATUS_KEYS;
     const proxy = await startProxy({
       openaiBridge: bridgeConfig(bridge.url, {
-        degradeMapping: {
-          enabled: true,
-          codexStatusUrl: `${silent.url}/healthz`,
-          codexStatusTimeoutMs,
-        },
+        degradeMapping: { enabled: true, [urlKey]: `${silent.url}/healthz`, [timeoutKey]: 30_000 },
       }),
     });
+
+    // Codex の設定ファイルがある env と、子を返すだけで終わらせない spawn の差し替え。
+    const spawned = [];
+    const spawnImpl = (command, args) => {
+      const child = stubChild();
+      spawned.push({ command, args, child });
+      return child;
+    };
+    const readCodexSection = createCodexSectionReader({ env: await envWithCodexConfig(), spawnImpl });
+
+    // proxy が答えることを先に確かめる（proxy が Codex の子を起こせないことは、上の import のつながりの
+    // テストが固定する）。
+    assert.equal((await requestJson(`${proxy.url}/internal/health`)).status, 200);
+    assert.equal((await requestJson(`${proxy.url}/internal/status`)).status, 200);
+
+    // CLI の Codex の節の子が止まったままでも、health は待たない。
+    const io = createIo();
+    let screenDone = false;
+    const screen = runCli(['status'], {
+      ...io,
+      readStatus: async () => JSON.parse((await requestJson(`${proxy.url}/internal/status`)).bodyText),
+      readCodexSection,
+    }).finally(() => { screenDone = true; });
+    for (let i = 0; i < 400 && spawned.length === 0; i++) await new Promise(done => { setTimeout(done, 5); });
+    assert.equal(spawned.length, 1, 'the CLI has started its child and is waiting for it');
 
     const startedAt = Date.now();
     const health = await requestJson(`${proxy.url}/internal/health`);
@@ -829,15 +913,17 @@ describe('health-does-not-wait-for-codex-or-refresh (設計書 §9.6・§14.4)',
 
     assert.equal(health.status, 200);
     assert.equal(JSON.parse(health.bodyText).ok, true);
-    // 決め手は下の connectionCount()===0（＝そもそも接続しない）。経過時間は
-    // 「待っていたら codexStatusTimeoutMs まで掛かる」ことに対する相対的な上限で見る。
-    const elapsedBudgetMs = Math.min(codexStatusTimeoutMs / 2, HEALTH_ELAPSED_CEILING_MS);
     assert.ok(
-      elapsed < elapsedBudgetMs,
-      `/internal/health は codex-rotator を待たない（codexStatusTimeoutMs=${codexStatusTimeoutMs}ms `
-      + `に対し実測 ${elapsed}ms。${elapsedBudgetMs}ms 未満であること）`,
+      elapsed < HEALTH_ELAPSED_CEILING_MS,
+      `/internal/health は Codex の節の子を待たない（実測 ${elapsed}ms。${HEALTH_ELAPSED_CEILING_MS}ms 未満であること）`,
     );
-    assert.equal(silent.connectionCount(), 0, 'proxy-server は codexStatusUrl へ接続すらしない');
+    assert.equal(screenDone, false, 'the CLI was still waiting for its stuck child when health answered');
+    assert.equal(silent.connectionCount(), 0, 'proxy-server は旧い取得先へ接続すらしない');
+
+    // 後片付け: 止まっていた子を0以外で終わらせると、画面は Codex の節が1行のまま描き終わる。
+    spawned[0].child.emit('close', 1, null);
+    assert.equal(await screen, 0);
+    assert.match(io.output(), /Codex Rotator\s+codex: display error \(exit 1\)/);
   });
 
   it('answers while the initial credential check is still blocked', async () => {
@@ -1080,8 +1166,10 @@ describe('unset-config-is-byte-identical (設計書 §14.1・§7.3-3)', () => {
 // ---------------------------------------------------------------------------
 // 4. codex-rotator-absent-is-harmless
 //
-// 設計書 §14.2: degradeMapping.enabled が真でも codex-rotator が動いていない構成で、
-// claude-* 要求も /internal/health も `claude-rotator status` も現行どおり働く。
+// codex-rotator が無い・動かない構成で、claude-* 要求も /internal/health も `claude-rotator status` も
+// 現行どおり働く。Codex の設定ファイルが無ければ子プロセスを起動しない。設定ファイルがあっても、
+// 子を起動できない・子が0以外で終わるときは、Codex の節が1行になるだけで、画面の残りと終了コードは
+// 変わらない。設定に旧い版の2つのキーが残っていても、読まずに無視する。
 // ---------------------------------------------------------------------------
 
 describe('codex-rotator-absent-is-harmless (設計書 §14.2)', () => {
@@ -1101,14 +1189,14 @@ describe('codex-rotator-absent-is-harmless (設計書 §14.2)', () => {
   it('keeps claude-* traffic, /internal/health and the status screen working with codex-rotator down', async () => {
     const upstream = await startAnthropicUpstream();
     cleanupAfterTest(async () => upstream.close());
-    // 誰も listen していないループバックポート＝codex-rotator 不在の再現。
+    // 本番の設定と同じ形の合成の設定。旧い版の2つのキーが残り、その取得先は誰も listen していない。
     const deadPort = await unusedLoopbackPort();
-    const codexStatusUrl = `http://127.0.0.1:${deadPort}/healthz`;
+    const [urlKey, timeoutKey] = RETIRED_CODEX_STATUS_KEYS;
     const config = {
       openaiBridge: {
         enabled: true,
         url: 'http://127.0.0.1:18765',
-        degradeMapping: { enabled: true, codexStatusUrl, codexStatusTimeoutMs: 400 },
+        degradeMapping: { enabled: true, [urlKey]: `http://127.0.0.1:${deadPort}/healthz`, [timeoutKey]: 400 },
       },
     };
 
@@ -1122,21 +1210,55 @@ describe('codex-rotator-absent-is-harmless (設計書 §14.2)', () => {
     assert.equal(JSON.parse(claude.bodyText).ok, true);
     assert.equal((await requestJson(`${proxy.url}/internal/health`)).status, 200);
 
-    // CLI 側（src/cli.js の readCodexStatus）は1行だけ落として Claude 側を描き切る。
+    // Codex の設定ファイルが無い env では、子を起動せず、画面は Codex の節の無いものになる。
+    const home = await mkdtemp(join(tmpdir(), 'rotator-invariance-codex-absent-'));
+    cleanupAfterTest(async () => rm(home, { recursive: true, force: true }));
+    const spawned = [];
+    const spawnImpl = (...args) => { spawned.push(args); throw new Error('no child may be started'); };
     const io = createIo();
-    const startedAt = Date.now();
     const code = await runCli(['status'], {
       ...io,
       readStatus: async () => claudeStatus,
-      loadConfig: async () => config,
+      readCodexSection: createCodexSectionReader({ env: { HOME: home, XDG_CONFIG_HOME: join(home, 'config') }, spawnImpl }),
     });
-    const elapsed = Date.now() - startedAt;
 
     assert.equal(code, 0);
-    assert.match(io.output(), /Codex Rotator\s+codex: unreachable \(/, 'Codex 節は1行の未到達表示になる');
+    assert.equal(spawned.length, 0, '設定ファイルが無ければ子プロセスを起動しない');
+    assert.equal(io.output(), renderStatus(claudeStatus), 'Codex の節の無い画面のまま');
     assert.match(io.output(), /user-a@example\.com\s+active/, 'Claude 側の表示は壊れない');
     assert.match(io.output(), /5h ███████░░░  76%/);
-    assert.ok(elapsed < 5000, `status は codex-rotator 不在でハングしない（実測 ${elapsed}ms）`);
+  });
+
+  it('turns a child that cannot start or exits non-zero into one line, leaving the rest of the screen and the exit code alone', async () => {
+    const env = await envWithCodexConfig();
+    const baseline = renderStatus(claudeStatus);
+    const cases = [
+      // 起動する実行ファイルが無い（spawn の error。node の ENOENT と同じ形）。
+      { name: 'no executable', reason: 'spawn failed', spawnImpl: () => {
+        const child = stubChild();
+        setImmediate(() => child.emit('error', Object.assign(new Error('spawn ENOENT'), { code: 'ENOENT' })));
+        return child;
+      } },
+      { name: 'non-zero exit', reason: 'exit 1', spawnImpl: () => {
+        const child = stubChild();
+        setImmediate(() => child.emit('close', 1, null));
+        return child;
+      } },
+    ];
+    for (const { name, reason, spawnImpl } of cases) {
+      const io = createIo();
+      const code = await runCli(['status'], {
+        ...io,
+        readStatus: async () => claudeStatus,
+        readCodexSection: createCodexSectionReader({ env, spawnImpl }),
+      });
+
+      assert.equal(code, 0, `${name}: the exit code is unchanged`);
+      const codexLines = io.output().split('\n').filter(line => line.startsWith('Codex Rotator'));
+      assert.equal(codexLines.length, 1, name);
+      assert.match(codexLines[0], new RegExp(`^Codex Rotator\\s+codex: display error \\(${reason}\\)$`), name);
+      assert.equal(io.output().replace(`${codexLines[0]}\n\n`, ''), baseline, `${name}: the rest of the screen is unchanged`);
+    }
   });
 });
 
