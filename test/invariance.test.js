@@ -22,30 +22,33 @@
 //     ポートが衝突しない。固定ポートは1つも使わない。
 //   - 時刻依存の判定を持ち込まない（AccountManager の now は固定値）。唯一の時間比較は
 //     テスト2の「health が期限より十分早く返る」だが、判定の決め手は時間ではなく
-//     「codexStatusUrl へ接続すらしない」「点検側は実際に止まったまま」という観測であり、
-//     経過時間は補助的な上限にすぎない。閾値は絶対値ではなく設定値との相対で取り、
+//     「Codex の節の子は実際に止まったまま」「点検側は実際に止まったまま」という観測であり、
+//     経過時間は補助的な上限にすぎない。閾値は十分に大きな絶対値にして、
 //     CI の遅い環境で誤って落ちないようにしてある（HEALTH_ELAPSED_CEILING_MS）。
 //   - fixture には実在の資格情報・実ラベル・実メールアドレスを一切書かない。
 //     `.codex/auth.json` の中身は本ファイルで生成する合成の目印文字列である。
 
 import { afterEach, describe, it } from 'node:test';
 import assert from 'node:assert/strict';
+import { EventEmitter } from 'node:events';
 import http from 'node:http';
 import net from 'node:net';
-import { mkdir, mkdtemp, readFile, readdir, rm, stat, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, readFile, readdir, rm, stat, symlink, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
-import { dirname, join, resolve } from 'node:path';
+import { dirname, join, relative, resolve, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 import { AccountManager } from '../src/account-manager.js';
 import { createGptPoolState, parseBridgeContract } from '../src/degrade-state.js';
 import { runCli } from '../src/cli.js';
+import { createCodexSectionReader } from '../src/codex-status-child.js';
 import { LOCAL_GATEWAY_AUTH_TOKEN } from '../src/config.js';
 import { writeJsonFileDurable } from '../src/json-file.js';
 import { renderStatus } from '../src/monitor.js';
 import { createProxyServer } from '../src/proxy-server.js';
 import { MemorySecretStore } from '../src/secret-store.js';
 import { normalizeSessionAffinity, sidHash } from '../src/session-affinity.js';
+import { codexRotatorConfigFile } from '../src/shared/codex-locator.js';
 import { startFakeBridge } from './helpers/fake-bridge.js';
 
 const cleanupCallbacks = [];
@@ -69,8 +72,28 @@ function cleanupAfterTest(callback) {
 // 1. never-reads-codex-credentials-in-claude-process
 //
 // 設計書 §5.1「ClaudeRotator が持たないもの」: Codex（ChatGPT）の資格情報。
-// rotator が codex-rotator の認証ファイルへ触れないことを、静的（src/ の走査）と
-// 動的（一時 HOME に置いた目印ファイルが読まれない）の両面で固定する。
+//
+// 主の保証は import グラフの境界検査である。Claude 側のコードが Codex 側のコード
+// （資格情報を読む部品を含む）を import しないことを、src/ と bin/ の全ファイルの import を
+// 字句解析して固定する。文字列の走査は保証にならない（例えば src/codex/credentials.js は
+// 資格情報のパスを引数で受け取るので走査に一致せず、Claude 側がこれを import しても走査では
+// 捕まらない）ため、補助として残す。動的な確認（一時 HOME に置いた目印ファイルが読まれない）
+// も残す。
+//
+// 境界の区分（パスはリポジトリ根からの相対）:
+//   - Codex 側 : src/codex/ の下と bin/codex-rotator.js
+//   - 共用部品 : src/shared/ の下
+//   - Claude 側: それ以外の src/ と bin/（bin/claude-rotator.js など）
+// 規則:
+//   - src/codex/ の外（Claude 側と共用部品）は Codex 側を import しない。Claude 側は src/・bin/ の
+//     外（lib/ など）も import しない（外を経由すると、その先の越境を検査できない）。
+//   - `#…`（package.json の imports）と自分のパッケージ名での参照は、どの側でも違反とする。
+//   - Codex 側が import してよいのは、Codex 側・共用部品・許可リストの3ファイル
+//     （src/json-file.js・src/log-rotation.js・src/paths.js）・`node:` の標準部品だけ。
+//   - 共用部品が import してよいのは、共用部品と `node:` の標準部品だけ。
+//   - 文字列でない動的 import・require()（`import(variable)` など）、エスケープを含む行き先
+//     （`'\x2e/codex/…'` など）、createRequire は、行き先を静的に確かめられないので、どの側でも
+//     違反とする。走査するのは .js・.mjs・.cjs のファイル。
 // ---------------------------------------------------------------------------
 
 // 走査対象は「npm へ同梱され利用者の環境で実行されるコード」＝package.json の files が
@@ -79,9 +102,457 @@ function cleanupAfterTest(callback) {
 const REPO_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 const SCAN_ROOTS = Object.freeze([join(REPO_ROOT, 'src'), join(REPO_ROOT, 'bin')]);
 
+// 自分のパッケージ名（`claude-rotator/src/codex/…` のような自己参照を見分けるため）。
+const PACKAGE_NAME = JSON.parse(await readFile(join(REPO_ROOT, 'package.json'), 'utf8')).name;
+
+const CODEX_DIR = 'src/codex/';
+const CODEX_BIN = 'bin/codex-rotator.js';
+const SHARED_DIR = 'src/shared/';
+// Codex 側が import してよい、src/codex/・src/shared/ の外の既存部品（許可リスト）。
+const CODEX_ALLOWED_CLAUDE_MODULES = Object.freeze(['src/json-file.js', 'src/log-rotation.js', 'src/paths.js']);
+
+function repoRelative(absolutePath) {
+  return relative(REPO_ROOT, absolutePath).split(sep).join('/');
+}
+
+function isCodexSide(relPath) {
+  return relPath.startsWith(CODEX_DIR) || relPath === CODEX_BIN;
+}
+
+function boundarySideOf(relPath) {
+  if (isCodexSide(relPath)) return 'codex';
+  if (relPath.startsWith(SHARED_DIR)) return 'shared';
+  return 'claude';
+}
+
+// 正規表現リテラルの直前に来うるキーワード。これ以外の名前・`)`・`]`・`}` の後の `/` は割り算。
+// （`if (x) /re/` のような書き方は割り算と読む。取り違えて文字列やコメントが閉じなくなれば
+// 下の fail が例外にするので、黙って緑にはならない。）
+const REGEX_AFTER_KEYWORDS = new Set(['return', 'typeof', 'instanceof', 'in', 'of', 'new', 'delete',
+  'void', 'throw', 'case', 'do', 'else', 'yield', 'await']);
+const WORD = /[A-Za-z0-9_$\u0080-\uffff]+/y;
+// 直前がこの字句なら、次の `/` は割り算（正規表現ではない）。
+const DIVISION_AFTER_PUNCT = new Set([')', ']', '}', '++', '--']);
+
+// JS の字句を、import の抽出に要る粒度だけで切り出す。目的はコメント・文字列・テンプレート・
+// 正規表現の中身をコードと取り違えないことで、構文の正しさは検査しない。閉じていない文字列・
+// コメント・テンプレートや、波括弧の食い違いは例外にする（取り違えたまま緑にしない）。
+function tokenizeModuleSource(source) {
+  const tokens = [];
+  const braces = []; // '{' はブロック・オブジェクト、'${' はテンプレートの埋め込み
+  let index = 0;
+  let line = 1;
+  const fail = what => { throw new Error(`import scanner: ${what} at line ${line}`); };
+  const push = (type, value, at = line) => { tokens.push({ type, value, line: at }); };
+  const regexAllowed = () => {
+    const previous = tokens.at(-1);
+    if (!previous) return true;
+    if (previous.type === 'name') return REGEX_AFTER_KEYWORDS.has(previous.value);
+    // 後置の `++`・`--` の後も割り算（`n++ / x / 2`）。前置の直後に `/` は来ない。
+    return previous.type === 'punct' && !DIVISION_AFTER_PUNCT.has(previous.value);
+  };
+  // `index` はテンプレートの文字部分の先頭（'`' か、埋め込みを閉じる '}' の直後）を指す。
+  const readTemplate = () => {
+    const at = line;
+    while (index < source.length) {
+      const char = source[index];
+      if (char === '\\') {
+        if (source[index + 1] === '\n') line++;
+        index += 2;
+        continue;
+      }
+      if (char === '`') { index++; push('template', null, at); return; }
+      if (char === '$' && source[index + 1] === '{') {
+        index += 2;
+        braces.push('${');
+        push('template', null, at);
+        return;
+      }
+      if (char === '\n') line++;
+      index++;
+    }
+    fail('unterminated template literal');
+  };
+
+  if (source.startsWith('#!')) {
+    const end = source.indexOf('\n');
+    index = end === -1 ? source.length : end;
+  }
+  while (index < source.length) {
+    const char = source[index];
+    const next = source[index + 1];
+    if (char === '\n') { line++; index++; continue; }
+    if (/\s/.test(char)) { index++; continue; }
+    if (char === '/' && next === '/') {
+      const end = source.indexOf('\n', index);
+      index = end === -1 ? source.length : end;
+      continue;
+    }
+    if (char === '/' && next === '*') {
+      const end = source.indexOf('*/', index + 2);
+      if (end === -1) fail('unterminated block comment');
+      line += source.slice(index, end).split('\n').length - 1;
+      index = end + 2;
+      continue;
+    }
+    if (char === '"' || char === "'") {
+      // 文字列の値は解釈しない。行継続（`\` と改行）は値に何も足さないので読み飛ばし、
+      // それ以外のエスケープ（`\x2e`・`/` など）を含む文字列には escaped の印を付ける。
+      // 印付きの文字列を import の行き先に使うと、下の scanModuleImports が違反にする。
+      const at = line;
+      let text = '';
+      let escaped = false;
+      index++;
+      for (;;) {
+        const current = source[index];
+        if (current === undefined || current === '\n') fail('unterminated string literal');
+        if (current === char) { index++; break; }
+        if (current === '\\') {
+          const following = source[index + 1];
+          if (following === '\r' && source[index + 2] === '\n') { line++; index += 3; continue; }
+          if (following === '\n' || following === '\r' || following === ' ' || following === ' ') {
+            if (following === '\n') line++;
+            index += 2;
+            continue;
+          }
+          escaped = true;
+          text += following ?? '';
+          index += 2;
+          continue;
+        }
+        text += current;
+        index++;
+      }
+      tokens.push({ type: 'string', value: text, escaped, line: at });
+      continue;
+    }
+    if (char === '`') { index++; readTemplate(); continue; }
+    if (char === '}' && braces.at(-1) === '${') { braces.pop(); index++; readTemplate(); continue; }
+    if (char === '/' && regexAllowed()) {
+      const at = line;
+      let inClass = false;
+      index++;
+      for (;;) {
+        const current = source[index];
+        if (current === undefined || current === '\n') fail('unterminated regular expression');
+        index++;
+        if (current === '\\') { index++; continue; }
+        if (current === '[') inClass = true;
+        else if (current === ']') inClass = false;
+        else if (current === '/' && !inClass) break;
+      }
+      while (/[A-Za-z]/.test(source[index] ?? '')) index++; // フラグ
+      push('regex', null, at);
+      continue;
+    }
+    WORD.lastIndex = index;
+    const word = WORD.exec(source);
+    if (word) {
+      push(/[0-9]/.test(word[0][0]) ? 'number' : 'name', word[0]);
+      index += word[0].length;
+      continue;
+    }
+    // `++`・`--` は1つの字句として読む（`+` 1つと取り違えると、直後の `/` を正規表現と読む）。
+    if ((char === '+' || char === '-') && next === char) {
+      push('punct', char + char);
+      index += 2;
+      continue;
+    }
+    if (char === '{') braces.push('{');
+    else if (char === '}' && braces.pop() !== '{') fail('unbalanced braces');
+    push('punct', char);
+    index++;
+  }
+  if (braces.length) fail('unbalanced braces');
+  return tokens;
+}
+
+// `x, { a as b }`・`* as ns` の節を読み進め、`from '<行き先>'` の文字列トークンを返す。
+// 節の途中で別の字句（`;`・`=`・次の文のキーワード等）に当たれば null。
+function findFromSpecifier(tokens, start) {
+  for (let i = start; i < tokens.length; i++) {
+    const token = tokens[i];
+    if (token.type === 'name' && token.value === 'from' && tokens[i + 1]?.type === 'string') return tokens[i + 1];
+    const inClause = (token.type === 'name' && token.value !== 'import' && token.value !== 'export')
+      || token.type === 'string' || (token.type === 'punct' && '{},*'.includes(token.value));
+    if (!inClause) return null;
+  }
+  return null;
+}
+
+// 違反の理由。陽性対照は、見本ごとに期待した理由で捕まったことまで確かめる。
+const BOUNDARY_REASON = Object.freeze({
+  intoCodex: 'the Claude side imports the Codex side',
+  codexOutside: 'the Codex side imports something outside its allow-list',
+  sharedOutside: 'src/shared/ imports something other than src/shared/ and node:',
+  nonLiteralImport: 'non-literal dynamic import',
+  nonLiteralRequire: 'non-literal require',
+  escapedSpecifier: 'escaped import specifier',
+  ambiguousSpecifier: 'import specifier containing %, ? or #',
+  createRequire: 'createRequire is not allowed',
+  getBuiltinModule: 'getBuiltinModule is not allowed',
+  loaderModule: 'the module loader (node:module) is not allowed',
+  indirectRequire: 'require used other than as a direct call',
+  symlink: 'symbolic link under src/ or bin/',
+  outsideSources: 'the Claude side imports a file outside src/ and bin/',
+  subpathImport: "package-internal '#' import is not allowed",
+  selfReference: "import through the package's own name is not allowed",
+  unrecognised: 'unrecognised import statement',
+});
+
+// ローダーへ間接的に届く名前。名前（`module.createRequire`）でも文字列（`module['createRequire']`）でも拾う。
+const LOADER_NAMES = new Map([
+  ['createRequire', BOUNDARY_REASON.createRequire],
+  ['getBuiltinModule', BOUNDARY_REASON.getBuiltinModule],
+]);
+
+// import の行き先を抜き出す。拾う形は静的 import・`export … from`・動的 import・`require()`。
+//   - 動的 import と require() は、第1引数がちょうど1つの文字列リテラルのときだけ行き先として
+//     扱う。それ以外（変数・連結・テンプレート）は行き先を確かめられないので problems に入れる。
+//   - 行き先の文字列がエスケープ（`\x2e` など）を含むときは、値を解釈せずに problems に入れる。
+//   - ローダーを間接的に使う形は、どこに書いても problems に入れる: createRequire・
+//     getBuiltinModule の名前、直接の呼出し以外の require（`module.require`・`const r = require`）。
+//     node:module の import は boundaryCrossing が違反にする。
+// 対象外（静的な境界検査では確かめられない）: 実行時に組み立てて読み込む形（eval・new Function・
+// Worker・child_process）。
+function scanModuleImports(source) {
+  const tokens = tokenizeModuleSource(source);
+  const edges = [];
+  const problems = [];
+  const isPunct = (token, value) => token?.type === 'punct' && token.value === value;
+  const addEdge = (form, specifierToken, line) => {
+    if (specifierToken.escaped) problems.push({ line, reason: BOUNDARY_REASON.escapedSpecifier });
+    else edges.push({ form, specifier: specifierToken.value, line });
+  };
+  // `import(x)`・`require(x)` の引数を読む。文字列リテラル1つなら edge、それ以外は problem。
+  const addCall = (form, token, i, nonLiteralReason) => {
+    const argument = tokens[i + 2];
+    const after = tokens[i + 3];
+    if (argument?.type === 'string' && (isPunct(after, ')') || isPunct(after, ','))) addEdge(form, argument, token.line);
+    else problems.push({ line: token.line, reason: nonLiteralReason });
+  };
+  for (let i = 0; i < tokens.length; i++) {
+    const token = tokens[i];
+    const previous = tokens[i - 1];
+    const next = tokens[i + 1];
+    if ((token.type === 'name' || token.type === 'string') && LOADER_NAMES.has(token.value)) {
+      problems.push({ line: token.line, reason: LOADER_NAMES.get(token.value) });
+      continue;
+    }
+    // require は、プロパティでない名前をその場で呼ぶ `require('…')` だけを行き先として読む。
+    // `module.require`・`module['require']`・`const r = require` は行き先を追えないので違反。
+    if (token.value === 'require' && (token.type === 'string'
+      || (token.type === 'name' && (isPunct(previous, '.') || !isPunct(next, '('))))) {
+      problems.push({ line: token.line, reason: BOUNDARY_REASON.indirectRequire });
+      continue;
+    }
+    // `obj.import(...)`・`obj?.import` はプロパティであってキーワードではない。
+    if (token.type !== 'name' || isPunct(previous, '.')) continue;
+    if (token.value === 'require') {
+      addCall('require', token, i, BOUNDARY_REASON.nonLiteralRequire);
+      continue;
+    }
+    if (token.value === 'import') {
+      if (isPunct(next, '.')) continue; // import.meta
+      if (isPunct(next, '(')) {
+        addCall('dynamic import', token, i, BOUNDARY_REASON.nonLiteralImport);
+        continue;
+      }
+      const specifier = next?.type === 'string' ? next : findFromSpecifier(tokens, i + 1);
+      if (specifier) addEdge('import', specifier, token.line);
+      else problems.push({ line: token.line, reason: BOUNDARY_REASON.unrecognised });
+      continue;
+    }
+    if (token.value === 'export' && (isPunct(next, '*') || isPunct(next, '{'))) {
+      const specifier = findFromSpecifier(tokens, i + 1);
+      if (specifier) addEdge('export from', specifier, token.line);
+    }
+  }
+  return { edges, problems };
+}
+
+function resolveImportTarget(fromRel, specifier) {
+  if (specifier === 'node:module' || specifier === 'module') return { kind: 'loader' };
+  // `#…` は package.json の imports、自分のパッケージ名は exports を通って、パスの比較を経ずに
+  // どこへでも届きうるので、どの側でも違反にする。
+  if (specifier.startsWith('#')) return { kind: 'subpath' };
+  if (specifier === PACKAGE_NAME || specifier.startsWith(`${PACKAGE_NAME}/`)) return { kind: 'self' };
+  if (specifier.startsWith('node:')) return { kind: 'builtin' };
+  const relativeOrAbsolute = /^\.{1,2}(?:\/|$)/.test(specifier) || specifier.startsWith('/');
+  if (relativeOrAbsolute || specifier.startsWith('file:')) {
+    // Node は `%` を復号し、`?`・`#` を捨てて読み込む（`./cod%65x/…` は codex/…、
+    // `./codex-rotator.js?x` は codex-rotator.js）。パスの比較が当てにならないので違反にする。
+    if (/[%?#]/.test(specifier)) return { kind: 'ambiguous' };
+    const absolute = relativeOrAbsolute ? resolve(REPO_ROOT, dirname(fromRel), specifier) : fileURLToPath(specifier);
+    return { kind: 'file', rel: repoRelative(absolute) };
+  }
+  return { kind: 'bare' }; // パッケージ名、または `node:` の付かない標準部品
+}
+
+function boundaryCrossing(side, target) {
+  if (target.kind === 'loader') return BOUNDARY_REASON.loaderModule;
+  if (target.kind === 'ambiguous') return BOUNDARY_REASON.ambiguousSpecifier;
+  if (target.kind === 'subpath') return BOUNDARY_REASON.subpathImport;
+  if (target.kind === 'self') return BOUNDARY_REASON.selfReference;
+  if (side === 'claude') {
+    if (target.kind !== 'file') return null;
+    if (isCodexSide(target.rel)) return BOUNDARY_REASON.intoCodex;
+    // src/・bin/ の外（lib/ など）を経由すると、そこから先の越境を検査できないので外へ出さない。
+    // Codex 側と共用部品は、下の許可リストがそもそも src/ の中だけなので外へ出られない。
+    return target.rel.startsWith('src/') || target.rel.startsWith('bin/') ? null : BOUNDARY_REASON.outsideSources;
+  }
+  if (target.kind === 'builtin') return null;
+  if (side === 'shared') {
+    return target.kind === 'file' && target.rel.startsWith(SHARED_DIR) ? null : BOUNDARY_REASON.sharedOutside;
+  }
+  // 許可リスト: src/codex/ の中・src/shared/・3ファイル・node:。bin/codex-rotator.js は入らない。
+  const allowed = target.kind === 'file' && (target.rel.startsWith(CODEX_DIR) || target.rel.startsWith(SHARED_DIR)
+    || CODEX_ALLOWED_CLAUDE_MODULES.includes(target.rel));
+  return allowed ? null : BOUNDARY_REASON.codexOutside;
+}
+
+function findBoundaryViolations(fromRel, source) {
+  const side = boundarySideOf(fromRel);
+  const { edges, problems } = scanModuleImports(source);
+  const violations = problems.map(problem => `${fromRel}:${problem.line} ${problem.reason}`);
+  for (const edge of edges) {
+    const crossing = boundaryCrossing(side, resolveImportTarget(fromRel, edge.specifier));
+    if (crossing) violations.push(`${fromRel}:${edge.line} ${edge.form} '${edge.specifier}': ${crossing}`);
+  }
+  return { violations, edges };
+}
+
+// 字句解析の取りこぼしを見る突合せ用。行頭の静的 import・`export … from`（複数行の節を含む）
+// を素朴な正規表現で拾い、字句解析の結果に全部含まれることを確かめる。行き先にエスケープを
+// 含むものは字句解析が行き先として採らず違反にするので、突合せの対象から外す。
+// 既知の誤検出（違反でないのに赤になる。未対応）: 複数行のテンプレート・コメントの中の行頭 import など。
+const LINE_ANCHORED_IMPORT = /^(?:import\s*|(?:import|export)\b[^;'"`()=]*?\bfrom\s*)(['"])([^'"\n]+)\1/gm;
+
+// 走査するファイルの拡張子。ESM・CommonJS のどちらで書かれても境界の外には出さない。
+const MODULE_FILE = /\.(?:js|mjs|cjs)$/;
+
+// 検査が「何にも一致しないから緑」になっていないことを示す見本（違反の再現）。
+// path はリポジトリ相対の仮想パスで、見本はファイルに書かずに検査へ直接渡す。
+// reason は、その見本が捕まるべき理由（別の理由で捕まって合格にならないよう照合する）。
+const R = BOUNDARY_REASON;
+const BOUNDARY_VIOLATION_SAMPLES = Object.freeze([
+  // Claude 側から Codex 側を import する形（`../codex/…` を含む）
+  { reason: R.intoCodex, path: 'src/status/codex-card.js', source: "import { createCodexAccountPool } from '../codex/account-pool.js';" },
+  { reason: R.intoCodex, path: 'src/proxy-server.js', source: "import { readCodexUsage } from './codex/usage.js';" },
+  { reason: R.intoCodex, path: 'src/proxy-server.js', source: "import u from './codex/usage.js';" },
+  { reason: R.intoCodex, path: 'src/cli.js', source: ['import {', '  readCodexCredentials,', '  accountIdHash,', "} from './codex/credentials.js';"].join('\n') },
+  { reason: R.intoCodex, path: 'src/monitor.js', source: "export * from './codex/usage.js';" },
+  { reason: R.intoCodex, path: 'src/monitor.js', source: "export { readCodexUsage as readUsage } from './codex/usage.js';" },
+  { reason: R.intoCodex, path: 'src/install.js', source: "import './codex/account-pool.js';" },
+  { reason: R.intoCodex, path: 'src/cli.js', source: "const { readCodexUsage } = await import('./codex/usage.js');" },
+  { reason: R.intoCodex, path: 'bin/claude-rotator.js', source: "#!/usr/bin/env node\nconst { readCodexUsage } = await import('../src/codex/usage.js');" },
+  { reason: R.intoCodex, path: 'bin/claude-rotator.js', source: "await import('./codex-rotator.js');" },
+  // 行継続（`\` と改行）は値に何も足さないので、解釈した行き先で判定される。
+  { reason: R.intoCodex, path: 'src/cli.js', source: "import u from './co\\\ndex/usage.js';" },
+  // .mjs・.cjs も同じ規則（CommonJS の require() も行き先として読む）
+  { reason: R.intoCodex, path: 'src/status.mjs', source: "import { readCodexUsage } from './codex/usage.js';" },
+  { reason: R.intoCodex, path: 'src/status.cjs', source: "const { readCodexUsage } = require('./codex/usage.js');" },
+  // Codex 側から許可リストの外（`../proxy-server.js` を含む）を import する形
+  { reason: R.codexOutside, path: 'src/codex/status.js', source: "import { createProxyServer } from '../proxy-server.js';" },
+  { reason: R.codexOutside, path: 'src/codex/status.js', source: "import { loadConfig } from '../config.js';" },
+  { reason: R.codexOutside, path: 'src/codex/status.js', source: "import { readFile } from 'fs/promises';" },
+  { reason: R.codexOutside, path: 'bin/codex-rotator.js', source: "const { runCli } = await import('../src/cli.js');" },
+  // src/codex/ から bin/ の入口を import する形（bin/codex-rotator.js は許可リストに無い）
+  { reason: R.codexOutside, path: 'src/codex/cli.js', source: "import '../../bin/codex-rotator.js';" },
+  { reason: R.codexOutside, path: 'src/codex/cli.js', source: "const entry = await import('../../bin/codex-rotator.js');" },
+  // 共用部品から共用部品と node: の外を import する形
+  { reason: R.sharedOutside, path: 'src/shared/local-http.js', source: "import { readCodexUsage } from '../codex/usage.js';" },
+  { reason: R.sharedOutside, path: 'src/shared/local-http.js', source: "import { writeJsonFileDurable } from '../json-file.js';" },
+  // 文字列でない動的 import・require()（どの側でも違反）
+  { reason: R.nonLiteralImport, path: 'src/cli.js', source: "const target = './codex/usage.js';\nawait import(target);" },
+  { reason: R.nonLiteralImport, path: 'src/cli.js', source: "await import('./codex/' + name);" },
+  { reason: R.nonLiteralImport, path: 'src/cli.js', source: 'await import(`./codex/${name}.js`);' },
+  { reason: R.nonLiteralImport, path: 'src/codex/cli.js', source: 'const loaded = await import(modulePath);' },
+  { reason: R.nonLiteralRequire, path: 'src/status.cjs', source: 'const loaded = require(modulePath);' },
+  // 後置の `++`・`--` の後の `/` を正規表現と読むと、間の import を見逃す形
+  { reason: R.nonLiteralImport, path: 'src/cli.js', source: 'let n = 0;\nn++ / (await import(target), 1) / 2;' },
+  { reason: R.nonLiteralImport, path: 'src/cli.js', source: 'let n = 0;\nn-- / (await import(target), 1) / 2;' },
+  // 行き先に %・?・# を含む形（Node は復号・除去して Codex 側や bin/ の入口を読み込む）
+  { reason: R.ambiguousSpecifier, path: 'src/cli.js', source: "import u from './cod%65x/usage.js';" },
+  { reason: R.ambiguousSpecifier, path: 'bin/claude-rotator.js', source: "await import('./codex-rotator.js?x');" },
+  { reason: R.ambiguousSpecifier, path: 'bin/claude-rotator.js', source: "await import('./codex-rotator.js#x');" },
+  { reason: R.ambiguousSpecifier, path: 'src/cli.js', source: "import u from 'file:///opt/app/src/cod%65x/usage.js';" },
+  // 行き先の文字列にエスケープを含む形（値を解釈すると './codex/usage.js' になる）
+  { reason: R.escapedSpecifier, path: 'src/cli.js', source: "await import('\\x2e/codex/usage.js');" },
+  { reason: R.escapedSpecifier, path: 'src/cli.js', source: "import u from '\\x2e/codex/usage.js';" },
+  { reason: R.escapedSpecifier, path: 'src/monitor.js', source: "export * from '.\\u002fcodex/usage.js';" },
+  // createRequire による迂回（どの側でも違反）
+  { reason: R.createRequire, path: 'src/cli.js', source: "import { createRequire } from 'node:module';\nconst require = createRequire(import.meta.url);" },
+  { reason: R.createRequire, path: 'src/codex/cli.js', source: "import module from 'node:module';\nconst load = module.createRequire(import.meta.url);" },
+  { reason: R.createRequire, path: 'src/shared/local-http.js', source: "import * as module from 'node:module';\nconst load = module['createRequire'](import.meta.url);" },
+  // ローダーを間接的に使う形（どの側でも違反）
+  { reason: R.loaderModule, path: 'src/cli.js', source: "import mod from 'module';" },
+  { reason: R.loaderModule, path: 'src/codex/cli.js', source: "const loader = await import('node:module');" },
+  { reason: R.getBuiltinModule, path: 'src/cli.js', source: "const loader = process.getBuiltinModule('node:module');" },
+  { reason: R.getBuiltinModule, path: 'src/cli.js', source: "const loader = process['getBuiltinModule']('node:module');" },
+  // src/・bin/ の外を経由する形（lib/re.js から先で Codex 側へ入る経路を断つ）
+  { reason: R.outsideSources, path: 'src/status.js', source: "import { readUsage } from '../lib/re.js';" },
+  { reason: R.outsideSources, path: 'src/status/card.js', source: "const relay = await import('../../lib/re.js');" },
+  { reason: R.outsideSources, path: 'bin/claude-rotator.js', source: "await import('../lib/re.js');" },
+  { reason: R.outsideSources, path: 'src/cli.js', source: "import pkg from '../package.json' with { type: 'json' };" },
+  { reason: R.outsideSources, path: 'src/cli.js', source: "import relay from '/opt/app/lib/re.js';" },
+  { reason: R.codexOutside, path: 'src/codex/cli.js', source: "import { relay } from '../../lib/re.js';" },
+  { reason: R.codexOutside, path: 'bin/codex-rotator.js', source: "await import('../lib/re.js');" },
+  { reason: R.sharedOutside, path: 'src/shared/local-http.js', source: "import { relay } from '../../lib/re.js';" },
+  // `#…`（package.json の imports）と、自分のパッケージ名での参照（どの側でも違反）
+  { reason: R.subpathImport, path: 'src/cli.js', source: "import u from '#internal/usage.js';" },
+  { reason: R.subpathImport, path: 'src/codex/cli.js', source: "const u = await import('#internal');" },
+  { reason: R.subpathImport, path: 'src/shared/local-http.js', source: "export * from '#shared';" },
+  { reason: R.selfReference, path: 'src/cli.js', source: `import u from '${PACKAGE_NAME}/src/codex/usage.js';` },
+  { reason: R.selfReference, path: 'bin/claude-rotator.js', source: `const u = await import('${PACKAGE_NAME}');` },
+  { reason: R.selfReference, path: 'src/codex/cli.js', source: `import { runCli } from '${PACKAGE_NAME}/src/cli.js';` },
+  { reason: R.indirectRequire, path: 'src/status.cjs', source: "const usage = module.require('./codex/usage.js');" },
+  { reason: R.indirectRequire, path: 'src/status.cjs', source: "const load = require;\nconst usage = load('./codex/usage.js');" },
+  { reason: R.indirectRequire, path: 'src/status.cjs', source: "const usage = module['require']('./codex/usage.js');" },
+]);
+
+// 逆に、違反にしてはいけない形。コメント・文字列・テンプレート・正規表現・プロパティの中の
+// `import` は import ではない。import の行き先でない文字列のエスケープは問わない。
+const BOUNDARY_ALLOWED_SAMPLES = Object.freeze([
+  { path: 'src/codex/cli.js', source: [
+    "import { readFile } from 'node:fs/promises';",
+    "import { createCodexAccountPool } from './account-pool.js';",
+    "import { requestLocal } from '../shared/local-http.js';",
+    "import { writeJsonFileDurable } from '../json-file.js';",
+    "import { rotateLogFile } from '../log-rotation.js';",
+    "import { resolvePaths } from '../paths.js';",
+    "import { readCodexUsage } from './us\\\nage.js';",
+    "const { readCodexUsage: again } = await import('./usage.js');",
+    'const here = new URL(import.meta.url);',
+    "const note = 'it\\'s fine \\x41 \\u0042';",
+  ].join('\n') },
+  { path: 'bin/codex-rotator.js', source: "#!/usr/bin/env node\nconst { main } = await import('../src/codex/cli.js');" },
+  { path: 'src/shared/local-http.js', source: "import http from 'node:http';\nexport { helper } from './helper.js';" },
+  { path: 'src/cli.js', source: [
+    "import { requestLocal } from './shared/local-http.js';",
+    "import { loadConfig } from './config.js';",
+    "// import { readCodexUsage } from './codex/usage.js';",
+    "/* await import('./codex/usage.js'); */",
+    "const hint = \"import('./codex/usage.js')\";",
+    "const shown = `import ${name} from './codex/usage.js'`;",
+    "const pattern = /import\\('\\.\\/codex\\//;",
+    'plugin.import(target);',
+    "const ratio = total / count; const quoted = /'/.test(text);",
+    'let n = 4; const half = n++ / 2 / 1; const back = n-- / 2; const again = ++n;',
+    "throw new Error('changes require the shared lock');",
+    // 名前が自分のパッケージ名で始まるだけの別パッケージは自己参照ではない。
+    `import extra from '${PACKAGE_NAME}-extra';`,
+  ].join('\n') },
+  { path: 'bin/claude-rotator.js', source: [
+    '#!/usr/bin/env node',
+    "const { runCli } = await import('../src/cli.js');",
+    "import { helper } from './helper.js';",
+  ].join('\n') },
+]);
+
 // 拾いたいのは「Codex の資格情報へ触れるコード」だけなので、パターンは文脈まで見る。
 //   - `.codex` は引用符かスラッシュに続くとき（＝パスの一部）だけ拾い、`options.codex` /
-//     `raw.codexStatusUrl` のようなプロパティ名は拾わない。
+//     `deps.readCodexSection` のようなプロパティ名は拾わない。
 //   - `auth.json` も同じくパス文脈のときだけ拾う（散文での言及は違反ではない）。
 //   - `CODEX_HOME` は環境変数として読むとき（`process.env.CODEX_HOME` / `env['CODEX_HOME']`）
 //     だけ拾う。
@@ -104,9 +575,9 @@ const CODEX_CREDENTIAL_VIOLATIONS = Object.freeze([
 
 // 逆に、拾ってはいけない現行コードの見本（プロパティ名・設定キー名）。
 const CODEX_CREDENTIAL_NON_VIOLATIONS = Object.freeze([
-  'lines.push(...renderCodexSection(options.codex, now));',
-  'const codexStatusUrl = normalizeCodexStatusUrl(raw.codexStatusUrl);',
-  "  'degradeMapping.codexStatusUrl must be loopback; codex status section disabled';",
+  'lines.push(...codexSectionLines(options.codex, now));',
+  'const codex = deps.readCodexSection ? await deps.readCodexSection() : null;',
+  'readCodexSection: createCodexSectionReader({ env: process.env, spawnImpl: spawn }),',
 ]);
 
 function findCodexCredentialHits(text, label) {
@@ -119,16 +590,96 @@ function findCodexCredentialHits(text, label) {
   return hits;
 }
 
-async function collectJsFiles(dir, out = []) {
+// シンボリックリンクはたどらずに links へ集める（どこを指していても、境界の判定がパスで
+// できなくなるので違反にする）。
+async function collectModuleFiles(dir, out = [], links = []) {
   for (const entry of await readdir(dir, { withFileTypes: true })) {
     const path = join(dir, entry.name);
-    if (entry.isDirectory()) await collectJsFiles(path, out);
-    else if (entry.isFile() && path.endsWith('.js')) out.push(path);
+    if (entry.isSymbolicLink()) links.push(path);
+    else if (entry.isDirectory()) await collectModuleFiles(path, out, links);
+    else if (entry.isFile() && MODULE_FILE.test(path)) out.push(path);
   }
   return out;
 }
 
 describe('never-reads-codex-credentials-in-claude-process (設計書 §5.1・§14.4)', () => {
+  it('uses an import-graph check that catches every boundary violation sample (positive control)', () => {
+    // このテストが無いと、検査を壊しても「違反0件」で緑になってしまう。理由まで照合するのは、
+    // 別の理由（例えば「import の文を読めない」）で捕まって合格になる事態を防ぐため。
+    for (const sample of BOUNDARY_VIOLATION_SAMPLES) {
+      const { violations } = findBoundaryViolations(sample.path, sample.source);
+      assert.ok(
+        violations.some(violation => violation.includes(sample.reason)),
+        `違反の見本を期待した理由（${sample.reason}）で検出できていない: ${sample.path}: ${sample.source}`
+        + ` → 検出: ${JSON.stringify(violations)}`,
+      );
+    }
+    for (const sample of BOUNDARY_ALLOWED_SAMPLES) {
+      assert.deepEqual(
+        findBoundaryViolations(sample.path, sample.source).violations,
+        [],
+        `許される import を違反と誤検出している: ${sample.path}`,
+      );
+    }
+  });
+
+  it('finds symbolic links without following them (positive control)', async () => {
+    // このテストが無いと、リンクの検出が壊れても「リンク0件」で緑になってしまう。
+    const root = await mkdtemp(join(tmpdir(), 'rotator-invariance-links-'));
+    cleanupAfterTest(async () => rm(root, { recursive: true, force: true }));
+    await mkdir(join(root, 'sub'));
+    await writeFile(join(root, 'a.js'), '');
+    await writeFile(join(root, 'sub', 'b.mjs'), '');
+    await symlink('../a.js', join(root, 'sub', 'link.js'));
+    await symlink('sub', join(root, 'dirlink'));
+
+    const links = [];
+    const found = await collectModuleFiles(root, [], links);
+    assert.deepEqual(found.map(file => relative(root, file)).sort(), ['a.js', join('sub', 'b.mjs')]);
+    assert.deepEqual(links.map(link => relative(root, link)).sort(), ['dirlink', join('sub', 'link.js')]);
+  });
+
+  it('keeps the Claude side and the Codex side apart in the import graph of src/ and bin/', async () => {
+    const violations = [];
+    const missed = [];
+    const files = { claude: 0, shared: 0, codex: 0 };
+    const edges = { claude: 0, shared: 0, codex: 0 };
+    for (const root of SCAN_ROOTS) {
+      const links = [];
+      const found = await collectModuleFiles(root, [], links);
+      violations.push(...links.map(link => `${repoRelative(link)}: ${BOUNDARY_REASON.symlink}`));
+      assert.ok(found.length > 0, `${root} に .js が1つも無いなら走査条件が壊れている`);
+      for (const file of found) {
+        const rel = repoRelative(file);
+        const side = boundarySideOf(rel);
+        const source = await readFile(file, 'utf8');
+        const result = findBoundaryViolations(rel, source);
+        violations.push(...result.violations);
+        files[side]++;
+        edges[side] += result.edges.length;
+        const specifiers = new Set(result.edges.map(edge => edge.specifier));
+        for (const match of source.matchAll(LINE_ANCHORED_IMPORT)) {
+          if (!match[2].includes('\\') && !specifiers.has(match[2])) missed.push(`${rel}: ${match[2]}`);
+        }
+      }
+    }
+
+    assert.deepEqual(
+      violations,
+      [],
+      'src/codex/ の外（Claude 側と src/shared/）は Codex 側（src/codex/・bin/codex-rotator.js）を'
+      + ' import しない。Codex 側は Codex 側・src/shared/・許可リストの3ファイル・node: だけを、'
+      + 'src/shared/ は src/shared/ と node: だけを import する。文字列でない動的 import・require()、'
+      + 'エスケープや %・?・# を含む行き先、ローダーの間接利用（node:module・createRequire・'
+      + 'getBuiltinModule・直接呼出し以外の require）、src/ と bin/ の下のシンボリックリンクは使わない。'
+      + 'Claude 側は src/・bin/ の外を import せず、`#…` と自分のパッケージ名での参照はどの側でも使わない',
+    );
+    assert.deepEqual(missed, [], '行頭の import を字句解析が拾っていない（字句解析の取りこぼし）');
+    // 空振りで緑にしない: 両側にファイルがあり、import を実際に読めていること。
+    assert.ok(files.claude > 0 && edges.claude > 0, 'Claude 側の import を1つも読めていない');
+    assert.ok(files.codex > 0 && edges.codex > 0, 'Codex 側の import を1つも読めていない');
+  });
+
   it('uses a scanner that actually catches a Codex credential access (positive control)', () => {
     // このテストが無いと、パターンを壊しても「一致0件」で緑になってしまう。
     for (const violation of CODEX_CREDENTIAL_VIOLATIONS) {
@@ -147,14 +698,16 @@ describe('never-reads-codex-credentials-in-claude-process (設計書 §5.1・§1
     }
   });
 
-  it('has no reference to a Codex credential path anywhere under src/ or bin/', async () => {
+  it('has no reference to a Codex credential path on the Claude side of src/ or bin/ (auxiliary scan)', async () => {
     // test/helpers/fake-bridge.js は codex-rotator のスタブなので対象外。
-    // 見るのは配布物に載る src/ と bin/ の配下だけである。
+    // 見るのは配布物に載る src/ と bin/ の配下だけである。Codex 側（src/codex/・
+    // bin/codex-rotator.js）は資格情報を扱う側なので走査しない。境界は上の import グラフの
+    // 検査が保証し、この走査は Claude 側のコードが直接パスを書く形を拾う補助である。
     const files = [];
     for (const root of SCAN_ROOTS) {
-      const found = await collectJsFiles(root);
+      const found = await collectModuleFiles(root);
       assert.ok(found.length > 0, `${root} に .js が1つも無いなら走査条件が壊れている`);
-      files.push(...found);
+      files.push(...found.filter(file => !isCodexSide(repoRelative(file))));
     }
 
     const hits = [];
@@ -244,34 +797,115 @@ describe('never-reads-codex-credentials-in-claude-process (設計書 §5.1・§1
 // ---------------------------------------------------------------------------
 // 2. health-does-not-wait-for-codex-or-refresh
 //
-// 設計書 §9.6 の理由①②: /internal/health は「安価な生存確認」であり、
-// codex-rotator への取得も資格情報の点検も待たない。codex-rotator の統合表示は
-// CLI 側だけの機能であり、proxy-server には1行も入っていない（それをここで固定する）。
+// /internal/health は「安価な生存確認」であり、Codex の節の読取も資格情報の点検も待たない。
+// Codex の節を読む子プロセスを起動するのは CLI だけ（bin/claude-rotator.js が作って runCli へ渡す
+// 読取関数。src/codex-status-child.js）で、proxy-server はその部品と、子の入口と設定の場所を決める部品
+// （src/shared/codex-locator.js）を import のつながりに持たず、Codex の節の子を1回も起動しない（それを
+// ここで固定する）。
 // ---------------------------------------------------------------------------
 
 // 経過時間は判定の決め手ではなく「待っていたら絶対に超える」ことを示す補助的な上限。
-// 遅い CI でも誤失敗しないよう、設定値との相対（timeout の半分）とこの絶対上限の
-// 小さいほうを使う。
+// 遅い CI でも誤失敗しないよう、絶対値で十分に大きく取る。
 const HEALTH_ELAPSED_CEILING_MS = 2000;
 
+// Codex の節を読む子プロセスを起動する部品と、その子の入口と codex-rotator の設定の場所を決める部品
+// （リポジトリの根からの相対パス）。
+const CODEX_SECTION_CHILD_MODULE = 'src/codex-status-child.js';
+const CODEX_LOCATOR_MODULE = 'src/shared/codex-locator.js';
+
+// 以前の版が status の Codex の節の取得先と期限に読んでいた設定のキー（今は読まない）。名前は組み立てて
+// 書く（以前の版のキーの名前が src・test・README に1つも残っていないことを grep で確かめるため）。
+const RETIRED_CODEX_STATUS_KEYS = Object.freeze([['codexStatus', 'Url'].join(''), ['codexStatus', 'TimeoutMs'].join('')]);
+
+// fromRel から import のつながりをたどって届く src/ と bin/ のファイル（リポジトリの根からの相対パス）。
+async function importClosure(fromRel) {
+  const seen = new Set();
+  const queue = [fromRel];
+  while (queue.length > 0) {
+    const rel = queue.shift();
+    if (seen.has(rel)) continue;
+    seen.add(rel);
+    const { edges } = scanModuleImports(await readFile(join(REPO_ROOT, rel), 'utf8'));
+    for (const { specifier } of edges) {
+      const target = resolveImportTarget(rel, specifier);
+      if (target.kind === 'file') queue.push(target.rel);
+    }
+  }
+  return seen;
+}
+
+// Codex の設定ファイルを置いた一時フォルダの env（HOME と XDG_CONFIG_HOME だけを持つ）。
+async function envWithCodexConfig() {
+  const home = await mkdtemp(join(tmpdir(), 'rotator-invariance-codex-'));
+  cleanupAfterTest(async () => rm(home, { recursive: true, force: true }));
+  const env = { HOME: home, XDG_CONFIG_HOME: join(home, 'config') };
+  const configFile = codexRotatorConfigFile(env);
+  await mkdir(dirname(configFile), { recursive: true });
+  await writeFile(configFile, '{}');
+  return env;
+}
+
+// 子の代わり（stdout と kill を持つだけ）。
+function stubChild() {
+  const child = new EventEmitter();
+  child.stdout = new EventEmitter();
+  child.kill = () => true;
+  return child;
+}
+
 describe('health-does-not-wait-for-codex-or-refresh (設計書 §9.6・§14.4)', () => {
-  it('answers well before the codex status timeout while that socket never replies', async () => {
-    // 接続は受けるが1バイトも返さないサーバ（fake-bridge の idle 相当を TCP だけで作る）。
+  it('keeps the modules that start the Codex child and locate its entry out of the import graph of the proxy, so the proxy starts no Codex child', async () => {
+    const fromProxy = await importClosure('src/proxy-server.js');
+    assert.ok(fromProxy.size > 5, `the walk follows the imports of the proxy (${fromProxy.size} files)`);
+    assert.equal(fromProxy.has(CODEX_SECTION_CHILD_MODULE), false, 'the proxy cannot start the Codex child');
+    assert.equal(fromProxy.has(CODEX_LOCATOR_MODULE), false, 'the proxy cannot find the Codex entry or its config');
+    // runCli も自分では読取関数を作らない（入口から渡されたものを呼ぶだけ）。
+    const fromCli = await importClosure('src/cli.js');
+    assert.equal(fromCli.has(CODEX_SECTION_CHILD_MODULE), false);
+    assert.equal(fromCli.has(CODEX_LOCATOR_MODULE), false);
+    // 陽性対照: 入口からたどると届く（たどり方が壊れて「届かない」と言っているのではない）。
+    const fromEntry = await importClosure('bin/claude-rotator.js');
+    assert.equal(fromEntry.has(CODEX_SECTION_CHILD_MODULE), true);
+    assert.equal(fromEntry.has(CODEX_LOCATOR_MODULE), true);
+  });
+
+  it('answers health while the Codex section child the CLI started is stuck', async () => {
+    // 旧い版の2つのキーが残った設定。取得先は、接続は受けるが1バイトも返さないサーバ。
     const silent = await startSilentServer();
     cleanupAfterTest(async () => silent.close());
     const bridge = await startFakeBridge({ port: 0, mode: 'ok' });
     cleanupAfterTest(async () => bridge.close());
-
-    const codexStatusTimeoutMs = 30_000;
+    const [urlKey, timeoutKey] = RETIRED_CODEX_STATUS_KEYS;
     const proxy = await startProxy({
       openaiBridge: bridgeConfig(bridge.url, {
-        degradeMapping: {
-          enabled: true,
-          codexStatusUrl: `${silent.url}/healthz`,
-          codexStatusTimeoutMs,
-        },
+        degradeMapping: { enabled: true, [urlKey]: `${silent.url}/healthz`, [timeoutKey]: 30_000 },
       }),
     });
+
+    // Codex の設定ファイルがある env と、子を返すだけで終わらせない spawn の差し替え。
+    const spawned = [];
+    const spawnImpl = (command, args) => {
+      const child = stubChild();
+      spawned.push({ command, args, child });
+      return child;
+    };
+    const readCodexSection = createCodexSectionReader({ env: await envWithCodexConfig(), spawnImpl });
+
+    // proxy が答えることを先に確かめる（proxy が Codex の子を起こせないことは、上の import のつながりの
+    // テストが固定する）。
+    assert.equal((await requestJson(`${proxy.url}/internal/health`)).status, 200);
+    assert.equal((await requestJson(`${proxy.url}/internal/status`)).status, 200);
+
+    // CLI の Codex の節の子が止まったままでも、health は待たない。
+    const io = createIo();
+    let screenDone = false;
+    const screen = runCli(['status'], {
+      ...io,
+      readStatus: async () => JSON.parse((await requestJson(`${proxy.url}/internal/status`)).bodyText),
+      readCodexSection,
+    }).finally(() => { screenDone = true; });
+    for (let i = 0; i < 400 && spawned.length === 0; i++) await new Promise(done => { setTimeout(done, 5); });
+    assert.equal(spawned.length, 1, 'the CLI has started its child and is waiting for it');
 
     const startedAt = Date.now();
     const health = await requestJson(`${proxy.url}/internal/health`);
@@ -279,15 +913,17 @@ describe('health-does-not-wait-for-codex-or-refresh (設計書 §9.6・§14.4)',
 
     assert.equal(health.status, 200);
     assert.equal(JSON.parse(health.bodyText).ok, true);
-    // 決め手は下の connectionCount()===0（＝そもそも接続しない）。経過時間は
-    // 「待っていたら codexStatusTimeoutMs まで掛かる」ことに対する相対的な上限で見る。
-    const elapsedBudgetMs = Math.min(codexStatusTimeoutMs / 2, HEALTH_ELAPSED_CEILING_MS);
     assert.ok(
-      elapsed < elapsedBudgetMs,
-      `/internal/health は codex-rotator を待たない（codexStatusTimeoutMs=${codexStatusTimeoutMs}ms `
-      + `に対し実測 ${elapsed}ms。${elapsedBudgetMs}ms 未満であること）`,
+      elapsed < HEALTH_ELAPSED_CEILING_MS,
+      `/internal/health は Codex の節の子を待たない（実測 ${elapsed}ms。${HEALTH_ELAPSED_CEILING_MS}ms 未満であること）`,
     );
-    assert.equal(silent.connectionCount(), 0, 'proxy-server は codexStatusUrl へ接続すらしない');
+    assert.equal(screenDone, false, 'the CLI was still waiting for its stuck child when health answered');
+    assert.equal(silent.connectionCount(), 0, 'proxy-server は旧い取得先へ接続すらしない');
+
+    // 後片付け: 止まっていた子を0以外で終わらせると、画面は Codex の節が1行のまま描き終わる。
+    spawned[0].child.emit('close', 1, null);
+    assert.equal(await screen, 0);
+    assert.match(io.output(), /Codex Rotator\s+codex: display error \(exit 1\)/);
   });
 
   it('answers while the initial credential check is still blocked', async () => {
@@ -530,8 +1166,10 @@ describe('unset-config-is-byte-identical (設計書 §14.1・§7.3-3)', () => {
 // ---------------------------------------------------------------------------
 // 4. codex-rotator-absent-is-harmless
 //
-// 設計書 §14.2: degradeMapping.enabled が真でも codex-rotator が動いていない構成で、
-// claude-* 要求も /internal/health も `claude-rotator status` も現行どおり働く。
+// codex-rotator が無い・動かない構成で、claude-* 要求も /internal/health も `claude-rotator status` も
+// 現行どおり働く。Codex の設定ファイルが無ければ子プロセスを起動しない。設定ファイルがあっても、
+// 子を起動できない・子が0以外で終わるときは、Codex の節が1行になるだけで、画面の残りと終了コードは
+// 変わらない。設定に旧い版の2つのキーが残っていても、読まずに無視する。
 // ---------------------------------------------------------------------------
 
 describe('codex-rotator-absent-is-harmless (設計書 §14.2)', () => {
@@ -551,14 +1189,14 @@ describe('codex-rotator-absent-is-harmless (設計書 §14.2)', () => {
   it('keeps claude-* traffic, /internal/health and the status screen working with codex-rotator down', async () => {
     const upstream = await startAnthropicUpstream();
     cleanupAfterTest(async () => upstream.close());
-    // 誰も listen していないループバックポート＝codex-rotator 不在の再現。
+    // 本番の設定と同じ形の合成の設定。旧い版の2つのキーが残り、その取得先は誰も listen していない。
     const deadPort = await unusedLoopbackPort();
-    const codexStatusUrl = `http://127.0.0.1:${deadPort}/healthz`;
+    const [urlKey, timeoutKey] = RETIRED_CODEX_STATUS_KEYS;
     const config = {
       openaiBridge: {
         enabled: true,
         url: 'http://127.0.0.1:18765',
-        degradeMapping: { enabled: true, codexStatusUrl, codexStatusTimeoutMs: 400 },
+        degradeMapping: { enabled: true, [urlKey]: `http://127.0.0.1:${deadPort}/healthz`, [timeoutKey]: 400 },
       },
     };
 
@@ -572,21 +1210,55 @@ describe('codex-rotator-absent-is-harmless (設計書 §14.2)', () => {
     assert.equal(JSON.parse(claude.bodyText).ok, true);
     assert.equal((await requestJson(`${proxy.url}/internal/health`)).status, 200);
 
-    // CLI 側（src/cli.js の readCodexStatus）は1行だけ落として Claude 側を描き切る。
+    // Codex の設定ファイルが無い env では、子を起動せず、画面は Codex の節の無いものになる。
+    const home = await mkdtemp(join(tmpdir(), 'rotator-invariance-codex-absent-'));
+    cleanupAfterTest(async () => rm(home, { recursive: true, force: true }));
+    const spawned = [];
+    const spawnImpl = (...args) => { spawned.push(args); throw new Error('no child may be started'); };
     const io = createIo();
-    const startedAt = Date.now();
     const code = await runCli(['status'], {
       ...io,
       readStatus: async () => claudeStatus,
-      loadConfig: async () => config,
+      readCodexSection: createCodexSectionReader({ env: { HOME: home, XDG_CONFIG_HOME: join(home, 'config') }, spawnImpl }),
     });
-    const elapsed = Date.now() - startedAt;
 
     assert.equal(code, 0);
-    assert.match(io.output(), /Codex Rotator\s+codex: unreachable \(/, 'Codex 節は1行の未到達表示になる');
+    assert.equal(spawned.length, 0, '設定ファイルが無ければ子プロセスを起動しない');
+    assert.equal(io.output(), renderStatus(claudeStatus), 'Codex の節の無い画面のまま');
     assert.match(io.output(), /user-a@example\.com\s+active/, 'Claude 側の表示は壊れない');
     assert.match(io.output(), /5h ███████░░░  76%/);
-    assert.ok(elapsed < 5000, `status は codex-rotator 不在でハングしない（実測 ${elapsed}ms）`);
+  });
+
+  it('turns a child that cannot start or exits non-zero into one line, leaving the rest of the screen and the exit code alone', async () => {
+    const env = await envWithCodexConfig();
+    const baseline = renderStatus(claudeStatus);
+    const cases = [
+      // 起動する実行ファイルが無い（spawn の error。node の ENOENT と同じ形）。
+      { name: 'no executable', reason: 'spawn failed', spawnImpl: () => {
+        const child = stubChild();
+        setImmediate(() => child.emit('error', Object.assign(new Error('spawn ENOENT'), { code: 'ENOENT' })));
+        return child;
+      } },
+      { name: 'non-zero exit', reason: 'exit 1', spawnImpl: () => {
+        const child = stubChild();
+        setImmediate(() => child.emit('close', 1, null));
+        return child;
+      } },
+    ];
+    for (const { name, reason, spawnImpl } of cases) {
+      const io = createIo();
+      const code = await runCli(['status'], {
+        ...io,
+        readStatus: async () => claudeStatus,
+        readCodexSection: createCodexSectionReader({ env, spawnImpl }),
+      });
+
+      assert.equal(code, 0, `${name}: the exit code is unchanged`);
+      const codexLines = io.output().split('\n').filter(line => line.startsWith('Codex Rotator'));
+      assert.equal(codexLines.length, 1, name);
+      assert.match(codexLines[0], new RegExp(`^Codex Rotator\\s+codex: display error \\(${reason}\\)$`), name);
+      assert.equal(io.output().replace(`${codexLines[0]}\n\n`, ''), baseline, `${name}: the rest of the screen is unchanged`);
+    }
   });
 });
 
