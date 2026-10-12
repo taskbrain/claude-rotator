@@ -2,6 +2,8 @@
 // ファイル（権限・作り直し・所有を確かめた削除）、拒否したときの不変、秘密の持ち出し、読み直し（検証・世代・
 // 直列化・ポートの変更・適用の途中の例外で止まる）、状態の JSON のスキーマ、User-Agent の出どころ、プールの
 // 観測方式、出来事の記録と reconcile() の回数、射影の例外、reconcile() へ models を渡さないこと、停止の後。
+// 口座を選ぶ入口（POST /internal/select）の判定・トークン・本文の検査と、select と reload の応答の設定の
+// sha256（設定ファイルのバイト列の値・世代とともに入れ替わる・読み直しの失敗では変わらない）。
 //
 // 絶対条件:
 //   - 実の待受・実の設定・実のホーム・実の Codex CLI・実の上流へ届かない。env・要求関数・起動関数は
@@ -14,18 +16,22 @@
 //     連結して作る。値を比べるところは assert.ok と説明文だけで判定する（失敗しても値を表示しない）。
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
+import { createHash } from 'node:crypto';
 import { EventEmitter } from 'node:events';
 import { createServer as createHttpServer } from 'node:http';
-import { chmod, lstat, mkdir, rm, symlink, writeFile } from 'node:fs/promises';
+import { chmod, lstat, mkdir, readFile, rm, symlink, writeFile } from 'node:fs/promises';
 import { basename, dirname, join } from 'node:path';
 import { inspect } from 'node:util';
 import { CODEX_UA_COMMENT, CODEX_UA_PRODUCT } from '../../src/codex/client-version.js';
-import { DEFAULT_DAEMON_PORT, loadCodexConfig, validateCodexConfig } from '../../src/codex/config.js';
+import {
+  CONFIG_SHA256_PATTERN, DEFAULT_DAEMON_PORT, loadCodexConfig, loadCodexConfigSnapshot, validateCodexConfig,
+} from '../../src/codex/config.js';
 import {
   CONTROL_TOKEN_HEADER, ControlTokenError, readControlToken,
 } from '../../src/codex/control-token.js';
 import {
-  CODEX_DAEMON_START_STAGE, CodexDaemonStartError, codexAccountEntries, startCodexDaemon,
+  CODEX_DAEMON_PATHS, CODEX_DAEMON_START_STAGE, CODEX_SELECT_OUTCOME, CODEX_SELECT_REFUSAL, CodexDaemonStartError,
+  codexAccountEntries, startCodexDaemon,
 } from '../../src/codex/daemon.js';
 import { createCodexLogger } from '../../src/codex/logger.js';
 import { codexRotatorConfigDir, codexRotatorConfigPath, controlTokenPath } from '../../src/codex/paths.js';
@@ -78,6 +84,25 @@ async function exists(path) {
 // 値を表示しない包含の確かめ。
 function absent(text, value, message) {
   assert.ok(!String(text).includes(value), message);
+}
+
+const sha256Of = bytes => createHash('sha256').update(bytes).digest('hex');
+
+// 設定の読込みの差し替えが返す形（設定と、その設定の文字列の sha256）。
+const snapshotOf = config => ({ config, sha256: sha256Of(JSON.stringify(config)) });
+
+// 常駐の待受（ポート0で割り当てられた番号）のほかへは1つも接続していないこと。実の待受の番号と、登録して
+// いない番号への接続は、隔離が開く手前で拒否するので、許した接続の記録に現れない。
+const UNREGISTERED_SERVICE_PORT = 18765;
+function assertOnlyDaemonConnections(f) {
+  assert.ok(f.isolation.connections.length > 0, 'the test connected to the daemon');
+  for (const connection of f.isolation.connections) {
+    assert.ok(f.startedPorts.includes(connection.port), 'every connection went to a daemon the test started');
+  }
+  for (const port of [...REAL_SERVICE_PORTS, UNREGISTERED_SERVICE_PORT]) {
+    assert.equal(f.isolation.connections.filter(connection => connection.port === port).length, 0,
+      'no connection to a real service port');
+  }
 }
 
 // 例外の中身（メッセージ・文字列化・inspect）。
@@ -154,7 +179,7 @@ function fakeChild({ stdout = [`zz-fake-codex-cli ${VERSION}\n`], stderr = [], e
  *   codex: 偽の codex を置いて PATH に入れる。behave() が偽の子を返す。
  *   start: false なら起動しない（起動の失敗を確かめるテスト）。
  *   wrapLogger(logger): 本物のロガーを包んだものを常駐へ渡す（registerSecret を失敗させるテスト）。
- *   ほかは startCodexDaemon へそのまま渡す（generateToken・loadConfig・createServer・listenHost・now など）。
+ *   ほかは startCodexDaemon へそのまま渡す（generateToken・loadConfigSnapshot・createServer・listenHost・now など）。
  */
 async function fixture(t, { config = {}, respond = ({ clock }) => lowUsage(clock), codex = null, start = true,
   readCredentials, wrapLogger, ...daemonOptions } = {}) {
@@ -209,16 +234,17 @@ async function fixture(t, { config = {}, respond = ({ clock }) => lowUsage(clock
   };
   const f = {
     isolation, clock, scheduler, env, settings, lines, logger, options, codexPath,
-    credentialReads, fetchCalls, createServerCalls, servers, daemon: null,
+    credentialReads, fetchCalls, createServerCalls, servers, daemon: null, startedPorts: [],
     tokenPath: controlTokenPath(env),
     // 割り当てられた番号が実サービスの番号に当たったら、止めて起動し直す（隔離はその番号へ接続させない）。
     async start(extra = {}) {
       for (let attempt = 0; ; attempt++) {
         f.daemon = await startCodexDaemon({ ...options, ...extra });
-        if (!REAL_SERVICE_PORTS.includes(f.daemon.port)) break;
+        if (!REAL_SERVICE_PORTS.includes(f.daemon.port) && f.daemon.port !== UNREGISTERED_SERVICE_PORT) break;
         await f.daemon.stop();
         if (attempt >= 5) throw new Error('the system kept assigning a real service port');
       }
+      f.startedPorts.push(f.daemon.port);
       isolation.allowRequest(f.daemon.port);
       return f.daemon;
     },
@@ -236,6 +262,17 @@ async function fixture(t, { config = {}, respond = ({ clock }) => lowUsage(clock
     async reload(token) {
       const response = await f.call('/internal/reload', { method: 'POST', token: token ?? await f.token() });
       return { status: response.status, body: JSON.parse(response.body) };
+    },
+    // 正しいトークンで select を1回送り、200 の本文を返す。
+    async select(request = {}) {
+      const response = await f.call(CODEX_DAEMON_PATHS.select, { method: 'POST', token: await f.token(),
+        body: JSON.stringify(request) });
+      assert.equal(response.status, 200, 'select answers 200');
+      return JSON.parse(response.body);
+    },
+    // 今の設定ファイルのバイト列の sha256。
+    async fileSha256() {
+      return sha256Of(await readFile(codexRotatorConfigPath(env)));
     },
     async tick(ms) {
       clock.advance(ms);
@@ -363,7 +400,8 @@ test('daemon: with loopback headers, POST /internal/reload without, with a wrong
 test('daemon: a POST to an unknown path is 401 without the token and 404 with it; wrong methods are 405', async t => {
   const f = await fixture(t);
   const token = await f.token();
-  for (const path of ['/internal/zz-unknown', '/', '/internal/status', '/internal/health', '/internal/reload']) {
+  for (const path of ['/internal/zz-unknown', '/', '/internal/status', '/internal/health', '/internal/reload',
+    '/internal/select']) {
     const response = await f.call(path, { method: 'POST' });
     assert.equal(response.status, 401, `POST ${path} without the token`);
     assert.deepEqual(JSON.parse(response.body), { error: 'unauthorized' });
@@ -444,11 +482,11 @@ test('daemon: every start writes a new token, with the default generator and wit
 test('daemon: a token folder that is a symbolic link or 0755 stops the start before it listens', async t => {
   const f = await fixture(t, { start: false });
   const validated = validateCodexConfig(f.settings, { env: f.env });
-  const loadConfig = async () => validated;
+  const loadConfigSnapshot = async () => snapshotOf(validated);
   const folder = dirname(f.tokenPath);
 
   await chmod(folder, 0o755);
-  await assertStartFails(f, CODEX_DAEMON_START_STAGE.tokenFolder, { loadConfig });
+  await assertStartFails(f, CODEX_DAEMON_START_STAGE.tokenFolder, { loadConfigSnapshot });
   assert.equal(f.createServerCalls.length, 0);
   assert.equal(await exists(f.tokenPath), false);
 
@@ -456,7 +494,7 @@ test('daemon: a token folder that is a symbolic link or 0755 stops the start bef
   const target = join(f.isolation.root, 'zz-link-target');
   await mkdir(target, { mode: 0o700 });
   await symlink(target, folder);
-  await assertStartFails(f, CODEX_DAEMON_START_STAGE.tokenFolder, { loadConfig });
+  await assertStartFails(f, CODEX_DAEMON_START_STAGE.tokenFolder, { loadConfigSnapshot });
   assert.equal(f.createServerCalls.length, 0);
   assert.equal(await exists(join(target, basename(f.tokenPath))), false, 'nothing was written through the link');
   assert.equal(f.credentialReads.length, 0);
@@ -554,7 +592,7 @@ test('daemon: a replaced token never reaches the log, the status JSON, errors or
   // 待受のポートを変えた候補（起動し直しが要る）。
   await writeConfigFile(f.env, { ...f.settings, daemon: { port: 1 } });
   const restart = await f.reload();
-  assert.deepEqual(restart.body, { error: 'restart-required' });
+  assert.deepEqual(restart.body, { error: 'restart-required', configSha256: failed.body.configSha256 });
   await writeConfigFile(f.env, f.settings);
   assert.equal((await f.reload()).status, 200);
   await f.call('/internal/reload', { method: 'POST', token: `${TOKEN_MARKER}0` });
@@ -580,7 +618,7 @@ test('daemon: a replaced token never reaches the log, the status JSON, errors or
 
   // 読込を待つ間に停止した読み直し（何も適用せず、stopping の語をログに出す）。
   const loader = gatedLoader();
-  await f.start({ generateToken: () => TOKEN_MARKER, loadConfig: loader.loadConfig });
+  await f.start({ generateToken: () => TOKEN_MARKER, loadConfigSnapshot: loader.loadConfigSnapshot });
   loader.hold();
   const called = loader.nextCall();
   const interrupted = f.call('/internal/reload', { method: 'POST', token: TOKEN_MARKER }).catch(error => error);
@@ -591,7 +629,7 @@ test('daemon: a replaced token never reaches the log, the status JSON, errors or
   const interruptedResult = await withDeadline(interrupted, SIGNAL_DEADLINE_MS, 'the interrupted reload');
 
   // 適用の途中の例外で自分で止まる（検証を通った候補で、口座の key が重なる形）。
-  await f.start({ generateToken: () => TOKEN_MARKER, loadConfig: loader.loadConfig });
+  await f.start({ generateToken: () => TOKEN_MARKER, loadConfigSnapshot: loader.loadConfigSnapshot });
   const loadedForDuplicate = await loadCodexConfig({ env: f.env });
   loader.replacement = { ...loadedForDuplicate,
     accounts: [loadedForDuplicate.accounts[0], { ...loadedForDuplicate.accounts[0], label: 'zz-b' }] };
@@ -624,6 +662,7 @@ test('daemon: a failed reload, including one that changes the listen port, keeps
       labels: json.accounts.map(account => account.label), userAgentSource: json.observation.userAgentSource };
   };
   const before = await snapshot();
+  const beforeSha256 = await f.fileSha256();
   assert.equal(before.userAgentSource, 'config');
   const good = configFor(f.isolation, { accounts: [{ label: 'zz-a' }, { label: 'zz-b' }] });
   // 待受のポートを変える候補（口座の並びも入れ替え、適用されていないことを見分けられるようにする）。
@@ -643,13 +682,14 @@ test('daemon: a failed reload, including one that changes the listen port, keeps
     await writeConfigFile(f.env, config, mode);
     const response = await f.reload();
     assert.equal(response.status, 422, what);
-    assert.deepEqual(response.body, { error: word }, what);
+    assert.deepEqual(response.body, { error: word, configSha256: beforeSha256 }, `${what}: the failure and the old sha256`);
     assert.deepEqual(await snapshot(), before, `${what}: nothing changed`);
   }
   await writeConfigFile(f.env, { ...good, accounts: [good.accounts[1], good.accounts[0]] });
   const ok = await f.reload();
   assert.equal(ok.status, 200);
-  assert.deepEqual(ok.body, { reloaded: true, configGeneration: before.configGeneration + 1 });
+  assert.deepEqual(ok.body, { reloaded: true, configGeneration: before.configGeneration + 1,
+    configSha256: await f.fileSha256() });
   const after = await snapshot();
   assert.equal(after.configGeneration, before.configGeneration + 1);
   assert.equal(after.poolGeneration, before.poolGeneration + 1);
@@ -866,7 +906,7 @@ test('daemon: /internal/health answers fixed keys only, whatever the pool holds'
 
 test('daemon: a reload while another is running is 409, and the in-progress mark is cleared afterwards', async t => {
   const loader = gatedLoader();
-  const f = await fixture(t, { loadConfig: loader.loadConfig });
+  const f = await fixture(t, { loadConfigSnapshot: loader.loadConfigSnapshot });
   const token = await f.token();
   loader.hold();
   const called = loader.nextCall();
@@ -896,8 +936,8 @@ async function assertStoppedByApplyFailure(f, port, generation) {
 
 test('daemon: a reload that passes the checks but fails before anything is applied answers 500 and stops the daemon', async t => {
   let replacement = null;
-  const loadConfig = async options => replacement ?? loadCodexConfig(options);
-  const f = await fixture(t, { loadConfig });
+  const loadConfigSnapshot = async options => (replacement ? snapshotOf(replacement) : loadCodexConfigSnapshot(options));
+  const f = await fixture(t, { loadConfigSnapshot });
   const port = f.daemon.port;
   // 検証を通った候補で、口座の key が重なる形（reconcile() が最初に投げる）。
   const loaded = await loadCodexConfig({ env: f.env });
@@ -1090,13 +1130,13 @@ test('daemon: a token write that fails after the rename is removed by the cleanu
 // nextCall() は、次に読込が呼ばれたときに解決する合図を返す（要求を出す前に取る）。
 function gatedLoader() {
   const state = { loads: 0, gate: null, release: null, replacement: null, onCall: null };
-  state.loadConfig = async options => {
+  state.loadConfigSnapshot = async options => {
     state.loads++;
     const onCall = state.onCall;
     state.onCall = null;
     onCall?.();
     if (state.gate) await state.gate;
-    return state.replacement ?? loadCodexConfig(options);
+    return state.replacement ? snapshotOf(state.replacement) : loadCodexConfigSnapshot(options);
   };
   state.nextCall = () => withDeadline(new Promise(resolve => { state.onCall = resolve; }), SIGNAL_DEADLINE_MS,
     'the config read of the reload');
@@ -1117,7 +1157,7 @@ async function untilNoConnections(server) {
 
 test('daemon: a reload whose client disconnected before a failed apply still stops the daemon', { timeout: 10_000 }, async t => {
   const loader = gatedLoader();
-  const f = await fixture(t, { loadConfig: loader.loadConfig });
+  const f = await fixture(t, { loadConfigSnapshot: loader.loadConfigSnapshot });
   const port = f.daemon.port;
   const token = await f.token();
   const loaded = await loadCodexConfig({ env: f.env });
@@ -1150,7 +1190,7 @@ test('daemon: a reload whose client disconnected before a failed apply still sto
 
 test('daemon: a reload whose config read returns after stop() applies nothing', { timeout: 10_000 }, async t => {
   const loader = gatedLoader();
-  const f = await fixture(t, { loadConfig: loader.loadConfig, config: { accounts: [{ label: 'zz-a' }, { label: 'zz-b' }] } });
+  const f = await fixture(t, { loadConfigSnapshot: loader.loadConfigSnapshot, config: { accounts: [{ label: 'zz-a' }, { label: 'zz-b' }] } });
   const token = await f.token();
   const loaded = await loadCodexConfig({ env: f.env });
   const before = f.daemon.inspect();
@@ -1176,4 +1216,393 @@ test('daemon: a reload whose config read returns after stop() applies nothing', 
   assert.ok(stoppedAt >= 0);
   assert.equal(events.slice(stoppedAt).includes('codex_daemon_reloaded'), false, 'no reload after the stop');
   assert.ok(f.lines.some(line => JSON.parse(line).reason === 'stopping'));
+});
+
+// --- 口座を選ぶ入口（POST /internal/select）と設定の sha256 ------------------------------------------------
+
+// select の応答のキー（どの判定でも同じ）。
+const VERDICT_KEYS = Object.freeze(['configSha256', 'label', 'lastResort', 'outcome', 'reason', 'refusal', 'stateWord',
+  'usageKnown']);
+// 選んだときだけ出るログの行。
+const selectedLines = f => f.lines.map(line => JSON.parse(line)).filter(record => record.event === 'codex_daemon_selected');
+// 状態を比べるための写し（世代・出来事・停止の記録・次に選ぶ口座）。
+async function selectionState(f) {
+  const inspected = f.daemon.inspect();
+  const json = await f.status();
+  return {
+    configGeneration: inspected.configGeneration,
+    poolGeneration: inspected.poolGeneration,
+    eventsTotal: inspected.eventsTotal,
+    latch: inspected.accounts.map(({ label, state, windowCaps, upstreamBlocked, resumePending, stopEpoch }) =>
+      ({ label, state, windowCaps, upstreamBlocked, resumePending, stopEpoch })),
+    next: json.next,
+    events: json.events,
+    selectedLines: selectedLines(f).length,
+  };
+}
+
+test('daemon: select right after the start carries the sha256 of the config file bytes, and a selection records one selected event', async t => {
+  const f = await fixture(t, { config: { accounts: [{ label: 'zz-a' }, { label: 'zz-b' }] }, start: false });
+  // 字下げと改行のあるバイト列で書く（値が、解析した値を並べ直したものではなく、ファイルのバイト列のものであることを見分ける）。
+  await writeConfigFile(f.env, `${JSON.stringify(f.settings, null, 2)}\n`);
+  await f.start();
+  const fileSha256 = await f.fileSha256();
+  assert.match(fileSha256, CONFIG_SHA256_PATTERN);
+  assert.notEqual(fileSha256, sha256Of(JSON.stringify(f.settings)), 'the file bytes are not the compact form');
+  assert.equal((await loadCodexConfigSnapshot({ env: f.env })).sha256, fileSha256, 'the read function gives the same value');
+
+  const first = await f.select();
+  assert.deepEqual(Object.keys(first).sort(), VERDICT_KEYS);
+  assert.equal(first.configSha256, fileSha256);
+  assert.match(first.configSha256, CONFIG_SHA256_PATTERN);
+  assert.equal(first.outcome, CODEX_SELECT_OUTCOME.none, 'no account is usable before the first read');
+  assert.equal(f.daemon.inspect().eventsTotal, 0, 'no account was chosen, so nothing was recorded');
+
+  await f.tick(1);
+  const before = f.daemon.inspect().eventsTotal;
+  const chosen = await f.select();
+  assert.deepEqual(chosen, { outcome: CODEX_SELECT_OUTCOME.selected, label: 'zz-a', lastResort: false, usageKnown: true,
+    refusal: null, stateWord: 'ready', reason: null, configSha256: fileSha256 });
+  const json = await f.status();
+  assert.equal(isValidCodexStatus(json), true);
+  assert.equal(f.daemon.inspect().eventsTotal, before + 1);
+  assert.deepEqual(json.events.filter(event => event.type === 'selected').map(({ type, label }) => ({ type, label })),
+    [{ type: 'selected', label: 'zz-a' }]);
+  assert.deepEqual(selectedLines(f).map(record => [record.account_label, record.account_switch_reason]), [['zz-a', 'selectable']]);
+
+  const explicit = await f.select({ label: 'zz-b' });
+  assert.deepEqual(explicit, { outcome: CODEX_SELECT_OUTCOME.selected, label: 'zz-b', lastResort: false, usageKnown: true,
+    refusal: null, stateWord: 'ready', reason: null, configSha256: fileSha256 });
+  assert.deepEqual((await f.status()).events.filter(event => event.type === 'selected').map(event => event.label),
+    ['zz-a', 'zz-b']);
+  const loaded = await loadCodexConfig({ env: f.env });
+  for (const account of loaded.accounts) {
+    for (const text of [JSON.stringify(first), JSON.stringify(chosen), JSON.stringify(explicit), f.logText()]) {
+      absent(text, account.codexHome, 'no account folder in the select answer or the log');
+    }
+  }
+  assertOnlyDaemonConnections(f);
+});
+
+test('daemon: after a reload that passes, select and reload carry the new sha256 and choose in the new generation; after one that fails, both keep the old', async t => {
+  const f = await fixture(t, { config: { accounts: [{ label: 'zz-a' }, { label: 'zz-b' }] } });
+  await f.tick(1);
+  const firstSha256 = await f.fileSha256();
+  const first = await f.select();
+  assert.equal(first.label, 'zz-a');
+  assert.equal(first.configSha256, firstSha256);
+
+  const onlyB = configFor(f.isolation, { accounts: [{ label: 'zz-b' }] });
+  await writeConfigFile(f.env, `${JSON.stringify(onlyB, null, 2)}\n`);
+  const secondSha256 = await f.fileSha256();
+  assert.notEqual(secondSha256, firstSha256);
+  assert.deepEqual(await f.reload(), { status: 200, body: { reloaded: true, configGeneration: 2, configSha256: secondSha256 } });
+  const afterReload = await f.select();
+  assert.equal(afterReload.configSha256, secondSha256);
+  assert.equal(afterReload.outcome, CODEX_SELECT_OUTCOME.selected);
+  assert.equal(afterReload.label, 'zz-b', 'the new generation chose');
+  assert.deepEqual(await f.select({ label: 'zz-a' }), { outcome: CODEX_SELECT_OUTCOME.unknownLabel, label: null,
+    lastResort: false, usageKnown: null, refusal: null, stateWord: null, reason: null, configSha256: secondSha256 });
+
+  // 検証に失敗する読み直し。どれも zz-a を戻す中身なので、適用されていれば選択で見分けられる。
+  const both = configFor(f.isolation, { accounts: [{ label: 'zz-a' }, { label: 'zz-b' }] });
+  const failures = [
+    ['not JSON', '{ not json', 0o600, 'reload-failed'],
+    ['a 0644 file', both, 0o644, 'reload-failed'],
+    ['not activated', { ...both, enabled: false }, 0o600, 'not-activated'],
+    ['another listen port', { ...both, daemon: { port: 1 } }, 0o600, 'restart-required'],
+  ];
+  for (const [what, config, mode, word] of failures) {
+    await writeConfigFile(f.env, config, mode);
+    assert.notEqual(await f.fileSha256(), secondSha256, `${what}: the file changed`);
+    assert.deepEqual(await f.reload(), { status: 422, body: { error: word, configSha256: secondSha256 } },
+      `${what}: the failure and the old value`);
+    const auto = await f.select();
+    assert.equal(auto.configSha256, secondSha256, `${what}: select keeps the old value`);
+    assert.equal(auto.label, 'zz-b', `${what}: the old generation chose`);
+    const explicit = await f.select({ label: 'zz-a' });
+    assert.equal(explicit.outcome, CODEX_SELECT_OUTCOME.unknownLabel, `${what}: the old generation decided`);
+    assert.equal(explicit.configSha256, secondSha256);
+    assert.equal(f.daemon.inspect().configGeneration, 2, `${what}: the generation did not change`);
+  }
+  assertOnlyDaemonConnections(f);
+});
+
+test('daemon: select answers 200 with the sha256 for every verdict, and a refused or unknown label changes neither the record, the events nor the next account', async t => {
+  const failed = new Response('{}', { status: 500, headers: { 'content-type': 'application/json' } });
+  const f = await fixture(t, {
+    config: { accounts: [
+      { label: 'zz-a' },
+      { label: 'zz-c', policy: { stopUsedPercent: 100, resumeUsedPercent: 60, blockWhenUnknown: false } },
+      { label: 'zz-r', policy: { ...POLICY, blockWhenUnknown: true } },
+      { label: 'zz-u' },
+      { label: 'zz-n' },
+      { label: 'zz-e' },
+    ] },
+    respond: ({ clock, account }) => {
+      if (account === 'zz-a') return usageResponse(clock, { primary: fiveHour(80), secondary: weekly(10) });
+      if (account === 'zz-c') return usageResponse(clock, { primary: fiveHour(100), secondary: weekly(10) });
+      if (account === 'zz-r' || account === 'zz-u') return failed.clone();
+      return lowUsage(clock);
+    },
+    readCredentials: async authPath => {
+      const label = basename(dirname(authPath));
+      if (label === 'zz-n') throw new Error('zz-unreadable-credentials');
+      if (label === 'zz-e') throw new Error('send credentials expired');
+      return { accessToken: 'zz-fake-access', accountId: label };
+    },
+  });
+  // 読めない資格情報は2周期で no creds になる。
+  await f.tick(1);
+  for (let i = 0; i < 10 && accountOf(await f.status(), 'zz-n').stateWord !== 'no creds'; i++) await f.tick(MIN);
+  const json = await f.status();
+  const words = Object.fromEntries(json.accounts.map(account => [account.label, account.stateWord]));
+  assert.deepEqual(words, { 'zz-a': 'held', 'zz-c': 'capped', 'zz-r': 'reserved', 'zz-u': 'unread', 'zz-n': 'no creds',
+    'zz-e': 'needs login' });
+  const fileSha256 = await f.fileSha256();
+  const before = await selectionState(f);
+
+  const refusals = [
+    ['zz-a', 'held', CODEX_SELECT_REFUSAL.accountStopped],
+    ['zz-c', 'capped', CODEX_SELECT_REFUSAL.accountStopped],
+    ['zz-r', 'reserved', CODEX_SELECT_REFUSAL.usageUnknown],
+    ['zz-n', 'no creds', CODEX_SELECT_REFUSAL.noCreds],
+  ];
+  for (const [label, stateWord, refusal] of refusals) {
+    const verdict = await f.select({ label });
+    assert.deepEqual(Object.keys(verdict).sort(), VERDICT_KEYS, label);
+    assert.equal(verdict.outcome, CODEX_SELECT_OUTCOME.refused, label);
+    assert.equal(verdict.label, label);
+    assert.equal(verdict.refusal, refusal, label);
+    assert.equal(verdict.stateWord, stateWord, label);
+    assert.equal(verdict.usageKnown, null, label);
+    assert.equal(verdict.lastResort, false, label);
+    assert.equal(verdict.configSha256, fileSha256, `${label}: the value is in a refusal too`);
+  }
+  assert.deepEqual(await f.select({ label: 'zz-zz' }), { outcome: CODEX_SELECT_OUTCOME.unknownLabel, label: null,
+    lastResort: false, usageKnown: null, refusal: null, stateWord: null, reason: null, configSha256: fileSha256 });
+  assert.deepEqual(await selectionState(f), before, 'the refusals and the unknown label changed nothing');
+  assert.equal(before.selectedLines, 0);
+
+  // 方針が偽で使用量が分からない口座は、明示すれば使用量が分からないまま選ぶ（ログイン切れも同じ）。
+  const unread = await f.select({ label: 'zz-u' });
+  assert.deepEqual(unread, { outcome: CODEX_SELECT_OUTCOME.selected, label: 'zz-u', lastResort: false, usageKnown: false,
+    refusal: null, stateWord: 'unread', reason: 'usage-unknown', configSha256: fileSha256 });
+  const expired = await f.select({ label: 'zz-e' });
+  assert.equal(expired.outcome, CODEX_SELECT_OUTCOME.selected);
+  assert.equal(expired.usageKnown, false);
+  assert.equal(expired.stateWord, 'needs login');
+  assert.equal(expired.reason, 'access-token-expired');
+  // 自動の選択: 選べる口座が無いので、最後の手段（停止していない・方針が偽・使用量が分からない口座）。
+  const auto = await f.select();
+  assert.deepEqual(auto, { outcome: CODEX_SELECT_OUTCOME.selected, label: 'zz-u', lastResort: true, usageKnown: false,
+    refusal: null, stateWord: 'unread', reason: 'usage-unknown', configSha256: fileSha256 });
+  const after = await selectionState(f);
+  assert.equal(after.eventsTotal, before.eventsTotal + 3);
+  assert.deepEqual(after.events.filter(event => event.type === 'selected').map(event => event.label), ['zz-u', 'zz-e', 'zz-u']);
+  assert.deepEqual(selectedLines(f).map(record => [record.account_label, record.account_switch_reason]),
+    [['zz-u', 'explicit'], ['zz-e', 'explicit'], ['zz-u', 'last-resort']]);
+  assert.deepEqual(after.next, before.next, 'selecting does not move the next account');
+  assert.deepEqual(after.latch, before.latch);
+  assertOnlyDaemonConnections(f);
+});
+
+test('daemon: with two selectable accounts, two automatic selections in a row choose the same account and leave the next account where it was', async t => {
+  const f = await fixture(t, { config: { accounts: [{ label: 'zz-a' }, { label: 'zz-b' }] } });
+  await f.tick(1);
+  const json = await f.status();
+  assert.deepEqual(json.accounts.filter(account => account.selectable === true).map(account => account.label), ['zz-a', 'zz-b'],
+    'both accounts are selectable');
+  const before = await selectionState(f);
+  assert.notEqual(before.next.label, null, 'there is a next account');
+  const fileSha256 = await f.fileSha256();
+
+  const first = await f.select();
+  const middle = await selectionState(f);
+  const second = await f.select();
+  const after = await selectionState(f);
+  const expected = { outcome: CODEX_SELECT_OUTCOME.selected, label: before.next.label, lastResort: false, usageKnown: true,
+    refusal: null, stateWord: 'ready', reason: null, configSha256: fileSha256 };
+  assert.deepEqual(first, expected, 'the first automatic selection chose the next account');
+  assert.deepEqual(second, expected, 'the second automatic selection chose the same account');
+  assert.deepEqual(middle.next, before.next, 'the first selection did not move the next account');
+  assert.deepEqual(after.next, before.next, 'the second selection did not move the next account');
+  assert.equal(after.eventsTotal, before.eventsTotal + 2, 'both selections were recorded');
+  assert.deepEqual(after.events.filter(event => event.type === 'selected').map(event => event.label),
+    [before.next.label, before.next.label]);
+  assert.deepEqual(after.latch, before.latch);
+  assert.equal(after.configGeneration, before.configGeneration);
+  assertOnlyDaemonConnections(f);
+});
+
+test('daemon: a reload that moves a label to another folder starts that label from before any observation', async t => {
+  const f = await fixture(t, { respond: ({ clock, account }) => (account === 'zz-a'
+    ? usageResponse(clock, { primary: fiveHour(80), secondary: weekly(10) })
+    : lowUsage(clock)) });
+  await f.tick(1);
+  const stoppedSelect = async what => {
+    const verdict = await f.select({ label: 'zz-a' });
+    assert.equal(verdict.outcome, CODEX_SELECT_OUTCOME.refused, what);
+    assert.equal(verdict.refusal, CODEX_SELECT_REFUSAL.accountStopped, what);
+  };
+  assert.equal(accountOf(await f.status(), 'zz-a').stateWord, 'held');
+  await stoppedSelect('stopped before the reload');
+  // 同じフォルダのままの読み直しは、停止を引き継ぐ（対照）。
+  assert.equal((await f.reload()).status, 200);
+  assert.equal(accountOf(await f.status(), 'zz-a').latch.stopped, true, 'the same folder keeps its stop');
+  await stoppedSelect('stopped after a reload with the same folder');
+
+  const moved = configFor(f.isolation);
+  const oldHome = moved.accounts[0].codexHome;
+  moved.accounts[0].codexHome = join(dirname(oldHome), 'zz-a-moved');
+  await writeConfigFile(f.env, moved);
+  const reloaded = await f.reload();
+  assert.deepEqual(reloaded, { status: 200, body: { reloaded: true, configGeneration: 3, configSha256: await f.fileSha256() } });
+  const account = accountOf(await f.status(), 'zz-a');
+  assert.equal(account.latch, null, 'no stop is carried over');
+  assert.equal(account.stateWord, 'starting', 'the label starts from before any observation');
+  assert.deepEqual(account.windows, { fiveHour: null, weekly: null }, 'no observation is carried over');
+  assert.equal(account.observedAt, null);
+  const entry = f.daemon.inspect().accounts.find(candidate => candidate.label === 'zz-a');
+  assert.equal(entry.windowCaps, undefined);
+  assert.equal(entry.windows, undefined);
+  assert.equal(entry.state, 'unknown');
+  const verdict = await f.select({ label: 'zz-a' });
+  assert.equal(verdict.outcome, CODEX_SELECT_OUTCOME.selected, 'the stop of the old folder does not refuse the new one');
+  assert.equal(verdict.usageKnown, false);
+  assert.equal(verdict.stateWord, 'starting');
+  await f.tick(MIN);
+  assert.equal(accountOf(await f.status(), 'zz-a').stateWord, 'ready', 'the new folder is observed on its own');
+  assert.ok(f.credentialReads.includes('zz-a-moved'), 'the new folder was read');
+  assertOnlyDaemonConnections(f);
+});
+
+test('daemon: with loopback headers, POST /internal/select without, with a wrong, or with several tokens is 401 and records nothing; the right one selects', async t => {
+  const f = await fixture(t, { config: { accounts: [{ label: 'zz-a' }, { label: 'zz-b' }] }, generateToken: () => TOKEN_MARKER });
+  await f.tick(1);
+  const token = await f.token();
+  const port = f.daemon.port;
+  const local = { host: `127.0.0.1:${port}`, origin: `http://127.0.0.1:${port}`, 'sec-fetch-site': 'same-origin' };
+  const wrongSameLength = `${token.slice(0, -1)}${token.endsWith('0') ? '1' : '0'}`;
+  const body = JSON.stringify({ label: 'zz-b' });
+  const before = await selectionState(f);
+  const cases = [
+    ['no header', {}, body],
+    ['a wrong value of the same length', { [CONTROL_TOKEN_HEADER]: wrongSameLength }, body],
+    ['a wrong value of another length', { [CONTROL_TOKEN_HEADER]: `${token}0` }, body],
+    ['a short value', { [CONTROL_TOKEN_HEADER]: token.slice(0, 8) }, body],
+    ['several values', { [CONTROL_TOKEN_HEADER]: [token, token] }, body],
+    ['several values, the right one first', { [CONTROL_TOKEN_HEADER]: [token, wrongSameLength] }, body],
+    // 照合は本文より先: 本文が壊れていても 400 ではなく 401。
+    ['a broken body without the token', { 'x-zz-marker': HEADER_MARKER }, `${HEADER_MARKER}${'x'.repeat(2048)}`],
+  ];
+  for (const [what, headers, requestBody] of cases) {
+    const response = await f.call(CODEX_DAEMON_PATHS.select, { method: 'POST', headers: { ...local, ...headers },
+      body: requestBody });
+    assert.equal(response.status, 401, what);
+    assert.deepEqual(JSON.parse(response.body), { error: 'unauthorized' }, what);
+    const text = `${response.body}\n${JSON.stringify(response.headers)}`;
+    for (const value of [TOKEN_MARKER, HEADER_MARKER]) absent(text, value, `${what}: no request value in the answer`);
+  }
+  const forbidden = await f.call(CODEX_DAEMON_PATHS.select, { method: 'POST', token, body,
+    headers: { host: 'zz-not-loopback.example' } });
+  assert.equal(forbidden.status, 403);
+  assert.deepEqual(await selectionState(f), before, 'the rejections changed nothing');
+  for (const value of [TOKEN_MARKER, HEADER_MARKER]) absent(f.logText(), value, 'the log carries no request value');
+
+  const ok = await f.call(CODEX_DAEMON_PATHS.select, { method: 'POST', headers: local, token, body });
+  assert.equal(ok.status, 200);
+  const verdict = JSON.parse(ok.body);
+  assert.equal(verdict.outcome, CODEX_SELECT_OUTCOME.selected);
+  assert.equal(verdict.label, 'zz-b');
+  absent(ok.body, TOKEN_MARKER, 'the token is not in the answer');
+  const after = await selectionState(f);
+  assert.equal(after.eventsTotal, before.eventsTotal + 1);
+  assert.deepEqual(after.events.filter(event => event.type === 'selected').map(event => event.label), ['zz-b']);
+  assertOnlyDaemonConnections(f);
+});
+
+test('daemon: a select body that is not a JSON object with an optional label is 400 and records nothing; GET is 405', async t => {
+  const f = await fixture(t);
+  await f.tick(1);
+  const token = await f.token();
+  const before = await selectionState(f);
+  const bodies = [
+    ['empty', ''],
+    ['not JSON', '{ not json'],
+    ['an array', '[]'],
+    ['null', 'null'],
+    ['a string', '"zz-a"'],
+    ['an unknown key', '{"zz":1}'],
+    ['a label and an unknown key', '{"label":"zz-a","zz":1}'],
+    ['a label of another form', '{"label":"ZZ-A"}'],
+    ['a null label', '{"label":null}'],
+    ['a number label', '{"label":1}'],
+    ['a body over the limit', `${JSON.stringify({ label: 'zz-a' })}${' '.repeat(2048)}`],
+  ];
+  for (const [what, body] of bodies) {
+    const response = await f.call(CODEX_DAEMON_PATHS.select, { method: 'POST', token, body });
+    assert.equal(response.status, 400, what);
+    assert.deepEqual(JSON.parse(response.body), { error: 'bad-request' }, what);
+  }
+  const get = await f.call(CODEX_DAEMON_PATHS.select, { token });
+  assert.equal(get.status, 405);
+  assert.equal(get.headers.allow, 'POST');
+  assert.deepEqual(JSON.parse(get.body), { error: 'method-not-allowed' });
+  assert.deepEqual(await selectionState(f), before, 'none of these selected');
+  const padded = await f.call(CODEX_DAEMON_PATHS.select, { method: 'POST', token, body: ' {"label":"zz-a"} \n' });
+  assert.equal(padded.status, 200, 'white space around the object is JSON');
+  assert.equal(JSON.parse(padded.body).label, 'zz-a');
+  assertOnlyDaemonConnections(f);
+});
+
+test('daemon: a config read without a sha256 of the right form stops the start and fails a reload with the old value', async t => {
+  const f = await fixture(t, { start: false });
+  const validated = validateCodexConfig(f.settings, { env: f.env });
+  const bad = [
+    ['the config alone', validated],
+    ['no sha256', { config: validated }],
+    ['upper case', { config: validated, sha256: 'A'.repeat(64) }],
+    ['63 digits', { config: validated, sha256: '0'.repeat(63) }],
+    ['not hexadecimal', { config: validated, sha256: 'g'.repeat(64) }],
+  ];
+  for (const [what, value] of bad) {
+    const error = await assertStartFails(f, CODEX_DAEMON_START_STAGE.config, { loadConfigSnapshot: async () => value });
+    assert.equal(error.stage, CODEX_DAEMON_START_STAGE.config, what);
+  }
+  assert.equal(f.createServerCalls.length, 0);
+  assert.equal(await exists(f.tokenPath), false);
+
+  let reply = null;
+  let reads = 0;
+  await f.start({ loadConfigSnapshot: async options => {
+    reads++;
+    return reply ?? loadCodexConfigSnapshot(options);
+  } });
+  assert.equal(reads, 1, 'the start reads the config once');
+  const startSha256 = await f.fileSha256();
+  for (const [what, value] of bad) {
+    reply = value;
+    assert.deepEqual(await f.reload(), { status: 422, body: { error: 'reload-failed', configSha256: startSha256 } }, what);
+    assert.equal((await f.select()).configSha256, startSha256, what);
+  }
+  assert.equal(reads, 1 + bad.length, 'each reload reads the config once');
+  assert.equal(f.daemon.inspect().configGeneration, 1);
+  reply = null;
+  assert.deepEqual(await f.reload(), { status: 200, body: { reloaded: true, configGeneration: 2, configSha256: startSha256 } });
+  assertOnlyDaemonConnections(f);
+});
+
+test('daemon: the tests reach only the daemon they started; the real service ports and an unregistered port are refused before a socket opens', async t => {
+  const f = await fixture(t);
+  assert.equal((await f.call('/internal/health')).status, 200);
+  assert.equal((await f.select()).outcome, CODEX_SELECT_OUTCOME.none);
+  const refusedPorts = [...REAL_SERVICE_PORTS, UNREGISTERED_SERVICE_PORT];
+  assert.ok(REAL_SERVICE_PORTS.includes(DEFAULT_DAEMON_PORT), 'the default daemon port is one of the refused ports');
+  for (const port of refusedPorts) {
+    await assert.rejects(() => requestLocal({ request: f.isolation.request, port, path: CODEX_DAEMON_PATHS.select,
+      method: 'POST', body: '{}' }), `port ${port} is refused`);
+  }
+  assert.deepEqual(f.isolation.refusedRequests.map(request => request.port), refusedPorts);
+  assertOnlyDaemonConnections(f);
 });

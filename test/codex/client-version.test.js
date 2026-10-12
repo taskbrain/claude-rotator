@@ -326,7 +326,7 @@ for (const [name, reason, arrange, spawns, atDeadline] of UNREADABLE_CASES) {
     assert.equal(health.observationErrorCode, reason);
     assert.equal(health.observationGate, 'failed');
     assert.equal(health.lastObservationSuccessAt, null);
-    // 画面の状態語 unread（口座の状態を表示用に写すときに付ける語）の元: 使用量が分からず選ばれない、理由は上の語。
+    // 画面の状態語 unread（口座の状態を表示用に写すとき src/codex/snapshot.js が付ける）の元: 使用量が分からず選ばれない、理由は上の語。
     assert.equal(f.view('home:0').selectionBlockReason, 'usage-unknown');
     assert.equal(f.view('home:0').surveyed, false);
     assert.equal(f.pool.snapshot()[0].state, 'ready', 'no read was sent, so nothing counts against the login');
