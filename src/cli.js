@@ -377,10 +377,10 @@ async function runServer({ write }) {
     currentAccountId: config.activeAccount,
     rotationPolicy: config.rotationPolicy,
     logger,
-    // 切替履歴（`events`）を保存・復元し上限50件を適用するかどうか（設計書 §5.2(b)・
-    // D-56-6）。**復元は下の `restoreRuntimeState` で起きるので、その前に決めておく
+    // 切替履歴（`events`）を保存・復元し上限50件を適用するかどうか。
+    // **復元は下の `restoreRuntimeState` で起きるので、その前に決めておく
     // 必要がある**——createProxyServer が同じ値を入れ直すのは reload のためである。
-    // 台帳へ渡すのは真偽値1つだけで、mode 文字列も表も渡さない（D-182）。
+    // 台帳へ渡すのは真偽値1つだけで、mode 文字列も表も渡さない。
     eventHistory: normalizeSessionAffinity(config.sessionAffinity).mode !== 'off',
   });
   const statePath = runtimeStatePath();
@@ -388,7 +388,7 @@ async function runServer({ write }) {
   // 起動時に1回だけ。失敗しても起動は止めない（1行ログのみ）。
   await cleanupStaleRuntimeStateTmpFiles(statePath, { logger });
   // 台帳を先に復元し、その戻り値（資格情報が別物になった口座 ID）を createProxyServer へ
-  // 渡す。sticky の表はそこで、口座台帳の復元が終わった後に読み戻される（設計書 §8.1）。
+  // 渡す。sticky の表はそこで、口座台帳の復元が終わった後に読み戻される。
   const { savedState, credentialChangedAccountIds } = await restoreRuntimeState(
     statePath,
     accountManager,
@@ -434,7 +434,7 @@ async function runServer({ write }) {
 }
 
 /**
- * `runtime-state.json` の書き込み口（設計書 §8・D-56-5）。
+ * `runtime-state.json` の書き込み口。
  *
  * `writeJsonFile` は `writeFile` → `rename` だけで `fsync` を1回も呼ばないため、電源断・
  * カーネルパニックでは直前の書き込みがまるごと失われる。バインド表は「再起動をまたいで
@@ -483,14 +483,14 @@ export async function cleanupStaleRuntimeStateTmpFiles(statePath, { logger = nul
 }
 
 /**
- * 起動時の runtime-state 復元（設計書 §8.1）。
+ * 起動時の runtime-state 復元。
  *
  * **順序が仕様である。** `restoreState` を先に呼び、その戻り値（`credentialIdentityChanged`
  * と判定した口座 ID の一覧）を受け取ってから sticky の表を読み戻す。逆順にすると、台帳の
  * quota・status が初期化される前に口座の実在を判定してしまい、資格情報が別物になった口座
- * へのバインドがそのまま残る（§8 の破棄条件⑥・F3）。
+ * へのバインドがそのまま残る。
  *
- * 読み取りに失敗しても起動は必ず成功させる（F1）。その場合は「保存状態なし」として扱う。
+ * 読み取りに失敗しても起動は必ず成功させる。その場合は「保存状態なし」として扱う。
  *
  * @param {string} statePath `runtime-state.json` の絶対パス。
  * @param {{restoreState: (state: object) => string[]}} accountManager 口座台帳。

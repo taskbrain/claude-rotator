@@ -19,12 +19,12 @@ const HOP_BY_HOP = new Set([
 // 接頭辞一致（大文字小文字を区別しない）ですべて落とす。
 const CONTRACT_HEADER_PREFIX = 'x-ombr-';
 
-// 契約 §C4.6: bridge は非 SSE 要求の生存通知（102 Processing）を
+// bridge との取り決めでは、bridge は非 SSE 要求の生存通知（102 Processing）を
 // 「rotator の idleTimeoutMs の 1/2 以下」の間隔で送る義務を負う。その 1/2 を計算する
 // ためには rotator が実際に使っている打ち切り時間を知る必要があるので、要求ヘッダで渡す。
 const IDLE_TIMEOUT_REQUEST_HEADER = 'x-ombr-idle-timeout-ms';
 
-// 追試4b（docs/research/11b_spike4b-nonretryable-status.md）で確定: bridge不達は403
+// bridge不達は403
 // permission_errorで統一する。502/504はClaude Codeが最大301回・指数バックオフで
 // 再試行し続け明示エラーにならないため使わない。
 const BRIDGE_UNREACHABLE_STATUS = 403;
@@ -33,15 +33,15 @@ export const DEFAULT_OPENAI_BRIDGE = {
   enabled: false,
   url: 'http://127.0.0.1:18765',
   modelPattern: '^gpt-|^o[0-9]|^openai/',
-  // 仕様書 4.2.1 節（v3）: 接続確立前（connectRetriesでのリトライ対象）と確立後の
+  // 接続確立前（connectRetriesでのリトライ対象）と確立後の
   // アイドル（無応答）は別障害なので分ける。いずれも最終的なHTTPステータスは
-  // 403 permission_error で統一する（追試4b・2026-09-07確定。旧稿は502/504）。
+  // 403 permission_error で統一する（BRIDGE_UNREACHABLE_STATUS と同じ）。
   connectTimeoutMs: 5000,
   idleTimeoutMs: 30000,
   connectRetries: 0,
 };
 
-// 設計書 §7.3-1（R3-2）: degradeMapping の既定は DEFAULT_OPENAI_BRIDGE にも
+// degradeMapping の既定は DEFAULT_OPENAI_BRIDGE にも
 // createDefaultConfig() にも足さず、内部定数として持つ。理由は2つある。
 // 理由A（浅いマージの罠）: resolveOpenAiBridgeSettings() の
 //   raw = { ...DEFAULT_OPENAI_BRIDGE, ...config.openaiBridge } は浅いマージなので、
@@ -53,19 +53,19 @@ export const DEFAULT_OPENAI_BRIDGE = {
 export const DISABLED_DEGRADE_MAPPING = Object.freeze({
   enabled: false,
   bothUnusableStatus: 403,
-  // 統合設計 v2.1 §3.1: 上流全滅・一時障害で 403 の代わりに 429 ＋ Retry-After: 30 を返し、
+  // 上流全滅・一時障害で 403 の代わりに 429 ＋ Retry-After: 30 を返し、
   // Claude Code のセッションを止めない。**未指定・false は現行とバイト互換**であり、
-  // 層1（T2b・T6b・キャッシュ非学習）も含めてこのキー1つで切り戻せる。
+  // GPT プール状態の学習の変更（成功応答での unusable の解除・TTL による上限・キャッシュ非学習）も含めてこのキー1つで切り戻せる。
   // 平坦キーにしてあるのは、既存4キーがすべて平坦であること、Object.freeze が浅いこと、
-  // ネストの型検査を1段増やさないことによる（同 §3.1）。
+  // ネストの型検査を1段増やさないことによる。
   recoveryWaitEnabled: false,
-  // 坂根氏 2026-09-18: Claude 上流（Anthropic）が返す 529 overloaded を 429 ＋ Retry-After
+  // Claude 上流（Anthropic）が返す 529 overloaded を 429 ＋ Retry-After
   // へ写像し、Claude Code を同じモデルのまま待たせて再試行させる。**未指定・false は
   // 現行とバイト互換**であり、このキー1つで切り戻せる。degradeMapping.enabled とは
   // 独立に効く（Claude 専用の機能であり、bridge の有無と関係がないため）。
   upstreamOverloadTo429: false,
   upstreamOverloadRetryAfterSeconds: 30,
-  // 母艦裁定 D-261（段 2・方式イ）: Claude 口座が**全枯渇**したときに rotator が合成する
+  // Claude 口座が**全枯渇**したときに rotator が合成する
   // 429 を 529 へ写像するかどうか。**このキーだけ既定が true**＝現行どおり写像する。
   // false にすると合成 429 を unified ヘッダ・本文ごと素通しし、週次上限の待機は
   // Claude Code 側（同じモデルのまま再試行）へ委ねる。
@@ -76,31 +76,31 @@ export const DISABLED_DEGRADE_MAPPING = Object.freeze({
 });
 
 // bothUnusableStatus は「明示停止（403）」か「退避を試み続ける（529）」の二択のみ。
-// 不正値は安全側（403＝明示停止）へ倒す（設計書 §7.2）。
+// 不正値は安全側（403＝明示停止）へ倒す。
 const BOTH_UNUSABLE_STATUSES = new Set([403, 529]);
 
 // openaiBridge.enabled が偽のまま degradeMapping.enabled を真にする構成は禁止しない
 // （Fable 週次サブキャップだけの枯渇は bridge 無しでも fallbackModel で救済できる）が、
 // fallbackModel の最終要素まで同じ枯渇プールに当たる構成では無言待ちになるため、
-// 気づけるように1行だけ通知する（設計書 §7.3-4・§14.2）。
+// 気づけるように1行だけ通知する。
 const DEGRADE_MAPPING_WITHOUT_BRIDGE_NOTICE =
   'degradeMapping enabled without openaiBridge; 529 mapping applies to Claude-internal fallback only';
 
-// 03 §4.1: recoveryWait が有効な構成では、両プール全滅の帰結を決めるのは
+// recoveryWait が有効な構成では、両プール全滅の帰結を決めるのは
 // bothUnusableStatus ではなく本機能の応答表（429 ＋ Retry-After）である。設定を読んだ人が
 // 取り違えないよう、起動と reload のときだけ1行残す（要求ごとには出さない）。
 const RECOVERY_WAIT_PRECEDENCE_NOTICE =
   'degradeMapping.recoveryWaitEnabled takes precedence over bothUnusableStatus; '
   + 'both-pool exhaustion answers 429 with Retry-After';
 
-// 坂根氏 2026-09-18: Claude 上流の 529 を 429 にする機能は bridge とは無関係に効くので、
+// Claude 上流の 529 を 429 にする機能は bridge とは無関係に効くので、
 // 設定を読んだ人が「bridge 用の節だから bridge がなければ関係ない」と取り違えないよう、
 // 起動時と reload 時だけ1行残す（要求ごとには出さない）。未設定なら1行も出ない。
 const UPSTREAM_OVERLOAD_NOTICE =
   'degradeMapping.upstreamOverloadTo429 answers a Claude upstream 529 overloaded_error '
   + 'with 429 + Retry-After';
 
-// D-261（段 2・方式イ）: 全枯渇の 529 写像を止めた構成は、Claude Code が週次上限として
+// 全枯渇の 529 写像を止めた構成は、Claude Code が週次上限として
 // 認識できる合成 429 を素通しする。既定（true）では1行も出ない——出るのは運用者が
 // 明示的に false を書いたときだけで、「なぜ 529 が出なくなったのか」を後から読めるようにする。
 const CLAUDE_EXHAUSTED_PASSTHROUGH_NOTICE =
@@ -132,7 +132,7 @@ function idleTimeoutRequestHeaderValue(settings) {
   return idleTimeoutMs === null ? null : String(Math.trunc(idleTimeoutMs));
 }
 
-// セクションが無い／キーが無い／型が違う、のいずれでも「無効」に倒れる（設計書 §7.3-3）。
+// セクションが無い／キーが無い／型が違う、のいずれでも「無効」に倒れる。
 // 判定式は settings.degradeMapping.enabled === true の1つだけにするため、
 // enabled は真偽値の true だけを受け付ける（'true' や 1 は無効）。
 // 下に挙げないキーは読まない。以前の版が status の Codex の節の取得先と期限のために読んでいた
@@ -148,7 +148,7 @@ export function normalizeDegradeMapping(raw) {
     recoveryWaitEnabled: raw.recoveryWaitEnabled === true,
     // 上流 529 の写像も同じ規律。各キーは独立に正規化するので enabled には依存しない。
     upstreamOverloadTo429: raw.upstreamOverloadTo429 === true,
-    // D-261: 既定が true のキーなので、**真偽値の false だけ**を無効化として受ける。
+    // 既定が true のキーなので、**真偽値の false だけ**を無効化として受ける。
     // 'false'・0・null・未指定はすべて既定（写像する＝現行どおり）へ倒れる。
     claudeExhaustedTo529: raw.claudeExhaustedTo529 !== false,
     // 秒は 1..3600 の整数のみ。0 以下は待機の意味を失い、長すぎる値は再開を遅らせる。
@@ -162,7 +162,7 @@ export function normalizeDegradeMapping(raw) {
   });
 }
 
-// 起動時と POST /internal/reload 時に出す通知（設計書 §7.2・§7.3-4）。呼び出し元は
+// 起動時と POST /internal/reload 時に出す通知。呼び出し元は
 // src/proxy-server.js の2箇所（createProxyServer の初回解決直後と /internal/reload の
 // 再解決直後）だけであり、gpt-* の要求ごとには出さない。
 // resolveOpenAiBridgeSettings() は純粋に保ちたいので、ログ出力はこの関数へ分けてある。
@@ -175,11 +175,11 @@ export function logDegradeMappingConfigNotice(settings, logger) {
   const degradeMapping = settings?.degradeMapping;
   if (!degradeMapping) return [];
   const reasons = [];
-  // (1) bridge 分岐が無効なまま写像だけを有効にした構成（設計書 §7.3-4）。
+  // (1) bridge 分岐が無効なまま写像だけを有効にした構成。
   if (!settings.enabled && degradeMapping.enabled === true) {
     reasons.push(DEGRADE_MAPPING_WITHOUT_BRIDGE_NOTICE);
   }
-  // (2) recoveryWait が bothUnusableStatus より優先することの明示（03 §4.1）。
+  // (2) recoveryWait が bothUnusableStatus より優先することの明示。
   if (settings.enabled && degradeMapping.enabled === true && degradeMapping.recoveryWaitEnabled === true) {
     reasons.push(RECOVERY_WAIT_PRECEDENCE_NOTICE);
   }
@@ -187,7 +187,7 @@ export function logDegradeMappingConfigNotice(settings, logger) {
   if (degradeMapping.upstreamOverloadTo429 === true) {
     reasons.push(UPSTREAM_OVERLOAD_NOTICE);
   }
-  // (2c) 全枯渇の 529 写像を止めた構成（D-261・方式イ）。既定 true と、正規化を通って
+  // (2c) 全枯渇の 529 写像を止めた構成。既定 true と、正規化を通って
   // いない手組みの settings（キーそのものが無い）では1行も出ない。
   if (degradeMapping.claudeExhaustedTo529 === false) {
     reasons.push(CLAUDE_EXHAUSTED_PASSTHROUGH_NOTICE);
@@ -215,15 +215,15 @@ function disabled(raw, warning, degradeMapping = DISABLED_DEGRADE_MAPPING) {
 export function resolveOpenAiBridgeSettings(config) {
   const raw = { ...DEFAULT_OPENAI_BRIDGE, ...(config?.openaiBridge || {}) };
   // 利用者が bridge 分岐を意図的に切っている経路だけは degradeMapping を正規化して返す。
-  // (b) の 529 写像は bridge を必要としないため、ClaudeRotator 単体構成を成立させる
-  // （設計書 §7.3-2・§14.2）。以下の fail-safe 3経路（modelPattern / url / 非ループバック）は
+  // 529 写像は bridge を必要としないため、ClaudeRotator 単体構成を成立させる。
+  // 以下の fail-safe 3経路（modelPattern / url / 非ループバック）は
   // 「設定を解釈できなかった」のだから隣接する新機能も信用せず、既定（無効）のままにする。
   if (!raw.enabled) return disabled(raw, null, normalizeDegradeMapping(raw.degradeMapping));
   let modelPattern;
   try {
     modelPattern = new RegExp(raw.modelPattern);
   } catch {
-    // fail-safe（仕様書 4.2.2 節 b・v3 で拡張）: コンパイル失敗でも例外を投げず、
+    // fail-safe: コンパイル失敗でも例外を投げず、
     // 分岐を無効化して既存の Anthropic 宛転送経路を壊さない。
     return disabled(raw, 'invalid openaiBridge.modelPattern; branch disabled');
   }
@@ -264,7 +264,7 @@ export function safeParseModel(body) {
 
 export function shouldRouteToOpenAiBridge(body, settings) {
   if (!settings?.enabled) {
-    // fail-safe（仕様書 4.2.2 節 b）で無効化された場合は 'parse-error' として記録し、
+    // fail-safe で無効化された場合は 'parse-error' として記録し、
     // 設定どおりの通常オフ（'disabled'）と区別する（呼び出し側のログ outcome=parse-error-fallback）。
     // 無効時は body を一切パースしない（無駄なパースを避ける早期 return）。
     return { route: false, model: null, reason: settings?.warning ? 'parse-error' : 'disabled' };
@@ -315,9 +315,9 @@ function pinnedUpstreamTarget(requestUrl, bridgeUrl) {
   return target;
 }
 
-// 設計書 §9.3: degradeReason は bridge の x-ombr-degrade-reason 由来だが、
-// 「不達のとき（＝契約ヘッダを1つも受け取れなかったとき）は rotator 自身が §9.4 の値を
-// 入れる」。値は outcome の snake_case（degradeReason だけは snake_case ＝ §9.3 の但し書き）。
+// degradeReason は bridge の x-ombr-degrade-reason 由来だが、
+// 不達のとき（＝契約ヘッダを1つも受け取れなかったとき）は rotator 自身が下の値を
+// 入れる。値は outcome（kebab-case）を snake_case にしたもの。
 const ROTATOR_DEGRADE_REASONS = Object.freeze({
   'bridge-unreachable': 'bridge_unreachable',
   'bridge-connect-timeout': 'bridge_connect_timeout',
@@ -325,16 +325,16 @@ const ROTATOR_DEGRADE_REASONS = Object.freeze({
   'bridge-stream-error': 'bridge_stream_error',
 });
 
-// ログ行は空白区切りの key=value なので、値に空白・改行を残さない（契約 §C3.1）。
+// ログ行は空白区切りの key=value なので、値に空白・改行を残さない。
 // src/degrade-state.js の logToken と同型（あちらは内部関数なので公開されていない）。
 function logToken(value) {
   return String(value).replace(/\s+/g, '_').slice(0, 64);
 }
 
-// 設計書 §9: エラー種別（error.code）と message をログへ残す。現行は ENOTFOUND /
+// エラー種別（error.code）と message をログへ残す。現行は ENOTFOUND /
 // ECONNRESET / EPIPE をすべて応答本文の 'connection refused' へ丸めており、ログからも
-// 区別できなかった。**応答本文の文言は変えない**（§8.9「HTTP 応答は不変」）。
-// 丸めを解消するのはログ側だけであり、追記は末尾へ・値があるときだけ行う（§9.2）。
+// 区別できなかった。**応答本文の文言は変えない**。
+// 丸めを解消するのはログ側だけであり、追記は末尾へ・値があるときだけ行う。
 function errorLogFields(error) {
   const fields = {};
   if (error?.code) fields.errorCode = logToken(error.code);
@@ -390,13 +390,13 @@ export function planConnectRetry({ attempt, retries, elapsedMs }) {
   return { retry: true, delayMs };
 }
 
-// gptPoolState は任意引数である（設計書 §11.1 R3-4）。渡さない呼び出しは現行と完全に
-// 同一に振る舞い、ログへ1フィールドも足さない（§14.4）。渡すのは src/proxy-server.js が
+// gptPoolState は任意引数である。渡さない呼び出しは現行と完全に
+// 同一に振る舞い、ログへ1フィールドも足さない。渡すのは src/proxy-server.js が
 // degradeMapping.enabled を真と解決したときだけで、生成・破棄もそちらが受け持つ。
-// claudeAllUnusable も任意引数である（設計書 §11.1 R4-1 の補足）。**真偽値ではなく関数**を
+// claudeAllUnusable も任意引数である。**真偽値ではなく関数**を
 // 受け取るのは、要求の開始時点ではなく **bridge の応答ヘッダを受け取った時点の台帳**で
 // 判定するためである（要求から応答までの間に口座が回復しうる）。渡さない呼び出しは
-// 現行と完全に同一に振る舞い、403 への書換も claudePoolState の追記も起きない（§14.4）。
+// 現行と完全に同一に振る舞い、403 への書換も claudePoolState の追記も起きない。
 // claudeResetAt も同型の任意引数で、Claude 側の最も早い回復見込み時刻（RFC3339）を返す
 // 関数である。403 の本文へ「GPT 側と Claude 側の早いほう」を載せるためにだけ使い、
 // 書換の可否には影響しない。渡さなければ本文は GPT 側の reset-at だけで組み立てられる。
@@ -470,17 +470,17 @@ export function forwardToOpenAiBridge({
     // bridge が返した契約ヘッダ（x-ombr-*）の解析結果。応答ヘッダを受け取るまでは null。
     let contract = null;
 
-    // 設計書 §14.4「degradeMapping 無効時に openai-bridge のログ行が現行と同一である
-    // （追記フィールドが1つも出ないこと）」。追記は写像機能を有効にした構成だけの挙動であり、
+    // degradeMapping 無効時は openai-bridge のログ行が現行と同一である
+    // （追記フィールドが1つも出ない）。追記は写像機能を有効にした構成だけの挙動であり、
     // 既定（無効）の利用者のログは outcome 名の改名以外は1文字も変わらない。
     const metaEnabled = settings?.degradeMapping?.enabled === true;
-    // 層2（統合設計 v2.1 §3）。親（degradeMapping.enabled）が真のときだけ効く。
+    // recoveryWait は親（degradeMapping.enabled）が真のときだけ効く。
     // 偽なら応答もログも現行と1バイト変わらない。
     const recoveryWaitEnabled = metaEnabled && settings.degradeMapping.recoveryWaitEnabled === true;
 
-    // 設計書 §9.3 / §9.5(a): 学習した (pool) / (pool, model) の状態は、状態そのものを
+    // 学習した (pool) / (pool, model) の状態は、状態そのものを
     // 保持しているときだけ載せる。gptPoolState を渡さない呼び出し（＝既定の経路）では
-    // 1フィールドも増えない。read() は期限切れ（T6・T7）を反映した現在値を返す。
+    // 1フィールドも増えない。read() は期限切れ（resetAt の到来・TTL の経過）を反映した現在値を返す。
     const poolStateFields = () => {
       if (!gptPoolState) return {};
       const view = gptPoolState.read(model);
@@ -488,13 +488,13 @@ export function forwardToOpenAiBridge({
     };
 
     // 応答ヘッダを受け取った時点で1回だけ評価した Claude 側台帳の判定（null＝未評価）。
-    // 評価済みの場合だけ claudePoolState をログへ載せる（§9.5(a) の完成形）。
+    // 評価済みの場合だけ claudePoolState をログへ載せる。
     let claudeExhausted = null;
 
     // 台帳の判定は呼び出し側から注入された関数であり、ここは http の応答コールバックの
     // 内側である。例外がそのまま抜けると未捕捉例外になり、未捕捉例外ハンドラを持たない
-    // rotator はプロセスごと落ちる（＝全 Claude セッション停止。§8.7 手順6 と同じ理由）。
-    // 判定できなかった場合は「Claude は使える」側＝退避を試みる側へ倒す（§8.7 の安全側）。
+    // rotator はプロセスごと落ちる（＝全 Claude セッション停止。下の書換の手順6 と同じ理由）。
+    // 判定できなかった場合は「Claude は使える」側＝退避を試みる側へ倒す。
     const evaluateClaudeLedger = () => {
       if (typeof claudeAllUnusable !== 'function') return null;
       try {
@@ -516,7 +516,7 @@ export function forwardToOpenAiBridge({
       }
     };
 
-    // Claude 側の空きを**三値**で読む（統合設計 v2.1 §3.5）。判定不能（未結線・例外・
+    // Claude 側の空きを**三値**で読む。判定不能（未結線・例外・
     // 口座0件）を available へ丸めない——丸めると、実際には死んでいる Claude へ退避して
     // 最終退避先の無音バックオフに落ちる。二値版 evaluateClaudeLedger() は off 経路の
     // ためにそのまま残し、null（例外）はここで indeterminate として保持する。
@@ -547,7 +547,7 @@ export function forwardToOpenAiBridge({
 
     // rotator 自身が検出した不達・接続期限・無通信期限（応答ヘッダ未送出）の帰結。
     // recoveryWait 有効時は Claude 共通枠が none／indeterminate なら 429 で待たせ、空きが
-    // あるなら 529 にして fallbackModel へ退避させる（統合設計 v2.1 §3.2 の 8 行目）。
+    // あるなら 529 にして fallbackModel へ退避させる。
     // 不達は恒久拒否ではないので、現行の 403（即停止）はこの局面で欠陥になる。
     // 無効時は現行どおり 403 を返し、ログにも1フィールドも足さない。
     const unreachableOutcome = () => {
@@ -568,22 +568,22 @@ export function forwardToOpenAiBridge({
       };
     };
 
-    // 設計書 §9.3 のフィールドを「値があるときだけ」末尾へ足す形に組み立てる。
-    // 第3引数（写像の痕跡）は §9.3 の表の順序で並べたいので buildBridgeLogMeta 側へ渡す。
+    // ログの追記フィールドを「値があるときだけ」末尾へ足す形に組み立てる。
+    // 第3引数（写像の痕跡）は決まった順序で並べたいので buildBridgeLogMeta 側へ渡す。
     const logMeta = (outcome, extra = {}, mapped = null) => {
       if (!metaEnabled) return null;
-      // 契約 §C3.7-1: x-ombr-contract の無い応答は「契約前の bridge」なので、契約由来の
+      // x-ombr-contract の無い応答は「契約前の bridge」なので、契約由来の
       // 値は1つも載せない（他の x-ombr-* が付いていても信用しない）。この場合でも、
-      // rotator 自身が観測した事実（§9.4 の degradeReason・エラー種別）は残す＝§9.5(d)。
+      // rotator 自身が観測した事実（rotator 側の degradeReason・エラー種別）は残す。
       const parsed = contract?.contract ? contract : null;
       return {
         ...buildBridgeLogMeta({
           ...(parsed || {}),
-          // bridge 自身が理由を名乗っていればそれを優先する（実データ）。名乗っていない
+          // bridge 自身が理由を名乗っていればそれを優先する。名乗っていない
           // 障害（不達・タイムアウト・ストリーム障害）だけ rotator 側の値を入れる。
           reason: parsed?.reason ?? ROTATOR_DEGRADE_REASONS[outcome] ?? null,
         }, {
-          // T2b の第3条件（cached ≠ yes）とキャッシュ非学習を本番ログで監査するため、
+          // unusable の解除条件（cached ≠ yes）とキャッシュ非学習をログで監査するため、
           // recoveryWait 有効時はヘッダが無い場合も 'none' として必ず出す（既存の
           // bridgeCached はヘッダがあるときしか出ないので、無い場合と機能無効の場合を
           // 区別できない）。
@@ -612,10 +612,10 @@ export function forwardToOpenAiBridge({
       resolve({ outcome, status: status ?? null });
     };
 
-    // アイドルタイムアウト（outcome=bridge-idle-timeout。応答ヘッダの前後を問わない＝§9.4）。
+    // アイドルタイムアウト（outcome=bridge-idle-timeout。応答ヘッダの前後を問わない）。
     // 接続確立の直後（ヘッダ待ち）から、以後の各チャンク受信のたびに再武装するので、
     // 「接続はできたが応答が全く無い」場合と「200 を受け取った後にチャンクが来ない」場合
-    // （§8.10）の両方をこの一本のタイマーだけで検出できる（connect の成否だけを見る
+    // の両方をこの一本のタイマーだけで検出できる（connect の成否だけを見る
     // connectTimer とは責務を分ける）。ヘッダ送出後の発火では 403 を合成できず切断だけになる。
     // 無音はここで拾い、ストリームの実障害は bridge-stream-error として別に扱う。
     const armIdleTimer = () => {
@@ -672,14 +672,14 @@ export function forwardToOpenAiBridge({
           agent: false,
         },
         upstreamRes => {
-          // 応答ヘッダを受け取った時点で契約ヘッダを解析しておく（設計書 §9.3）。
+          // 応答ヘッダを受け取った時点で契約ヘッダを解析しておく。
           // 値域外・未知の値はすべて null へ倒れるので、ここから先のログは
           // 「bridge が名乗った正しい値」だけを載せる。
           contract = parseBridgeContract(upstreamRes.headers);
-          // 設計書 §11.1 R3-4・契約 §C10.3: 応答ヘッダの受領点で GPT プール状態を学習する。
+          // 応答ヘッダの受領点で GPT プール状態を学習する。
           // 学習はメモリ上の状態を更新するだけであり、**応答は1バイトも変えない**
-          // （529→403 の書換は R4-1 の範囲）。observe() 側で「契約ヘッダの無い応答は
-          // 学習しない（T9）」「200 と 4xx/5xx だけが入力になる」を判定する。
+          // （529→403 の書換は下の別の処理）。observe() 側で「契約ヘッダの無い応答は
+          // 学習しない」「200 と 4xx/5xx だけが入力になる」を判定する。
           // res.destroyed のガードより前に置くのは、クライアントが切断していても
           // 「bridge がこう答えた」という事実は変わらないためである（学習を捨てると
           // 次の要求で同じ枯渇へもう1回投げることになる）。
@@ -697,7 +697,7 @@ export function forwardToOpenAiBridge({
           for (const [key, value] of Object.entries(upstreamRes.headers)) {
             if (!HOP_BY_HOP.has(key.toLowerCase())) responseHeaders[key] = value;
           }
-          // ── R4-1: (c) 両プール利用不可のときだけ 529 を 403 へ書き換える（設計書 §8.7）──
+          // ── 両プール利用不可のときだけ 529 を 403 へ書き換える ──
           // 判定は degrade-state.js の decideBridgeResponse に閉じてある（4条件のすべてが
           // 成り立つときだけ真を返す）。ここでは「決まった手順で応答を作り替える」だけを行う。
           if (metaEnabled) claudeExhausted = evaluateClaudeLedger();
@@ -708,7 +708,7 @@ export function forwardToOpenAiBridge({
           // 写像の評価順（1要求につき1回だけ・排他）:
           //   ① recoveryWait の待機判定（529→429／一時障害 403→429|529）。有効時のみ。
           //   ② 529→403（既存。recoveryWait が①で決めなかったときだけ走る）
-          //   ③ 403→529（R7・認証失効）
+          //   ③ 403→529（認証失効）
           // ①は AUTH_EXPIRED_REASONS を明示的に除外するので、③と取り合いにならない
           // （順序ではなく上流の実ステータスと reason で判定している）。
           let decision = { rewrite: false };
@@ -732,12 +732,12 @@ export function forwardToOpenAiBridge({
               claudeAllUnusable: claudeExhausted === true,
               gptPoolState: learnedPool?.state,
               gptResetAt: learnedPool?.resetAt,
-              // 本文の「最早回復時刻」は GPT 側と Claude 側の早いほうを採る（§8.7）。
+              // 本文の「最早回復時刻」は GPT 側と Claude 側の早いほうを採る。
               claudeResetAt: claudeExhausted === true ? evaluateClaudeResetAt() : null,
               bothUnusableStatus: settings.degradeMapping.bothUnusableStatus,
             });
           }
-          // ── R7-1（母艦裁定 D-72）: 認証失効の 403 だけは 529 へ書き換える ──
+          // ── 認証失効の 403 だけは 529 へ書き換える ──
           // 上の判定（529→403）とは入力が排他である（片方は 529 だけを、こちらは 403
           // だけを見る）ので、先に決まっていなければ評価する、という順序で足りる。
           // 応答の作り替え手順は下の decision.rewrite の分岐をそのまま使う。
@@ -761,7 +761,7 @@ export function forwardToOpenAiBridge({
             // 手順2b（recoveryWait の合成応答だけ）: 元の Retry-After と
             // anthropic-ratelimit-*（unified-* を含む）を大小文字問わず全部落とす。残すと
             // 再試行監視が有効な Claude Code はそれを最優先し、5 日先の reset で最大 6 時間
-            // 無音で眠る（統合設計 v2.1 §3.3・S-8）。429 では 10 進整数秒の Retry-After を
+            // 無音で眠る。429 では 10 進整数秒の Retry-After を
             // 1つだけ付け直す。既存の 529→403・403→529 の経路はここを通らない。
             const outboundHeaders = decision.stripRateLimitHeaders === true
               ? (decision.retryAfterSeconds
@@ -806,7 +806,7 @@ export function forwardToOpenAiBridge({
             finish('forwarded', upstreamRes.statusCode || 200, logMeta('forwarded'));
           });
           // 応答ストリームの実障害（ECONNRESET・socket hang up 等）。無音は含まない
-          // （無音は bridge-idle-timeout。設計書 §9.4）。
+          // （無音は bridge-idle-timeout）。
           upstreamRes.on('error', error => {
             clearTimers();
             res.destroy();
@@ -820,7 +820,7 @@ export function forwardToOpenAiBridge({
         requestFullySent = true;
       });
 
-      // 非 SSE 要求の生存通知（契約 §C4.6）。非ストリーミング応答には SSE の開始マーカーに
+      // 非 SSE 要求の生存通知。非ストリーミング応答には SSE の開始マーカーに
       // 相当する「流すもの」が無いため、bridge が上流の応答ヘッダを待っている間は rotator へ
       // 1バイトも届かず、長考がアイドル判定を超えた時点で 403 を合成してしまう。bridge が
       // 周期送出する 102 Processing を「bridge は生きている」の合図として受け取り、
@@ -845,7 +845,7 @@ export function forwardToOpenAiBridge({
 
       // 接続確立前のタイムアウト（403 permission_error・outcome=bridge-connect-timeout）。
       // 接続拒否・DNS 失敗（bridge-unreachable）とは意味が違う——ポートは開いているのに
-      // 受け付けられていない状態を指す（設計書 §9.4）。
+      // 受け付けられていない状態を指す。
       // TCP の接続確立（socket の 'connect'）が起きるまでだけを計測する。確立後は
       // ヘッダ待ち・チャンク間の無応答を問わずすべて idleTimer の責務にする。
       // 再試行が有効なときは、この待ちも「接続前の締切」の内側に収める。試行ごとに
@@ -889,8 +889,8 @@ export function forwardToOpenAiBridge({
         // 捨てた試行から遅れて届いた 'error'（destroy() 由来の重複など）。現行の試行は
         // 別にあるので、ここから再試行も応答書込みもしない。
         if (attemptAbandoned) return;
-        // ヘッダ送出後は新しいステータスを返せない（仕様書 4.2.3 節）。応答は既に
-        // 始まっていて上流側で壊れたのだから、不達ではなくストリーム障害である（§9.4）。
+        // ヘッダ送出後は新しいステータスを返せない。応答は既に
+        // 始まっていて上流側で壊れたのだから、不達ではなくストリーム障害である。
         if (res.headersSent) {
           res.destroy();
           finish('bridge-stream-error', null, logMeta('bridge-stream-error', errorLogFields(error)));
@@ -939,7 +939,7 @@ export function forwardToOpenAiBridge({
           }, plan.delayMs);
           return;
         }
-        // 応答本文は現行のまま（丸めたまま）にし、種別はログの errorCode で判別する（§8.9・§9）。
+        // 応答本文は現行のまま（丸めたまま）にし、種別はログの errorCode で判別する。
         const outcome = unreachableOutcome();
         sendSynthetic(res, 'connection refused', outcome);
         finish(

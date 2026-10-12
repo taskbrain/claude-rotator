@@ -9,7 +9,7 @@ import {
   sidHash,
 } from '../src/session-affinity.js';
 
-// sticky affinity の鍵・表・世代番号（設計書 v1.5 §2 / §3 / §4.4 / §8 / §9）。
+// sticky affinity の鍵・表・世代番号。
 // このファイルは src/session-affinity.js の単体テストであり（未記載構成の確認に限り src/config.js の
 // createDefaultConfig も読む）、HTTP も fs も触らない。
 // 時刻はすべて注入したクロックから読むので、TTL・LRU・savedAt を決定的に検証できる。
@@ -44,7 +44,7 @@ function createAffinity(overrides = {}) {
   return { affinity, clock, logger };
 }
 
-// 予約（§4.4 ①）。R-S7 が forwardWithRotation の同期区間で呼ぶ形をそのまま使う。
+// 予約。proxy の forwardWithRotation が同期区間で呼ぶ形をそのまま使う。
 function reserve(affinity, key, account, options = {}) {
   return affinity.note(key, { account, ...options });
 }
@@ -54,7 +54,7 @@ function ledger(ids) {
 }
 
 // ---------------------------------------------------------------------------
-// normalizeSessionKey（設計書 §2.2）
+// normalizeSessionKey
 // ---------------------------------------------------------------------------
 
 describe('normalizeSessionKey', () => {
@@ -83,7 +83,7 @@ describe('normalizeSessionKey', () => {
 
   it('trims the surrounding whitespace and keeps the allowed character set', () => {
     assert.equal(normalizeSessionKey(`  ${SESSION_ID}  `), SESSION_ID);
-    // §2.2 は trim を先に行うので、末尾の改行は「値に混ざった改行」ではなく余白として落ちる。
+    // 正規化は trim を先に行うので、末尾の改行は「値に混ざった改行」ではなく余白として落ちる。
     // 返る値そのものは必ず文字集合の検査を通っており、制御文字を含まない。
     assert.equal(normalizeSessionKey(`${SESSION_ID}\n`), SESSION_ID);
     assert.equal(normalizeSessionKey('A-z.0_9:x'), 'A-z.0_9:x');
@@ -91,7 +91,7 @@ describe('normalizeSessionKey', () => {
 });
 
 // ---------------------------------------------------------------------------
-// sidHash（設計書 §2.3・R7・D-54-1）
+// sidHash
 // ---------------------------------------------------------------------------
 
 describe('sidHash', () => {
@@ -111,7 +111,7 @@ describe('sidHash', () => {
 });
 
 // ---------------------------------------------------------------------------
-// sessionKeyFrom（設計書 §2.1・D-54-1）
+// sessionKeyFrom
 // ---------------------------------------------------------------------------
 
 describe('sessionKeyFrom', () => {
@@ -149,7 +149,7 @@ describe('sessionKeyFrom', () => {
       },
     }));
     assert.equal(sessionKeyFrom(req, body), SESSION_ID);
-    // すでに解析済みの本文を渡す経路（R-S7 は routingModelFamily の解析結果を共有する）。
+    // すでに解析済みの本文を渡す経路（proxy は routingModelFamily の解析結果を共有する）。
     assert.equal(sessionKeyFrom(req, JSON.parse(body.toString('utf8'))), SESSION_ID);
   });
 
@@ -181,7 +181,7 @@ describe('sessionKeyFrom', () => {
 });
 
 // ---------------------------------------------------------------------------
-// バインドの予約と確定（設計書 §3・§4.4）
+// バインドの予約と確定
 // ---------------------------------------------------------------------------
 
 describe('SessionAffinity binding', () => {
@@ -206,7 +206,7 @@ describe('SessionAffinity binding', () => {
     assert.deepEqual(linesOf(logger, 'affinity_bind'), [
       `2025-09-04T15:33:20.000Z affinity_bind sid=${sidHash(SESSION_ID)} account=acct-a reason=new_session sessions=1`,
     ]);
-    // 生のセッション id はどの行にも出さない（R7・D-54-1）。
+    // 生のセッション id はどの行にも出さない。
     for (const line of logger.lines) assert.ok(!line.includes(SESSION_ID));
   });
 
@@ -235,7 +235,7 @@ describe('SessionAffinity binding', () => {
 });
 
 // ---------------------------------------------------------------------------
-// 世代照合（設計書 §4.4・D-60-1・D-63 C3）
+// 世代照合
 // ---------------------------------------------------------------------------
 
 describe('SessionAffinity generations', () => {
@@ -289,7 +289,7 @@ describe('SessionAffinity generations', () => {
     const reserved = reserve(affinity, SESSION_ID, 'acct-a');
 
     clock.ms += 1_000;
-    // 認証失敗・throttled・5xx・短期レート制限は reason を持たずにここへ来る（D-63 C3）。
+    // 認証失敗・throttled・5xx・短期レート制限は reason を持たずにここへ来る。
     const confirmed = affinity.note(SESSION_ID, { account: 'acct-b', expectedGen: reserved.gen });
 
     assert.equal(confirmed.disposition, 'bound');
@@ -299,10 +299,10 @@ describe('SessionAffinity generations', () => {
     assert.equal(linesOf(logger, 'affinity_switch').length, 0);
   });
 
-  it('never rebinds on account_removed at the confirmation stage (D-142)', () => {
+  it('never rebinds on account_removed at the confirmation stage', () => {
     // 確定段で付け替えてよい理由は枠の枯渇（共通枠・当該系統枠）の2値だけである。
     // 台帳から口座が消えたことは予約段（affinity_switch）と退避段（affinity_evict）の
-    // 事象であり、送信直前の確定でバインドを動かす理由にはならない（D-142）。
+    // 事象であり、送信直前の確定でバインドを動かす理由にはならない。
     const { affinity, logger } = createAffinity();
     const reserved = reserve(affinity, SESSION_ID, 'acct-a');
 
@@ -348,7 +348,7 @@ describe('SessionAffinity generations', () => {
 });
 
 // ---------------------------------------------------------------------------
-// 系統別副バインド（設計書 §4.1・§4.3・D-54-3・D-63 C2）
+// 系統別副バインド
 // ---------------------------------------------------------------------------
 
 describe('SessionAffinity family sub-bindings', () => {
@@ -375,7 +375,7 @@ describe('SessionAffinity family sub-bindings', () => {
     reserve(affinity, SESSION_ID, 'acct-a');
     reserve(affinity, SESSION_ID, 'acct-d', { modelFamily: 'fable', reason: 'family_exhausted' });
 
-    // 副バインド先 D の共通枠が枯れた。付け替えるのは Fable の副バインドだけ（D-63 C2）。
+    // 副バインド先 D の共通枠が枯れた。付け替えるのは Fable の副バインドだけ。
     const moved = reserve(affinity, SESSION_ID, 'acct-e', { modelFamily: 'fable', reason: 'common_exhausted' });
 
     assert.equal(moved.slot, 'family');
@@ -399,7 +399,7 @@ describe('SessionAffinity family sub-bindings', () => {
 });
 
 // ---------------------------------------------------------------------------
-// TTL・LRU・容量（設計書 §3・§8・F4・F6）
+// TTL・LRU・容量
 // ---------------------------------------------------------------------------
 
 describe('SessionAffinity ttl and capacity', () => {
@@ -456,7 +456,7 @@ describe('SessionAffinity ttl and capacity', () => {
     assert.equal(affinity.get(SESSION_ID).home, 'acct-a');
     assert.deepEqual(affinity.prune(), []);
     assert.equal(affinity.size, 1);
-    // 巻き戻った時刻へ丸める（負の経過時間で全消ししない・F4）。
+    // 巻き戻った時刻へ丸める（負の経過時間で全消ししない）。
     assert.equal(affinity.get(SESSION_ID).lastSeen, clock.ms);
     assert.equal(linesOf(logger, 'affinity_evict').length, 0);
   });
@@ -519,7 +519,7 @@ describe('SessionAffinity ttl and capacity', () => {
 });
 
 // ---------------------------------------------------------------------------
-// evictAccounts（設計書 §8.1・D-60-3）
+// evictAccounts
 // ---------------------------------------------------------------------------
 
 describe('SessionAffinity evictAccounts', () => {
@@ -565,7 +565,7 @@ describe('SessionAffinity evictAccounts', () => {
 });
 
 // ---------------------------------------------------------------------------
-// summary（設計書 §7.3）
+// summary
 // ---------------------------------------------------------------------------
 
 describe('SessionAffinity summary', () => {
@@ -601,7 +601,7 @@ describe('SessionAffinity summary', () => {
 });
 
 // ---------------------------------------------------------------------------
-// export / restore（設計書 §8・§8.1・F1）
+// export / restore
 // ---------------------------------------------------------------------------
 
 describe('SessionAffinity export and restore', () => {
@@ -620,7 +620,7 @@ describe('SessionAffinity export and restore', () => {
       { k: sidHash(SESSION_ID), a: 'acct-a', f: { fable: 'acct-d' }, t: START_MS, s: 1 },
       { k: sidHash('plain-session'), a: 'acct-b', t: START_MS + 2_000, s: 0 },
     ]);
-    // 生のセッション id も世代番号も保存しない（§8・D-60-1）。
+    // 生のセッション id も世代番号も保存しない。
     const serialized = JSON.stringify(saved);
     assert.ok(!serialized.includes(SESSION_ID));
     assert.ok(!serialized.includes('gen'));
@@ -641,7 +641,7 @@ describe('SessionAffinity export and restore', () => {
     assert.equal(affinity.get(SESSION_ID).home, 'acct-a');
     assert.equal(affinity.get(SESSION_ID, { modelFamily: 'fable' }).bound, 'acct-d');
     assert.equal(affinity.get(SESSION_ID).switches, 1);
-    // 世代は保存していないので 0 から数え直す（D-60-1）。
+    // 世代は保存していないので 0 から数え直す。
     assert.equal(affinity.get(SESSION_ID).gen, 0);
   });
 
@@ -676,7 +676,7 @@ describe('SessionAffinity export and restore', () => {
       assert.equal(result.restored, 0);
     }
     assert.equal(affinity.size, 0);
-    // 壊れた保存データの本文はログへ出さない（F1）。
+    // 壊れた保存データの本文はログへ出さない。
     assert.equal(linesOf(logger, 'affinity_restore').length, 5);
     for (const line of logger.lines) assert.ok(!line.includes('nope'));
   });
@@ -767,7 +767,7 @@ describe('SessionAffinity export and restore', () => {
       entries: [{ k: sidHash('kept'), a: 'acct-a', t: START_MS, s: 0 }],
     };
 
-    // restoreState の早期 return が undefined を返した場合でも壊れない（v1.5 §8.1）。
+    // restoreState の早期 return が undefined を返した場合でも壊れない。
     const result = affinity.restore(saved, {
       accountManager: ledger(['acct-a']),
       credentialChangedAccountIds: undefined,
@@ -779,10 +779,10 @@ describe('SessionAffinity export and restore', () => {
 });
 
 // ---------------------------------------------------------------------------
-// 設定の正規化と reload（設計書 §6 / R-S6）
+// 設定の正規化と reload
 //
 // 既存の import 文（ファイル冒頭）は1行も書き換えない。ESM の import 宣言は位置に
-// 関係なく巻き上げられるため、R-S6 で足りない分だけを別の import 文にする。
+// 関係なく巻き上げられるため、ここから下の試験で足りない分だけを別の import 文にする。
 // ---------------------------------------------------------------------------
 
 import { createDefaultConfig } from '../src/config.js';
@@ -803,7 +803,7 @@ const FULL_SECTION = {
   persist: false,
 };
 
-describe('SessionAffinity holds (F9)', () => {
+describe('SessionAffinity holds', () => {
   it('keeps a held row through a ttl sweep and drops it once the response is released', () => {
     const { affinity, clock, logger } = createAffinity({ idleTtlMs: 60_000 });
     reserve(affinity, SESSION_ID, 'acct-a');
@@ -853,7 +853,7 @@ describe('SessionAffinity holds (F9)', () => {
   });
 });
 
-describe('normalizeSessionAffinity (R-S6 / 設計書 §6)', () => {
+describe('normalizeSessionAffinity', () => {
   it('falls back to the shared defaults when the section is absent or is not an object', () => {
     // セクションが無い／型が違う、のいずれでも既定（mode:"off"）へ倒れる。
     for (const raw of [undefined, null, false, 0, '', 'on', 42, [], [{ mode: 'on' }]]) {
@@ -869,7 +869,7 @@ describe('normalizeSessionAffinity (R-S6 / 設計書 §6)', () => {
       maxSessions: 10_000,
       assignStopUtilization: 0.9,
       rebindGraceMs: 60_000,
-      // v1.7（判断6 案(a)）で足した2つ。既定はメイン会話のキャッシュ寿命 1 時間と、
+      // 冷えた固定の解放に使う2つ。既定はメイン会話のキャッシュ寿命 1 時間と、
       // 冷えた固定を動かし始める利用率 85%。
       warmTtlMs: 3_600_000,
       drainStartUtilization: 0.85,
@@ -884,7 +884,7 @@ describe('normalizeSessionAffinity (R-S6 / 設計書 §6)', () => {
 
   it('keeps the remaining defaults when only one key is written (浅いマージの罠)', () => {
     // createDefaultConfig() 側に既定を置いていたら、この部分指定で他のキーが
-    // すべて undefined になる。専用の正規化関数を通すことでそれを避ける（§6 理由①）。
+    // すべて undefined になる。専用の正規化関数を通すことでそれを避ける。
     for (const partial of [{ mode: 'on' }, { maxSessions: 5 }, { persist: false }]) {
       const normalized = normalizeSessionAffinity(partial);
       for (const key of Object.keys(DEFAULT_SESSION_AFFINITY)) {
@@ -902,7 +902,7 @@ describe('normalizeSessionAffinity (R-S6 / 設計書 §6)', () => {
     for (const mode of ['off', 'observe', 'on']) {
       assert.equal(normalizeSessionAffinity({ mode }).mode, mode, mode);
     }
-    // 未知の値は "off" へ倒す（§6）。大文字・真偽値・数値も未知として扱う。
+    // 未知の値は "off" へ倒す。大文字・真偽値・数値も未知として扱う。
     for (const mode of ['ON', 'On', 'enabled', '', 'true', true, 1, null, undefined, {}, []]) {
       assert.equal(
         normalizeSessionAffinity({ mode }).mode,
@@ -932,7 +932,7 @@ describe('normalizeSessionAffinity (R-S6 / 設計書 §6)', () => {
         );
       }
     }
-    // 明示された 0 は既定へ戻さない: rebindGraceMs:0 は待機の無効化（§6・v1.1 の挙動へ）、
+    // 明示された 0 は既定へ戻さない: rebindGraceMs:0 は待機の無効化、
     // assignStopUtilization:0 はゲートの最も厳しい側であって「未指定」ではない。
     assert.equal(normalizeSessionAffinity({ rebindGraceMs: 0 }).rebindGraceMs, 0);
     assert.equal(normalizeSessionAffinity({ assignStopUtilization: 0 }).assignStopUtilization, 0);
@@ -975,10 +975,10 @@ describe('normalizeSessionAffinity (R-S6 / 設計書 §6)', () => {
   });
 });
 
-describe('OSS 独立性 > sessionAffinity 未記載 (R-S6)', () => {
+describe('OSS 独立性 > sessionAffinity 未記載', () => {
   it('leaves createDefaultConfig() unchanged and resolves to off', () => {
     // 新規インストールの config.json（createDefaultConfig）にはセクションが無い。
-    // 生成物を1バイトも変えないため、既定側にキーを足していないことを固定する（§6 理由②）。
+    // 生成物を1バイトも変えないため、既定側にキーを足していないことを固定する。
     const config = createDefaultConfig();
     assert.equal(config.sessionAffinity, undefined);
     assert.equal(Object.prototype.hasOwnProperty.call(config, 'sessionAffinity'), false);
@@ -991,7 +991,7 @@ describe('OSS 独立性 > sessionAffinity 未記載 (R-S6)', () => {
   });
 });
 
-describe('SessionAffinity applySettings (R-S6 / 設計書 §6 の reload)', () => {
+describe('SessionAffinity applySettings (reload)', () => {
   it('starts from an empty table when the mode goes from off to on', () => {
     const { affinity, logger } = createAffinity();
     reserve(affinity, 'session-a', 'acct-a');
@@ -1019,7 +1019,7 @@ describe('SessionAffinity applySettings (R-S6 / 設計書 §6 の reload)', () =
     assert.deepEqual(linesOf(logger, 'affinity_disabled'), [
       `${isoAt(clock.ms)} affinity_disabled sessions=2`,
     ]);
-    // 値そのものは出さない（§6）。設定由来の数値・ハッシュ・口座名を載せない。
+    // 値そのものは出さない。設定由来の数値・ハッシュ・口座名を載せない。
     const [line] = linesOf(logger, 'affinity_disabled');
     for (const forbidden of ['21600000', '10000', 'idleTtlMs', 'maxSessions', 'acct-a', sidHash('session-a')]) {
       assert.equal(line.includes(forbidden), false, forbidden);
@@ -1041,7 +1041,7 @@ describe('SessionAffinity applySettings (R-S6 / 設計書 §6 の reload)', () =
     reserve(affinity, 'session-b', 'acct-b');
     reserve(affinity, 'session-c', 'acct-c');
 
-    // 0 は 1 へクランプされるので、最も新しい1件だけが残る（§3 の LRU）。
+    // 0 は 1 へクランプされるので、最も新しい1件だけが残る（LRU）。
     const result = affinity.applySettings({ mode: 'on', maxSessions: 0 }, { previousMode: 'on' });
 
     assert.equal(affinity.maxSessions, 1);
@@ -1075,7 +1075,7 @@ describe('SessionAffinity applySettings (R-S6 / 設計書 §6 の reload)', () =
   });
 });
 
-describe('logSessionAffinityStartupNotice (R-S6 / U17)', () => {
+describe('logSessionAffinityStartupNotice', () => {
   it('records the switch threshold on exactly one line while affinity runs', () => {
     for (const mode of ['on', 'observe']) {
       const lines = [];
@@ -1111,17 +1111,17 @@ describe('logSessionAffinityStartupNotice (R-S6 / U17)', () => {
 });
 
 // ---------------------------------------------------------------------------
-// reload のモード記憶と表の変化通知（R-S11 / FU-69・D-175・設計書 §6・§8）
+// reload のモード記憶と表の変化通知
 //
-// FU-69: 直前のモードを結線側が渡す方式だと、渡し忘れた瞬間に「有効→off」の
+// 直前のモードを結線側が渡す方式だと、渡し忘れた瞬間に「有効→off」の
 // `affinity_disabled` が黙って消える。モードはインスタンスが持ち、`applySettings` は
 // 明示の `previousMode` が無ければ自分の値を使う。
 //
 // 表の変化通知（`onChange`）は永続化の dirty 判定の唯一の入口である。バインドが
-// 変わったときだけ呼ばれ、`lastSeen` の更新（再訪）では呼ばれない（設計書 §8）。
+// 変わったときだけ呼ばれ、`lastSeen` の更新（再訪）では呼ばれない。
 // ---------------------------------------------------------------------------
 
-describe('SessionAffinity mode memory and change notice (R-S11 / FU-69)', () => {
+describe('SessionAffinity mode memory and change notice', () => {
   function createTracked(overrides = {}) {
     const clock = { ms: overrides.startMs ?? START_MS };
     const logger = overrides.logger ?? collectingLogger();
@@ -1141,7 +1141,7 @@ describe('SessionAffinity mode memory and change notice (R-S11 / FU-69)', () => 
     const { affinity } = createTracked({ mode: 'observe' });
 
     assert.equal(affinity.mode, 'observe');
-    assert.equal(new SessionAffinity().mode, 'off', '既定は off（R-S6 の未記載構成と同じ）');
+    assert.equal(new SessionAffinity().mode, 'off', '既定は off');
   });
 
   it('uses its own mode as previousMode when the caller does not pass one', () => {
@@ -1149,7 +1149,7 @@ describe('SessionAffinity mode memory and change notice (R-S11 / FU-69)', () => 
     reserve(affinity, 'session-a', 'acct-a');
     reserve(affinity, 'session-b', 'acct-b');
 
-    // 結線側が previousMode を渡し忘れても、有効→off の1行は消えない（FU-69）。
+    // 結線側が previousMode を渡し忘れても、有効→off の1行は消えない。
     const result = affinity.applySettings({ mode: 'off' });
 
     assert.equal(result.previousMode, 'on');
@@ -1178,7 +1178,7 @@ describe('SessionAffinity mode memory and change notice (R-S11 / FU-69)', () => 
 
     assert.equal(result.previousMode, 'off');
     assert.equal(affinity.mode, 'on');
-    assert.equal(affinity.size, 0, 'off→on は空表から開始する（§6）');
+    assert.equal(affinity.size, 0, 'off→on は空表から開始する');
     assert.deepEqual(linesOf(logger, 'affinity_disabled'), []);
   });
 
@@ -1230,7 +1230,7 @@ describe('SessionAffinity mode memory and change notice (R-S11 / FU-69)', () => 
 });
 
 // ---------------------------------------------------------------------------
-// 復元したあとの LRU 順（R-S12 / FU-54）
+// 復元したあとの LRU 順
 //
 // 表の順序は Map の挿入順＝recency（古い順）であり、`trimToCapacity` は「先頭が最も古い」
 // という前提で退避先を選ぶ。空の表へ読み戻す起動時はそれで正しいが、すでに行のある表へ
@@ -1239,7 +1239,7 @@ describe('SessionAffinity mode memory and change notice (R-S11 / FU-69)', () => 
 // 昇順で並べ直して、この取り違えを防ぐ。
 // ---------------------------------------------------------------------------
 
-describe('SessionAffinity restore ordering (R-S12 / FU-54)', () => {
+describe('SessionAffinity restore ordering', () => {
   it('re-orders the table by last seen so a restore into a live table still evicts the oldest first', () => {
     const { affinity, clock } = createAffinity({ maxSessions: 3 });
     // いま触ったばかりのセッション。挿入順ではこれが先頭にいる。
@@ -1271,7 +1271,7 @@ describe('SessionAffinity restore ordering (R-S12 / FU-54)', () => {
 });
 
 // ---------------------------------------------------------------------------
-// warm セッション数の増分保持（R-S16 / 設計書 v1.7 §3・P-c）
+// warm セッション数の増分保持
 //
 // 「温かい」＝最後に触れてから `warmTtlMs`（既定 1 時間）以内。要求ごとに表を全件
 // 走査して数え直すのをやめ、bind / rebind / evict と `lastSeen` の更新で増分更新する。
@@ -1279,7 +1279,7 @@ describe('SessionAffinity restore ordering (R-S12 / FU-54)', () => {
 // `pruneWarm()` を 1,000 要求ごとに償却で回す（新しいタイマーは作らない）。
 // ---------------------------------------------------------------------------
 
-describe('SessionAffinity warm counts (R-S16 / 設計書 v1.7 P-c)', () => {
+describe('SessionAffinity warm counts', () => {
   it('counts a binding as warm until warmTtlMs has passed and drops it on the amortised sweep', () => {
     const { affinity, clock } = createAffinity({ warmTtlMs: 3_600_000 });
     reserve(affinity, 'session-1', 'acct-a');
@@ -1309,7 +1309,7 @@ describe('SessionAffinity warm counts (R-S16 / 設計書 v1.7 P-c)', () => {
 
     reserve(affinity, 'session-1', 'acct-a');
     assert.deepEqual(affinity.summary().warmSessionsByAccount, { 'acct-a': 1 });
-    // `get()` は `lastSeen` を動かさないので温め直さない（表を読むだけ・§3）。
+    // `get()` は `lastSeen` を動かさないので温め直さない（表を読むだけ）。
     // 温め直すのは予約（`note()`）であり、要求は必ずそこを通る。
     clock.ms += 3_600_001;
     affinity.pruneWarm();
@@ -1383,7 +1383,7 @@ describe('SessionAffinity warm counts (R-S16 / 設計書 v1.7 P-c)', () => {
     reserve(affinity, 'session-2', 'acct-b');
 
     // `previousMode:'on'` は「有効なまま設定だけ変えた reload」。既定の 'off' からの
-    // 有効化だと表ごと捨てるので、数え直しの検証にならない（§6）。
+    // 有効化だと表ごと捨てるので、数え直しの検証にならない。
     affinity.applySettings({ mode: 'on', warmTtlMs: 60_000 }, { previousMode: 'on' });
 
     assert.deepEqual(
@@ -1425,7 +1425,7 @@ describe('SessionAffinity warm counts (R-S16 / 設計書 v1.7 P-c)', () => {
   });
 });
 
-describe('SessionAffinity warm sweep (R-S17 / 設計書 v1.7 P-c の遅延償却)', () => {
+describe('SessionAffinity warm sweep (遅延償却)', () => {
   it('sweeps once every 1,000 requests instead of on every request or on a timer', () => {
     const { affinity, clock } = createAffinity({ warmTtlMs: 60_000 });
     reserve(affinity, 'cold-session', 'acct-a');
@@ -1445,14 +1445,14 @@ describe('SessionAffinity warm sweep (R-S17 / 設計書 v1.7 P-c の遅延償却
 });
 
 // ---------------------------------------------------------------------------
-// 冷えた固定の解放（R-S18 / 設計書 v1.7 §4.3・P-b）
+// 冷えた固定の解放
 //
 // 予約段だけの理由である。キャッシュが失効したセッションを空いている口座へ動かすのは
-// 費用ゼロなので付け替えてよいが、**送信直前の確定（§4.4 ②）では付け替えない**
-// ——確定で動かしてよいのは枠の枯渇の2値だけという D-142 は v1.7 でも変えない。
+// 費用ゼロなので付け替えてよいが、**送信直前の確定では付け替えない**
+// ——確定で動かしてよいのは枠の枯渇の2値だけという決まりは、この理由でも変えない。
 // ---------------------------------------------------------------------------
 
-describe('SessionAffinity cold_reassign (R-S18 / 設計書 v1.7 P-b)', () => {
+describe('SessionAffinity cold_reassign', () => {
   it('counts and logs cold_reassign as a known switch reason at the reservation stage', () => {
     const { affinity, logger } = createAffinity();
     reserve(affinity, SESSION_ID, 'acct-a');
@@ -1469,7 +1469,7 @@ describe('SessionAffinity cold_reassign (R-S18 / 設計書 v1.7 P-b)', () => {
     );
   });
 
-  it('refuses to move the binding when cold_reassign arrives at the confirm stage (D-142)', () => {
+  it('refuses to move the binding when cold_reassign arrives at the confirm stage', () => {
     const { affinity } = createAffinity();
     const reserved = reserve(affinity, SESSION_ID, 'acct-a');
 

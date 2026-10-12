@@ -1,16 +1,16 @@
-// セッション単位の口座固定（sticky affinity）の鍵と表（設計書 v1.5 §2・§3・§4.4・§8）。
+// セッション単位の口座固定（sticky affinity）の鍵と表。
 //
 // このファイルは単独で完結する。HTTP も fs も触らず、時刻は必ず注入された `now()` から読む。
-// `AccountManager` の内部状態は増やさない（設計書 §3）。proxy への結線は R-S7 以降で行う。
+// `AccountManager` の内部状態は増やさない。proxy への結線は proxy-server 側が行う。
 //
-// 表の鍵は「セッション鍵の SHA-256 先頭12桁」である（§3 の `Map<sidHash, entry>`）。
-// 生のセッション id は表にも、ログにも、`runtime-state.json` にも残さない（R7・D-54-1・§8）。
-// 生の鍵を表の鍵にする案（§9 F14）は採らなかった——保存形式 §8 が `"k":"<12桁ハッシュ>"` で
+// 表の鍵は「セッション鍵の SHA-256 先頭12桁」である（`Map<sidHash, entry>`）。
+// 生のセッション id は表にも、ログにも、`runtime-state.json` にも残さない。
+// 生の鍵を表の鍵にする案は採らなかった——保存形式が `"k":"<12桁ハッシュ>"` で
 // あり、復元後に同じセッションを引き当てるには「セッション id から鍵を再計算できること」が
-// 要る。生の鍵を表の鍵にすると、その鍵を保存しない限り復元が成立せず、保存すれば §8 の
-// 「生 UUID を含まない」に反する。F14 の衝突（10,000 セッションで約 1.8×10⁻⁷）は残るが、
-// 衝突しても要求は必ず通る（R1）。
-// 鍵の抽出・正規化・指紋化（設計書 §2.1〜§2.3・D-54-1）は `./session-key.js` の1箇所に置き、
+// 要る。生の鍵を表の鍵にすると、その鍵を保存しない限り復元が成立せず、保存すれば保存形式の
+// 「生 UUID を含まない」に反する。ハッシュの衝突（10,000 セッションで約 1.8×10⁻⁷）は残るが、
+// 衝突しても要求は必ず通る。
+// 鍵の抽出・正規化・指紋化は `./session-key.js` の1箇所に置き、
 // ここからは再 export するだけにする。以前は同じ実装がこのファイルにも複製されていた。
 import { sidHash } from './session-key.js';
 
@@ -21,14 +21,14 @@ export {
   sidHash,
 } from './session-key.js';
 
-/** 保存形式の版（§8）。読み込み時に一致しなければ表ごと捨てる。 */
+/** 保存形式の版。読み込み時に一致しなければ表ごと捨てる。 */
 export const SESSION_AFFINITY_STATE_VERSION = 1;
-/** 既定の idle TTL（6時間・§3）。実際の値の正規化とクランプは R-S6 の設定側が行う。 */
+/** 既定の idle TTL（6時間）。実際の値の正規化とクランプは `normalizeSessionAffinity()` が行う。 */
 export const DEFAULT_IDLE_TTL_MS = 21_600_000;
-/** 既定の表の上限（§3）。溢れは `lastSeen` の古い順に落とす。 */
+/** 既定の表の上限。溢れは `lastSeen` の古い順に落とす。 */
 export const DEFAULT_MAX_SESSIONS = 10_000;
 /**
- * 既定の warm TTL（1時間・設計書 v1.7 §3・P-c）。
+ * 既定の warm TTL（1時間）。
  * 「温かい」＝最後に触れてから この時間以内＝上流のプロンプトキャッシュがまだ生きている
  * 見込みがある、という意味である。メイン会話のキャッシュ寿命（最終利用から1時間）に
  * 合わせてある。`idleTtlMs`（表から落とすまでの 6 時間）とは別物で、冷えただけの行は
@@ -36,14 +36,14 @@ export const DEFAULT_MAX_SESSIONS = 10_000;
  */
 export const DEFAULT_WARM_TTL_MS = 3_600_000;
 /**
- * 温かい数の掃除を回す間隔（要求数・設計書 v1.7 P-c）。
+ * 温かい数の掃除を回す間隔（要求数）。
  * **新しいタイマーは作らない。** 冷えることは事象を伴わないので、要求の流れに乗せて
  * 償却する。1,000 本に1回で、10,000 行の表でも1回あたりの走査は冷えた分だけで済む。
  */
 export const WARM_SWEEP_REQUEST_INTERVAL = 1_000;
 
 /**
- * 設定セクション `sessionAffinity` の既定（設計書 §6・D-54-6）。
+ * 設定セクション `sessionAffinity` の既定。
  * `createDefaultConfig()` にはこのキーを足さない——足すと ①浅いマージで、利用者が一部だけ
  * 書いた瞬間に残りが `undefined` になる ②本機能を使わない利用者の生成 `config.json` が
  * 変わる。既定は内部の凍結定数として持ち、キーごとに個別へ正規化する
@@ -55,7 +55,7 @@ export const DEFAULT_SESSION_AFFINITY = Object.freeze({
   maxSessions: DEFAULT_MAX_SESSIONS,
   assignStopUtilization: 0.9,
   rebindGraceMs: 60_000,
-  // v1.7（判断6 案(a)）の2キー。`warmTtlMs` はキャッシュが生きている見込みの長さ、
+  // 冷えた固定の解放に使う2キー。`warmTtlMs` はキャッシュが生きている見込みの長さ、
   // `drainStartUtilization` は「冷えた固定を動かし始める利用率」である。1 にすると
   // 冷えた固定の解放は起きない（無効化）。
   warmTtlMs: DEFAULT_WARM_TTL_MS,
@@ -64,9 +64,9 @@ export const DEFAULT_SESSION_AFFINITY = Object.freeze({
 });
 
 // `off`＝コード経路にも入らず現行と同一 ／ `observe`＝鍵の抽出とログだけ ／ `on`＝固定。
-// 未知の値（大文字・真偽値・数値を含む）はすべて `off` へ倒す（§6）。
+// 未知の値（大文字・真偽値・数値を含む）はすべて `off` へ倒す。
 const SESSION_AFFINITY_MODES = new Set(['off', 'observe', 'on']);
-// 6つの数値キーの値域（§6 の表）。`min` 側も既定へ戻さずクランプする——`rebindGraceMs:0` は
+// 6つの数値キーの値域。`min` 側も既定へ戻さずクランプする——`rebindGraceMs:0` は
 // 「待機の無効化」、`assignStopUtilization:0` は「ゲートの最も厳しい側」であって未指定ではない。
 const SESSION_AFFINITY_RANGES = Object.freeze({
   idleTtlMs: { min: 60_000, max: 604_800_000 },
@@ -81,24 +81,24 @@ const SESSION_AFFINITY_RANGES = Object.freeze({
 
 const SID_HASH_PATTERN = /^[0-9a-f]{12}$/;
 
-// 結び付け先を付け替えてよい理由（§4.3 の表・§7.2）。確定（§4.4 ②）でこの3つ以外の理由が
+// 結び付け先を付け替えてよい理由。確定でこの3つ以外の理由が
 // 来たときは表を書き換えない——認証失敗・throttled・error・上流 5xx・切断・timeout・短期
-// レート制限は、その要求だけ別の口座で完走させ、次の要求は元の口座へ戻す（D-63 C3）。
-// `cold_reassign` は v1.7（判断6 案(a)・P-b）で足した予約段だけの理由である。
+// レート制限は、その要求だけ別の口座で完走させ、次の要求は元の口座へ戻す。
+// `cold_reassign` は冷えた固定の解放のために足した、予約段だけの理由である。
 // キャッシュが失効（`warmTtlMs` 超過）したセッションを、利用率の高い口座から空いている
 // 口座へ動かす——**移すものが無いので費用はゼロ**であり、温かいセッションはこの線では
 // 1本も動かない。
 const REBIND_REASONS = new Set(['common_exhausted', 'family_exhausted', 'account_removed', 'cold_reassign']);
-// 確定（§4.4 ②）で付け替えてよい理由は枠の枯渇の2値だけである（D-142）。台帳から口座が
+// 確定で付け替えてよい理由は枠の枯渇の2値だけである。台帳から口座が
 // 消えたことは予約段（`affinity_switch`）と退避段（`affinity_evict`）の事象であって、
 // 送信直前にバインドを動かす理由にはならない。
 const CONFIRM_REBIND_REASONS = new Set(['common_exhausted', 'family_exhausted']);
-// 退避の理由（§7.2 の `affinity_evict` ＋ §8.1 の reload で台帳から消えた口座）。
+// 退避の理由（`affinity_evict` の理由 ＋ reload で台帳から消えた口座）。
 const EVICT_REASONS = new Set(['ttl', 'capacity', 'credential_changed', 'account_removed']);
 const UNKNOWN_REASON = 'unknown';
 
 /**
- * 設定セクション `sessionAffinity` を正規化する（設計書 §6）。
+ * 設定セクション `sessionAffinity` を正規化する。
  * セクションが無い・型が違う・キーが欠けている、のいずれでも既定へ倒れるので、
  * 戻り値のキーが `undefined` になることはない。
  *
@@ -121,13 +121,13 @@ export function normalizeSessionAffinity(raw) {
 }
 
 /**
- * 起動時に1行だけ残す記録（U17・§5.2 末尾）。
+ * 起動時に1行だけ残す記録。
  *
- * 行のキーは `affinity_config` である（FU-70・D-184）。`affinity_bind` / `affinity_evict` /
+ * 行のキーは `affinity_config` である。`affinity_bind` / `affinity_evict` /
  * `affinity_disabled` と同じ系統の1語にしておくと、ログの抽出が空白ではなくキー名1つで済む。
  *
- * `switchThreshold` は sticky の前提ではない（v1.0 の「`mode:"on"` かつ 1 未満なら affinity を
- * off へ倒す」は D-56-7 で撤回した）が、1 未満だと既存の可用性判定と全滅判定がその分だけ
+ * `switchThreshold` は sticky の前提ではない（`mode:"on"` で 1 未満でも affinity を
+ * off へは倒さない）が、1 未満だと既存の可用性判定と全滅判定がその分だけ
  * 手前で止まるため、後から読めるように値を残す。**`mode:"off"` では1行も出さない**——
  * 未記載構成でログ・status・CLI 出力・`runtime-state.json` を現行と同一に保つため。
  *
@@ -162,15 +162,15 @@ function clampSetting(value, key) {
 }
 
 /**
- * セッション鍵から結び付け先への表（設計書 §3）。
+ * セッション鍵から結び付け先への表。
  *
  * エントリは `{ home, families, gen, boundAt, lastSeen, requests, switches }` で、
  * `gen` は「そのセッションのバインドが変わった回数」を数える単調増加の整数である。
- * 予約（§4.4 ①）で控えた `gen` を確定（②）へ渡すことで、`await` を挟んで遅れて着いた確定が
- * その間に別の要求が作った新しいバインドを上書きすることを防ぐ（D-60-1）。
+ * 予約で控えた `gen` を確定へ渡すことで、`await` を挟んで遅れて着いた確定が
+ * その間に別の要求が作った新しいバインドを上書きすることを防ぐ。
  *
  * 表の順序は recency（古い順）で保つ。溢れたときは先頭＝最も長く触られていないエントリを
- * 落とす（§3 の LRU）。
+ * 落とす（LRU）。
  */
 export class SessionAffinity {
   constructor({
@@ -184,11 +184,11 @@ export class SessionAffinity {
   } = {}) {
     this.now = typeof now === 'function' ? now : () => Date.now();
     this.logger = typeof logger === 'function' ? logger : null;
-    // 現在のモードはインスタンスが持つ（FU-69・D-175）。結線側が reload のたびに
+    // 現在のモードはインスタンスが持つ。結線側が reload のたびに
     // 直前のモードを渡す方式だと、渡し忘れた瞬間に「有効→off」の affinity_disabled が
     // 黙って消える。applySettings は明示の previousMode が無ければこの値を使う。
     this.mode = normalizeMode(mode);
-    // 表が変わったことの唯一の通知口（設計書 §8 の dirty）。バインドが変わったときだけ
+    // 表が変わったことの唯一の通知口（永続化の dirty 判定）。バインドが変わったときだけ
     // 呼び、`lastSeen` の更新（再訪）では呼ばない。
     this.onChange = typeof onChange === 'function' ? onChange : null;
     this.idleTtlMs = positiveInteger(idleTtlMs, DEFAULT_IDLE_TTL_MS);
@@ -197,7 +197,7 @@ export class SessionAffinity {
     this.entries = new Map();
     this.switchCounts = new Map();
     this.evictCounts = new Map();
-    // 口座ごとの「温かいバインド数」（設計書 v1.7 P-c）。要求ごとの全件走査をやめ、
+    // 口座ごとの「温かいバインド数」。要求ごとの全件走査をやめ、
     // バインドの増減と `lastSeen` の更新だけで保つ。数え方は `sessionsByAccount` と同じで、
     // 1セッションは1口座につき1回だけ数える（副バインドがあれば2口座に1ずつ載る）。
     this.warmCounts = new Map();
@@ -210,7 +210,7 @@ export class SessionAffinity {
 
   /**
    * そのセッションの現在のバインドを読む。バインドは書き換えない（行うのは TTL 切れの掃除と、
-   * 時計が逆行したときの `lastSeen` の丸めだけ・F4）。
+   * 時計が逆行したときの `lastSeen` の丸めだけ）。
    *
    * @param {unknown} key セッション鍵。
    * @param {{modelFamily?:string|null, now?:number}} [options]
@@ -224,13 +224,13 @@ export class SessionAffinity {
   }
 
   /**
-   * 予約（§4.4 ①）と確定（②）の唯一の書き込み口。
+   * 予約と確定の唯一の書き込み口。
    *
    * `expectedGen` を渡さなければ予約——エントリが無ければ作り、口座が変わっていれば
    * 付け替えて `gen` を1つ進める。呼び出し側は戻り値の `gen` を `myGen` として控える。
    * `expectedGen` を渡せば確定——表の `gen` が一致するときだけ書き、一致しなければ
-   * `affinity_stale` を1行出して捨てる（D-60-1）。確定で付け替えるのは枠の枯渇由来の
-   * 理由のときだけである（D-63 C3）。
+   * `affinity_stale` を1行出して捨てる。確定で付け替えるのは枠の枯渇由来の
+   * 理由のときだけである。
    *
    * @param {unknown} key セッション鍵。
    * @param {{account:string, modelFamily?:string|null, expectedGen?:number|null,
@@ -252,10 +252,10 @@ export class SessionAffinity {
   }
 
   /**
-   * 猶予の待機に入ったことを1行残す（§4.3.1・§7.2 の `affinity_defer`・D-60-2）。
+   * 猶予の待機に入ったことを1行残す（`affinity_defer`）。
    *
    * **表は1バイトも変えない。** この行は「バインドが変わらなかった」ことの記録であり、
-   * 全損（§7.4 の遷移回数）には数えない。書き込み口を `note()` と分けているのは、
+   * 全損（遷移回数）には数えない。書き込み口を `note()` と分けているのは、
    * 猶予が結び付け先を動かさないことをこのクラスの側でも構造で示すためである。
    *
    * @param {unknown} key セッション鍵。
@@ -273,11 +273,11 @@ export class SessionAffinity {
   }
 
   /**
-   * TTL 切れ・容量超過・台帳から消えた口座を表から落とす（§3・§8.1）。
+   * TTL 切れ・容量超過・台帳から消えた口座を表から落とす。
    *
    * @param {{now?:number, knownAccountIds?:Iterable<string>|null}|number} [options]
    *   `knownAccountIds` を渡したときだけ、台帳に残っていない口座へのバインドも落とす
-   *   （reload 直後の掃除・§8.1）。渡さなければ TTL と容量だけを見る。
+   *   （reload 直後の掃除）。渡さなければ TTL と容量だけを見る。
    * @returns {Array<{sid:string, account:string, reason:string, ageMs:number}>} 落としたもの。
    */
   prune(options = {}) {
@@ -287,7 +287,7 @@ export class SessionAffinity {
     const evicted = [];
 
     for (const [hash, entry] of [...this.entries]) {
-      // F4 の丸めは保持中でも行うので、判定は必ず expired() を通す。
+      // 時計の逆行の丸めは保持中でも行うので、判定は必ず expired() を通す。
       if (this.expired(entry, now) && !held(entry)) {
         evicted.push(this.dropEntry(hash, entry, 'ttl', now));
         continue;
@@ -311,7 +311,7 @@ export class SessionAffinity {
   }
 
   /**
-   * 資格情報が別物になった口座・台帳から消えた口座のバインドを落とす（§8.1・D-60-3・F3）。
+   * 資格情報が別物になった口座・台帳から消えた口座のバインドを落とす。
    * 基本バインドが該当すればセッションごと、系統別副バインドが該当すればその副バインドだけ。
    *
    * @param {Iterable<string>|string|null} ids 対象の口座 ID。
@@ -340,8 +340,8 @@ export class SessionAffinity {
   }
 
   /**
-   * 応答が終わるまで表の行を保持する（§9 F9）。長時間 SSE の途中で TTL・容量の退避に
-   * 落とされると、確定（§4.4 ②）が行を見失い、次の要求が別の口座へ載る。
+   * 応答が終わるまで表の行を保持する。長時間 SSE の途中で TTL・容量の退避に
+   * 落とされると、確定が行を見失い、次の要求が別の口座へ載る。
    * 戻り値は解放する関数で、二重に呼んでも保持数は負にならない。
    * `close` / `abort` を含む応答終了で**必ず**呼ぶこと。
    *
@@ -362,8 +362,8 @@ export class SessionAffinity {
   }
 
   /**
-   * 設定の再正規化（§6 の reload）で上限が変わったときに、その場で表へ反映する。
-   * `maxSessions` を縮めたときは即 LRU で切り詰める（§3）。
+   * 設定の再正規化（reload）で上限が変わったときに、その場で表へ反映する。
+   * `maxSessions` を縮めたときは即 LRU で切り詰める。
    *
    * @param {{idleTtlMs?:number, maxSessions?:number, warmTtlMs?:number}} [limits]
    * @param {{now?:number}} [options]
@@ -373,20 +373,20 @@ export class SessionAffinity {
     if (maxSessions !== undefined) this.maxSessions = positiveInteger(maxSessions, this.maxSessions);
     if (warmTtlMs !== undefined) this.warmTtlMs = positiveInteger(warmTtlMs, this.warmTtlMs);
     const evicted = this.prune({ now });
-    // reload は稀なので、窓が変わったときは増分更新ではなく全件で数え直す（P-c）。
+    // reload は稀なので、窓が変わったときは増分更新ではなく全件で数え直す。
     this.resyncWarm(now);
     return evicted;
   }
 
   /**
-   * 正規化し直した設定を表へ反映する（§6 の reload）。
+   * 正規化し直した設定を表へ反映する（reload）。
    * `off` へ落ちるときは表を破棄して `affinity_disabled sessions=<n>` を1行だけ残す
    * （設定値そのものはログへ出さない）。`off` から有効化するときは空表から開始する。
    * それ以外は上限を入れ直すだけで、結び付け先は保つ。
    *
    * @param {object} settings 生の `config.sessionAffinity` でも正規化済みでもよい。
    * @param {{previousMode?:string, now?:number}} [options] 直前のモード。**既定はインスタンスが
-   *   覚えている現在のモード**（FU-69・D-175）——結線側の渡し忘れで `affinity_disabled` が
+   *   覚えている現在のモード**——結線側の渡し忘れで `affinity_disabled` が
    *   消えないように、明示されたときだけそちらを優先する。
    * @returns {{mode:string, previousMode:string, cleared:number, evicted:Array}}
    */
@@ -418,12 +418,12 @@ export class SessionAffinity {
   }
 
   /**
-   * status 出力用の集計（§7.3）。
+   * status 出力用の集計。
    * `sessionsByAccount` は「その口座に結び付いているセッション数」であり、系統別副バインドで
    * 1セッションが2口座に数えられるため、**合計はセッション総数と一致しない**。
    *
    * `warmSessionsByAccount` はそのうち「最後に触れてから `warmTtlMs` 以内」のものだけを
-   * 数えた数である（設計書 v1.7 §3・P-c）。**総数側 `sessionsByAccount` は従来どおり全件を
+   * 数えた数である。**総数側 `sessionsByAccount` は従来どおり全件を
    * 数える**——冷えたセッションも表には残っており、status で「何本が表にいるか」と
    * 「何本がまだキャッシュを持っていそうか」は別々に読めたほうがよい。
    *
@@ -450,8 +450,8 @@ export class SessionAffinity {
   }
 
   /**
-   * 選択側（`AccountManager.selectForNewAssignment`）が要求ごとに読む温かいバインド数
-   * （設計書 v1.7 P-a・P-c）。O(口座数) の複製を返すので、受け取った側が書き換えても
+   * 選択側（`AccountManager.selectForNewAssignment`）が要求ごとに読む温かいバインド数。
+   * O(口座数) の複製を返すので、受け取った側が書き換えても
    * 内部の数は壊れない。**表の全件走査はしない。**
    *
    * @returns {Map<string,number>}
@@ -461,7 +461,7 @@ export class SessionAffinity {
   }
 
   /**
-   * 冷えた行を温かい数から落とす（設計書 v1.7 P-c の遅延償却）。
+   * 冷えた行を温かい数から落とす（遅延償却）。
    *
    * 「冷えた」は事象を伴わないので、増分更新だけでは数が減らない。表の順序は
    * recency（古い順）なので、**先頭から見て最初に温かい行が来たらそこで止められる**
@@ -472,7 +472,7 @@ export class SessionAffinity {
    * @returns {number} 温かい数から落とした行数。
    */
   /**
-   * 要求1本ぶんの償却（設計書 v1.7 P-c）。`WARM_SWEEP_REQUEST_INTERVAL` 本に1回だけ
+   * 要求1本ぶんの償却。`WARM_SWEEP_REQUEST_INTERVAL` 本に1回だけ
    * `pruneWarm()` を呼ぶ。結線側はこれを鍵のある要求ごとに1回呼ぶだけでよい。
    *
    * @param {number} [now]
@@ -497,9 +497,9 @@ export class SessionAffinity {
   }
 
   /**
-   * `runtime-state.json` へ相乗りさせる表のスナップショット（§8）。
+   * `runtime-state.json` へ相乗りさせる表のスナップショット。
    * 含めるのは ①12桁ハッシュ ②口座ラベル ③系統別副バインド ④epoch ms ⑤切替回数だけで、
-   * 秘密・メールアドレス・生 UUID は含まない。**世代番号 `gen` は保存しない**（D-60-1）。
+   * 秘密・メールアドレス・生 UUID は含まない。**世代番号 `gen` は保存しない**。
    */
   export({ now = this.now() } = {}) {
     const entries = [];
@@ -514,12 +514,12 @@ export class SessionAffinity {
   }
 
   /**
-   * 保存した表を読み戻す（§8 の破棄条件・§8.1・F1）。
+   * 保存した表を読み戻す。
    * 該当分を捨てるだけで、**起動は必ず成功させる**。
    *
    * 破棄条件: ①`version` 不一致 ②`savedAt` が未来（時計逆行） ③口座が現台帳に無い
    * ④`now - t > idleTtlMs` ⑤`maxSessions` 超過分（`t` 降順で残す）
-   * ⑥`credentialIdentityChanged` が真だった口座（D-60-3・F3）。
+   * ⑥`credentialIdentityChanged` が真だった口座。
    *
    * @param {object|null} saved 保存された `sessionAffinity` セクション。
    * @param {{accountManager?:{accounts?:Array}|null, knownAccountIds?:Iterable<string>|null,
@@ -536,7 +536,7 @@ export class SessionAffinity {
   } = {}) {
     const dropped = { unknown_account: 0, ttl: 0, capacity: 0, credential_changed: 0 };
     const skip = reason => {
-      // F1: 壊れた保存データの本文はログへ出さない。理由コードだけを1行。
+      // 壊れた保存データの本文はログへ出さない。理由コードだけを1行。
       this.write(now, `affinity_restore skipped=${reason}`);
       return { restored: 0, skipped: reason, dropped };
     };
@@ -576,7 +576,7 @@ export class SessionAffinity {
       const savedFamilies = record.f && typeof record.f === 'object' ? record.f : {};
       for (const [family, accountId] of Object.entries(savedFamilies)) {
         if (typeof accountId !== 'string' || accountId.length === 0) continue;
-        // 副バインドだけが該当するときは、その副バインドを落として home は残す（D-63 C2）。
+        // 副バインドだけが該当するときは、その副バインドを落として home は残す。
         if (changed.has(accountId)) continue;
         if (known && !known.has(accountId)) continue;
         families[family] = accountId;
@@ -599,7 +599,7 @@ export class SessionAffinity {
     }
 
     usable.sort((left, right) => right.entry.lastSeen - left.entry.lastSeen);
-    // 空の表へ読み戻すのが通常（起動時・§8.1）。すでに何か入っている表へ読み戻すときは、
+    // 空の表へ読み戻すのが通常（起動時）。すでに何か入っている表へ読み戻すときは、
     // 生きているエントリを押し出さないよう空き分だけを復元する。
     const room = Math.max(0, this.maxSessions - this.entries.size);
     if (usable.length > room) {
@@ -610,9 +610,9 @@ export class SessionAffinity {
     for (const { hash, entry } of usable.reverse()) this.entries.set(hash, entry);
     // 非空の表へ読み戻すと、すでに入っている行（多くはいま触られたばかり）が挿入順の
     // 先頭に残り、そこへ古い復元分が後ろから並ぶ。`trimToCapacity` は先頭を最も古い行と
-    // みなすので、そのままでは生きているセッションのほうが先に落ちる（FU-54）。
+    // みなすので、そのままでは生きているセッションのほうが先に落ちる。
     this.sortByRecency();
-    // 復元した行の `lastSeen` は過去なので、温かい数は入れ直した後に一度だけ数え直す（P-c）。
+    // 復元した行の `lastSeen` は過去なので、温かい数は入れ直した後に一度だけ数え直す。
     this.resyncWarm(now);
 
     return { restored: usable.length, skipped: null, dropped };
@@ -624,13 +624,13 @@ export class SessionAffinity {
     const entry = this.entries.get(hash);
     if (!entry) return null;
     if (!this.expired(entry, now)) return entry;
-    // F9: 応答中の行は落とさない。解放されてから次の掃除で落ちる。
+    // 応答中の行は落とさない。解放されてから次の掃除で落ちる。
     if (held(entry)) return entry;
     this.dropEntry(hash, entry, 'ttl', now);
     return null;
   }
 
-  // F4: 時計が逆行したらエントリを捨てず `lastSeen` を now へ丸め、経過時間は
+  // 時計が逆行したらエントリを捨てず `lastSeen` を now へ丸め、経過時間は
   // Math.max(0, …) で測る（負の経過時間で全消ししない）。
   // 数でない最後の使用時刻は、比べると常に偽になって行が残り続けるので、期限切れかつ冷えているとみなす。
   expired(entry, now) {
@@ -639,7 +639,7 @@ export class SessionAffinity {
     return now - entry.lastSeen > this.idleTtlMs;
   }
 
-  // --- 温かいバインド数（設計書 v1.7 P-c）--------------------------------
+  // --- 温かいバインド数 --------------------------------------------------
   //
   // `entry.warm` は「この行がいま `warmCounts` に載っているか」を表す真偽値で、
   // 数の増減は必ずこの旗を通る。旗を持たせているのは、口座が変わる編集
@@ -702,14 +702,14 @@ export class SessionAffinity {
     this.touch(hash, entry, now);
     const bound = boundAccount(entry, modelFamily);
     if (bound === account) return result(hash, account, entry, 'bound', null, reason);
-    // 予約で口座が変わるのは、選択側が新しい結び付け先を決めたときである（§4.1）。
+    // 予約で口座が変わるのは、選択側が新しい結び付け先を決めたときである。
     return this.rebind(hash, entry, { account, modelFamily, reason, now, gen: entry.gen + 1 });
   }
 
   confirm(hash, entry, { account, modelFamily, reason, now, expectedGen }) {
     if (!entry || entry.gen !== expectedGen) {
       // 待っているあいだに別の要求が新しいバインドを作った。遅着した確定は捨て、
-      // この要求は送信済みの口座でそのまま完走させる（D-60-1）。
+      // この要求は送信済みの口座でそのまま完走させる。
       this.write(now, `affinity_stale sid=${hash} myGen=${expectedGen} curGen=${entry ? entry.gen : 'none'} dropped=${account}`);
       return {
         sid: hash,
@@ -726,7 +726,7 @@ export class SessionAffinity {
     const bound = boundAccount(entry, modelFamily);
     if (bound === account) return result(hash, account, entry, 'bound', null, reason);
     // 枠の枯渇由来のときだけ付け替える。一時障害（認証失敗・throttled・error・上流 5xx・
-    // 切断・timeout・短期レート制限）では表を書き換えない（D-63 C3・§4.3 の表）。
+    // 切断・timeout・短期レート制限）では表を書き換えない。
     if (!CONFIRM_REBIND_REASONS.has(reason)) return result(hash, bound, entry, 'bound', null, reason);
     return this.rebind(hash, entry, { account, modelFamily, reason, now, gen: expectedGen + 1 });
   }
@@ -734,13 +734,13 @@ export class SessionAffinity {
   rebind(hash, entry, { account, modelFamily, reason, now, gen }) {
     const from = boundAccount(entry, modelFamily);
     const slot = rebindSlot(entry, modelFamily, reason);
-    // 口座の集合が変わるので、先に古い集合ぶんを引いてから書き換える（P-c）。
+    // 口座の集合が変わるので、先に古い集合ぶんを引いてから書き換える。
     this.removeWarm(entry);
     if (slot === 'family') {
       entry.families[modelFamily] = account;
     } else {
       // home を付け替えるときは副バインドを破棄する——副バインドは home の系統別の
-      // 迂回先なので、home が移れば前提が変わる（§4.1・D-56-4）。
+      // 迂回先なので、home が移れば前提が変わる。
       entry.home = account;
       entry.families = {};
       entry.boundAt = now;
@@ -762,7 +762,7 @@ export class SessionAffinity {
 
   touch(hash, entry, now) {
     entry.lastSeen = now;
-    // 再訪で温まり直す。すでに温かければ何もしない（P-c）。
+    // 再訪で温まり直す。すでに温かければ何もしない。
     this.addWarm(entry);
     // Map の挿入順を recency として使う（LRU の退避が O(1) で済む）。
     this.entries.delete(hash);
@@ -770,7 +770,7 @@ export class SessionAffinity {
   }
 
   // 挿入順＝recency（古い順）を組み直す。`touch` は1行ずつ順序を保つが、`restore` は
-  // 複数行をまとめて入れるのでここで一度だけ整える（FU-54）。
+  // 複数行をまとめて入れるのでここで一度だけ整える。
   sortByRecency() {
     const ordered = [...this.entries].sort((left, right) => left[1].lastSeen - right[1].lastSeen);
     this.entries = new Map(ordered);
@@ -779,8 +779,8 @@ export class SessionAffinity {
   trimToCapacity(now, protectedHash = null) {
     const evicted = [];
     while (this.entries.size > this.maxSessions) {
-      // 古い順に、応答中（F9）でも作ったばかりでもない行を1つ選ぶ。候補が無ければ
-      // 容量超過を一時的に許す——要求は必ず通す方を優先する（R1）。
+      // 古い順に、応答中でも作ったばかりでもない行を1つ選ぶ。候補が無ければ
+      // 容量超過を一時的に許す——要求は必ず通す方を優先する。
       let victim = null;
       for (const candidate of this.entries) {
         if (candidate[0] === protectedHash || held(candidate[1])) continue;
@@ -808,7 +808,7 @@ export class SessionAffinity {
     return { sid: hash, account, reason: label, ageMs };
   }
 
-  // 表が変わったことを結線側へ知らせる（設計書 §8 の dirty）。通知そのものが失敗しても
+  // 表が変わったことを結線側へ知らせる（永続化の dirty 判定）。通知そのものが失敗しても
   // HTTP 処理を巻き添えにしない——永続化は次の書き込みで必ず追いつく。
   markChanged() {
     if (!this.onChange) return;
@@ -825,14 +825,14 @@ export class SessionAffinity {
   }
 }
 
-// F9 の保持数。復元・保存には現れない（`export` は項目を明示して組み立てる）。
+// 応答中の保持数。復元・保存には現れない（`export` は項目を明示して組み立てる）。
 function held(entry) {
   return (entry.holds ?? 0) > 0;
 }
 
 // その行が結び付いている口座の集合（重複なし）。`sessionsByAccount` と
 // `warmSessionsByAccount` は必ずこれを通して数える——2箇所で数え方がずれると、
-// 片方だけ「1セッションが2回」になる（設計書 §7.3）。
+// 片方だけ「1セッションが2回」になる。
 function entryAccounts(entry) {
   return new Set([entry.home, ...Object.values(entry.families)]);
 }
@@ -856,9 +856,9 @@ function boundAccount(entry, modelFamily) {
   return sub ?? entry.home;
 }
 
-// 付け替える範囲は「いま使えなかった結び付け先」に限る（D-63 C2）。
+// 付け替える範囲は「いま使えなかった結び付け先」に限る。
 // 当該系統の副バインドが使われていたならその副バインドだけを、home が使われていたなら
-// home を付け替える。系統枠だけが枯れたときは副バインドを新しく1つ作る（D-54-3）。
+// home を付け替える。系統枠だけが枯れたときは副バインドを新しく1つ作る。
 function rebindSlot(entry, modelFamily, reason) {
   if (!modelFamily) return 'home';
   if (reason === 'family_exhausted') return 'family';

@@ -2459,7 +2459,7 @@ describe('createProxyServer', () => {
       'Bearer access-token-1',
       'Bearer live-current-token',
     ]);
-    // 反応的確認が確定したのは Fable の系統枠だけなので、R-S2b（設計書 §5.1）により
+    // 反応的確認が確定したのは Fable の系統枠だけなので、
     // この要求だけが `current` へ流れ、currentIndex は acct_1 に残る。
     // 再生先の資格情報を実口座から読めることを押さえるのがこのテストの主旨で、そこは不変。
     assert.equal(accountManager.getStatus().currentAccount, 'acct_1');
@@ -4295,7 +4295,7 @@ describe('createProxyServer', () => {
     }, 'cause=Error のような中身のない原因を画面へ出さない');
   });
 
-  // (c) 母艦裁定 C-20260915-3F-03。上のテストと同じ「古い失敗を後から適用する」経路で、
+  // (c) 上のテストと同じ「古い失敗を後から適用する」経路で、
   // 記録される検出時刻が「適用した時刻」ではなく「実際に失敗を見た時刻」であることを見る。
   // 適用は newer な観測が片付くまで待たされるので、適用時に時計を読むと、口座が落ちた
   // 時刻が実際より後ろにずれて記録されてしまう。
@@ -9074,8 +9074,8 @@ describe('createProxyServer', () => {
 });
 
 // ---------------------------------------------------------------------------
-// R3-2 の配線: degradeMapping の config-notice を起動時と /internal/reload 時に出す
-// （設計書 §7.2・§7.3-4）。通知文言そのものの検査は test/openai-bridge.test.js 側にあり、
+// 配線: degradeMapping の config-notice を起動時と /internal/reload 時に出す
+// 通知文言そのものの検査は test/openai-bridge.test.js 側にあり、
 // ここでは「本番の呼び出し元が実在すること」と「既定構成では1行も出ないこと」だけを固定する。
 // ---------------------------------------------------------------------------
 describe('openai-bridge degradeMapping config-notice の配線', () => {
@@ -9108,7 +9108,7 @@ describe('openai-bridge degradeMapping config-notice の配線', () => {
   });
 
   it('starts and stays silent when the config still has the two keys an earlier version read for the Codex block of status', async () => {
-    // 本番の設定と同じ形の合成の設定（旧い2つのキーが残ったもの）。名前は組み立てて書く（以前の版の
+    // 実際の設定にありうる形の合成の設定（旧い2つのキーが残ったもの）。名前は組み立てて書く（以前の版の
     // キーの名前が src・test・README に1つも残っていないことを grep で確かめるため）。
     const logLines = [];
     const proxy = await startProxy({
@@ -9275,14 +9275,13 @@ async function requestJson(url, options = {}) {
 }
 
 // ---------------------------------------------------------------------------
-// R3-4 の配線: GPT プール状態の生成・受け渡しと、/internal/reload での破棄
-// （設計書 §11.1 R3-4）。
+// 配線: GPT プール状態の生成・受け渡しと、/internal/reload での破棄。
 //
 // 状態機械そのものの検査は test/degrade-state.test.js と test/openai-bridge.test.js に
 // あり、ここでは「本番の生成元・受け渡し・reload での破棄が実在すること」だけを固定する。
-// 既存ケースは1件も削除・書換しない（§14.4）。以下はすべて新規追加である。
+// 既存ケースは1件も削除・書換しない。以下はすべて新規追加である。
 // ---------------------------------------------------------------------------
-describe('openai-bridge の GPT プール状態の配線 (R3-4)', () => {
+describe('openai-bridge の GPT プール状態の配線', () => {
   // 契約ヘッダ付きの 529（＝(pool) を unusable にする）と、契約ヘッダ無しの 200
   // （＝学習しないので、そのとき保持している状態がログにそのまま出る）を切り替える偽 bridge。
   async function startContractBridge() {
@@ -9365,7 +9364,7 @@ describe('openai-bridge の GPT プール状態の配線 (R3-4)', () => {
     );
   });
 
-  it('creates no pool state at all while degradeMapping is disabled (§14.4)', async () => {
+  it('creates no pool state at all while degradeMapping is disabled', async () => {
     const bridge = await startContractBridge();
     cleanupAfterTest(async () => close(bridge.server));
     const logLines = [];
@@ -9433,15 +9432,14 @@ describe('openai-bridge の GPT プール状態の配線 (R3-4)', () => {
 });
 
 // ---------------------------------------------------------------------------
-// R4-1 の配線: Claude 側台帳の判定を gpt-* 経路へ「関数」で渡す
-// （設計書 §11.1 R4-1 の補足・§4.2）。
+// 配線: Claude 側台帳の判定を gpt-* 経路へ「関数」で渡す。
 //
 // 書換の判定そのものは test/degrade-state.test.js と test/openai-bridge.test.js が
 // 網羅している。ここでは「本番の呼び出しが台帳を実際に見ていること」と
 // 「見る時点が応答受領時であること（要求ごとに評価し直すこと）」だけを固定する。
-// 既存ケースは1件も削除・書換しない（§14.4）。以下はすべて新規追加である。
+// 既存ケースは1件も削除・書換しない。以下はすべて新規追加である。
 // ---------------------------------------------------------------------------
-describe('openai-bridge へ渡す Claude 側台帳の判定 (R4-1 / 設計書 §4.2)', () => {
+describe('openai-bridge へ渡す Claude 側台帳の判定', () => {
   // 全口座枯渇（scope=pool の 529）を常に返す偽 bridge。
   async function startExhaustedBridge() {
     return listen(http.createServer((req, res) => {
@@ -9515,18 +9513,18 @@ describe('openai-bridge へ渡す Claude 側台帳の判定 (R4-1 / 設計書 §
     );
     assert.match(lastBridgeLine(), /outcome=forwarded-mapped /);
     assert.match(lastBridgeLine(), /claudePoolState=all-exhausted mappedFrom=529 .*mappedTo=403 mapReason=both_pools_unusable/);
-    assert.match(lastBridgeLine(), / status=403 .*upstreamStatus=429/, '実際の上流ステータスを同じ行に残す（受入条件7）');
+    assert.match(lastBridgeLine(), / status=403 .*upstreamStatus=429/, '実際の上流ステータスを同じ行に残す');
   });
 
   it('never rewrites while no account is registered at all (インストール直後の保険)', async () => {
     const logLines = [];
     const { askAstra, lastBridgeLine } = await startProxyFor({ accounts: [], logLines });
 
-    assert.equal((await askAstra()).status, 529, '口座0件は「全枯渇」とみなさない（設計書 §4.2）');
+    assert.equal((await askAstra()).status, 529, '口座0件は「全枯渇」とみなさない');
     assert.match(lastBridgeLine(), /claudePoolState=available/);
   });
 
-  it('passes no ledger probe at all while degradeMapping is disabled (§14.4)', async () => {
+  it('passes no ledger probe at all while degradeMapping is disabled', async () => {
     const logLines = [];
     const { accountManager, askAstra, lastBridgeLine } = await startProxyFor({
       accounts: [{ id: 'acct_1', name: 'a@example.com', type: 'oauth' }],
@@ -9563,15 +9561,15 @@ describe('openai-bridge へ渡す Claude 側台帳の判定 (R4-1 / 設計書 §
 });
 
 // ---------------------------------------------------------------------------
-// R4-2 / R4-3 / R4-4 / R4-6 の配線: Claude 全枯渇の 429 を 529（両プールとも利用
+// 配線: Claude 全枯渇の 429 を 529（両プールとも利用
 // 不可なら 403）へ写像する単一判定関数 mapClaudeExhaustion を、429 を書き出す
-// 7系統すべて（設計書 §4.2 の P-a〜P-g）へ結線したこと。
+// 7系統すべて（以下 P-a〜P-g と呼ぶ）へ結線したこと。
 //
 // 判定そのものの検査は test/degrade-state.test.js にあり、ここでは「本番の各終端
-// 経路が実際にその1関数を通ること」を実 TCP で固定する（設計書 §11.3 受入条件
-// 4-a〜4-g・5-a〜5-c）。既存ケースは1件も削除・書換していない（§14.4）。
+// 経路が実際にその1関数を通ること」を実 TCP で固定する（試験名の 4-a〜4-g は経路 P-a〜P-g、
+// 4-i は 403 への切り替え、5-a〜5-c は写像しない場合）。既存ケースは1件も削除・書換していない。
 // ---------------------------------------------------------------------------
-describe('Claude 全枯渇 429 の 529 写像を7系統へ結線する (R4-2/R4-3/R4-4/R4-6 / 設計書 §4.2)', () => {
+describe('Claude 全枯渇 429 の 529 写像を7系統へ結線する', () => {
   const ENABLED = { enabled: true };
 
   async function startProxy({
@@ -9616,16 +9614,16 @@ describe('Claude 全枯渇 429 の 529 写像を7系統へ結線する (R4-2/R4-
     timeoutMs: 3_000,
   });
 
-  // 写像したときだけ出る痕跡（degradeLog）。R4-5 で暫定行を廃止し、その要求の proxy ログ行へ併記する形にしたので、ここも proxy 行を見る。
+  // 写像したときだけ出る痕跡（degradeLog）。暫定行は廃止し、その要求の proxy ログ行へ併記する形にしたので、ここも proxy 行を見る。
   // **proxy ログ行を持たない経路（P-b / P-g）では痕跡が残らない**ため、
   // それらのケースは応答（status・上流が付けた x-path-test ヘッダ）で経路を固定する。
-  // P-d は R-S9b（母艦裁定 D-197）で proxy 行を持つようになった（下の 4-d 2件）。
+  // P-d は写像したときだけ proxy 行を持つ（下の 4-d 2件）。
   const mapLines = logLines => logLines.filter(line => / proxy account=/.test(line) && /mapReason=/.test(line));
   const lastMapLine = logLines => mapLines(logLines).at(-1);
 
   const exhaustedBody = '{"type":"error","error":{"type":"overloaded_error"}}';
 
-  // (pool)=unusable を学習させるための偽 bridge（契約 §C10.3 T3）。
+  // (pool)=unusable を学習させるための偽 bridge（x-ombr-* の取り決めのヘッダ付きで、プールの枯渇を知らせる 529 を返す）。
   async function startExhaustedBridge() {
     const bridge = await listen(http.createServer((req, res) => {
       req.resume();
@@ -9659,7 +9657,7 @@ describe('Claude 全枯渇 429 の 529 写像を7系統へ結線する (R4-2/R4-
   }
 
   // -------------------------------------------------------------------------
-  // R4-2: P-a（局所合成の 429）と P-d（sendUnavailableAccounts の 429 分岐）
+  // P-a（局所合成の 429）と P-d（sendUnavailableAccounts の 429 分岐）
   // -------------------------------------------------------------------------
 
   it('4-a: maps the locally synthesised quota 429 (P-a) to 529 overloaded_error', async () => {
@@ -9691,7 +9689,7 @@ describe('Claude 全枯渇 429 の 529 写像を7系統へ結線する (R4-2/R4-
     assert.equal(
       response.headers['content-length'],
       String(Buffer.byteLength(response.bodyText)),
-      'Content-Length は写像後の本文長へ入れ替える（§8.7 手順3）',
+      'Content-Length は写像後の本文長へ入れ替える',
     );
   });
 
@@ -9712,19 +9710,19 @@ describe('Claude 全枯渇 429 の 529 写像を7系統へ結線する (R4-2/R4-
     assert.equal(response.status, 529);
     assert.equal(response.body.error.type, 'overloaded_error');
     assert.deepEqual(seen, []);
-    // R-S9b（母艦裁定 D-197）でこの経路にも痕跡が残るようになった。R4-5 の時点では
+    // 写像したときはこの経路にも痕跡が残る。以前の実装では
     // P-d は proxy ログ行を1行も持たず、写像したことがログのどこにも出なかった。
     const pdLines = logLines.filter(line => / proxy account=/.test(line));
-    assert.equal(pdLines.length, 1, 'P-d の痕跡は1行だけ（R-S9b）');
+    assert.equal(pdLines.length, 1, 'P-d の痕跡は1行だけ');
     assert.match(pdLines[0], /mapPath=d rotatorReason=quota_exhausted$/);
   });
 
-  // 【R-S9】この経路の期待値は 503 → 529 へ変わった（設計書 §5.3(d)・§14.2 案イ・
-  // 坂根氏の判断⑤(e)）。全滅台帳の終端が口座の個別 state で 503 に化けると、529 を
-  // fallbackModel の発火条件にしている bridge 側で退避が働かないためである（I-6・
-  // D-67-2）。503 は「写像しないと決まったとき」だけ残る（同 describe の 5-b 群と、
-  // 「全滅時の終端応答を写像入口へ揃える (R-S9 …)」describe が押さえる）。
-  it('4-d: routes the credential branch of P-d through the mapper as well (R-S9 / I-6)', async () => {
+  // この経路の期待値は 503 ではなく 529 である。
+  // 全滅台帳の終端が口座の個別 state で 503 に化けると、529 を
+  // fallbackModel の発火条件にしている bridge 側で退避が働かないためである。
+  // 503 は「写像しないと決まったとき」だけ残る（同 describe の 5-b 群と、
+  // 「全滅時の終端応答を写像入口へ揃える 」describe が押さえる）。
+  it('4-d: routes the credential branch of P-d through the mapper as well', async () => {
     const { upstream } = await startUnusedUpstream();
     const accountManager = new AccountManager({
       accounts: [{ id: 'acct_1', type: 'oauth' }],
@@ -9736,16 +9734,16 @@ describe('Claude 全枯渇 429 の 529 写像を7系統へ結線する (R4-2/R4-
 
     const response = await ask(proxy);
 
-    assert.equal(response.status, 529, '認証失敗でも全滅時の終端は写像入口を通す（I-6）');
+    assert.equal(response.status, 529, '認証失敗でも全滅時の終端は写像入口を通す');
     assert.equal(response.body.error.type, 'overloaded_error');
-    // R-S9b（母艦裁定 D-197）: 資格情報起因の全滅は理由まで痕跡に残す（4-d 上段と同じ1行）。
-    // D-199 で語彙を分割したので、認証失効は「人を呼ぶ」側の credential_login_required。
+    // 資格情報起因の全滅は理由まで痕跡に残す（4-d 上段と同じ1行）。
+    // 認証失効は、語彙のうち「人を呼ぶ」側の credential_login_required になる。
     const pdLines = logLines.filter(line => / proxy account=/.test(line));
-    assert.equal(pdLines.length, 1, 'P-d の痕跡は1行だけ（R-S9b）');
+    assert.equal(pdLines.length, 1, 'P-d の痕跡は1行だけ');
     assert.match(pdLines[0], /mapPath=d rotatorReason=credential_login_required$/);
   });
 
-  it('5-b: keeps the P-a response at 429 while degradeMapping is unset (§14.4)', async () => {
+  it('5-b: keeps the P-a response at 429 while degradeMapping is unset', async () => {
     const { upstream } = await startUnusedUpstream();
     const secretStore = new MemorySecretStore();
     await secretStore.set('acct_1', { accessToken: 'access-token-1' });
@@ -9784,9 +9782,9 @@ describe('Claude 全枯渇 429 の 529 写像を7系統へ結線する (R4-2/R4-
   });
 
   it('5-a: never maps the P-a 429 while an un-polled peer account is still usable', async () => {
-    // acct_2 は使用量が未取得なので switchTargetScore() は null を返す（R-10）。
+    // acct_2 は使用量が未取得なので switchTargetScore() は null を返す。
     // getRoutingAvailability().state を判定根拠にすると「使えない」と誤判定して
-    // 過剰に 529 を返すが、isAvailable() を根拠にすれば写像は起きない（設計書 §4.2）。
+    // 過剰に 529 を返すが、isAvailable() を根拠にすれば写像は起きない。
     const { upstream, seen } = await startUnusedUpstream();
     const secretStore = new MemorySecretStore();
     await secretStore.set('acct_1', { accessToken: 'access-token-1' });
@@ -9818,11 +9816,11 @@ describe('Claude 全枯渇 429 の 529 写像を7系統へ結線する (R4-2/R4-
   });
 
   // -------------------------------------------------------------------------
-  // R4-3: P-b（lastRetryableResponse の再生）
+  // P-b（lastRetryableResponse の再生）
   // -------------------------------------------------------------------------
 
   // 反応的枠確認が「確認済み」になった後、唯一の再生先が選択前に throttled になり、
-  // 直前の上流 429 がそのまま再生される経路（設計書 §4.2 の P-b）。
+  // 直前の上流 429 がそのまま再生される経路（P-b）。
   async function runReactiveReplayScenario({ degradeMapping = ENABLED } = {}) {
     const upstreamSeen = [];
     const originalBody = {
@@ -9899,7 +9897,7 @@ describe('Claude 全枯渇 429 の 529 写像を7系統へ結線する (R4-2/R4-
     assert.match(
       replayLines[0],
       /^\d{4}-\d{2}-\d{2}T[\d:.]+Z claude-exhaustion-replay account=acct_1 method=POST path=\/v1\/messages status=529 durationMs=0 outcome=quota-exhausted-replay upstreamStatus=429 gptPoolState=unknown claudePoolState=all-exhausted mappedFrom=429 mappedFromType=rate_limit_error mappedTo=529 mapReason=all_claude_accounts_exhausted mapPath=b$/,
-      '既存 proxy 行と同じ形＋§9.3 の順序で写像フィールドを併記する',
+      '既存 proxy 行と同じ形＋決まった順序で写像フィールドを併記する',
     );
     assert.ok(
       logLines.indexOf(replayLines[0]) > logLines.findLastIndex(line => / proxy account=/.test(line)),
@@ -9939,11 +9937,11 @@ describe('Claude 全枯渇 429 の 529 写像を7系統へ結線する (R4-2/R4-
     assert.equal(
       response.headers['content-length'],
       String(Buffer.byteLength(response.bodyText)),
-      'content-* だけは写像後の本文に合わせて入れ替える（§8.7 手順2・3）',
+      'content-* だけは写像後の本文に合わせて入れ替える',
     );
   });
 
-  it('5-b: replays the upstream 429 unchanged while degradeMapping is unset (§14.4)', async () => {
+  it('5-b: replays the upstream 429 unchanged while degradeMapping is unset', async () => {
     const { response, originalBody, logLines } = await runReactiveReplayScenario({ degradeMapping: null });
 
     assert.equal(response.status, 429);
@@ -9958,11 +9956,11 @@ describe('Claude 全枯渇 429 の 529 写像を7系統へ結線する (R4-2/R4-
 
 
   // -------------------------------------------------------------------------
-  // R4-4: P-c（利用不可口座での実送信）と P-e（通常ローテーションの素通し）
+  // P-c（利用不可口座での実送信）と P-e（通常ローテーションの素通し）
   // -------------------------------------------------------------------------
 
   // markRateLimited 済みの単一口座＋資格情報あり ⇒ forwardCurrentUnavailableAccount が
-  // passthroughErrors:true で1回だけ実送信する（設計書 §4.2 の P-c）。
+  // passthroughErrors:true で1回だけ実送信する（P-c）。
   async function runUnavailableAccountSendScenario({
     upstreamStatus = 429,
     degradeMapping = ENABLED,
@@ -10026,7 +10024,7 @@ describe('Claude 全枯渇 429 の 529 写像を7系統へ結線する (R4-2/R4-
 
   // 通常ローテーション（passthroughErrors:false）で上流 429 を素通しする経路。
   // markRateLimited() が同じ応答の中で先に走るため、「台帳を全枯渇へ変える最後の
-  // 1件」がその場で写像される（設計書 §4.2 の P-e）。
+  // 1件」がその場で写像される（P-e）。
   async function runRateLimitPassthroughScenario({
     accounts,
     degradeMapping = ENABLED,
@@ -10091,7 +10089,7 @@ describe('Claude 全枯渇 429 の 529 写像を7系統へ結線する (R4-2/R4-
     assert.deepEqual(mapLines(logLines), []);
   });
 
-  it('5-b: passes the P-e 429 through byte-for-byte while degradeMapping is unset (§14.4)', async () => {
+  it('5-b: passes the P-e 429 through byte-for-byte while degradeMapping is unset', async () => {
     const { response, logLines, upstreamBody } = await runRateLimitPassthroughScenario({
       accounts: [{ id: 'acct_1', type: 'oauth' }],
       degradeMapping: null,
@@ -10111,7 +10109,7 @@ describe('Claude 全枯渇 429 の 529 写像を7系統へ結線する (R4-2/R4-
       warmBridge: true,
     });
 
-    assert.equal(response.status, 403, '529 では無言で固まる（M-6）ので明示停止する');
+    assert.equal(response.status, 403, '529 では無言で固まるので明示停止する');
     assert.equal(response.body.error.type, 'permission_error');
     assert.match(
       response.body.error.message,
@@ -10120,7 +10118,7 @@ describe('Claude 全枯渇 429 の 529 写像を7系統へ結線する (R4-2/R4-
     assert.equal(
       response.headers['content-length'],
       String(Buffer.byteLength(response.bodyText)),
-      '403 本文の長さと Content-Length が一致する（受入条件 4-j）',
+      '403 本文の長さと Content-Length が一致する',
     );
     assert.match(lastMapLine(logLines), /mapPath=e/);
     assert.match(lastMapLine(logLines), /gptPoolState=unusable /);
@@ -10128,7 +10126,7 @@ describe('Claude 全枯渇 429 の 529 写像を7系統へ結線する (R4-2/R4-
   });
 
   // -------------------------------------------------------------------------
-  // 403 昇格の根拠は「要求モデル系列の枯渇」ではなく「共通枠の枯渇」（設計書 §4.2）。
+  // 403 昇格の根拠は「要求モデル系列の枯渇」ではなく「共通枠の枯渇」。
   // Fable 週次サブキャップだけが全口座で切れている状態は、GPT プールが使えなくても
   // Opus へ退避できるので 529 に留める（403 にすると Claude Code が止まってしまう）。
   // -------------------------------------------------------------------------
@@ -10273,7 +10271,7 @@ describe('Claude 全枯渇 429 の 529 写像を7系統へ結線する (R4-2/R4-
   });
 
   // -------------------------------------------------------------------------
-  // R4-6: P-f（反応的枠確認が未確認に終わった再生）と P-g（reload で消えた口座）
+  // P-f（反応的枠確認が未確認に終わった再生）と P-g（reload で消えた口座）
   // -------------------------------------------------------------------------
 
   async function runReactivePendingScenario({ accounts, fableUtilization, degradeMapping = ENABLED }) {
@@ -10299,7 +10297,7 @@ describe('Claude 全枯渇 429 の 529 写像を7系統へ結線する (R4-2/R4-
     }
     const accountManager = new AccountManager({ accounts });
     // 先頭以外は再生先の候補になれるよう使用量を入れておく（switchTargetScore が
-    // null の口座は snapshotKnownAvailableAlternates が候補にしない＝R-10）。
+    // null の口座は snapshotKnownAvailableAlternates が候補にしない）。
     for (const account of accounts.slice(1)) {
       accountManager.updateQuota(account.id, { 'anthropic-ratelimit-unified-5h-utilization': '0.1' });
     }
@@ -10389,7 +10387,7 @@ describe('Claude 全枯渇 429 の 529 写像を7系統へ結線する (R4-2/R4-
     assert.equal(response.headers['x-path-test'], 'p-g1', '上流ヘッダが残るので経路を固定できる');
     // 台帳から消えた口座の要求は c0f79d4 の時点から proxy ログ行を出さない
     // （recordProxyRequest が accounts.includes(account) で守られている）ため、
-    // 痕跡の残し先が無い（R4-5 の残課題）。
+    // 痕跡の残し先が無い。
     assert.deepEqual(logLines.filter(line => / proxy account=/.test(line)), []);
   });
 
@@ -10406,7 +10404,7 @@ describe('Claude 全枯渇 429 の 529 写像を7系統へ結線する (R4-2/R4-
       String(Buffer.byteLength(response.bodyText)),
     );
     // 写像が2回起きれば本文が二重に書かれて上の2つが壊れる（res.headersSent 後は
-    // 写像しない＝§8.6）。P-g はログ行を持たないので、検証は応答側で行う。
+    // 写像しない）。P-g はログ行を持たないので、検証は応答側で行う。
     assert.equal(logLines.filter(line => /mapReason=/.test(line)).length, 0, 'P-g は痕跡行を持たない');
   });
 
@@ -10418,7 +10416,7 @@ describe('Claude 全枯渇 429 の 529 写像を7系統へ結線する (R4-2/R4-
     assert.deepEqual(mapLines(logLines), []);
   });
 
-  it('5-b: passes the stale 429 through while degradeMapping is unset (§14.4)', async () => {
+  it('5-b: passes the stale 429 through while degradeMapping is unset', async () => {
     const { response, logLines, upstreamBody } = await runStaleHeadScenario({ degradeMapping: null });
 
     assert.equal(response.status, 429);
@@ -10473,15 +10471,15 @@ describe('Claude 全枯渇 429 の 529 写像を7系統へ結線する (R4-2/R4-
     assert.equal(response.status, 529);
     assert.equal(response.body.error.type, 'overloaded_error');
     assert.equal(response.headers['x-path-test'], 'p-g2', '上流ヘッダが残るので経路を固定できる');
-    // P-g1 と同じく、台帳から消えた口座の要求は proxy ログ行を持たない（R4-5 の残課題）。
+    // P-g1 と同じく、台帳から消えた口座の要求は proxy ログ行を持たない。
     assert.deepEqual(logLines.filter(line => / proxy account=/.test(line)), []);
   });
 });
 
 // ---------------------------------------------------------------------------
-// 上流 529 overloaded を 429 ＋ Retry-After へ写像する（坂根氏 2026-09-18 の要件）。
+// 上流 529 overloaded を 429 ＋ Retry-After へ写像する。
 //
-// 「ハイデマンドで Fable 5.1 が使えない時は、リトライが走る 429 になるように」。
+// 高負荷でモデルが使えないときは、再試行が走る 429 にする。
 // Claude Code は 529 を3回で fallbackModel へ退避させるが、429 なら同じモデルのまま
 // 待って再試行する。ここでは偽 Anthropic 上流を立て、実 TCP で写像を固定する。
 //
@@ -10614,8 +10612,8 @@ describe('上流 529 overloaded の 429 写像 (upstreamOverloadTo429)', () => {
       '返した status（429）を行の status にする',
     );
     // 行末で閉じない。観測整備（PR #42）の `model= sid= in= …` が同じ行のこの後ろへ
-    // 付くので、`$` で留めると写像とは無関係な理由で落ちる（§7.1「追記は末尾で、
-    // 順序に依存しない読み方をすること」）。写像フィールドが連続していることは見る。
+    // 付くので、`$` で留めると写像とは無関係な理由で落ちる（追記は末尾で、
+    // 順序に依存しない読み方をする）。写像フィールドが連続していることは見る。
     assert.match(
       lines[0],
       / upstreamStatus=529 mappedFrom=529 mappedFromType=overloaded_error mappedTo=429 retryAfter=30 mapReason=claude_upstream_overloaded/,
@@ -10775,15 +10773,15 @@ describe('上流 529 overloaded の 429 写像 (upstreamOverloadTo429)', () => {
 });
 
 // ---------------------------------------------------------------------------
-// 段 2（母艦裁定 D-261・方式イ）: 全枯渇のとき合成 429 を 529 へ写像しない。
+// claudeExhaustedTo529: false のとき、全枯渇の合成 429 を 529 へ写像しない。
 //
 // 週次上限では「同じモデルのまま自動リトライ」させたい（`fallbackModel` は撤去済み）。
 // Claude Code は `anthropic-ratelimit-unified-*` の有無でプラン上限と一時スロットルを
 // 区別するので、rotator は答えを作り替えず**合成 429 をヘッダごと素通し**する。
-// 36 番設計の方式ア（429 ＋ Retry-After をクランプして合成する）は L1 で差し戻された。
+// 429 ＋ Retry-After をクランプして合成する形は採らない。
 // 既定（キー未指定・true）では現行どおり 529 へ写像し、応答もログも1バイト変わらない。
 // ---------------------------------------------------------------------------
-describe('全枯渇の 529 写像を止める (claudeExhaustedTo529 / D-261)', () => {
+describe('全枯渇の 529 写像を止める (claudeExhaustedTo529)', () => {
   const OFF = { enabled: true, claudeExhaustedTo529: false };
 
   async function startProxy({
@@ -10864,7 +10862,7 @@ describe('全枯渇の 529 写像を止める (claudeExhaustedTo529 / D-261)', (
     assert.equal(response.headers['anthropic-ratelimit-unified-reset'], '4070908800');
     assert.equal(response.headers['anthropic-ratelimit-unified-7d-utilization'], '1');
     assert.equal(response.headers['anthropic-ratelimit-unified-7d-reset'], '4070908800');
-    // 方式ア（撤回）で合成しようとしていたものは1つも付けない。
+    // rotator が作るヘッダ（Retry-After・写像専用ヘッダ）は1つも付けない。
     assert.equal(response.headers['retry-after'], undefined, 'Retry-After は合成しない');
     assert.equal(response.headers['x-claude-rotator-reason'], undefined, '写像専用ヘッダも付かない');
     assert.deepEqual(seen, [], '素通しでも上流へは送らない（口座台帳の判定だけで決める）');
@@ -10885,7 +10883,7 @@ describe('全枯渇の 529 写像を止める (claudeExhaustedTo529 / D-261)', (
   });
 
   it('picks the flag up and drops it again through POST /internal/reload', async () => {
-    // 切戻し手順（37 番 §6）の裏づけ: キー1つを戻して reload するだけで現行へ戻る。
+    // 切り戻しの裏づけ: キー1つを戻して reload するだけで現行へ戻る。
     let nextBridge = { enabled: false, degradeMapping: { enabled: true } };
     const { proxy } = await exhaustedProxy({
       degradeMapping: { enabled: true },
@@ -10912,14 +10910,14 @@ describe('全枯渇の 529 写像を止める (claudeExhaustedTo529 / D-261)', (
 });
 
 // ---------------------------------------------------------------------------
-// R4-5: 写像した要求の「既存の proxy ログ行」へ、写像フィールドを併記すること。
+// 写像した要求の「既存の proxy ログ行」へ、写像フィールドを併記すること。
 //
-// 設計書 §9.1「529 と偽装する以上、実際の上流ステータスを必ず同じ行に残す」
-// （受入条件7）を、暫定行ではなく本来のログ行で満たす。
-// 追記は §9.3 の順序で、値があるキーだけを末尾へ足す。写像しなかった要求と
-// degradeMapping を書いていない構成では、行は現行（c0f79d4）と文字列一致する（§14.4）。
+// 529 と偽装する以上、実際の上流ステータスを必ず同じ行に残す。これを、
+// 暫定行ではなく本来のログ行で満たす。
+// 追記は決まった順序で、値があるキーだけを末尾へ足す。写像しなかった要求と
+// degradeMapping を書いていない構成では、行は現行（c0f79d4）と文字列一致する。
 // ---------------------------------------------------------------------------
-describe('写像フィールドを既存の proxy ログ行へ併記する (R4-5 / 設計書 §9.3・§9.5)', () => {
+describe('写像フィールドを既存の proxy ログ行へ併記する', () => {
   const ENABLED = { enabled: true };
   // c0f79d4 時点の proxy 行の形（末尾に何も足さない）。requestId / errorType は
   // 任意なので、この正規表現は「追記フィールドが1つも無いこと」を見ている。
@@ -10951,7 +10949,7 @@ describe('写像フィールドを既存の proxy ログ行へ併記する (R4-5
         usagePolling: { enabled: false },
         openaiBridge: { ...bridge, ...(degradeMapping ? { degradeMapping } : {}) },
         // この describe が固定しているのは「degradeMapping が proxy 行を変えないこと」であって、
-        // キャッシュ観測の追記ではない。観測は既定 on（U-3）なので、明示的に切って
+        // キャッシュ観測の追記ではない。観測は既定 on なので、明示的に切って
         // degradeMapping だけを見る。観測を on にした行の形は
         // describe('cache observability') と test/invariance.test.js が固定する。
         observability: { requestLog: { enabled: false } },
@@ -11000,7 +10998,7 @@ describe('写像フィールドを既存の proxy ログ行へ併記する (R4-5
   }
 
   // P-e（通常ローテーションの素通し）。bridge を先に1往復させると (pool)=unusable を
-  // 学習し、同じ 429 が 403 へ写像される（設計書 §8.7）。
+  // 学習し、同じ 429 が 403 へ写像される。
   async function runPassthroughScenario({ accounts, degradeMapping = ENABLED, warmBridge = false } = {}) {
     const upstreamBody = JSON.stringify({
       type: 'error', error: { type: 'rate_limit_error', message: 'upstream throttled' },
@@ -11048,7 +11046,7 @@ describe('写像フィールドを既存の proxy ログ行へ併記する (R4-5
     return { response, logLines, upstreamBody };
   }
 
-  it('R4-5-1: keeps the real upstream status on the very line that returned 529 (P-a / 受入条件7)', async () => {
+  it('keeps the real upstream status on the very line that returned 529 (P-a)', async () => {
     const { response, logLines } = await runExhaustedAccountScenario();
 
     assert.equal(response.status, 529);
@@ -11056,12 +11054,12 @@ describe('写像フィールドを既存の proxy ログ行へ併記する (R4-5
     assert.match(
       line,
       / status=529 durationMs=\d+ outcome=quota-exhausted-local upstreamStatus=429 gptPoolState=unknown claudePoolState=all-exhausted mappedFrom=429 mappedFromType=rate_limit_error mappedTo=529 mapReason=all_claude_accounts_exhausted mapPath=a$/,
-      '返した status（529）と実際の上流ステータス（429）が同じ1行に並ぶ（§9.3 の順序）',
+      '返した status（529）と実際の上流ステータス（429）が同じ1行に並ぶ',
     );
     assert.equal(proxyLines(logLines).length, 1, 'P-a は行を増やさない（既存の1行へ併記する）');
   });
 
-  it('R4-5-2: records mappedTo=403, mapReason and resetAt when both pools are unusable', async () => {
+  it('records mappedTo=403, mapReason and resetAt when both pools are unusable', async () => {
     const { response, logLines } = await runPassthroughScenario({
       accounts: [{ id: 'acct_1', type: 'oauth' }],
       warmBridge: true,
@@ -11072,11 +11070,11 @@ describe('写像フィールドを既存の proxy ログ行へ併記する (R4-5
     assert.match(line, / status=403 /, '返した status が行の status になる');
     assert.match(line, / upstreamStatus=429 resetAt=\S+ gptPoolState=unusable claudePoolState=all-exhausted /);
     // mappedFromType はヘッダ送出点（P-c / P-e / P-g1）では本文がまだ届いていないので
-    // 出ない。「値があるキーだけを載せる」（§9.2）の当然の帰結である。
+    // 出ない。「値があるキーだけを載せる」の当然の帰結である。
     assert.match(line, /mappedFrom=429 mappedTo=403 mapReason=both_pools_unusable mapPath=e$/);
   });
 
-  it('R4-5-3: leaves a non-mapped 429 line exactly as it is today (§14.4)', async () => {
+  it('leaves a non-mapped 429 line exactly as it is today', async () => {
     const { response, logLines, upstreamBody } = await runPassthroughScenario({
       accounts: [{ id: 'acct_1', type: 'oauth' }, { id: 'acct_2', type: 'oauth' }],
     });
@@ -11092,7 +11090,7 @@ describe('写像フィールドを既存の proxy ログ行へ併記する (R4-5
     );
   });
 
-  it('R4-5-4: leaves every proxy line unchanged while degradeMapping is unset (§14.4)', async () => {
+  it('leaves every proxy line unchanged while degradeMapping is unset', async () => {
     const passthrough = await runPassthroughScenario({
       accounts: [{ id: 'acct_1', type: 'oauth' }],
       degradeMapping: null,
@@ -11106,7 +11104,7 @@ describe('写像フィールドを既存の proxy ログ行へ併記する (R4-5
     for (const line of lines) assert.match(line, LEGACY_PROXY_LINE);
   });
 
-  it('R4-5-5: no longer writes the interim claude-exhaustion-map line', async () => {
+  it('no longer writes the interim claude-exhaustion-map line', async () => {
     const { response, logLines } = await runExhaustedAccountScenario();
 
     assert.equal(response.status, 529, '写像そのものは起きている');
@@ -11115,16 +11113,16 @@ describe('写像フィールドを既存の proxy ログ行へ併記する (R4-5
 });
 
 // ---------------------------------------------------------------------------
-// R-S9b（母艦裁定 D-197。語彙は D-199 で分割した）: 写像後の 529 / 403 が「なぜ止まって
+// 写像後の 529 / 403 が「なぜ止まって
 // いるのか」を機械可読で名乗る。ヘッダは `x-claude-rotator-reason` の1本だけで、語彙は
 // 既存の分類をそのまま写した3値（`quota_exhausted` / `credential_cooldown` /
 // `credential_login_required`）。新しい分類は作らない。読み手が最初に知りたいのは
 // 「待てば回復するのか、人を呼ぶのか」なので、資格情報起因はそこで2つに割る。
 // あわせて、これまで proxy ログ行を1行も持たなかった P-d（sendUnavailableAccounts）に、
 // 写像したときだけ既存と同じ形の行を1行出す（末尾に mapPath=d と rotatorReason）。
-// degradeMapping を書いていない構成では、ヘッダも行も1つも増えない（§14.4）。
+// degradeMapping を書いていない構成では、ヘッダも行も1つも増えない。
 // ---------------------------------------------------------------------------
-describe('写像後 529 の理由ヘッダと P-d の proxy 行 (R-S9b / 母艦裁定 D-197)', () => {
+describe('写像後 529 の理由ヘッダと P-d の proxy 行', () => {
   const ENABLED = { enabled: true };
   const REASON_HEADER = 'x-claude-rotator-reason';
 
@@ -11206,7 +11204,7 @@ describe('写像後 529 の理由ヘッダと P-d の proxy 行 (R-S9b / 母艦�
 
     const response = await ask(proxy);
 
-    assert.equal(response.status, 529, '資格情報の全滅でも終端は写像入口を通す（R-S9 / I-6）');
+    assert.equal(response.status, 529, '資格情報の全滅でも終端は写像入口を通す');
     assert.equal(response.headers[REASON_HEADER], 'credential_login_required');
     assert.deepEqual(seen, [], 'P-d は上流へ送らない');
     const lines = proxyLines(logLines);
@@ -11214,7 +11212,7 @@ describe('写像後 529 の理由ヘッダと P-d の proxy 行 (R-S9b / 母艦�
     assert.match(lines[0], / status=529 durationMs=0 outcome=unavailable-accounts-local/);
     assert.match(lines[0], /mapReason=all_claude_accounts_exhausted/);
     assert.match(lines[0], /mapPath=d rotatorReason=credential_login_required$/);
-    // D-199 (B): 行頭の時刻は実時計ではなく注入した時計（now: () => 1000）から取る。
+    // 行頭の時刻は実時計ではなく注入した時計（now: () => 1000）から取る。
     // 他の proxy 行（accountManager.recordProxyRequest）と同じ出所にしておかないと、
     // 時刻を固定したテストでこの行だけがずれる。
     assert.match(lines[0], /^1970-01-01T00:00:01\.000Z proxy account=acct_1 /);
@@ -11234,7 +11232,7 @@ describe('写像後 529 の理由ヘッダと P-d の proxy 行 (R-S9b / 母艦�
     assert.match(proxyLines(logLines).at(-1), /mapPath=d rotatorReason=quota_exhausted$/);
   });
 
-  it('9b-4: adds neither the header nor the P-d line while degradeMapping is unset (§14.4)', async () => {
+  it('9b-4: adds neither the header nor the P-d line while degradeMapping is unset', async () => {
     const { upstream } = await startUnusedUpstream();
     const accountManager = singleAccountManager();
     accountManager.markError('acct_1', 'authentication_error', 'OAuth token rejected');
@@ -11250,7 +11248,7 @@ describe('写像後 529 の理由ヘッダと P-d の proxy 行 (R-S9b / 母艦�
     assert.deepEqual(proxyLines(logLines), [], 'P-d のログ行も出ない');
   });
 
-  it('9b-5: leaves the P-a 429 without the header while degradeMapping is unset (§14.4)', async () => {
+  it('9b-5: leaves the P-a 429 without the header while degradeMapping is unset', async () => {
     const { upstream } = await startUnusedUpstream();
     const secretStore = new MemorySecretStore();
     await secretStore.set('acct_1', { accessToken: 'access-token-1' });
@@ -11271,7 +11269,7 @@ describe('写像後 529 の理由ヘッダと P-d の proxy 行 (R-S9b / 母艦�
   });
 
   // -------------------------------------------------------------------------
-  // D-199 (A): P-d の分類は `currentIndex` が指す1口座の理由ではなく、**全口座**の
+  // P-d の分類は `currentIndex` が指す1口座の理由ではなく、**全口座**の
   // `unavailableReason` を走査して決める。このヘッダの用途は「待てばよいのか、人を呼ぶ
   // のか」の機械判別なので、現在口座が枠切れでも別の口座が再ログイン待ちなら人を呼ぶ
   // 価値がある。優先は credential_login_required ＞ credential_cooldown ＞ quota_exhausted。
@@ -11434,7 +11432,7 @@ describe('account_switch trigger wiring', () => {
       secretStore,
       config: { upstream: upstream.url, usagePolling: { enabled: false } },
       // 反応的確認が確定させるのは共通枠（5h）の枯渇。系統枠だけの枯渇では
-      // R-S2b（設計書 §5.1）により currentIndex が動かず、切替行そのものが出ない。
+      // currentIndex が動かず、切替行そのものが出ない。
       usageFetcher: async () => ({
         five_hour: { utilization: 1, resets_at: futureReset() },
       }),
@@ -11500,7 +11498,7 @@ describe('account_switch trigger wiring', () => {
   });
 });
 
-describe('サブキャップ 429 の非対称の是正 (R-S2b / 設計書 §5.1)', () => {
+describe('サブキャップ 429 の非対称の是正', () => {
   function switchLines(logLines) {
     return logLines.filter(line => line.includes(' account_switch '));
   }
@@ -11700,14 +11698,15 @@ describe('サブキャップ 429 の非対称の是正 (R-S2b / 設計書 §5.1)
 });
 
 // ---------------------------------------------------------------------------
-// sticky affinity 本体の結線（R-S7 / 設計書 v1.5 §4.1・§4.4・§7.1・§7.2・§9 F9）
+// sticky affinity 本体の結線
 //
-// 統合①②③④⑥⑦⑫⑬⑯㉑ ＋ `fam=` 1件 ＋ F9 1件。
+// 試験名の頭の記号（①〜㉔・F9 など）は、このファイルの中で試験を指すための見出しである。
+// この describe の試験は ①②③④⑥⑦⑫⑬⑯㉑ ＋ `fam=` 1件 ＋ F9 1件。
 // 既存ケースは1件も削除・書換しない。`mode:"off"`（既定・未記載）では proxy 行が
 // 追加前とバイト同一であること（`fam` 用の1件で固定する）。
 // ---------------------------------------------------------------------------
-describe('session affinity wiring (R-S7)', () => {
-  // 末尾追記あり（§7.1）。sid は鍵を持つ要求だけに出る。
+describe('session affinity wiring', () => {
+  // 末尾追記あり。sid は鍵を持つ要求だけに出る。
   const AFFINITY_PROXY_LINE = /^\d{4}-\d{2}-\d{2}T[\d:.]+Z proxy account=\S+ method=\S+ path=\S+ status=\S+ durationMs=\d+ outcome=[a-z-]+(?: requestId=\S+)?(?: errorType=\S+)?(?: sid=[0-9a-f]{12})? aff=(?:new|bound|switch|none) fam=(?:fable|other)$/;
   // 追記が1つも無い現行の形（`mode:"off"` で守る）。
   const LEGACY_PROXY_LINE_RS7 = /^\d{4}-\d{2}-\d{2}T[\d:.]+Z proxy account=\S+ method=\S+ path=\S+ status=\S+ durationMs=\d+ outcome=[a-z-]+(?: requestId=\S+)?(?: errorType=\S+)?$/;
@@ -11731,7 +11730,7 @@ describe('session affinity wiring (R-S7)', () => {
   }
 
   // 資格情報の解決（`resolveSecretForAccount` の await）を任意の口座で止められる保管庫。
-  // 統合⑫（予約が無い実装なら2本目が別口座へ割れる）と⑯（遅着した確定）で使う。
+  // ⑫（予約が無い実装なら2本目が別口座へ割れる）と⑯（遅着した確定）で使う。
   class GatedSecretStore extends MemorySecretStore {
     constructor() {
       super();
@@ -11795,7 +11794,7 @@ describe('session affinity wiring (R-S7)', () => {
         usagePolling: { enabled: false },
         ...(sessionAffinity ? { sessionAffinity } : {}),
         // この describe が固定しているのは sticky の追記（sid=/aff=/fam=）と `mode:"off"` で
-        // 行が現行のままであることで、キャッシュ観測の追記ではない。観測は既定 on（U-3）で
+        // 行が現行のままであることで、キャッシュ観測の追記ではない。観測は既定 on で
         // 同じ行の**さらに末尾**へ足すので、ここは明示的に切って affinity だけを見る。
         // 観測を on にした行の形は describe('cache observability') と
         // test/invariance.test.js が固定する。
@@ -11832,7 +11831,7 @@ describe('session affinity wiring (R-S7)', () => {
     // 指していない口座）へ結び付く状態を作る。固定していなければ acct_a へ戻ってしまう。
     assert.equal((await ask({ sid: 'session-zero' })).status, 200);
     assert.equal((await ask({ sid: 'session-one' })).status, 200);
-    // 結び付け先の残枠が減り、他口座の残枠が上回っても既存セッションは動かない（R2）。
+    // 結び付け先の残枠が減り、他口座の残枠が上回っても既存セッションは動かない。
     accountManager.updateQuota('acct_a', { 'anthropic-ratelimit-unified-5h-utilization': '0.01' });
     accountManager.updateQuota('acct_b', { 'anthropic-ratelimit-unified-5h-utilization': '0.8' });
     for (let index = 0; index < 9; index += 1) {
@@ -11916,14 +11915,14 @@ describe('session affinity wiring (R-S7)', () => {
     const secretStore = new GatedSecretStore();
     const { ask, seen, accountManager, logLines } = await startAffinity({ secretStore });
 
-    // 先に別セッションを acct_a へ載せ、K3（バインド数の少ない口座）で acct_b が選ばれる
+    // 先に別セッションを acct_a へ載せ、バインド数の少ない口座として acct_b が選ばれる
     // 状態を作る。予約が無い実装では、2本目が独立に選び直して acct_a へ割れる。
     assert.equal((await ask({ sid: 'session-zero' })).status, 200);
 
     const release = secretStore.openGate('acct_b');
     const first = ask({ sid: 'session-one' }).catch(error => ({ error }));
     const firstWaited = await waitFor(() => secretStore.entered.length === 1);
-    // ② と同じ手法を足す（R-S7 の L1 申し送り）: 1本目がゲートで待つあいだに
+    // ② と同じ手法を足す: 1本目がゲートで待つあいだに
     // acct_a の残枠を acct_b より良くし、新規割当の帯を acct_a だけにする。確定1点だけの
     // 実装はここで 2本目が acct_a を選び直し、同じセッションが2口座へ割れる。
     accountManager.updateQuota('acct_a', { 'anthropic-ratelimit-unified-5h-utilization': '0.01' });
@@ -11989,7 +11988,7 @@ describe('session affinity wiring (R-S7)', () => {
     const first = ask({ sid: 'session-one' }).catch(error => ({ error }));
     const waited = await waitFor(() => secretStore.entered.length === 1);
 
-    // R1 が待っているあいだに acct_a の共通枠が枯れ、R2 が acct_b へ付け替える。
+    // 1本目（R1）が待っているあいだに acct_a の共通枠が枯れ、2本目（R2）が acct_b へ付け替える。
     accountManager.updateQuota('acct_a', {
       'anthropic-ratelimit-unified-5h-utilization': '1',
       'anthropic-ratelimit-unified-5h-reset': futureResetSeconds(),
@@ -12119,16 +12118,16 @@ describe('session affinity wiring (R-S7)', () => {
 });
 
 // ---------------------------------------------------------------------------
-// R-S8: 固定セッションの試行ループと終端（設計書 §4.1・§4.3・§4.5・§5.3(a)(b)）。
+// 固定セッションの試行ループと終端。
 //
 // 押さえるのは3点である。
 //   (a) 再バインドは重複ガードへ到達する前に終わっており、固定セッションの試行ループの
 //       上限は「バインド先1 ＋ 再バインド候補数」である（鍵の無い要求は口座総数のまま）。
-//   (b) 固定セッションの枯渇応答は `selectBestExhaustedFallback` を通らない（P-2）。
-//   (c) 付け替える範囲は「いま使えなかった結び付け先」だけである（D-63 C2）。
-// 加えて D-154（反応的 429 の周のうちに系統別の副バインドを作る）を固定する。
+//   (b) 固定セッションの枯渇応答は `selectBestExhaustedFallback` を通らない。
+//   (c) 付け替える範囲は「いま使えなかった結び付け先」だけである。
+// 加えて、反応的 429 の周のうちに系統別の副バインドを作ることを固定する。
 // ---------------------------------------------------------------------------
-describe('session affinity rebind and terminal (R-S8)', () => {
+describe('session affinity rebind and terminal', () => {
   function eventLines(logLines, kind) {
     return logLines.filter(line => line.includes(` ${kind} `));
   }
@@ -12167,7 +12166,7 @@ describe('session affinity rebind and terminal (R-S8)', () => {
   }
 
   /**
-   * `currentIndex` の全代入点を直接見張る（統合⑪・D-54-2 の再定義）。関数名ではなく
+   * `currentIndex` の全代入点を直接見張る（⑪ で使う）。関数名ではなく
    * インスタンスへの代入そのものを捕まえるので、7点のどれから書かれても記録に残る。
    */
   function watchCurrentIndex(accountManager) {
@@ -12263,7 +12262,7 @@ describe('session affinity rebind and terminal (R-S8)', () => {
   });
 
   it('⑪: a pinned request reaches none of the 7 currentIndex assignment points', async () => {
-    // まず「代入点は7点・6関数」という前提そのものを固定する（D-54-2 の再定義・§5.3(b)）。
+    // まず「代入点は7点・6関数」という前提そのものを固定する。
     // 8点目が増えたらこの行で落ちるので、見張りの網が実装より遅れない。
     const source = await readFile(
       resolve(dirname(fileURLToPath(import.meta.url)), '../src/account-manager.js'),
@@ -12352,7 +12351,7 @@ describe('session affinity rebind and terminal (R-S8)', () => {
     assert.deepEqual(assignments, [], '固定セッションの付け替えでは currentIndex は動かない');
     assert.deepEqual(eventLines(logLines, 'account_switch'), []);
 
-    // 鍵の無い要求のためだけに、既存ロジックが currentIndex を動かす（§4.5）。
+    // 鍵の無い要求のためだけに、既存ロジックが currentIndex を動かす。
     assert.equal((await ask({})).status, 200);
     assert.deepEqual(assignments, [1]);
     const globalSwitches = eventLines(logLines, 'account_switch');
@@ -12377,7 +12376,7 @@ describe('session affinity rebind and terminal (R-S8)', () => {
     assert.equal((await ask({ sid: 'session-one', model: 'claude-fable-5' })).status, 200);
     assert.equal(seen.at(-1), 'Bearer token-acct_b');
 
-    // 副バインド先の共通枠が枯れる -> 動くのは副バインドだけである（D-63 C2）。
+    // 副バインド先の共通枠が枯れる -> 動くのは副バインドだけである。
     const assignments = watchCurrentIndex(accountManager);
     accountManager.updateQuota('acct_b', commonExhaustedHeaders());
     assert.equal((await ask({ sid: 'session-one', model: 'claude-fable-5' })).status, 200);
@@ -12460,7 +12459,7 @@ describe('session affinity rebind and terminal (R-S8)', () => {
     );
   });
 
-  it('D-154: an upstream 429 with family-quota evidence creates the sub-binding inside the same round', async () => {
+  it('an upstream 429 with family-quota evidence creates the sub-binding inside the same round', async () => {
     let fableLimited = true;
     const { ask, seen, accountManager, logLines } = await startAffinity({
       usageFetcher: async () => ({
@@ -12495,7 +12494,7 @@ describe('session affinity rebind and terminal (R-S8)', () => {
     assert.equal(eventLines(logLines, 'affinity_switch').length, 1, '付け替えは1回だけ');
   });
 
-  it('D-154: an upstream 429 with common-quota evidence rebinds the home in the same round', async () => {
+  it('an upstream 429 with common-quota evidence rebinds the home in the same round', async () => {
     let limited = true;
     const { ask, seen, accountManager, logLines } = await startAffinity({
       usageFetcher: async () => ({
@@ -12518,7 +12517,7 @@ describe('session affinity rebind and terminal (R-S8)', () => {
     assert.match(switches[0], / from=acct_a to=acct_b reason=common_exhausted family=fable switches=1$/);
     assert.deepEqual(eventLines(logLines, 'account_switch'), [], 'currentIndex は動かない');
 
-    // home が移ったので、非 Fable の要求も acct_b へ行く（副バインドは破棄・§4.1）。
+    // home が移ったので、非 Fable の要求も acct_b へ行く（副バインドは破棄）。
     limited = false;
     assert.equal((await ask({ sid: 'session-one' })).status, 200);
     assert.equal(seen.at(-1), 'Bearer token-acct_b');
@@ -12527,27 +12526,26 @@ describe('session affinity rebind and terminal (R-S8)', () => {
 });
 
 // ---------------------------------------------------------------------------
-// R-S9: 全滅時の終端応答を写像入口へ揃える（統合テスト㉔ / 設計書 §5.3(d)・§14.2 案イ /
-// 不変条件 I-6・実装で守る点 P-6）。
+// 全滅時の終端応答を写像入口へ揃える（試験 ㉔）。
 //
 // 現行は `sendUnavailableAccounts` の資格情報分岐が写像器を呼ばずに 503 を書いて
 // return するため、同じ「全滅」台帳でも固定先（= `getCurrentAccount()` が返す口座）が
 // 認証失敗・資格情報 cooldown のときだけ 529 が 503 に化ける。bridge は 529 を
 // Claude Code の fallbackModel の発火条件として前提にしているので、503 では退避が
-// 働かない（D-67-2）。sticky ではセッションが1口座へ張り付くぶん、この化けが
+// 働かない。sticky ではセッションが1口座へ張り付くぶん、この化けが
 // そのセッションの全滅時応答に居座り続ける。
 //
 // 述語 `isCredentialUnavailable` は status 画面（`src/monitor.js` の
 // `login expired` / `needs login`）と `futureAvailabilityForModelFamily` と共有して
 // いるので触らない。変更するのは分岐側だけで、「503 の意味（認証情報が使えない）を
-// 運用者へ伝える役割は status 画面が担う」という整理は §14.2（D-72）のまま変えない。
+// 運用者へ伝える役割は status 画面が担う」という整理は変えない。
 // ---------------------------------------------------------------------------
-describe('全滅時の終端応答を写像入口へ揃える (R-S9 / 統合㉔ / I-6・P-6)', () => {
+describe('全滅時の終端応答を写像入口へ揃える', () => {
   const ENABLED_MAPPING = { enabled: true };
 
   const exhaustedBridgeBody = '{"type":"error","error":{"type":"overloaded_error"}}';
 
-  // (pool)=unusable を学習させるための偽 bridge（契約 §C10.3 T3）。
+  // (pool)=unusable を学習させるための偽 bridge（x-ombr-* の取り決めのヘッダ付きで、プールの枯渇を知らせる 529 を返す）。
   async function startUnusableBridge() {
     const bridge = await listen(http.createServer((req, res) => {
       req.resume();
@@ -12649,7 +12647,7 @@ describe('全滅時の終端応答を写像入口へ揃える (R-S9 / 統合㉔ 
   }
 
   function assertNoCredential503(response) {
-    assert.notEqual(response.status, 503, '固定先の個別 state で 503 に化けない（I-6）');
+    assert.notEqual(response.status, 503, '固定先の個別 state で 503 に化けない');
     assert.ok(
       !response.bodyText.includes('No usable OAuth credential'),
       '資格情報分岐の 503 本文が漏れない',
@@ -12695,8 +12693,8 @@ describe('全滅時の終端応答を写像入口へ揃える (R-S9 / 統合㉔ 
     });
     assert.equal((await ask()).status, 200);
 
-    // 46e7d9c（J-1）で「保存済み refresh 資格情報の期限切れ」が認証失効へ分類される
-    // ようになった経路をそのまま通す（§0）。この入口は v1.0 起点のテストには無い。
+    // 46e7d9c で「保存済み refresh 資格情報の期限切れ」が認証失効へ分類される
+    // ようになった経路をそのまま通す。
     await secretStore.set('acct_a', {
       accessToken: 'token-acct_a',
       refreshToken: 'refresh-acct_a',
@@ -12716,8 +12714,7 @@ describe('全滅時の終端応答を写像入口へ揃える (R-S9 / 統合㉔ 
     assert.equal(response.body.error.type, 'overloaded_error');
     assertNoCredential503(response);
 
-    // 503 の意味（認証情報が使えない）は status 画面が担う。文言は1文字も変えない
-    // （D-72・§14.2 の整理）。
+    // 503 の意味（認証情報が使えない）は status 画面が担う。文言は1文字も変えない。
     const status = await requestJson(`${proxy.url}/internal/status`);
     const output = renderStatus(status.body, { columns: 200 });
     assert.match(output, /reason: login expired .* - run: claude-rotator login --id acct_a/);
@@ -12757,13 +12754,13 @@ describe('全滅時の終端応答を写像入口へ揃える (R-S9 / 統合㉔ 
     accountManager.markError('acct_a', 'authentication_error', 'OAuth token rejected');
     const response = await ask();
 
-    assert.equal(response.status, 403, '両プール枯渇なら 403（I-6）');
+    assert.equal(response.status, 403, '両プール枯渇なら 403');
     assert.equal(response.body.error.type, 'permission_error');
     assert.match(response.body.error.message, /^All Claude accounts and the Codex pool are unavailable\./);
     assertNoCredential503(response);
   });
 
-  it('㉔: keeps the 503 and its Retry-After when nothing maps the terminal (§14.4・案イ)', async () => {
+  it('㉔: keeps the 503 and its Retry-After when nothing maps the terminal', async () => {
     const { ask, accountManager } = await startTerminal({ degradeMapping: null });
     assert.equal((await ask()).status, 200);
 
@@ -12791,7 +12788,7 @@ describe('全滅時の終端応答を写像入口へ揃える (R-S9 / 統合㉔ 
 });
 
 // ---------------------------------------------------------------------------
-// R-S10: 再バインドの猶予（設計書 §4.3.1・D-60-2・D-62-2・D-63 C4）。
+// 再バインドの猶予。
 //
 // 押さえるのは2点である。
 //   ⑰ 回復見込みが `rebindGraceMs` 以内の共通枠枯渇では再バインドしない——選択の直後・
@@ -12804,7 +12801,7 @@ describe('全滅時の終端応答を写像入口へ揃える (R-S9 / 統合㉔ 
 // `attemptedAccountIds` に同じ口座が2回入らないことは、上流が受け取った要求の本数
 // （猶予の周は1本だけ）と、重複ガードの終端（429/529）ではなく 200 が返ることで見る。
 // ---------------------------------------------------------------------------
-describe('session affinity rebind grace (R-S10)', () => {
+describe('session affinity rebind grace', () => {
   function eventLines(logLines, kind) {
     return logLines.filter(line => line.includes(` ${kind} `));
   }
@@ -13005,7 +13002,7 @@ describe('session affinity rebind grace (R-S10)', () => {
     assert.equal((await ask({ sid: 'session-one', round: '2' })).status, 200);
     const elapsedMs = Date.now() - startedAt;
 
-    assert.equal(seen.at(-1), 'Bearer token-acct_b', 'v1.1 と同じ挙動へ戻る');
+    assert.equal(seen.at(-1), 'Bearer token-acct_b', '猶予を待たずにすぐ付け替える挙動へ戻る');
     assert.deepEqual(eventLines(logLines, 'affinity_defer'), [], '猶予の経路へ入らない');
     assert.equal(eventLines(logLines, 'affinity_switch').length, 1);
     assert.ok(elapsedMs < 250, `待ってしまっている: ${elapsedMs}ms`);
@@ -13050,22 +13047,22 @@ describe('session affinity rebind grace (R-S10)', () => {
 });
 
 // ---------------------------------------------------------------------------
-// 永続化・復元・reload の結線（R-S11 / 設計書 v1.5 §8・§8.1・§6・F1/F4/F5/F10）
+// 永続化・復元・reload の結線
 //
 // 固定するのは次の3群である。
 //   (a) 保存: 既存の runtime-state.json へ相乗りし、新しいファイルは作らない。
 //       `mode:"off"`／`persist:false` では節そのものを書かない。保存 JSON に秘密・
 //       口座メール・生のセッション UUID が1つも無く、世代番号 `gen` も保存しない。
-//   (b) 復元: §8 の破棄条件①〜⑥（version／未来の savedAt／未知口座／TTL 超過／容量／
-//       資格情報の変化）と F1（壊れた保存データでも起動する）・F4（時計の逆行）。
-//   (c) reload: 設定の再正規化 → applySettings → U17 の通知 →
-//       evictAccounts(credential_changed) → prune(account_removed)（D-155 ①〜④）。
+//   (b) 復元: 保存した表を捨てる条件（この describe の試験名の ①〜⑥。version／未来の savedAt／
+//       未知口座／TTL 超過／容量／資格情報の変化）と F1（壊れた保存データでも起動する）・F4（時計の逆行）。
+//   (c) reload: evictAccounts(credential_changed) → prune(account_removed) →
+//       設定の再正規化 → applySettings → affinity_config の通知。
 //
 // 時刻は AccountManager へ注入したクロックから読む（SessionAffinity も同じ時計を使う）
 // ので、TTL・savedAt・ageMs はすべて決定的である。
 // ---------------------------------------------------------------------------
 
-describe('session affinity persistence and reload (R-S11)', () => {
+describe('session affinity persistence and reload', () => {
   // 生のセッション UUID が保存 JSON・ログへ出ないことを見るための既知の値。
   const RAW_SESSION_ID = 'c7e1a904-5b6d-4f28-9a31-2e8b70d4f6c1';
   const OTHER_SESSION_ID = 'd18f2b35-6c7e-4a19-b042-3f9c81e5a7d2';
@@ -13156,7 +13153,7 @@ describe('session affinity persistence and reload (R-S11)', () => {
         usagePolling: { enabled: false },
         ...(sessionAffinity ? { sessionAffinity } : {}),
         // reload で `mode:"off"` へ戻したとき proxy 行が現行の形へ帰ることを見る describe。
-        // キャッシュ観測（既定 on・U-3）は同じ行のさらに末尾へ足すので、ここは明示的に
+        // キャッシュ観測（既定 on）は同じ行のさらに末尾へ足すので、ここは明示的に
         // 切って affinity の追記だけを見る（観測側の形は describe('cache observability')）。
         observability: { requestLog: { enabled: false } },
       },
@@ -13178,7 +13175,7 @@ describe('session affinity persistence and reload (R-S11)', () => {
     };
   }
 
-  // 保存済みの表を手で組む（復元の破棄条件を1つずつ狙うため）。
+  // 保存済みの表を手で組む（復元で表を捨てる条件を1つずつ狙うため）。
   function savedTable(entries, { version = 1, savedAtMs = CLOCK_START_MS - 1_000 } = {}) {
     return {
       version: 1,
@@ -13236,7 +13233,7 @@ describe('session affinity persistence and reload (R-S11)', () => {
         ['a', 'k', 's', 't'],
         '保存するのは ①ハッシュ ②口座ラベル ③副バインド ④epoch ms ⑤切替回数だけ',
       );
-      assert.equal('gen' in entry, false, '世代番号は保存しない（D-60-1）');
+      assert.equal('gen' in entry, false, '世代番号は保存しない');
       assert.match(entry.k, /^[0-9a-f]{12}$/);
     }
   });
@@ -13527,7 +13524,7 @@ describe('session affinity persistence and reload (R-S11)', () => {
     assert.equal(eventLines(logLines, 'affinity_bind').length, 1, '新規バインドは最初の1件だけ');
   });
 
-  it('FU-65: no account is handled as both credential_changed and account_removed', async () => {
+  it('no account is handled as both credential_changed and account_removed', async () => {
     const { ask, reload, holder, logLines } = await startPersisting({
       reloadable: true,
       accounts: ['acct_a', 'acct_b', 'acct_c'],
@@ -13557,7 +13554,7 @@ describe('session affinity persistence and reload (R-S11)', () => {
     assert.equal(evicted.length, 2, '同じ口座が両方で処理されない');
   });
 
-  it('D-155 ①②: a reload re-normalizes the section instead of keeping the startup values', async () => {
+  it('a reload re-normalizes the section instead of keeping the startup values', async () => {
     const { ask, reload, holder, logLines } = await startPersisting({ reloadable: true });
 
     await ask({ sid: RAW_SESSION_ID });
@@ -13572,7 +13569,7 @@ describe('session affinity persistence and reload (R-S11)', () => {
     assert.match(evicted[0], / reason=capacity /);
   });
 
-  it('D-155 ③: a reload records the U17 config line again', async () => {
+  it('a reload records the affinity_config line again', async () => {
     const { reload, holder, logLines } = await startPersisting({ reloadable: true });
     const atStartup = eventLines(logLines, 'affinity_config');
     assert.equal(atStartup.length, 1);
@@ -13585,7 +13582,7 @@ describe('session affinity persistence and reload (R-S11)', () => {
     assert.match(after[1], / affinity_config mode=observe switchThreshold=\S+$/);
   });
 
-  it('FU-69: a reload to off logs affinity_disabled once and returns the proxy line to its current shape', async () => {
+  it('a reload to off logs affinity_disabled once and returns the proxy line to its current shape', async () => {
     const { ask, reload, holder, logLines, persisted } = await startPersisting({ reloadable: true });
 
     await ask({ sid: RAW_SESSION_ID });
@@ -13643,19 +13640,19 @@ describe('session affinity persistence and reload (R-S11)', () => {
 });
 
 // ---------------------------------------------------------------------------
-// status 出力への sessionAffinity 節と events の条件付き永続化（R-S12・設計書 §7.3）
+// status 出力への sessionAffinity 節と events の条件付き永続化
 //
 // 節は **`mode:"off"` ではキー自体を出さない**。off の `/internal/status` の JSON は
-// 現行とバイト同一であり、`claude-rotator status` の出力も変わらない（R7）。
+// 現行とバイト同一であり、`claude-rotator status` の出力も変わらない。
 // 組み立ては結線側の1箇所（`sessionAffinityStatusSection`）だけで行い、status JSON を返す
-// すべての経路が同じ節を返す。口座台帳（AccountManager）は sticky の表を知らない（D-182）
+// すべての経路が同じ節を返す。口座台帳（AccountManager）は sticky の表を知らない
 // ——台帳が受け取るのは「events を履歴として扱うか」の真偽値1つだけである。
 //
 // sid 付与率は要求単位（鍵を抽出できた要求 ÷ この proxy が転送した要求）で数える。
-// 表の `summary()` には要求の数が無いので（FU-55）、結線側で数える。
+// 表の `summary()` には要求の数が無いので、結線側で数える。
 // ---------------------------------------------------------------------------
 
-describe('session affinity status section and event history (R-S12)', () => {
+describe('session affinity status section and event history', () => {
   const RAW_SESSION_ID = 'a41f77c2-0b93-4e58-9d17-5c3e8a1b2049';
   const OTHER_SESSION_ID = 'b52a88d3-1ca4-4f69-8e28-6d4f9b2c3150';
   const CLOCK_START_MS = Date.parse('2026-09-16T09:00:00.000Z');
@@ -13689,7 +13686,7 @@ describe('session affinity status section and event history (R-S12)', () => {
       accounts: accounts.map(id => ({ id, name: `${id}@example.com`, type: 'oauth' })),
       logger: line => logLines.push(line),
       now: () => clock.ms,
-      // 結線側が渡す真偽値。off では偽なので現行と同一（D-56-6）。
+      // 結線側が渡す真偽値。off では偽なので現行と同一。
       eventHistory: (sessionAffinity?.mode ?? 'off') !== 'off',
     });
     const holder = {
@@ -13770,11 +13767,11 @@ describe('session affinity status section and event history (R-S12)', () => {
     assert.deepEqual(section.evictionsByReason, {});
   });
 
-  // 設計書 v1.7 §7.3 の確定形は `{ mode, sessions, capacity, warmTtlMs, sessionsByAccount,
+  // 節の形は `{ mode, sessions, capacity, warmTtlMs, sessionsByAccount,
   // warmSessionsByAccount, switchesByReason, evictionsByReason, requests, sidRate }` である。
-  // v1.6 の形に足した2つを status 側で直接押さえる——`summary()` が返していても節へ載せ
-  // 忘れれば、README と設計書が約束した項目が欠ける（R-S18-FIX1 差戻し2）。
-  it('reports the warm window and the warm per-account counts in the status section (v1.7 §7.3)', async () => {
+  // 後から足した2つ（warmTtlMs・warmSessionsByAccount）を status 側で直接押さえる——`summary()` が返していても節へ載せ
+  // 忘れれば、README が約束した項目が欠ける。
+  it('reports the warm window and the warm per-account counts in the status section', async () => {
     const { ask, status } = await startStatus();
 
     await ask({ sid: RAW_SESSION_ID });
@@ -13788,12 +13785,12 @@ describe('session affinity status section and event history (R-S12)', () => {
       { acct_a: 1, acct_b: 1 },
       'いま来たばかりの2セッションはどちらも温かい（2本目は別口座へ散る）',
     );
-    // 冷えた行も表には残るので、総数側は別に読める（2つの差が冷えた本数・§7.3）。
+    // 冷えた行も表には残るので、総数側は別に読める（2つの差が冷えた本数）。
     assert.deepEqual(section.sessionsByAccount, { acct_a: 1, acct_b: 1 });
     assert.deepEqual(Object.keys(section), [
       'mode', 'sessions', 'capacity', 'warmTtlMs', 'sessionsByAccount',
       'warmSessionsByAccount', 'switchesByReason', 'evictionsByReason', 'requests', 'sidRate',
-    ], '§7.3 の確定形どおりの並び');
+    ], '決まった形どおりの並び');
   });
 
   it('counts the sid coverage per request instead of per session', async () => {
@@ -13862,7 +13859,7 @@ describe('session affinity status section and event history (R-S12)', () => {
     }
   });
 
-  it('FU-97: persists the table when a reload only changes the settings', async () => {
+  it('persists the table when a reload only changes the settings', async () => {
     const { ask, reload, holder, persisted } = await startStatus({ reloadable: true });
 
     await ask({ sid: RAW_SESSION_ID });
@@ -13885,7 +13882,7 @@ describe('session affinity status section and event history (R-S12)', () => {
     assert.equal('sessionAffinity' in persisted.at(-1), false);
   });
 
-  it('FU-97: a reload that changes neither the accounts nor the table persists nothing extra', async () => {
+  it('a reload that changes neither the accounts nor the table persists nothing extra', async () => {
     const { ask, reload, persisted } = await startStatus({ reloadable: true });
 
     await ask({ sid: RAW_SESSION_ID });
@@ -13926,15 +13923,15 @@ describe('session affinity status section and event history (R-S12)', () => {
 });
 
 // ---------------------------------------------------------------------------
-// 冷えた固定の解放（R-S18 / 設計書 v1.7 §4.3・P-b）
+// 冷えた固定の解放
 //
-// v1.6 は「口座が枯れるまで動かさない」だった。v1.7（2026-09-18 判断6 案(a)）は、
+// 以前は「口座が枯れるまで動かさない」だった。この線は、
 // **キャッシュが失効したセッションだけ**を、利用率の高い口座から空いている口座へ
 // 動かしてよいことにする。移すキャッシュがもう無いので費用はゼロであり、温かい
 // セッションはこの線では1本も動かない。
 // ---------------------------------------------------------------------------
 
-describe('session affinity cold reassign (R-S18 / 設計書 v1.7 P-b)', () => {
+describe('session affinity cold reassign', () => {
   function eventLines(logLines, kind) {
     return logLines.filter(line => line.includes(` ${kind} `));
   }
@@ -14182,10 +14179,10 @@ describe('session affinity cold reassign (R-S18 / 設計書 v1.7 P-b)', () => {
 });
 
 // ---------------------------------------------------------------------------
-// キャッシュ観測（計画書 Task 1 Step 6・Task 2）
+// キャッシュ観測
 //
 // 偽上流はすべて listen(0, '127.0.0.1')。実サービス・実 API・稼働中 rotator へは
-// 到達しない（~/.claude/rules/02-verification.md §3）。
+// 到達しない。
 // fixture のセッション id は本ファイルで作った合成値である。
 // ---------------------------------------------------------------------------
 
@@ -14366,7 +14363,7 @@ describe('cache observability', () => {
     assert.match(proxyLine(logLines), / enc=snappy usageParse=unsupported-encoding$/);
   });
 
-  it('proxy 行の末尾へ計画書の順序で観測を追記する', async () => {
+  it('proxy 行の末尾へ決まった順序で観測を追記する', async () => {
     const zlib = await import('node:zlib');
     const { proxy, logLines } = await startObservabilityProxy({
       upstreamHandler: (req, res) => {
@@ -14519,7 +14516,7 @@ describe('cache observability', () => {
     await requestRaw(`${proxy.url}/v1/messages`, {
       method: 'POST',
       body: JSON.stringify({ model: 'claude-opus-5-1' }),
-      // Task 1 Step 0 で実測した Claude Code 2.1.275 の実際の値。
+      // 実測した Claude Code 2.1.275 の実際の値。
       headers: { 'accept-encoding': 'gzip, deflate, br, zstd' },
     });
 

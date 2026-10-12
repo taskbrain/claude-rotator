@@ -112,7 +112,7 @@ const SCOPED_USAGE_PRESERVE_PREFIX = 'scoped_weekly_preserve:';
 const DEFAULT_RESET_CHECK_DELAY_MS = 1000;
 const MAX_TIMER_DELAY_MS = 2_147_483_647;
 const MIN_USABLE_ACCESS_TOKEN_LIFETIME_MS = 60_000;
-// バインドが変わってから runtime-state.json へ合流するまでの上限（設計書 §8）。
+// バインドが変わってから runtime-state.json へ合流するまでの上限。
 // 表そのものは persistState が走るたびに載るので、この時計は「要求の完了を待たない」
 // ための予備であり（長時間 SSE・reload 以外の掃除）、新しいファイルは作らない。
 const SESSION_AFFINITY_PERSIST_INTERVAL_MS = 5_000;
@@ -135,8 +135,8 @@ export function createProxyServer({
   reactiveQuotaConfirmTimeoutMs = REACTIVE_QUOTA_CONFIRM_TIMEOUT_MS,
   logger = null,
   stateWriter = null,
-  // 起動時の復元（設計書 §8.1）。`credentialChangedAccountIds` は cli.js が
-  // `accountManager.restoreState()` の戻り値をそのまま渡す（F3 の破棄条件⑥）。
+  // 起動時の復元。`credentialChangedAccountIds` は cli.js が
+  // `accountManager.restoreState()` の戻り値をそのまま渡す（資格情報が別物になった口座へのバインドを捨てるため）。
   savedState = null,
   credentialChangedAccountIds = null,
   sessionAffinityPersistIntervalMs = SESSION_AFFINITY_PERSIST_INTERVAL_MS,
@@ -283,17 +283,17 @@ export function createProxyServer({
   // 起動ログの並びを1行も変えないためである。
   let sessionAffinitySettings = null;
   let sessionAffinity = null;
-  // 表が変わってから保存されるまでの繋ぎ（設計書 §8 の dirty）。バインドが変わったときだけ
+  // 表が変わってから保存されるまでの繋ぎ。バインドが変わったときだけ
   // 立ち、`lastSeen` の更新では立たない。persistState が走れば下ろす。
   let affinityDirty = false;
   let affinityPersistTimer = null;
-  // sid 付与率の母数（§7.3）。要求単位で数える——鍵を抽出できた要求 ÷ この proxy が
+  // sid 付与率の母数。要求単位で数える——鍵を抽出できた要求 ÷ この proxy が
   // 転送した要求である。表の `summary()` はセッション単位の集計しか持たないので
-  // （FU-55）、要求の数はここで数える。表を作り直すたびに 0 から数え直す。
+  // 要求の数はここで数える。表を作り直すたびに 0 から数え直す。
   let affinityRequestCounts = createAffinityRequestCounts();
   function affinityPersistEnabled() {
     // `mode:"off"` と `persist:false` では節そのものを作らない（未記載構成の
-    // runtime-state.json を現行とバイト同一に保つ・§8・D-56-6）。
+    // runtime-state.json を現行とバイト同一に保つため）。
     return Boolean(sessionAffinity) && sessionAffinitySettings?.persist === true;
   }
   function cancelAffinityPersistTimer() {
@@ -316,7 +316,7 @@ export function createProxyServer({
   function persistState() {
     if (!stateWriter) return;
     const snapshot = accountManager.exportState();
-    // 既存の runtime-state.json へ相乗りする。新しいファイルは作らない（§8）。
+    // 既存の runtime-state.json へ相乗りする。新しいファイルは作らない。
     if (affinityPersistEnabled()) {
       snapshot.sessionAffinity = sessionAffinity.export();
       affinityDirty = false;
@@ -393,14 +393,14 @@ export function createProxyServer({
   if (openaiBridgeSettings.warning) {
     logger?.(`${new Date().toISOString()} openai-bridge config-warning ${openaiBridgeSettings.warning}`);
   }
-  // degradeMapping の設定通知（設計書 §7.2・§7.3-4）。reload 時も同じ関数を呼ぶ。
+  // degradeMapping の設定通知。reload 時も同じ関数を呼ぶ。
   // degradeMapping を書いていない構成では1行も出ない。
   logDegradeMappingConfigNotice(openaiBridgeSettings, logger);
 
-  // sticky affinity（設計書 §4・§6・§7）。設定は必ず normalizeSessionAffinity() を通す
+  // sticky affinity。設定は必ず normalizeSessionAffinity() を通す
   // ——生の config.sessionAffinity を渡すとクランプも未知 mode→off も効かない。
   // `mode:"off"`（既定・未記載構成）では表そのものを作らず forwardWithRotation へも渡さない
-  // ので、応答もログも現行とバイト単位で同一になる。起動時の1行（U17）も出ない。
+  // ので、応答もログも現行とバイト単位で同一になる。起動時の1行（logSessionAffinityStartupNotice）も出ない。
   function createSessionAffinityFor(settings) {
     if (settings.mode === 'off') return null;
     affinityRequestCounts = createAffinityRequestCounts();
@@ -416,7 +416,7 @@ export function createProxyServer({
     });
   }
   sessionAffinitySettings = normalizeSessionAffinity(config.sessionAffinity);
-  // 台帳へ渡すのは真偽値1つだけ（D-182・§5.2(b)）。`mode:"off"` では現行のまま
+  // 台帳へ渡すのは真偽値1つだけ。`mode:"off"` では現行のまま
   // ——`events` は保存も復元もされず、メモリ上限も効かない。
   accountManager.setEventHistoryEnabled(sessionAffinitySettings.mode !== 'off');
   logSessionAffinityStartupNotice(sessionAffinitySettings, {
@@ -424,10 +424,10 @@ export function createProxyServer({
     logger,
   });
   sessionAffinity = createSessionAffinityFor(sessionAffinitySettings);
-  // 保存済みの表を読み戻す（§8.1）。台帳の復元（cli.js の restoreState）は既に終わっていて、
+  // 保存済みの表を読み戻す。台帳の復元（cli.js の restoreState）は既に終わっていて、
   // その戻り値が `credentialChangedAccountIds` として届いている——順序を逆にすると資格情報が
-  // 別物になった口座へのバインドを残す（破棄条件⑥・F3）。節が無いのは「壊れている」ではない
-  // ので、その場合は F1 の1行を出さない。
+  // 別物になった口座へのバインドを残す。節が無いのは「壊れている」ではない
+  // ので、その場合は `affinity_restore skipped=` の1行を出さない。
   if (sessionAffinity && sessionAffinitySettings.persist && savedState?.sessionAffinity != null) {
     sessionAffinity.restore(savedState.sessionAffinity, {
       accountManager,
@@ -435,9 +435,9 @@ export function createProxyServer({
     });
   }
 
-  // status JSON へ足す `sessionAffinity` 節（設計書 §7.3）。組み立てはこの1箇所だけで行い、
+  // status JSON へ足す `sessionAffinity` 節。組み立てはこの1箇所だけで行い、
   // 台帳の `getStatus()` を返すすべての経路が `statusJson()` を通る。**`mode:"off"` では
-  // キー自体を出さない**ので、未記載構成の JSON は現行とバイト同一である（R7・D-56-6）。
+  // キー自体を出さない**ので、未記載構成の JSON は現行とバイト同一である。
   function sessionAffinityStatusSection() {
     if (!sessionAffinity || sessionAffinitySettings?.mode === 'off') return null;
     const summary = sessionAffinity.summary();
@@ -446,14 +446,14 @@ export function createProxyServer({
       mode: sessionAffinitySettings.mode,
       sessions: summary.sessions,
       capacity: summary.capacity,
-      // 「温かい」の境界そのもの（設計書 v1.7 §7.3）。下の2つの口座別の数をどう読めば
+      // 「温かい」の境界そのもの。下の2つの口座別の数をどう読めば
       // よいかがこの値で決まるので、数だけを出して窓を出さない形にはしない。
       warmTtlMs: summary.warmTtlMs,
       // 口座別の合計はセッション総数と一致しない（系統別副バインドで1セッションが
-      // 複数の口座に数えられるため・§7.3）。
+      // 複数の口座に数えられるため）。
       sessionsByAccount: summary.sessionsByAccount,
       // そのうち「最後に触れてから warmTtlMs 以内」＝上流のキャッシュがまだ生きている
-      // 見込みの本数（設計書 v1.7 §7.3・P-c）。冷えた固定の解放（P-b）が効いているかは、
+      // 見込みの本数。冷えた固定の解放（coldReassignTarget）が効いているかは、
       // この2つの差を見れば分かる。
       warmSessionsByAccount: summary.warmSessionsByAccount,
       switchesByReason: summary.switchesByReason,
@@ -467,9 +467,9 @@ export function createProxyServer({
     return section ? { ...status, sessionAffinity: section } : status;
   }
 
-  // GPT プール状態（設計書 §11.1 R3-4・契約 §C10.2）。プロセス内メモリだけで持ち、
+  // GPT プール状態。プロセス内メモリだけで持ち、
   // degradeMapping が無効な構成では生成しない（null＝forwardToOpenAiBridge へも渡らず、
-  // 応答もログも現行と完全に同一になる＝§14.4）。
+  // 応答もログも現行と完全に同一になる）。
   // 設計判断: POST /internal/reload では設定を読み直すだけでなく、学習済みの
   // 状態も破棄して作り直す。ロールバック（無効化→reload→再有効化）で古い unusable が
   // 残ると、実際には回復しているのに最大 gptPoolUnusableTtlMs の間 403 で止めてしまう。
@@ -477,36 +477,36 @@ export function createProxyServer({
   const createGptPoolStateFor = settings => (settings.degradeMapping?.enabled === true
     ? createGptPoolState({
       unusableTtlMs: settings.degradeMapping.gptPoolUnusableTtlMs,
-      // 層1（T2b・T6b・キャッシュ非学習）は recoveryWaitEnabled の配下に置く
-      // （統合設計 v2.1 §2.1 案A）。層1 は 403 書換の条件③を通じて応答バイトを変えうる
+      // 層1（GPT プール状態の学習・解除の変更とキャッシュ非学習）は recoveryWaitEnabled の配下に置く。
+      // 層1 は 403 書換の条件（GPT プールが unusable か）を通じて応答バイトを変えうる
       // ので、「フラグ off ＝現行とバイト互換」を保つには同じフラグで切る必要がある。
       recoveryWaitEnabled: settings.degradeMapping.recoveryWaitEnabled === true,
     })
     : null);
   let gptPoolState = createGptPoolStateFor(openaiBridgeSettings);
 
-  // 設計書 §4.2 案b-2・契約 §C10.4: 「Claude の口座がもう使えない」として 429 を
+  // 「Claude の口座がもう使えない」として 429 を
   // 書き出す**すべての**経路（P-a〜P-g の7系統）が、書き出す直前に必ずここを通る。
   // 経路ごとの個別書換ロジックは書かない（1か所でも漏れると「ある条件でだけ退避
   // しない」という再現困難な不具合になるため）。
   //
   // degradeMapping が無効な構成では呼び出し側へ渡さない（下の forwardWithRotation
-  // の条件つきスプレッド）ので、応答もログも現行とバイト単位で同一になる（§14.4）。
+  // の条件つきスプレッド）ので、応答もログも現行とバイト単位で同一になる。
   // ここでも enabled をもう一度見るのは、POST /internal/reload で無効化された直後の
   // 進行中要求が古い判定へ落ちないようにするためである。
   const applyClaudeExhaustionMapping = (candidate, {
     mapPath = null,
     modelFamily = null,
     headersSent = false,
-    // R-S9b（母艦裁定 D-197）: 写像後の応答が名乗る理由（`x-claude-rotator-reason`）。
+    // 写像後の応答が名乗る理由（`x-claude-rotator-reason`）。
     // 資格情報起因になりうるのは P-d だけなので、そこだけが明示的に分類を渡す。
     // 渡さない経路（上流 429 と局所合成の 429）は既定の quota_exhausted になる。
     reason = null,
   } = {}) => {
     const mapping = openaiBridgeSettings.degradeMapping;
     if (mapping?.enabled !== true || !candidate) return candidate;
-    // 判定根拠は accountManager の台帳（isAvailable）であって応答の見た目ではない
-    // （設計書 §4.3・契約 §C10.4）。GPT 側は学習済みの (pool) 鍵だけを見る。
+    // 判定根拠は accountManager の台帳（isAvailable）であって応答の見た目ではない。
+    // GPT 側は学習済みの (pool) 鍵だけを見る。
     const pool = gptPoolState ? gptPoolState.read().pool : null;
     const gptState = pool?.state || 'unknown';
     const allUnusable = claudeAllUnusable(accountManager, modelFamily);
@@ -514,14 +514,14 @@ export function createProxyServer({
     // scopeMatchesModelFamily() は modelFamily=null のとき Fable 週次サブキャップを
     // 無視するので、「Fable のサブキャップだけが全口座で切れているが共通枠は残って
     // いる」状態はここで false になり、403 ではなく 529 のまま Opus へ退避できる
-    // （§4.2。gpt-* 経路が最初から null で問うているのと同じ根拠）。
+    // （gpt-* 経路が最初から null で問うているのと同じ根拠）。
     // modelFamily が無い要求では同じ判定なので台帳を二度引かない。
     const commonAllUnusable = allUnusable
       ? (modelFamily ? claudeAllUnusable(accountManager, null) : true)
       : false;
     // 層2（recoveryWaitEnabled のときだけ）: 共通枠の空きを三値で問い直す。判定不能
-    // （判定関数が無い・口座0件・判定中の例外）を「空きあり」へ丸めず、待機側へ倒す
-    // （統合設計 v2.1 §3.5）。二値の commonAllUnusable は off 経路のためそのまま残す。
+    // （判定関数が無い・口座0件・判定中の例外）を「空きあり」へ丸めず、待機側へ倒す。
+    // 二値の commonAllUnusable は off 経路のためそのまま残す。
     const recoveryWaitEnabled = mapping.recoveryWaitEnabled === true;
     const commonQuota = recoveryWaitEnabled
       ? (allUnusable ? claudeQuotaState(accountManager, null) : 'available')
@@ -535,14 +535,14 @@ export function createProxyServer({
       commonFamilyAllUnusable: commonAllUnusable,
       recoveryWaitEnabled,
       commonFamilyQuotaState: commonQuota,
-      // D-261（段 2・方式イ）: 全枯渇の合成 429 を 529 へ写像するか。**既定は写像する**
+      // 全枯渇の合成 429 を 529 へ写像するか。**既定は写像する**
       // （＝現行）。ここでも設定を読み直すのは上の enabled と同じ理由で、
       // POST /internal/reload の直後に進行中の要求が古い判定へ落ちないようにするため。
       claudeExhaustedTo529: mapping.claudeExhaustedTo529 !== false,
       gptPoolState: gptState,
       bothUnusableStatus: mapping.bothUnusableStatus,
       gptResetAt: pool?.resetAt || null,
-      // 403 の本文へ載せる「最早回復時刻」にしか使わない（§8.7）。判定には使わない
+      // 403 の本文へ載せる「最早回復時刻」にしか使わない。判定には使わない
       // ので、403 になりうる組み合わせのときだけ台帳を引く。403 の根拠は**共通枠**の
       // 枯渇なので、回復時刻も共通枠（modelFamily 無し）で問う。要求系列で引くと、
       // Fable 週次サブキャップのように共通枠より遠いリセットを表示してしまう。
@@ -550,14 +550,14 @@ export function createProxyServer({
         ? claudeEarliestResetAt(accountManager, null)
         : null,
     });
-    // R4-5: 痕跡（degradeLog）はここでは書き出さない。呼び出し側が mapped.degradeLog を
-    // そのまま recordProxyRequest へ渡し、**その要求の既存の proxy ログ行**へ併記する
-    // （設計書 §9.1・§9.5(c)・受入条件7）。行を増やさないので、写像しなかった要求と
-    // degradeMapping を書いていない構成ではログは1文字も変わらない（§14.4）。
+    // 痕跡（degradeLog）はここでは書き出さない。呼び出し側が mapped.degradeLog を
+    // そのまま recordProxyRequest へ渡し、**その要求の既存の proxy ログ行**へ併記する。
+    // 行を増やさないので、写像しなかった要求と
+    // degradeMapping を書いていない構成ではログは1文字も変わらない。
     return mapped;
   };
 
-  // 坂根氏 2026-09-18: Claude 上流（Anthropic）が返した 529 overloaded を 429 ＋
+  // Claude 上流（Anthropic）が返した 529 overloaded を 429 ＋
   // Retry-After へ写像する。写像しないときは null を返し、呼び出し側が上流応答を
   // そのまま送る。ここでもスイッチを読み直すのは、POST /internal/reload で無効化した
   // 直後の進行中要求が古い判定へ落ちないようにするためである（上の写像と同じ理由）。
@@ -626,7 +626,7 @@ export function createProxyServer({
 
       if (req.method === 'POST' && req.url === '/internal/reload') {
         invalidateLiveClaudeCodeCache();
-        // FU-97・設計書 §8.1 末尾: この reload が表を変えたか。口座の入れ替えによる退避
+        // この reload が表を変えたか。口座の入れ替えによる退避
         // （evictAccounts / prune）だけでなく、**設定だけを変えた reload**（`on→off` で
         // 表を捨てた・`maxSessions` を縮めて退避した）も対象である。真なら末尾で
         // `persistState()` を1回だけ呼ぶ。
@@ -657,9 +657,9 @@ export function createProxyServer({
             duplicateRefreshAccounts,
           });
           const credentialChangedIds = accountManager.replaceAccounts(accounts);
-          // 設計書 §8.1: `replaceAccounts` の直後に evictAccounts → prune。
-          // 台帳に残ったまま資格情報が別物になった口座は戻り値で届き（F3）、台帳から
-          // 消えた口座は prune 側が拾う（F2）。**同じ口座が両方で処理されることはない**
+          // `replaceAccounts` の直後に evictAccounts → prune。
+          // 台帳に残ったまま資格情報が別物になった口座は戻り値で届き、台帳から
+          // 消えた口座は prune 側が拾う。**同じ口座が両方で処理されることはない**
           // ——`replaceAccounts` は残った口座しか報告しないからである。
           const affinityEvicted = sessionAffinity
             ? [
@@ -679,11 +679,11 @@ export function createProxyServer({
             ownedDuplicateIds,
           }) || duplicateStateChanged;
           affinityTableChanged = affinityTableChanged || affinityEvicted.length > 0;
-          // 表の保存は末尾の1回にまとめる（FU-97）。ここで保存すると、この後の
+          // 表の保存は末尾の1回にまとめる。ここで保存すると、この後の
           // 設定再読込が表をさらに変えたときに2回書くことになる。
           if (duplicateStateChanged) await persistState();
         }
-        // 既存の口座再読込に続けて openaiBridge を再読込する（仕様書 4.2.6 節）。
+        // 既存の口座再読込に続けて openaiBridge を再読込する。
         // 口座再読込のロジックには一切触れない。
         if (reloadOpenAiBridge) {
           const nextOpenaiBridge = await reloadOpenAiBridge();
@@ -704,7 +704,7 @@ export function createProxyServer({
           );
           logDegradeMappingConfigNotice(openaiBridgeSettings, logger);
         }
-        // sticky affinity の再読込（設計書 §5.1 ⑤・§6 の reload・D-155）。設定は必ず
+        // sticky affinity の再読込。設定は必ず
         // `normalizeSessionAffinity()` を通し直す——起動時に1度だけ正規化したものを使い回すと、
         // reload で書き換えた値にクランプも未知 mode→off も効かない。
         // `sessionAffinity` セクションを消した構成は既定（＝off）へ戻す。
@@ -713,7 +713,7 @@ export function createProxyServer({
           config.sessionAffinity = nextSessionAffinity;
           sessionAffinitySettings = normalizeSessionAffinity(config.sessionAffinity);
           if (sessionAffinity) {
-            // 直前のモードはインスタンスが覚えている（FU-69・D-175）。渡し忘れで
+            // 直前のモードはインスタンスが覚えている。渡し忘れで
             // 「有効→off」の `affinity_disabled` が消えることがない。
             const applied = sessionAffinity.applySettings(sessionAffinitySettings);
             // 表を捨てた（`on→off`）・容量縮小で退避した、のどちらも「変わった」である。
@@ -728,9 +728,9 @@ export function createProxyServer({
           } else {
             sessionAffinity = createSessionAffinityFor(sessionAffinitySettings);
           }
-          // 台帳の events の扱いも mode に合わせて切り替える（D-56-6・§5.2(b)）。
+          // 台帳の events の扱いも mode に合わせて切り替える。
           accountManager.setEventHistoryEnabled(sessionAffinitySettings.mode !== 'off');
-          // U17 の通知は degradeMapping と同じ位置・同じ関数で（`mode:"off"` では1行も出ない）。
+          // sticky affinity の設定通知は degradeMapping と同じ位置・同じ関数で（`mode:"off"` では1行も出ない）。
           logSessionAffinityStartupNotice(sessionAffinitySettings, {
             switchThreshold: accountManager.switchThreshold,
             logger,
@@ -757,7 +757,7 @@ export function createProxyServer({
         if (usagePollingEnabled(config)) {
           await usageScheduler.refreshNow({ afterCurrent: true });
         }
-        // FU-97: 表が変わった reload はここで1回だけ保存する。`on→off` では節を落とした
+        // 表が変わった reload はここで1回だけ保存する。`on→off` では節を落とした
         // 状態で書き直すので、保存ファイルに古い表が残らない。
         if (affinityTableChanged) await persistState();
         sendJson(res, 200, statusJson());
@@ -810,7 +810,7 @@ export function createProxyServer({
       const openaiBridgeRouting = shouldRouteToOpenAiBridge(body, openaiBridgeSettings);
       if (openaiBridgeRouting.route) {
         // 経路はここで OpenAI 宛に固定される。以後どのような失敗でも
-        // forwardWithRotation()（Anthropic 宛）へは迂回しない（仕様書 4.2.2 節 c）。
+        // forwardWithRotation()（Anthropic 宛）へは迂回しない。
         await forwardToOpenAiBridge({
           req,
           res,
@@ -822,16 +822,16 @@ export function createProxyServer({
           ...(gptPoolState ? {
             gptPoolState,
             // 関数で渡すのは、要求の開始時点ではなく bridge の応答ヘッダを受け取った
-            // 時点の台帳で判定するためである（設計書 §11.1 R4-1 の補足）。
-            // gpt-* の要求に Claude の modelFamily は無いので null（＝共通枠）で問う
-            // （§4.2）。Fable 週次サブキャップだけの枯渇では「Claude は使える」と判定され、
+            // 時点の台帳で判定するためである。
+            // gpt-* の要求に Claude の modelFamily は無いので null（＝共通枠）で問う。
+            // Fable 週次サブキャップだけの枯渇では「Claude は使える」と判定され、
             // 403 で止めずに 529 のまま Opus へ退避させる。
             claudeAllUnusable: () => claudeAllUnusable(accountManager, null),
-            // 三値版（統合設計 v2.1 §3.5）。二値版を残したまま隣に足す。引数は共通枠
-            // （modelFamily = null）で揃える——契約の条件2 が参照するのと同じ引数であり、
-            // 系列付きにすると契約と実装がずれる。
+            // 三値版。二値版を残したまま隣に足す。引数は共通枠
+            // （modelFamily = null）で揃える——二値版の claudeAllUnusable と同じ引数であり、
+            // 系列付きにすると二値版と三値版の判定がずれる。
             claudeQuotaState: () => claudeQuotaState(accountManager, null),
-            // 403 の本文へ載せる「最早回復時刻」の Claude 側の候補（§8.7）。
+            // 403 の本文へ載せる「最早回復時刻」の Claude 側の候補。
             // 全枯渇と判定したときだけ呼ばれる。判定そのものには使わない。
             claudeResetAt: () => claudeEarliestResetAt(accountManager, null),
           } : {}),
@@ -872,7 +872,7 @@ export function createProxyServer({
         upstreamConnectRetries,
         upstreamConnectRetryDelayMs,
         // degradeMapping.enabled が真のときだけ渡す（未指定＝現行と完全に同一の経路。
-        // 設計書 §14.4「exhaustionMapper を渡さない forwardOnce が現行と同一に振る舞う」）。
+        // exhaustionMapper を渡さない forwardOnce は現行と同一に振る舞う）。
         ...(openaiBridgeSettings.degradeMapping?.enabled === true
           ? { exhaustionMapper: applyClaudeExhaustionMapping }
           : {}),
@@ -1725,7 +1725,7 @@ function isFableRoutingModelId(value) {
 }
 
 /**
- * sid 付与率の母数（設計書 §7.3・FU-55）。表の `summary()` はセッション単位の集計しか
+ * sid 付与率の母数。表の `summary()` はセッション単位の集計しか
  * 持たないので、要求単位の2つの数だけをここで持つ。
  */
 function createAffinityRequestCounts() {
@@ -1733,12 +1733,12 @@ function createAffinityRequestCounts() {
 }
 
 /**
- * 1要求分の sticky affinity（設計書 §4.1・§4.4・§7.1）。
+ * 1要求分の sticky affinity。
  *
- * 返すのは ①proxy 行へ足す `sid` / `aff` / `fam` ②`select()`＝§4.1 の選択
- * ③`confirm()`＝§4.4 ②の確定 ④F9 の解放、の4つだけを持つ小さな状態である。
+ * 返すのは ①proxy 行へ足す `sid` / `aff` / `fam` ②`select()`＝口座の選択
+ * ③`confirm()`＝予約の確定 ④応答が終わったときの表の行の解放、の4つだけを持つ小さな状態である。
  * `mode:"off"` では呼び出し側が表を作らないので、この関数は `null` を返す。
- * `mode:"observe"` は鍵の抽出とログだけを行い、口座の選択は現行のまま（§6）。
+ * `mode:"observe"` は鍵の抽出とログだけを行い、口座の選択は現行のまま。
  *
  * @returns {object|null} 要求スコープの状態。affinity が無効なら `null`。
  */
@@ -1768,14 +1768,14 @@ function createSessionAffinityRequest({
   };
   if (!state.pinned) return state;
 
-  // 温かい数の償却掃除（設計書 v1.7 P-c）。冷えることは事象を伴わないので、要求の流れに
+  // 温かい数の償却掃除。冷えることは事象を伴わないので、要求の流れに
   // 乗せて 1,000 本に1回だけ掃除する。**新しいタイマーは作らない。**
   affinity.sweepWarm();
 
   const threshold = accountManager.switchThreshold;
-  // 除外集合は必ず口座 id（文字列）で渡す（FU-60）。`attemptedAccountIds` は id の Set。
+  // 除外集合は必ず口座 id（文字列）で渡す。`attemptedAccountIds` は id の Set。
   //
-  // 渡すのは**温かいバインド数**である（設計書 v1.7 P-a・P-c）。v1.6 は要求ごとに
+  // 渡すのは**温かいバインド数**である。以前の実装は要求ごとに
   // `summary()` を呼んで表を全件走査していたが、①10,000 行を毎要求なぞるのは無駄で、
   // ②冷えたセッションまで数えると「実際には空いている口座」を避け続けてしまう。
   // `warmSessionCounts()` は増分保持した数の複製を返すだけで、表は走査しない。
@@ -1786,11 +1786,11 @@ function createSessionAffinityRequest({
     sessionCounts: affinity.warmSessionCounts(),
   });
 
-  // ① 予約（§4.4 ①）。表を引き、結び付け先が使えるならそれを、使えないなら §4.1 の
+  // ① 予約。表を引き、結び付け先が使えるならそれを、使えないなら下の分岐の
   //    条件で付け替え先を決めて、この同期区間で `Map.set` まで済ませる。
   const entry = affinity.get(key, { modelFamily });
   const bound = entry ? accountManager.findOrNull(entry.bound) : null;
-  // ① の前に1つだけ足した線（設計書 v1.7 §4.3・P-b）。`entry.lastSeen` は **`note()` が
+  // ① の前に1つだけ足した線（冷えた固定の移し替え）。`entry.lastSeen` は **`note()` が
   // 触る前**の値なので、「前回の要求からどれだけ空いたか」をそのまま読める。
   const coldTarget = coldReassignTarget({
     entry, bound, accountManager, settings, modelFamily, assign,
@@ -1798,19 +1798,19 @@ function createSessionAffinityRequest({
   let binding = null;
   let sendTo = null;
   let reason = null;
-  // 猶予（§4.3.1・D-63 C4）。0 なら待機は1度も起きない。
+  // 猶予。0 なら待機は1度も起きない。
   let graceMs = 0;
   let graceAccountId = null;
   if (!entry) {
     binding = assign(null);
     sendTo = binding;
   } else if (!bound) {
-    // 口座が台帳から消えた（F2）。予約段では付け替えてよい（D-142）。
+    // 口座が台帳から消えた。予約段では付け替えてよい。
     binding = assign(null);
     sendTo = binding;
     reason = binding ? 'account_removed' : null;
   } else if (coldTarget) {
-    // キャッシュが失効した固定を、混んでいる口座から空いている口座へ移す（P-b）。
+    // キャッシュが失効した固定を、混んでいる口座から空いている口座へ移す。
     // 失うものが無いので費用はゼロ。行き先が無ければこの枝は立たず、下の枝へ落ちる。
     binding = coldTarget;
     sendTo = coldTarget;
@@ -1819,18 +1819,18 @@ function createSessionAffinityRequest({
     binding = bound;
     sendTo = bound;
   } else if (familyQuotaExhaustedOnly(bound, threshold, modelFamily, accountManager.now())) {
-    // 当該系統枠だけが枯れた: その系統専用の副バインドを1つ作る（D-54-3・D-56-3）。
+    // 当該系統枠だけが枯れた: その系統専用の副バインドを1つ作る。
     binding = assign([bound.id]);
     sendTo = binding;
     reason = binding ? 'family_exhausted' : null;
   } else if (isCommonQuotaExhausted(bound, threshold)) {
     // 共通枠が枯れた。回復見込みが `rebindGraceMs` 以内なら**再バインドしない**——
     // 結び付け先を選んだまま、選択の直後・資格情報の解決の前に有界待機を挟み、待機の
-    // 後に同じ口座へ1回だけ送る（D-60-2・D-63 C4・§4.3.1）。60秒待てば同じ口座で
+    // 後に同じ口座へ1回だけ送る。60秒待てば同じ口座で
     // 続けられる事象で付け替えるのは、1ターン分を全損させるだけで何も得ないためである。
     // 回復見込みが猶予より先・取得不能・`rebindGraceMs:0` なら待たずに付け替える
     // （無期限の待機を作らないための安全側の既定）。
-    // 付け替えるのは使えなかった結び付け先だけである（D-56-4・D-63 C2）。
+    // 付け替えるのは使えなかった結び付け先だけである。
     graceMs = quotaGraceWaitMs(bound, settings.rebindGraceMs, accountManager.now());
     if (graceMs > 0) {
       binding = bound;
@@ -1843,7 +1843,7 @@ function createSessionAffinityRequest({
     }
   } else {
     // 認証失敗・throttled・資格情報 cooldown・短期レート制限: バインドは変えず、
-    // この要求だけ別の口座で完走させる（D-56-3・D-63 C3・§4.3 の表）。
+    // この要求だけ別の口座で完走させる。
     binding = bound;
     sendTo = assign([bound.id]);
   }
@@ -1854,14 +1854,14 @@ function createSessionAffinityRequest({
       state.gen = reserved.gen;
       state.aff = reserved.disposition;
       state.reservedId = reserved.account;
-      // F9: 応答が終わるまで表の行を保持し、`close` / `abort` でも必ず解放する。
+      // 応答が終わるまで表の行を保持し、`close` / `abort` でも必ず解放する。
       const release = affinity.hold(key);
       res.once('close', release);
       if (res.destroyed || res.writableEnded) release();
     }
   }
 
-  // 待機は1要求につき1回まで（§4.3.1）。待機の連鎖を作らないよう、読み出した時点で
+  // 待機は1要求につき1回まで。待機の連鎖を作らないよう、読み出した時点で
   // 猶予を使い切る。予約済みの結び付け先へ送るときだけ効き、再バインド後の周では
   // 0 を返す（2周目以降は付け替えが済んでいるので待つ理由が無い）。
   state.beginQuotaGrace = account => {
@@ -1887,7 +1887,7 @@ function createSessionAffinityRequest({
   };
   state.confirm = account => {
     if (state.gen === null) return;
-    // `aff` はこの要求が実際にどの口座へ行ったかを表す（§7.4 の遷移回数と揃える）。
+    // `aff` はこの要求が実際にどの口座へ行ったかを表す。
     if (account.id !== state.reservedId) state.aff = 'switch';
     const confirmed = affinity.note(key, {
       account: account.id,
@@ -1898,12 +1898,12 @@ function createSessionAffinityRequest({
     if (confirmed && confirmed.disposition !== 'stale') state.gen = confirmed.gen;
     state.pendingReason = null;
   };
-  // D-154: 反応的 429 の再試行の周は、選択を replay 対象に絞った既存経路が行うので
+  // 反応的 429 の再試行の周は、選択を replay 対象に絞った既存経路が行うので
   // `select()` を経ずに確定へ入る。そのままだと付け替えの理由が立たず、表は果てた
   // 結び付け先を指したままになる。**429 を返したのが結び付け先そのもの**で、
   // その 429 が系統枠／共通枠の枯渇を示しているときだけ、その周のうちに付け替えの
-  // 理由を立てる（設計書 §4.3「上流 429 → その系統の副バインドを作る」）。
-  // 理由の語彙は確定段と同じ 2 値だけである（D-142）。
+  // 理由を立てる（上流 429 → その系統の副バインドを作る）。
+  // 理由の語彙は確定段と同じ 2 値だけである。
   state.noteUpstreamQuota = source => {
     if (state.gen === null || !source) return;
     const current = affinity.get(key, { modelFamily });
@@ -1939,7 +1939,7 @@ function createSessionAffinityRequest({
  */
 function coldReassignTarget({ entry, bound, accountManager, settings, modelFamily, assign }) {
   if (!entry || !bound) return null;
-  // 1 は「この線を切る」という意味である（設計書 §6 の値域）。
+  // 1 は「この線を切る」という意味である。
   const drainStart = settings.drainStartUtilization;
   if (!Number.isFinite(drainStart) || drainStart >= 1) return null;
   if (Math.max(0, accountManager.now() - entry.lastSeen) <= settings.warmTtlMs) return null;
@@ -1956,7 +1956,7 @@ function coldReassignTarget({ entry, bound, accountManager, settings, modelFamil
 }
 
 /**
- * 固定セッションの試行ループの上限（設計書 §5.3(a)・P-1・P-3）。
+ * 固定セッションの試行ループの上限。
  *
  * 「バインド先 1 ＋ 再バインド候補数」で数える。口座総数をそのまま使わず、
  * **鍵の無い要求の上限（口座総数）とは別に持つ**ことで、鍵の無い要求の振る舞いが
@@ -1970,7 +1970,7 @@ function pinnedAttemptBudget(accountManager, boundAccountId) {
 }
 
 /**
- * 確定（§4.4 ②）で付け替えてよい理由（D-63 C3・D-142）。枠の枯渇以外は `null` を返し、
+ * 確定で付け替えてよい理由。枠の枯渇以外は `null` を返し、
  * その要求だけ別の口座で完走させて表は元の口座を指したままにする。
  */
 function quotaRebindReason(account, threshold, modelFamily, now) {
@@ -1981,7 +1981,7 @@ function quotaRebindReason(account, threshold, modelFamily, now) {
 }
 
 /**
- * 共通枠の回復見込み（設計書 §4.3.1(b)・D-62-2）。
+ * 共通枠の回復見込み。
  *
  * 読むのは口座が**既に持っている** `quota.unified5hReset` / `unified7dReset` のうち
  * `now` より後の直近だけである。**新しいヘッダ解析も本文解析も1つも増やさない**——
@@ -1991,7 +1991,7 @@ function quotaRebindReason(account, threshold, modelFamily, now) {
  *
  * `retry-after` と短期レート制限の reset（`quota.resetsAt`）は取得元に入れない。
  * どちらも token / request の短期レート制限のもので、共通枠（unified 5h / 7d）の
- * 回復見込みではなく、§4.3 の表で「バインド不変」と決めた側に属する。
+ * 回復見込みではなく、「バインドは変えない」側（createSessionAffinityRequest の最後の分岐）に属する。
  *
  * @returns {number|null} 回復見込みの時刻（ms）。取得できなければ `null`。
  */
@@ -2006,11 +2006,11 @@ function commonQuotaRecoveryAt(account, now) {
 }
 
 /**
- * 猶予の待機時間（設計書 §4.3.1・D-60-2・D-63 C4）。
+ * 猶予の待機時間。
  *
  * 回復見込みが `rebindGraceMs` 以内のときだけ正の値を返す。取得できないときに待たない
- * のは、無期限の待機を作らないための安全側の既定である（§4.3.1 の表）。
- * **`rebindGraceMs: 0` では常に 0 を返し、猶予の経路は1度も実行されない**（v1.1 と同じ挙動）。
+ * のは、無期限の待機を作らないための安全側の既定である。
+ * **`rebindGraceMs: 0` では常に 0 を返し、猶予の経路は1度も実行されない**（待たずに付け替える）。
  *
  * @returns {number} 待つミリ秒。待たないなら 0。
  */
@@ -2023,14 +2023,14 @@ function quotaGraceWaitMs(account, rebindGraceMs, now) {
 }
 
 /**
- * 猶予の有界待機（設計書 §4.3.1(a)・D-63 C4）。
+ * 猶予の有界待機。
  *
  * 待つのは**上流へ送る前**なので、待機中に `res` へは1バイトも書かれない——「応答が
  * 始まった後に送り直さない」は、この位置によって構造的に守られる。待機の後に送るのは
  * 同じ口座への1回だけなので、`attemptedAccountIds` にも `attempt` にも触れない
  * （429 を受けた後に同じ口座へ送り直す経路は作らない）。
  *
- * クライアントの切断・要求の中断では待たずに抜ける（統合⑲）。`req` の 'close' は
+ * クライアントの切断・要求の中断では待たずに抜ける。`req` の 'close' は
  * 本文を読み終えた時点で既に出ているので見張らない。見るのは `res` の 'close' だけである。
  *
  * @returns {Promise<boolean>} 送信を続けてよければ `true`、切断で抜けたなら `false`。
@@ -2635,14 +2635,14 @@ async function forwardWithRotation({
   let reactiveReplayTargets = null;
   let reactiveReplayAuthorization = null;
 
-  // Routing uses the lenient matcher (M3): a dated/numbered Fable id
+  // Routing uses the lenient matcher: a dated/numbered Fable id
   // suffix must still route away from a Fable-exhausted account, unlike the
   // strict `requestModelFamily` used to gate reactive Usage confirmation.
   const modelFamily = routingModelFamily(body);
-  // 設計書 §4.4 ①: 鍵の抽出と予約は、最初の `await` より前のこの同期区間で終える。
+  // 鍵の抽出と予約は、最初の `await` より前のこの同期区間で終える。
   // Node は単一スレッドなのでここへ他の要求は割り込めない（ロックは要らない）。
   // 鍵の抽出が `shouldRouteToOpenAiBridge` より後であることも重要で、gpt-* 宛の要求は
-  // そもそもこの関数へ来ない（§1・R9）。
+  // そもそもこの関数へ来ない。
   const affinityRequest = createSessionAffinityRequest({
     req,
     res,
@@ -2652,40 +2652,40 @@ async function forwardWithRotation({
     affinity: sessionAffinity,
     settings: sessionAffinitySettings,
   });
-  // sid 付与率の母数（§7.3・FU-55）。ここを通る要求だけを数えるので、gpt-* 宛の要求
+  // sid 付与率の母数。ここを通る要求だけを数えるので、gpt-* 宛の要求
   // （openai-bridge へ分岐して本関数へ来ない）は分母にも分子にも入らない。
   if (affinityRequest && sessionAffinityCounts) {
     sessionAffinityCounts.proxied += 1;
     if (affinityRequest.sid) sessionAffinityCounts.keyed += 1;
   }
-  // 設計書 §5.3(a): 試行ループの上限は固定セッションと鍵の無い要求で別々に持つ。
+  // 試行ループの上限は固定セッションと鍵の無い要求で別々に持つ。
   // 鍵の無い要求は現行どおり口座総数、固定セッションは「バインド先 1 ＋ 再バインド候補数」である。
   // 再バインドは周の先頭（重複ガードより手前）で済むので、この本数で結び付け先と
   // 全候補を一周できる——口座総数のままにしておくと、台帳に使える口座が残っていても
-  // 素の 429 を返しうる（I-5・P-1・P-3）。
+  // 素の 429 を返しうる。
   const maxAttempts = affinityRequest?.pinned
     ? pinnedAttemptBudget(accountManager, affinityRequest.reservedId)
     : Math.max(1, accountManager.accounts.length);
-  // 設計書 §4.1 の `selectAccountForRequest`。鍵を持たない要求と `mode:"on"` 以外では
-  // 現行の `getActiveAccount` をそのまま呼ぶ（R-S1 の `trigger='request'` も同じ契機で渡す）。
+  // `selectAccountForRequest`。鍵を持たない要求と `mode:"on"` 以外では
+  // 現行の `getActiveAccount` をそのまま呼ぶ（`trigger='request'` も同じ契機で渡す）。
   const selectAccountForRequest = () => (affinityRequest?.pinned
     ? affinityRequest.select(attemptedAccountIds)
     : accountManager.getActiveAccount(modelFamily, { trigger: 'request' }));
-  // 設計書 §4.2: 7系統すべてが通る単一の判定点。modelFamily をここで束ねてから
+  // 7系統すべてが通る単一の判定点。modelFamily をここで束ねてから
   // 下位（P-a / P-c〜P-g）へ渡す。null なら下位も一切受け取らない＝現行と同一。
   const mapExhaustion = exhaustionMapper
     ? (candidate, options) => exhaustionMapper(candidate, { modelFamily, ...options })
     : null;
-  // P-b: 直前の上流応答の再生（R-20 の 11 か所）。再生する候補を必ずこの1関数へ通す。
+  // P-b: 直前の上流応答の再生。再生する候補を必ずこの1関数へ通す。
   const sendLastRetryable = () => {
     const mapped = mapExhaustion
       ? mapExhaustion(lastRetryableResponse, { mapPath: 'b', headersSent: res.headersSent })
       : lastRetryableResponse;
-    // R4-5: 再生元の 429 の proxy 行は、この写像が起きる前に
+    // 再生元の 429 の proxy 行は、この写像が起きる前に
     // 書き終わっている（forwardOnce の recordProxyRequest）。そのままでは 529 / 403 を
     // 返した事実がログのどこにも残らないので、**写像したときだけ**1行足す。
     // 台帳（accountManager.recordProxyRequest）は経由しないのでイベントは増えない。
-    // 写像しなかった再生と degradeMapping を書いていない構成では1行も増えない（§14.4）。
+    // 写像しなかった再生と degradeMapping を書いていない構成では1行も増えない。
     if (mapped?.degradeLog?.mapReason) {
       logger?.(
         `${new Date().toISOString()} claude-exhaustion-replay`
@@ -2758,8 +2758,8 @@ async function forwardWithRotation({
       return;
     }
 
-    // 設計書 §4.3.1(a)・D-63 C4: 猶予は「選択の直後・資格情報の解決の前」に置く。
-    // 予約（§4.4 ①）は `createSessionAffinityRequest` の同期区間で済んでいるので、
+    // 猶予は「選択の直後・資格情報の解決の前」に置く。
+    // 予約は `createSessionAffinityRequest` の同期区間で済んでいるので、
     // 待っている間に来た同一 sid の要求は予約済みの同じ口座を読む（別口座へ割れない）。
     // 待機の後に送るのは同じ口座への1回だけで、`attemptedAccountIds` も `attempt` も
     // 動かさない。台帳から口座が消えていれば、この下の既存の `includes` 検査が拾う。
@@ -2902,23 +2902,23 @@ async function forwardWithRotation({
       return;
     }
     attemptedAccountIds.add(account.id);
-    // D-154: 反応的 429 の周は `selectAccountForRequest` を経ないので付け替えの理由が
+    // 反応的 429 の周は `selectAccountForRequest` を経ないので付け替えの理由が
     // 立っていない。429 を返したのが結び付け先で、それが枠の枯渇を示しているときだけ、
-    // ここで理由を立ててその周のうちに副バインド／home の付け替えを確定させる（§4.3）。
+    // ここで理由を立ててその周のうちに副バインド／home の付け替えを確定させる。
     if (reactiveQuotaRetryUsed) affinityRequest?.noteUpstreamQuota(reactiveQuotaSource);
-    // 設計書 §4.4 ②: 実際に上流へ送ると決まった口座で予約を確定する。世代が進んで
+    // 実際に上流へ送ると決まった口座で予約を確定する。世代が進んで
     // いれば遅着として捨て（`affinity_stale`）、付け替えるのは枠の枯渇由来のときだけ。
     affinityRequest?.confirm(account);
-    // 設計書 §5.1（D-54-12）: 系統枠だけが枯れた 429 では currentIndex を動かさない。
+    // 系統枠だけが枯れた 429 では currentIndex を動かさない。
     // その口座は他の系統では現役のままなので、先回り経路（getActiveAccount の
     // `leave currentIndex untouched`）と同じく、この要求の送信先としてだけ候補を使う。
     // 判定するのは **429 を返した口座**（reactiveQuotaSource）であって切替先の候補ではない。
     // 切替先で判定すると、枯れていない新候補を見て「共通枠は無事」と読み、
     // 系統枠由来でもグローバル切替を実行してしまう（是正が逆に効く）。
     // reactiveQuotaSource が無いときは述語が偽になり、従来どおり切り替える。
-    // D-54-2（再定義・§5.3(b)）: 固定セッションの要求の処理中は、`currentIndex` を
+    // 固定セッションの要求の処理中は、`currentIndex` を
     // 変更するいかなる経路も通らない。そのセッションの付け替えは上の確定が行い、
-    // グローバル稼働口座の移動は**鍵の無い要求のために**既存ロジックが別途行う（§4.5）。
+    // グローバル稼働口座の移動は**鍵の無い要求のために**既存ロジックが別途行う。
     if (
       reactiveQuotaRetryUsed
       && !affinityRequest?.pinned
@@ -3445,7 +3445,7 @@ function hasUsableAccessToken(secret, now = Date.now()) {
 
 function isCredentialUnavailable(reason) {
   // The expired-login half of this predicate is shared with the status screen
-  // (D-72), so the two lists cannot drift apart.
+  // so the two lists cannot drift apart.
   return isCredentialRefreshCooldown(reason) || isAuthExpiredReason(reason);
 }
 
@@ -3659,9 +3659,9 @@ async function forwardOnceInner({
   let reactiveReplayTargets = null;
   let reactiveReplayAuthorization = null;
 
-  // R4-5: この要求で実際に写像が起きたときの痕跡。下の recordProxyRequest へ渡し、
-  // **この要求の proxy ログ行**へ §9.3 のフィールドを併記する（設計書 §9.5(c)）。
-  // 写像しなければ null のままなので、ログ行は現行と1文字も変わらない（§14.4）。
+  // この要求で実際に写像が起きたときの痕跡。下の recordProxyRequest へ渡し、
+  // **この要求の proxy ログ行**へ写像のフィールド（degradeLogFields）を併記する。
+  // 写像しなければ null のままなので、ログ行は現行と1文字も変わらない。
   let degradeLog = null;
 
   // 応答ヘッダ送出点（P-c :writeUpstreamResponseHead / P-e / P-g1）の単一の判定。
@@ -3718,7 +3718,7 @@ async function forwardOnceInner({
           // 529 だけ写像されない」という再現困難な穴になる。
           if (holdUpstreamOverload(upstreamRes)) return false;
           // P-g1: 応答ヘッダが届いた時点で口座が台帳から消えていた（reload）。
-          // ここを結線しないと、この 429 は写像されないまま素通しされる（設計書 §4.2 v1.3 訂正）。
+          // ここを結線しないと、この 429 は写像されないまま素通しされる。
           return writeMappedOrHead(upstreamRes, 'g');
         }
         const responseQuotaEvidence = unifiedQuotaHeaderEvidence(
@@ -3781,7 +3781,7 @@ async function forwardOnceInner({
         // P-c（passthroughErrors=true＝利用不可口座での実送信）と
         // P-e（通常ローテーションの rate-limit-passthrough）の共通の書き出し位置。
         // P-e では直前の markRateLimited() が済んでいるので、台帳を全枯渇へ変える
-        // 最後の 429 も、その同じ応答の中で写像される（設計書 §4.2）。
+        // 最後の 429 も、その同じ応答の中で写像される。
         return writeMappedOrHead(upstreamRes, passthroughErrors ? 'c' : 'e');
       },
       onChunk(chunk) {
@@ -3876,14 +3876,14 @@ async function forwardOnceInner({
   }
 
   // P-f の再生はこの下（bufferedPassthrough の分岐）で書き出すが、写像はログより先に
-  // 決めておく。そうしないと 529 を返した行に痕跡が載らない（§9.1・受入条件7）。
+  // 決めておく。そうしないと 529 を返した行に痕跡が載らない。
   const bufferedReplay = bufferedPassthrough && exhaustionMapper && !req.aborted && !res.destroyed
     ? exhaustionMapper(upstreamResponse, { mapPath: 'f', headersSent: res.headersSent })
     : null;
   if (bufferedReplay?.degradeLog?.mapReason) degradeLog = bufferedReplay.degradeLog;
 
   // durationMs は観測の解凍を await する前に確定させる。解凍時間が混ざると、
-  // 配備前後で遅延の分位点を比べられなくなる（計画書 (d)・リスク R-5）。
+  // 配備前後で遅延の分位点を比べられなくなる。
   const durationMs = Date.now() - startedAt;
 
   // 本文を onChunk でクライアントへ流し切った応答は、usage を読むための解凍を待たずに
@@ -3921,7 +3921,7 @@ async function forwardOnceInner({
       requestId: headerValue(upstreamResponse.headers['request-id'])
         || headerValue(upstreamResponse.headers['x-request-id']),
       // outcome は上流で実際に起きたこと（rate-limit-passthrough 等）のままにする。
-      // 何へ書き換えたかは同じ行の mappedTo / mapReason が持つ（§9.4 は bridge 経路の分岐）。
+      // 何へ書き換えたかは同じ行の mappedTo / mapReason が持つ。
       outcome: outcomeForResponse(outcome, upstreamResponse.statusCode),
       durationMs,
       degradeLog,
@@ -3962,7 +3962,7 @@ async function forwardOnceInner({
 
   if (bufferedPassthrough) {
     // P-f: 反応的枠確認が「未確認」に終わったときの再生。直前の markRateLimited() の
-    // 後に評価されるので、ここでも全枯渇へ変わる最後の 429 が写像される（設計書 §4.2）。
+    // 後に評価されるので、ここでも全枯渇へ変わる最後の 429 が写像される。
     // 写像の判定自体は上の bufferedReplay で済ませてある（順序を変えただけで挙動は同じ）。
     if (!req.aborted && !res.destroyed) {
       sendBufferedResponse(res, bufferedReplay || upstreamResponse);
@@ -3995,7 +3995,7 @@ function finishStaleAccountResponse(res, upstreamResponse, exhaustionMapper = nu
   if (res.destroyed || res.writableEnded) return;
   // P-g2: onResponse が false を返して本文をバッファした後（quota-retry /
   // reactive-quota-pending）に口座が消えた場合だけ、ここが 429 を書き出す。
-  // P-g1 を通った要求は res.headersSent が真なので、二重には書き換わらない（§8.6）。
+  // P-g1 を通った要求は res.headersSent が真なので、二重には書き換わらない。
   if (!res.headersSent && upstreamResponse) {
     sendBufferedResponse(res, exhaustionMapper
       ? exhaustionMapper(upstreamResponse, { mapPath: 'g', headersSent: res.headersSent })
@@ -4028,7 +4028,7 @@ function buildUpstreamHeaders(inputHeaders, account, secret, observability = DEF
     if (lower === 'x-api-key' || lower === 'authorization') continue;
     // 要求ヘッダを書き換える唯一の箇所。この実行環境が解けない符号化（Node 22.15 未満の
     // zstd）だけを一覧から落とす。Claude Code は `gzip, deflate, br, zstd` を送るので、
-    // 落とさないと上流が zstd で返したときに usage を1件も数えられない（計画書 Task 1 Step 0）。
+    // 落とさないと上流が zstd で返したときに usage を1件も数えられない。
     // 落とすものが無ければ受け取った文字列がそのまま返るので、ヘッダはバイト同一のままになる。
     headers[key] = lower === 'accept-encoding' && observability.upstream.dropUndecodableAcceptEncoding
       ? upstreamAcceptEncoding(value)
@@ -4276,7 +4276,7 @@ function outcomeForResponse(outcome, statusCode) {
 function recordProxyRequest({
   accountManager,
   logger,
-  // sticky affinity の1要求分の状態（§7.1）。`mode:"off"` では渡らないので null。
+  // sticky affinity の1要求分の状態。`mode:"off"` では渡らないので null。
   affinityLog = null,
   account,
   method,
@@ -4286,15 +4286,15 @@ function recordProxyRequest({
   outcome,
   durationMs,
   errorType = null,
-  // R4-5: 写像した要求の痕跡（mapClaudeExhaustion の戻り値 degradeLog）。任意引数なので
-  // 渡さなければ現行と完全に同一に振る舞う（設計書 §14.4）。
+  // 写像した要求の痕跡（mapClaudeExhaustion の戻り値 degradeLog）。任意引数なので
+  // 渡さなければ現行と完全に同一に振る舞う。
   degradeLog = null,
   // キャッシュ観測の追記情報。null なら行は現行とバイト単位で同一になる。
   observationLog = null,
 }) {
   // 写像した要求では、クライアントへ実際に返した status（mappedTo）を記録する。
   // 写像前の実ステータスは同じ行の upstreamStatus / mappedFrom に必ず残るので、
-  // 「529 と偽装した行から本当の上流ステータスが読める」（§9.1・受入条件7）。
+  // 「529 と偽装した行から本当の上流ステータスが読める」。
   const sentStatusCode = degradeLog?.mappedTo ?? statusCode;
   const event = accountManager.recordProxyRequest({
     account: account.id,
@@ -4310,11 +4310,11 @@ function recordProxyRequest({
 }
 
 /**
- * proxy ログ行へ足す sticky affinity の3項目（設計書 §7.1・D-95）。
- * `sid` は 48bit ハッシュで、生のセッション id は出さない（R7・D-54-1）。`aff` は
+ * proxy ログ行へ足す sticky affinity の3項目。
+ * `sid` は 48bit ハッシュで、生のセッション id は出さない。`aff` は
  * `bound` / `new` / `switch` / `none` の4値、`fam` は `fable` / `other` の2値。
  * `mode:"off"` では呼び出し側が null を渡すので空文字列になり、行は現行とバイト同一。
- * 追記は末尾で、順序に依存しない読み方をすること（§7.1・D-63 記載是正⑤）。
+ * 追記は末尾で、順序に依存しない読み方をすること。
  */
 function affinityLogFields(affinityLog) {
   if (!affinityLog) return '';
@@ -4323,7 +4323,7 @@ function affinityLogFields(affinityLog) {
 }
 
 /**
- * 写像した要求のログ行へ足すフィールド（設計書 §9.3 の順序で、値があるキーだけ）。
+ * 写像した要求のログ行へ足すフィールド（buildBridgeLogMeta の順序で、値があるキーだけ）。
  * upstreamStatus には写像前の実ステータスを入れる。P-a / P-d のように rotator が
  * 局所合成した 429 でも、「その要求が本来返そうとしていた status」を指す点は同じである。
  * 写像しなかった要求（mapReason が無い）では空文字列を返し、行は現行と一致する。
@@ -4340,7 +4340,7 @@ function degradeLogFields(degradeLog) {
  * `proxy` 行を書く。
  *
  * 引数順は `(logger, event, degradeLog, affinityLog, observationLog)` に固定し、
- * 連結順は `degradeLogFields` → `affinityLogFields`（sticky R-S7 が持ち込む） →
+ * 連結順は `degradeLogFields` → `affinityLogFields`（sticky affinity が持ち込む） →
  * `observationLogFields` の固定とする。
  * 追記は必ず末尾へ。値が1つも無ければ行は現行とバイト単位で同一になる。
  */
@@ -4357,7 +4357,7 @@ function writeProxyLog(logger, event, degradeLog = null, affinityLog = null, obs
   ];
   if (event.requestId) fields.push(`requestId=${event.requestId}`);
   if (event.errorType) fields.push(`errorType=${event.errorType}`);
-  // 追記は必ず末尾へ（§9.2）。値が1つも無ければ行は現行とバイト単位で同一になる。
+  // 追記は必ず末尾へ。値が1つも無ければ行は現行とバイト単位で同一になる。
   logger(`${fields.join(' ')}${degradeLogFields(degradeLog)}${affinityLogFields(affinityLog)}${observationLogFields(observationLog, affinityLog)}`);
 }
 
@@ -4389,11 +4389,11 @@ function sendCurrentQuotaUnavailableResponse({
   let account = accountManager.getCurrentAccount();
   // Use the modelFamily-aware reason so a non-matching-family request never
   // gets handed a misleading scoped claim (e.g. `seven_day_fable`) when it
-  // was really blocked by an unrelated common-quota window (m2).
+  // was really blocked by an unrelated common-quota window.
   let reason = accountManager.unavailableReasonForModelFamily(account, modelFamily);
   if (!isUnifiedQuotaExhaustion(reason)) return false;
 
-  // D-64 P-2（§4.5・§5.3(b)）: 固定セッションは `selectBestExhaustedFallback` を通さない。
+  // 固定セッションは `selectBestExhaustedFallback` を通さない。
   // これは `switchTo` / `switchToCandidate` とは別の第3の `currentIndex` 代入経路であり、
   // `fallback-switch` イベントも積む。読み取りだけの `bestExhaustedFallbackCandidate` で
   // 同じ口座を選ぶので、応答の中身（合成 429 の account / window / reset）は変わらない。
@@ -4407,9 +4407,9 @@ function sendCurrentQuotaUnavailableResponse({
   }
 
   const response = syntheticQuotaExhaustedResponse(account, reason);
-  // P-a: 合成した 429 を書き出す唯一の位置（設計書 §4.2）。写像はログより先に決める。
+  // P-a: 合成した 429 を書き出す唯一の位置。写像はログより先に決める。
   // ログ行の status は実際に返した値（529 / 403）にし、写像前の 429 は同じ行の
-  // upstreamStatus / mappedFrom として残す（§9.5(c)・受入条件7）。
+  // upstreamStatus / mappedFrom として残す。
   const mapped = exhaustionMapper
     ? exhaustionMapper(response, { mapPath: 'a', headersSent: res.headersSent })
     : response;
@@ -4770,19 +4770,19 @@ function sendJson(res, status, body) {
 }
 
 /**
- * P-d（sendUnavailableAccounts）で写像が起きたときの proxy ログ行（R-S9b・母艦裁定 D-197）。
+ * P-d（sendUnavailableAccounts）で写像が起きたときの proxy ログ行。
  * この経路は c0f79d4 の時点から proxy 行を1行も持たず、写像の痕跡がどこにも残らなかった
  * （degradeLog が捨てられていた）。行の形・フィールドの順序は writeProxyLog のまま使い、
  * mapPath=d と rotatorReason は既存の追記位置（末尾）へ載る。台帳
  * （accountManager.recordProxyRequest）は経由しないのでイベントは増えず、写像しなかった
- * 要求と degradeMapping を書いていない構成では1行も増えない（§14.4）。
+ * 要求と degradeMapping を書いていない構成では1行も増えない。
  */
 function logMappedUnavailableAccounts({
   logger, req, accountManager, account, mapped, affinityLog = null,
 }) {
   if (!logger || !req || !mapped?.degradeLog?.mapReason) return;
   writeProxyLog(logger, {
-    // D-199 (B): 時刻は他の proxy 行（accountManager.recordProxyRequest）とまったく同じ
+    // 時刻は他の proxy 行（accountManager.recordProxyRequest）とまったく同じ
     // 出所、すなわち注入された時計から取る。ここだけ実時計を読むと、時刻を固定した
     // 構成・テストでこの1行だけが別の時間軸で並ぶ。
     at: new Date(accountManager?.now?.() ?? Date.now()).toISOString(),
@@ -4796,13 +4796,13 @@ function logMappedUnavailableAccounts({
 }
 
 /**
- * P-d で写像した応答が名乗る理由（R-S9b・母艦裁定 D-197 / D-199）。分類はこの1箇所だけで
+ * P-d で写像した応答が名乗る理由。分類はこの1箇所だけで
  * 行い、503 分岐が使う述語 `isCredentialUnavailable` には触らない（status 画面と共有して
- * いるため。§5.3(d)）。
+ * いるため）。
  *
  * 見るのは `getCurrentAccount()` が指す1口座ではなく**全口座**の `unavailableReason` である。
  * このヘッダの用途は「待てばよいのか、人を呼ぶのか」の機械判別なので、現在口座が枠切れでも
- * 別の口座が再ログイン待ちなら人を呼ぶ価値がある（D-199 (A)）。優先順位は
+ * 別の口座が再ログイン待ちなら人を呼ぶ価値がある。優先順位は
  * credential_login_required ＞ credential_cooldown ＞ quota_exhausted。
  *
  * 語彙に包括値を置いていないのは、`isCredentialUnavailable` がこの2述語の和そのもの
@@ -4822,7 +4822,7 @@ function classifyUnavailableAccountsReason(accountManager) {
 }
 
 function sendUnavailableAccounts(res, accountManager = null, exhaustionMapper = null, {
-  // R-S9b（母艦裁定 D-197）: 写像したときだけ proxy ログ行を1行出すための文脈。
+  // 写像したときだけ proxy ログ行を1行出すための文脈。
   // 渡さなければ（既存の呼び出し形のままなら）行は1行も増えない。
   req = null,
   logger = null,
@@ -4834,16 +4834,16 @@ function sendUnavailableAccounts(res, accountManager = null, exhaustionMapper = 
     type: 'error',
     error: { type: 'rate_limit_error', message: 'All configured accounts are unavailable.' },
   };
-  // P-d の写像入口。I-6・P-6（設計書 §5.3(d)・§14.2 案イ）: 全滅時の終端は、稼働口座
+  // P-d の写像入口。全滅時の終端は、稼働口座
   // ／固定先の個別 state（枯渇・認証失敗・資格情報 cooldown）に依らず必ずここを通す。
   // 資格情報分岐を先に置いていた頃は、同じ全滅台帳でも `getCurrentAccount()` が返す
   // 口座が認証失敗なら写像器を呼ばずに 503 を書いて return していたため、529 を
-  // fallbackModel の発火条件にしている bridge 側で退避が働かなかった（D-67-2）。
+  // fallbackModel の発火条件にしている bridge 側で退避が働かなかった。
   // 分岐の順序だけを入れ替え、資格情報分岐は「写像へ渡す候補を作る」側へ寄せる。
   // 写像しないと決まったとき（台帳が全枯渇でない・degradeMapping 無効）は、下の 503 を
   // 現行のまま返す。述語 `isCredentialUnavailable` は status 画面（monitor.js の
-  // `login expired` / `needs login`）と共有しているので触らない（§5.3(d) の実装位置）。
-  // R-S9b（D-197 / D-199）: 写像後の 529 が「枠の枯渇」なのか「待てば回復する資格情報の
+  // `login expired` / `needs login`）と共有しているので触らない。
+  // 写像後の 529 が「枠の枯渇」なのか「待てば回復する資格情報の
   // cooldown」なのか「人が再ログインするまで戻らない失効」なのかを名乗れるように、下の
   // 503 分岐と同じ述語（isAuthExpiredReason / isCredentialRefreshCooldown）で分類して
   // から写像器へ渡す。分類は既存のものを写すだけで、新しい語彙は作らない。

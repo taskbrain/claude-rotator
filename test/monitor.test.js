@@ -271,14 +271,14 @@ describe('codex status section', () => {
 });
 
 // ---------------------------------------------------------------------------
-// R7-3: 認証失効の表示（母艦裁定 D-72 の 4）
+// 認証失効の表示
 //
-// 坂根氏の判断③「claude-rotator status には認証が切れているというメッセージだけ出す」。
+// claude-rotator status には、認証が切れているというメッセージだけを出す。
 // 内部の型名（oauth_refresh_failed 等）を画面へ素出しせず、何をすればよいかを出す。
 // 認証失効が1件も無い構成では、出力は1文字も変わらない。
 // ---------------------------------------------------------------------------
 
-describe('認証失効の表示 (D-72)', () => {
+describe('認証失効の表示', () => {
   const now = Date.parse('2026-06-04T09:00:00Z');
 
   it('tells the operator how to recover instead of printing the internal reason type', () => {
@@ -321,14 +321,14 @@ describe('認証失効の表示 (D-72)', () => {
 });
 
 // ---------------------------------------------------------------------------
-// (c) 認証失敗の原因コードと検出時刻の表示（母艦裁定 C-20260915-3F-03）
+// 認証失敗の原因コードと検出時刻の表示
 //
 // 「認証が切れている」だけでは、いつ・何が原因で落ちたのかが読めない。
-// 再ログインの案内（D-72）はそのまま残したうえで、原因コードと「検出した時刻」を
+// 再ログインの案内はそのまま残したうえで、原因コードと「検出した時刻」を
 // 添える。表示は必ず detected と書く——資格情報が実際に満了した時刻は当方では
 // 分からず、expired at と書けば別の時刻として読まれてしまうため。
 // ---------------------------------------------------------------------------
-describe('認証失敗の原因コードと検出時刻の表示 (c)', () => {
+describe('認証失敗の原因コードと検出時刻の表示', () => {
   const now = Date.parse('2026-06-04T09:00:00Z');
 
   it('adds the cause and the detected time without dropping the login guidance', () => {
@@ -402,7 +402,7 @@ describe('認証失敗の原因コードと検出時刻の表示 (c)', () => {
       /reason: login expired \(cause=NATIVE_REFRESH_REAUTH_REQUIRED; detected 06\/04 17:00 JST\) - run: claude-rotator login --id acct_1/,
       '再起動を挟んでも、原因と「1時間前に検出した」ことが画面から読める',
     );
-    assert.match(output, /needs login/, 'D-72 の routing 表示も従来どおり');
+    assert.match(output, /needs login/, 'routing の needs login 表示も従来どおり');
   });
 });
 
@@ -435,15 +435,15 @@ function authExpiredStatus(type) {
   return status;
 }
 
-describe('サブキャップ 429 で稼働口座が動かないときの表示 (P-4 / 設計書 §7.3)', () => {
+describe('サブキャップ 429 で稼働口座が動かないときの表示', () => {
   const NOW = Date.parse('2026-06-04T09:00:00.000Z');
   const FIVE_HOUR_RESET = '2026-06-04T12:00:00.000Z';
   const SEVEN_DAY_RESET = '2026-06-08T09:00:00.000Z';
   const FABLE_RESET = '2026-06-06T09:00:00.000Z';
 
-  // R-S2b（設計書 §5.1）は、反応的 429 の switchToCandidate を
+  // 反応的 429 の経路は、switchToCandidate を
   // familyQuotaExhaustedOnly で条件付きにする。ここではその条件式をそのまま置き、
-  // 系統枠だけが枯れた場合と共通枠が枯れた場合で画面がどう変わるかを固定する（P-4 の差分）。
+  // 系統枠だけが枯れた場合と共通枠が枯れた場合で画面がどう変わるかを固定する。
   function statusAfterReactive429({ commonExhausted }) {
     const manager = new AccountManager({
       accounts: [
@@ -504,7 +504,7 @@ describe('サブキャップ 429 で稼働口座が動かないときの表示 (
     assert.match(output, /b@example\.com\s+ready/);
     assert.ok(!/\bactive\b/.test(output), 'no account row may be labelled active');
     assert.ok(!output.includes('switched acct_1 -> acct_2'), 'no auto-switch line is rendered');
-    // 消えるのは active の表示だけ。枯渇理由・回復時刻・経路は現行のまま（I-1 / I-2）。
+    // 消えるのは active の表示だけ。枯渇理由・回復時刻・経路は現行のまま。
     assert.match(output, /reason: 7d Fable quota exhausted; reset -> 06\/06 18:00 JST/);
     assert.match(output, /routes Fable: 2d \| Other: now/);
     assert.match(renderStatus(common, { now: NOW, columns: 100 }), /b@example\.com\s+active/);
@@ -512,15 +512,15 @@ describe('サブキャップ 429 で稼働口座が動かないときの表示 (
 });
 
 // ---------------------------------------------------------------------------
-// セッション固定の節（R-S12 / 設計書 §7.3）
+// セッション固定の節
 //
 // 描くのは status JSON が `sessionAffinity` を持っているときだけである。`mode:"off"` では
 // `/internal/status` がキー自体を出さないので、この節は1行も描かれず `claude-rotator status`
-// の出力は現行とバイト同一になる（R7）。Codex 節（`renderCodexSection`）と同型で、
+// の出力は現行とバイト同一になる。Codex 節（`renderCodexSection`）と同型で、
 // `renderStatus` からの呼び出しは1箇所だけである。
 // ---------------------------------------------------------------------------
 
-describe('session affinity section (R-S12 / 設計書 §7.3)', () => {
+describe('session affinity section', () => {
   const NOW = Date.parse('2026-09-16T09:00:00.000Z');
 
   function baseStatus() {

@@ -24,7 +24,7 @@ import {
   withoutRateLimitHeaders,
 } from '../src/degrade-state.js';
 
-// 設計書 §11.1 R3-1 / 契約 v1.3 §C3・§C10 の純関数群。
+// src/degrade-state.js の純関数群。
 // すべて副作用なし・時刻注入で決定的に検証する（HTTP も fs も使わない）。
 
 const RESET_AT = '2026-09-08T13:00:00Z';
@@ -43,7 +43,7 @@ function headers(overrides = {}) {
   };
 }
 
-// accountManager は .accounts と .isAvailable() しか使わない（設計書 §4.2）。
+// accountManager は .accounts と .isAvailable() しか使わない。
 function fakeAccountManager(states, expectFamily) {
   const accounts = states.map((available, index) => ({ id: `acct-${index}`, available }));
   return {
@@ -61,7 +61,7 @@ function clockAt(startMs) {
 }
 
 // ---------------------------------------------------------------------------
-// sanitizeAccountLabel（設計書 §6.6 規律1）
+// sanitizeAccountLabel
 // ---------------------------------------------------------------------------
 
 describe('sanitizeAccountLabel', () => {
@@ -89,7 +89,7 @@ describe('sanitizeAccountLabel', () => {
 });
 
 // ---------------------------------------------------------------------------
-// parseBridgeContract（設計書 §6.2・§6.5、契約 §C3）
+// parseBridgeContract
 // ---------------------------------------------------------------------------
 
 describe('parseBridgeContract', () => {
@@ -126,7 +126,7 @@ describe('parseBridgeContract', () => {
   });
 
   it('infers-known-reason-but-requires-explicit-scope-for-gpt-map', () => {
-    // 設計書 §6.5: 学習には effectiveScope を使い、403 書換には rawScope しか使わない。
+    // 学習には effectiveScope を使い、403 書換には rawScope しか使わない。
     const parsed = parseBridgeContract({
       'x-ombr-contract': '1',
       'x-ombr-degrade-reason': 'codex_pool_exhausted',
@@ -208,10 +208,10 @@ describe('parseBridgeContract', () => {
 });
 
 // ---------------------------------------------------------------------------
-// createGptPoolState（契約 §C10.3 の遷移表 T1〜T10）
+// createGptPoolState の遷移 T1〜T10（各遷移の意味は下の試験の名前に書く）
 // ---------------------------------------------------------------------------
 
-describe('createGptPoolState transitions (契約 §C10.3)', () => {
+describe('createGptPoolState transitions', () => {
   it('T1: starts unknown for both keys', () => {
     const state = createGptPoolState({ now: () => 0 });
     const view = state.read('gpt-6-astra');
@@ -319,7 +319,7 @@ describe('createGptPoolState transitions (契約 §C10.3)', () => {
     clock.ms = 1000 + 59999;
     assert.equal(state.read().pool.state, 'unusable');
     clock.ms = 1000 + 60000;
-    assert.equal(state.read().pool.state, 'unknown', '既定 TTL は 60,000ms（契約 §C10.3 T7）');
+    assert.equal(state.read().pool.state, 'unknown', '既定 TTL は 60,000ms');
   });
 
   it('T7: unusableTtlMs is configurable and also expires the (pool, model) key', () => {
@@ -411,7 +411,7 @@ describe('createGptPoolState transitions (契約 §C10.3)', () => {
 });
 
 // ---------------------------------------------------------------------------
-// claudeAllUnusable（設計書 §4.2）
+// claudeAllUnusable
 // ---------------------------------------------------------------------------
 
 describe('claudeAllUnusable', () => {
@@ -435,7 +435,7 @@ describe('claudeAllUnusable', () => {
 });
 
 // ---------------------------------------------------------------------------
-// mapClaudeExhaustion（設計書 §4.2・§8.6・§8.7、契約 §C10.4）
+// mapClaudeExhaustion
 // ---------------------------------------------------------------------------
 
 function candidate429() {
@@ -490,7 +490,7 @@ describe('mapClaudeExhaustion', () => {
     );
     assert.equal(output.degradeLog.mapReason, 'both_pools_unusable');
     assert.equal(output.degradeLog.mapPath, 'd');
-    // R4-5: 403 で止めた行から回復時刻を本文を開かずに読めるようにする（設計書 §9.3 resetAt）。
+    // 403 で止めた行から回復時刻を本文を開かずに読めるようにする（ログの resetAt）。
     assert.equal(output.degradeLog.resetAt, RESET_AT);
   });
 
@@ -503,7 +503,7 @@ describe('mapClaudeExhaustion', () => {
       mapPath: 'a',
     });
     assert.equal(output.statusCode, 529);
-    assert.equal(output.degradeLog.resetAt, undefined, '値の無いキーはログ行に出さない（§9.2）');
+    assert.equal(output.degradeLog.resetAt, undefined, '値の無いキーはログ行に出さない');
   });
 
   it('rewrites content-length, drops content-encoding and keeps the other headers', () => {
@@ -535,7 +535,7 @@ describe('mapClaudeExhaustion', () => {
     const notExhausted = mapClaudeExhaustion(candidate429(), { ...base, claudeAllUnusable: false });
     assert.equal(notExhausted.statusCode, 429);
     assert.equal(notExhausted.degradeLog.mappedTo, undefined);
-    assert.equal(notExhausted.degradeLog.mapPath, 'c', '写像しなくても痕跡は残す（契約 §C10.4 補足③）');
+    assert.equal(notExhausted.degradeLog.mapPath, 'c', '写像しなくても痕跡は残す');
 
     for (const statusCode of [200, 503, 500]) {
       const other = mapClaudeExhaustion({ ...candidate429(), statusCode }, { ...base, claudeAllUnusable: true });
@@ -558,7 +558,7 @@ describe('mapClaudeExhaustion', () => {
   });
 
   // -------------------------------------------------------------------------
-  // 403 への昇格は「要求モデル系列の枯渇」だけを根拠にしない（設計書 §4.2）。
+  // 403 への昇格は「要求モデル系列の枯渇」だけを根拠にしない。
   // Fable 週次サブキャップだけが全口座で切れている状態は、共通枠（Opus 等）が
   // 残っている限り「Claude が使えない」ではないので 529 に留める。
   // -------------------------------------------------------------------------
@@ -579,7 +579,7 @@ describe('mapClaudeExhaustion', () => {
     assert.equal(body.error.message, 'All Claude accounts are exhausted.');
     assert.equal(output.degradeLog.mappedTo, 529);
     assert.equal(output.degradeLog.mapReason, 'all_claude_accounts_exhausted');
-    assert.equal(output.degradeLog.resetAt, undefined, '529 は回復時刻を持たない（§9.2）');
+    assert.equal(output.degradeLog.resetAt, undefined, '529 は回復時刻を持たない');
     assert.equal(output.degradeLog.gptPoolState, 'unusable', 'GPT 側の観測はそのまま痕跡に残す');
   });
 
@@ -610,11 +610,11 @@ describe('mapClaudeExhaustion', () => {
     assert.equal(output.statusCode, 529);
     assert.equal(JSON.parse(output.body.toString('utf8')).error.type, 'overloaded_error');
     assert.equal(output.degradeLog.mapReason, 'all_claude_accounts_exhausted');
-    assert.equal(output.degradeLog.resetAt, undefined, '529 は回復時刻を持たない（§9.2）');
+    assert.equal(output.degradeLog.resetAt, undefined, '529 は回復時刻を持たない');
   });
 
   // -------------------------------------------------------------------------
-  // R-S9b（母艦裁定 D-197。語彙は D-199 で分割した）: 写像後の応答へ「なぜ止まって
+  // 写像後の応答へ「なぜ止まって
   // いるのか」を1本のヘッダ（x-claude-rotator-reason）で残す。語彙は既存の分類を写した
   // 3値だけで、新しい分類は作らない: quota_exhausted / credential_cooldown（待てば回復
   // する）/ credential_login_required（人が再ログインするまで回復しない）。既定は
@@ -629,11 +629,11 @@ describe('mapClaudeExhaustion', () => {
     assert.equal(
       output.degradeLog.rotatorReason,
       undefined,
-      '既定の分類はログ行のフィールドを増やさない（値の無いキーは出さない＝§9.2）',
+      '既定の分類はログ行のフィールドを増やさない（値の無いキーは出さない）',
     );
   });
 
-  it('stamps credential_login_required and records it in the trace when the caller classifies the path (P-d)', () => {
+  it('stamps credential_login_required and records it in the trace when the caller classifies the path', () => {
     const output = mapClaudeExhaustion(candidate429(), {
       enabled: true,
       claudeAllUnusable: true,
@@ -646,7 +646,7 @@ describe('mapClaudeExhaustion', () => {
     assert.equal(output.statusCode, 529);
   });
 
-  // D-199: 資格情報起因を「待てばよい（cooldown）」と「人を呼ぶ（再ログイン）」へ分ける。
+  // 資格情報起因を「待てばよい（cooldown）」と「人を呼ぶ（再ログイン）」へ分ける。
   it('stamps credential_cooldown for the half that recovers on its own (待てば回復する側)', () => {
     const output = mapClaudeExhaustion(candidate429(), {
       enabled: true,
@@ -674,7 +674,7 @@ describe('mapClaudeExhaustion', () => {
   });
 
   it('falls back to quota_exhausted outside the 3-value vocabulary (語彙は作らない)', () => {
-    // `credential_failure` は D-199 で語彙から外した包括値。P-d の述語
+    // `credential_failure` は語彙に置かない包括値。使える口座が無いときの経路の述語
     // `isCredentialUnavailable` が cooldown と再ログイン必要の2述語の**和そのもの**
     // （src/proxy-server.js の同名関数）なので第3の資格情報起因は構造上あり得ず、
     // 包括値を受け取ったら未知値として既定へ落とす。
@@ -698,7 +698,7 @@ describe('mapClaudeExhaustion', () => {
     assert.equal(output.degradeLog.rotatorReason, undefined);
   });
 
-  it('adds no header at all while degradeMapping is disabled (§14.4)', () => {
+  it('adds no header at all while degradeMapping is disabled', () => {
     const input = candidate429();
     const output = mapClaudeExhaustion(input, {
       enabled: false, claudeAllUnusable: true, gptPoolState: 'unknown', mapPath: 'd', reason: 'credential_login_required',
@@ -709,10 +709,10 @@ describe('mapClaudeExhaustion', () => {
 });
 
 // ---------------------------------------------------------------------------
-// mapClaudeExhaustion > 全枯渇の 529 写像を止める（母艦裁定 D-261・段 2 方式イ）
+// mapClaudeExhaustion > 全枯渇の 529 写像を止める
 // ---------------------------------------------------------------------------
 
-describe('mapClaudeExhaustion > claudeExhaustedTo529 の素通し (D-261)', () => {
+describe('mapClaudeExhaustion > claudeExhaustedTo529 の素通し', () => {
   // rotator が全枯渇時に合成する 429 の再現。Claude Code が「週次上限」を判別する根拠は
   // この unified ヘッダ群なので、素通しでは1バイトも落としてはならない。
   const synthetic429 = () => ({
@@ -774,7 +774,7 @@ describe('mapClaudeExhaustion > claudeExhaustedTo529 の素通し (D-261)', () =
 
   it('takes precedence over the 403 and the recoveryWait 429 branches', () => {
     // 両プール全滅（403 になる構成）でも、recoveryWait の 429 待機構成でも、素通しが勝つ。
-    // 段 2 の目的は「rotator が答えを作らず Claude Code に週次上限として扱わせる」こと
+    // 素通しの目的は「rotator が答えを作らず Claude Code に週次上限として扱わせる」こと
     // なので、先に判定しないと本文とヘッダが作り替えられてしまう。
     for (const overrides of [
       { commonFamilyAllUnusable: true, bothUnusableStatus: 403, claudeResetAt: RESET_AT },
@@ -789,13 +789,13 @@ describe('mapClaudeExhaustion > claudeExhaustedTo529 の素通し (D-261)', () =
       assert.equal(output.headers, input.headers, JSON.stringify(overrides));
       assert.equal(output.body, input.body, JSON.stringify(overrides));
       assert.equal(output.degradeLog.mapReason, 'claude_exhausted_passthrough');
-      assert.equal(output.headers['Retry-After'], undefined, 'Retry-After を合成しない（方式ア の撤回）');
+      assert.equal(output.headers['Retry-After'], undefined, 'Retry-After を合成しない');
     }
   });
 
   it('adds no mapReason to a request that was never a mapping candidate', () => {
     // 全枯渇でない・429 でない・ヘッダ送出済みの3つは写像の候補ですらない。ここへ
-    // mapReason を足すと、写像と無関係な要求の proxy ログ行が1フィールド増える（§14.4）。
+    // mapReason を足すと、写像と無関係な要求の proxy ログ行が1フィールド増える。
     for (const ctx of [
       { claudeAllUnusable: false },
       { headersSent: true },
@@ -820,14 +820,14 @@ describe('mapClaudeExhaustion > claudeExhaustedTo529 の素通し (D-261)', () =
 });
 
 // ---------------------------------------------------------------------------
-// decideBridgeResponse（設計書 §8.7 の4条件）
+// decideBridgeResponse（4条件）
 // ---------------------------------------------------------------------------
 
 function bridgeCtx(overrides = {}) {
   return { enabled: true, upstreamStatus: 529, claudeAllUnusable: true, gptPoolState: 'unusable', ...overrides };
 }
 
-describe('decideBridgeResponse (設計書 §8.7 の4条件)', () => {
+describe('decideBridgeResponse (4条件)', () => {
   it('rewrites 529 to 403 only when all four conditions hold', () => {
     const decision = decideBridgeResponse(parseBridgeContract(headers()), bridgeCtx({ gptResetAt: RESET_AT }));
     assert.equal(decision.rewrite, true);
@@ -889,7 +889,7 @@ describe('decideBridgeResponse (設計書 §8.7 の4条件)', () => {
   });
 
   it('does not rewrite a 529 whose reason carries no pool-state (例: codex_upstream_overloaded)', () => {
-    // 設計書 §8.7 条件①: 過去に学習した (pool)=unusable だけを根拠に書き換えない。
+    // 条件①（pool-state が exhausted／mixed）: 過去に学習した (pool)=unusable だけを根拠に書き換えない。
     const parsed = parseBridgeContract({
       'x-ombr-contract': '1',
       'x-ombr-degrade-reason': 'codex_upstream_overloaded',
@@ -926,7 +926,7 @@ describe('buildDegradeBody', () => {
 });
 
 // ---------------------------------------------------------------------------
-// buildBridgeLogMeta / formatLogMeta（設計書 §9.3）
+// buildBridgeLogMeta / formatLogMeta
 // ---------------------------------------------------------------------------
 
 describe('buildBridgeLogMeta', () => {
@@ -947,7 +947,7 @@ describe('buildBridgeLogMeta', () => {
       'primaryUsedPercent', 'gptPoolState', 'gptModelState', 'claudePoolState',
       'mappedFrom', 'mappedFromType', 'mappedTo', 'mapReason', 'mapPath',
     ]);
-    assert.equal(meta.degradeScope, 'pool', 'degradeScope は rawScope を書く（設計書 §9.3）');
+    assert.equal(meta.degradeScope, 'pool', 'degradeScope は rawScope を書く');
     assert.equal(meta.accountLabel, 'pro-b');
   });
 
@@ -977,8 +977,8 @@ describe('buildBridgeLogMeta', () => {
 });
 
 // ---------------------------------------------------------------------------
-// 契約適合まわりの回帰テスト4件（2026-09-08）
-// 契約 §C3.2（値域）・§C3.7（契約前 bridge）・§C10.3（学習対象）に合わせる。
+// bridge の応答ヘッダの取り決めに合わせた回帰テスト4件
+// 値域・契約前 bridge（x-ombr-contract の無い応答）・学習対象を確かめる。
 // ---------------------------------------------------------------------------
 
 function withoutContract(source) {
@@ -987,7 +987,7 @@ function withoutContract(source) {
   return next;
 }
 
-describe('x-ombr-contract の無い応答からは学習しない（契約 §C3.7-1）', () => {
+describe('x-ombr-contract の無い応答からは学習しない', () => {
   it('契約前 bridge の 429/529/403 を何度観測しても両鍵とも unknown のまま', () => {
     const state = createGptPoolState({ now: () => 1000 });
     const parsed = parseBridgeContract(withoutContract(headers()));
@@ -1042,7 +1042,7 @@ describe('x-ombr-contract の無い応答からは学習しない（契約 §C3.
   });
 });
 
-describe('学習対象は 4xx/5xx と HTTP 200 だけ（契約 §C10.3 T2・T8・T9）', () => {
+describe('学習対象は 4xx/5xx と HTTP 200 だけ（T2・T8・T9）', () => {
   it('201・302・null・非整数のステータスからは枯渇を学習しない', () => {
     for (const status of [201, 204, 302, 304, null, undefined, '429', 429.5, NaN]) {
       const state = createGptPoolState({ now: () => 1000 });
@@ -1052,7 +1052,7 @@ describe('学習対象は 4xx/5xx と HTTP 200 だけ（契約 §C10.3 T2・T8�
     }
   });
 
-  it('200 以外の 2xx は available にもしない（契約 T2 は HTTP 200 に限定）', () => {
+  it('200 以外の 2xx は available にもしない（T2 は HTTP 200 に限定）', () => {
     for (const status of [201, 202, 204]) {
       const state = createGptPoolState({ now: () => 1000 });
       const parsed = parseBridgeContract({ 'x-ombr-contract': '1', 'x-ombr-pool-state': 'ok' });
@@ -1079,7 +1079,7 @@ describe('学習対象は 4xx/5xx と HTTP 200 だけ（契約 §C10.3 T2・T8�
   });
 });
 
-describe('値域検証（契約 §C3.2）', () => {
+describe('値域検証', () => {
   it('実在しない日付の reset-at を受理しない（Date.parse の繰り上げに頼らない）', () => {
     const invalid = [
       '2028-02-30T00:00:00Z', // 繰り上げで 3/1 になる
@@ -1136,7 +1136,7 @@ describe('値域検証（契約 §C3.2）', () => {
     assert.equal(parseBridgeContract({ 'x-ombr-upstream-status': 'none' }).upstreamStatus, 'none');
   });
 
-  it('used-percent は 0〜100・小数第1位までだけを受理する（契約 §C3.2）', () => {
+  it('used-percent は 0〜100・小数第1位までだけを受理する', () => {
     for (const value of ['12.34', '1e2', '0x10', '-1', '101', '100.1', '.5', '5.', '97,5']) {
       assert.equal(parseBridgeContract({ 'x-ombr-primary-used-percent': value }).primaryUsedPercent, null, value);
     }
@@ -1154,7 +1154,7 @@ describe('degrade-reason は列挙値だけを受理する（識別子の混入�
     'codex_upstream_timeout', 'bridge_internal_error', 'request_invalid', 'request_too_large',
   ];
 
-  it('契約 §C3.4 の列挙値はそのまま通す', () => {
+  it('degrade-reason の列挙値はそのまま通す', () => {
     for (const reason of DOCUMENTED_REASONS) {
       assert.equal(parseBridgeContract({ 'x-ombr-degrade-reason': reason }).reason, reason, reason);
     }
@@ -1191,14 +1191,14 @@ describe('degrade-reason は列挙値だけを受理する（識別子の混入�
 });
 
 // ---------------------------------------------------------------------------
-// R4-1 の付随修正: read() は観測していないモデル鍵を作らない（non_blocking 改善）
+// read() は観測していないモデル鍵を作らない
 //
 // read(model) は毎要求のログ組み立て（src/openai-bridge.js の poolStateFields）から
 // 呼ばれる。ここでエントリを作ると、bridge へ投げたモデル名の分だけ Map が単調に
 // 増え続け、snapshot() にも「一度も観測していないモデル」が unknown として並ぶ。
 // エントリを作ってよいのは observe()（＝実際に bridge から学習したとき）だけである。
 // ---------------------------------------------------------------------------
-describe('createGptPoolState > read() は観測していないモデル鍵を作らない (R4-1 付随)', () => {
+describe('createGptPoolState > read() は観測していないモデル鍵を作らない', () => {
   it('does not add an entry to snapshot() for a model that was only read', () => {
     const state = createGptPoolState({ now: () => 1000 });
 
@@ -1227,12 +1227,12 @@ describe('createGptPoolState > read() は観測していないモデル鍵を作
 });
 
 // ---------------------------------------------------------------------------
-// 契約 v1.5（bridge 側からの提案 C-20260908-D5-03 を当方 ACK 済み）:
+// bridge が返す次の reason と pool-state:
 // 新しい reason `codex_credentials_unavailable` と pool-state `credentials-unavailable`。
 // rotator の扱いは `codex_needs_login` と**完全に同一**にする（403 を素通しし、
-// (pool) は利用不可として学習する＝設計書 §8.8。403 書換の根拠にはしない）。
+// (pool) は利用不可として学習する。403 書換の根拠にはしない）。
 // ---------------------------------------------------------------------------
-describe('契約 v1.5 > codex_credentials_unavailable は codex_needs_login と同一に扱う', () => {
+describe('codex_credentials_unavailable は codex_needs_login と同一に扱う', () => {
   const v15Headers = reason => ({
     'x-ombr-contract': '1',
     'x-ombr-degrade-reason': reason,
@@ -1282,9 +1282,9 @@ describe('契約 v1.5 > codex_credentials_unavailable は codex_needs_login と�
 });
 
 // ---------------------------------------------------------------------------
-// R4-1 再検証①: 契約ヘッダを持たない応答は 403 へ書き換えない（契約 §C3.7-1）
+// 契約ヘッダを持たない応答は 403 へ書き換えない
 // ---------------------------------------------------------------------------
-describe('decideBridgeResponse > x-ombr-contract が無ければ書き換えない (R4-1 再検証①)', () => {
+describe('decideBridgeResponse > x-ombr-contract が無ければ書き換えない', () => {
   const rewritable = {
     enabled: true, upstreamStatus: 529, claudeAllUnusable: true,
     gptPoolState: 'unusable', bothUnusableStatus: 403,
@@ -1319,9 +1319,9 @@ describe('decideBridgeResponse > x-ombr-contract が無ければ書き換えな�
 });
 
 // ---------------------------------------------------------------------------
-// R4-1 再検証②: 403 本文の最早回復時刻に Claude 側を含める
+// 403 本文の最早回復時刻に Claude 側を含める
 // ---------------------------------------------------------------------------
-describe('claudeEarliestResetAt (R4-1 再検証②)', () => {
+describe('claudeEarliestResetAt', () => {
   const managerWith = entries => ({ getRoutingAvailability: () => entries });
 
   it('returns the earliest availableAt across the ledger', () => {
@@ -1352,12 +1352,12 @@ describe('claudeEarliestResetAt (R4-1 再検証②)', () => {
 });
 
 // ---------------------------------------------------------------------------
-// R6-6 / 契約 v1.6.3: 新しい reason `codex_aggregation_timeout`
+// reason `codex_aggregation_timeout`
 // （非 SSE 集約が総時間上限に達したときの 529。scope=model・pool-state 無し）。
 // rotator 側の変更は「理由名をログへ残せるようにする」ことだけで、挙動は一切変えない。
 // ---------------------------------------------------------------------------
-describe('契約 v1.6.3 > codex_aggregation_timeout は理由名として認識するだけで挙動を変えない (R6-6)', () => {
-  // bridge が実際に送る形（契約 §C3.4）。pool-state は付かない。
+describe('codex_aggregation_timeout は理由名として認識するだけで挙動を変えない', () => {
+  // bridge が実際に送る形。pool-state は付かない。
   const timeoutHeaders = () => ({
     'x-ombr-contract': '1',
     'x-ombr-degrade-reason': 'codex_aggregation_timeout',
@@ -1374,7 +1374,7 @@ describe('契約 v1.6.3 > codex_aggregation_timeout は理由名として認識�
     assert.equal(parsed.poolState, null, 'この理由に x-ombr-pool-state は付かない');
   });
 
-  it('learns nothing — neither (pool) nor (pool, model) changes (契約 §C10.3 T9)', () => {
+  it('learns nothing — neither (pool) nor (pool, model) changes (T9)', () => {
     const state = createGptPoolState({ now: () => 1000 });
     const result = state.observe(parseBridgeContract(timeoutHeaders()), 529, 'gpt-6-astra');
     assert.equal(result.transition, null, 'pool-state を持たない応答からは学習しない');
@@ -1385,7 +1385,7 @@ describe('契約 v1.6.3 > codex_aggregation_timeout は理由名として認識�
     assert.equal(state.read('gpt-6-astra').model.state, 'unknown');
   });
 
-  it('never rewrites the 529 to 403, even when every Claude account is unusable (設計書 §8.7 条件①)', () => {
+  it('never rewrites the 529 to 403, even when every Claude account is unusable', () => {
     const parsed = parseBridgeContract(timeoutHeaders());
     assert.deepEqual(
       decideBridgeResponse(parsed, bridgeCtx({ bothUnusableStatus: 403 })),
@@ -1405,10 +1405,8 @@ describe('契約 v1.6.3 > codex_aggregation_timeout は理由名として認識�
 });
 
 // ---------------------------------------------------------------------------
-// R7-1: 認証失効（Codex 側）の 403 を 529 へ写像する（母艦裁定 D-72 / 坂根氏の判断③）
+// 認証失効（Codex 側）の 403 を 529 へ写像する
 //
-// 「ログインが切れた場合は自動でローテーションして claude-rotator status には認証が
-// 切れているというメッセージだけ出す。止まるのが困るので止まらないように」（判断③）。
 // 403 のままだと Claude Code はその場で停止する。529 にすると fallbackModel（Opus 等）
 // へ自動退避するので作業が止まらない。
 //
@@ -1416,7 +1414,7 @@ describe('契約 v1.6.3 > codex_aggregation_timeout は理由名として認識�
 // codex_credentials_unavailable」の3条件がすべて成り立つときだけである。
 // scope（pool / model）は問わない（学習の可否＝T3 とは別の判断であるため）。
 // ---------------------------------------------------------------------------
-describe('decideAuthDegradeRewrite > 認証失効の 403 を 529 へ写像する (D-72)', () => {
+describe('decideAuthDegradeRewrite > 認証失効の 403 を 529 へ写像する', () => {
   const authHeaders = (overrides = {}) => ({
     'x-ombr-contract': '1',
     'x-ombr-degrade-reason': 'codex_needs_login',
@@ -1462,18 +1460,18 @@ describe('decideAuthDegradeRewrite > 認証失効の 403 を 529 へ写像する
     assert.match(
       JSON.parse(decision.body).error.message,
       /credential/i,
-      '「ログインし直せ」ではなく「資格情報を読めない」と書く（契約 §C3.4 が理由を分けた目的）',
+      '「ログインし直せ」ではなく「資格情報を読めない」と書く',
     );
     assert.equal(decision.meta.mapReason, 'codex_auth_expired', '写像の理由は1つに揃える');
   });
 
-  it('rewrites a model-scoped needs-login 403 as well (§D2 S7b-m)', () => {
+  it('rewrites a model-scoped needs-login 403 as well', () => {
     const decision = decideAuthDegradeRewrite(
       parseBridgeContract(authHeaders({ 'x-ombr-degrade-scope': 'model' })),
       { enabled: true, upstreamStatus: 403 },
     );
 
-    assert.equal(decision.rewrite, true, 'scope が model でも「止めない」方針は同じ（D-72 の1）');
+    assert.equal(decision.rewrite, true, 'scope が model でも「止めない」方針は同じ');
     assert.equal(decision.status, 529);
   });
 
@@ -1481,7 +1479,7 @@ describe('decideAuthDegradeRewrite > 認証失効の 403 を 529 へ写像する
     assert.deepEqual(
       decideAuthDegradeRewrite(parseBridgeContract({}), { enabled: true, upstreamStatus: 403 }),
       { rewrite: false, reason: 'no-contract-header' },
-      '契約前 bridge・bridge 不達の 403 は現行どおり素通しする（D-72 の2）',
+      '契約前 bridge・bridge 不達の 403 は現行どおり素通しする',
     );
     assert.deepEqual(
       decideAuthDegradeRewrite(null, { enabled: true, upstreamStatus: 403 }),
@@ -1499,7 +1497,7 @@ describe('decideAuthDegradeRewrite > 認証失効の 403 を 529 へ写像する
     assert.deepEqual(
       decideAuthDegradeRewrite(parsed, { enabled: true, upstreamStatus: 403 }),
       { rewrite: false, reason: 'reason-not-auth-expired' },
-      '設定の問題は時間でもローテーションでも解けないので止める（D-72 の2）',
+      '設定の問題は時間でもローテーションでも解けないので止める',
     );
   });
 
@@ -1539,13 +1537,13 @@ describe('decideAuthDegradeRewrite > 認証失効の 403 を 529 へ写像する
 });
 
 // ---------------------------------------------------------------------------
-// 段階①（統合設計 v2.1 / 契約 v1.6.10 条文案 送付版）
+// recoveryWaitEnabled の配下に置く2つの層
 //   層1: T2b・T6b・キャッシュ非学習（すべて recoveryWaitEnabled の配下）
 //   層2: 三値の Claude 空き判定・429 待機・認証失効の除外・本文と Retry-After
 // いずれも「フラグ off では現行と1分岐も変わらない」ことを同じ場所で固定する。
 // ---------------------------------------------------------------------------
 
-/** 契約 v1.6.10 §A A-7 の T2b が要求する「成功 200」のヘッダ組。 */
+/** T2b が要求する「成功 200」のヘッダ組。 */
 function successHeaders(overrides = {}) {
   return {
     'x-ombr-contract': '1',
@@ -1563,8 +1561,8 @@ function unusablePool({ now, unusableTtlMs, recoveryWaitEnabled = true, resetAt 
   return state;
 }
 
-describe('T2b: 成功 200 を古い否定の反証として使う (契約 v1.6.10 §A A-7)', () => {
-  // 母艦 R-20260916-3F-32 ①: 成功経路は SSE / codex 集約 / 非集約(legacy) の3種。
+describe('T2b: 成功 200 を古い否定の反証として使う', () => {
+  // 成功経路は SSE / codex 集約 / 非集約(legacy) の3種。
   // 判定は経路ではなく**ヘッダの組**で行うので、3経路とも同じ1本の判定を通る。
   const successRoutes = {
     sse: { 'content-type': 'text/event-stream' },
@@ -1628,7 +1626,7 @@ describe('T2b: 成功 200 を古い否定の反証として使う (契約 v1.6.1
   });
 
   it('does not fire when the 200 carries a pool-state (条件6・単一口座モードは T2 の対象)', () => {
-    // 母艦 R-20260916-3F-32 ④: 単一口座モードの成功 200 は pool-state: ok を付ける。
+    // 単一口座モードの成功 200 は pool-state: ok を付ける。
     // 6条件の「pool-state 無し」がこれを弾き、既存の T2（available へ）が引き受ける。
     const state = unusablePool({ now: () => 1000 });
     const result = state.observe(
@@ -1655,8 +1653,8 @@ describe('T2b: 成功 200 を古い否定の反証として使う (契約 v1.6.1
     }
   });
 
-  it('does not fire for a 403 that reports S12/S13 (upstream-status=none・pool-state 不在)', () => {
-    // 母艦 R-20260916-3F-32 ②: unreachable / timeout は pool-state を付けず
+  it('does not fire for an unreachable/timeout 403 (upstream-status=none・pool-state 不在)', () => {
+    // unreachable / timeout は pool-state を付けず
     // upstream-status: none の 403 になる。生の 200 ではないので T2b の条件1 が落ちる。
     for (const reason of ['codex_upstream_unreachable', 'codex_upstream_timeout']) {
       const state = unusablePool({ now: () => 1000 });
@@ -1682,7 +1680,7 @@ describe('T2b: 成功 200 を古い否定の反証として使う (契約 v1.6.1
   });
 });
 
-describe('T6b: resetAt 付き unusable にも TTL を重ねる (統合設計 v2.1 §2)', () => {
+describe('T6b: resetAt 付き unusable にも TTL を重ねる', () => {
   it('never outlives learnedAt + unusableTtlMs even when resetAt is days away', () => {
     const start = Date.parse('2026-09-14T00:00:00Z');
     const { clock, now } = clockAt(start);
@@ -1727,7 +1725,7 @@ describe('T6b: resetAt 付き unusable にも TTL を重ねる (統合設計 v2.
     assert.equal(state.read().pool.state, 'unknown', 'TTL が遠くても resetAt が来れば解ける');
   });
 
-  it('keeps the current behaviour while recoveryWait is off (本番の固着を再現する)', () => {
+  it('keeps the current behaviour while recoveryWait is off (現行の固着を再現する)', () => {
     const start = Date.parse('2026-09-14T00:00:00Z');
     const { clock, now } = clockAt(start);
     const state = unusablePool({ now, resetAt: '2026-09-19T08:10:38Z', recoveryWaitEnabled: false });
@@ -1737,7 +1735,7 @@ describe('T6b: resetAt 付き unusable にも TTL を重ねる (統合設計 v2.
   });
 });
 
-describe('キャッシュ由来の否定応答は学習の入力にしない (統合設計 v2.1 §2 / 03 §3.3)', () => {
+describe('キャッシュ由来の否定応答は学習の入力にしない', () => {
   it('cached_negative_never_learns_or_renews', () => {
     const { clock, now } = clockAt(1000);
     const state = createGptPoolState({ now, recoveryWaitEnabled: true });
@@ -1759,8 +1757,8 @@ describe('キャッシュ由来の否定応答は学習の入力にしない (�
   });
 
   it('learns from a 529 that carries no x-ombr-cached header at all (除外は cached: yes のときだけ)', () => {
-    // a8 の回答 R-20260916-a8-26: 本番で最も頻度が高い 529 は「使用率 95% 超の除外分岐
-    // （observationOnly）」由来で x-ombr-cached を付けない。つまり**学習対象**である。
+    // bridge の「使用率 95% 超の除外分岐（observationOnly）」由来の 529 は
+    // x-ombr-cached を付けない。つまり**学習対象**である。
     // キャッシュ非学習が効くのは cached: yes のときだけ、という前提をここで固定する。
     const state = createGptPoolState({ now: () => 1000, recoveryWaitEnabled: true });
     const parsed = parseBridgeContract(headers());
@@ -1792,7 +1790,7 @@ describe('キャッシュ由来の否定応答は学習の入力にしない (�
   });
 });
 
-describe('claudeQuotaState (統合設計 v2.1 §3.5)', () => {
+describe('claudeQuotaState', () => {
   it('claudeQuotaState returns indeterminate for zero accounts and for a missing predicate', () => {
     assert.equal(claudeQuotaState({ accounts: [], isAvailable: () => true }, null), 'indeterminate');
     assert.equal(claudeQuotaState({ accounts: [{ id: 'a' }] }, null), 'indeterminate');
@@ -1827,7 +1825,7 @@ describe('claudeQuotaState (統合設計 v2.1 §3.5)', () => {
   });
 });
 
-describe('buildDegradeBody / buildTransientDegradeBody の3状態 (統合設計 v2.1 §3.3)', () => {
+describe('buildDegradeBody / buildTransientDegradeBody の3状態', () => {
   it('buildDegradeBody(429) emits rate_limit_error, not overloaded_error', () => {
     const body = JSON.parse(buildDegradeBody(429, { resetAts: ['2099-01-01T00:00:00Z'] }));
     assert.equal(body.error.type, 'rate_limit_error');
@@ -1859,7 +1857,7 @@ describe('buildDegradeBody / buildTransientDegradeBody の3状態 (統合設計 
   });
 });
 
-describe('applyRecoveryWaitHeaders (統合設計 v2.1 §3.3・V1)', () => {
+describe('applyRecoveryWaitHeaders', () => {
   it('strips every retry-after and anthropic-ratelimit-* header and sets a single decimal Retry-After', () => {
     const next = applyRecoveryWaitHeaders({
       'Retry-After': '3600',
@@ -1883,7 +1881,7 @@ describe('applyRecoveryWaitHeaders (統合設計 v2.1 §3.3・V1)', () => {
   });
 });
 
-describe('decideRecoveryWaitResponse (統合設計 v2.1 §3.2・§4.1 案A)', () => {
+describe('decideRecoveryWaitResponse', () => {
   const exhausted529 = () => parseBridgeContract(headers());
   const wait = (parsed, ctx = {}) => decideRecoveryWaitResponse(parsed, {
     enabled: true, upstreamStatus: 529, claudeQuotaState: 'none', ...ctx,
@@ -1910,7 +1908,7 @@ describe('decideRecoveryWaitResponse (統合設計 v2.1 §3.2・§4.1 案A)', ()
 
   it('a 529 with scope model still waits when the Claude common quota is none', () => {
     const parsed = parseBridgeContract(headers({ 'x-ombr-degrade-scope': 'model' }));
-    assert.equal(wait(parsed).status, 429, 'scope は待機条件にしない（中5 案A）');
+    assert.equal(wait(parsed).status, 429, 'scope は待機条件にしない');
   });
 
   it('waits even when the 529 carries no pool-state at all', () => {
@@ -1954,7 +1952,7 @@ describe('decideRecoveryWaitResponse (統合設計 v2.1 §3.2・§4.1 案A)', ()
       });
       const decision = wait(parsed, { upstreamStatus: 403 });
       assert.deepEqual(decision, { rewrite: false, reason: 'auth-expired-stays-529' }, reason);
-      // R7 はそのまま効く（403 → 529）。
+      // 認証失効の書換（decideAuthDegradeRewrite）はそのまま効く（403 → 529）。
       const auth = decideAuthDegradeRewrite(parsed, { enabled: true, upstreamStatus: 403 });
       assert.equal(auth.rewrite, true, reason);
       assert.equal(auth.status, 529, reason);
@@ -2233,7 +2231,7 @@ describe('decideUpstreamOverloadedWait / mapUpstreamOverloaded (上流 529 overl
   });
 });
 
-describe('mapClaudeExhaustion > recoveryWait の 429 待機 (統合設計 v2.1 §3.2)', () => {
+describe('mapClaudeExhaustion > recoveryWait の 429 待機', () => {
   const candidate = (headersIn = {}) => ({
     statusCode: 429,
     headers: { 'content-length': '11', ...headersIn },
@@ -2321,7 +2319,7 @@ describe('mapClaudeExhaustion > recoveryWait の 429 待機 (統合設計 v2.1 �
   });
 });
 
-describe('buildBridgeLogMeta > cached と retryAfter (統合設計 v2.1 §4.2 ②)', () => {
+describe('buildBridgeLogMeta > cached と retryAfter', () => {
   it('emits cached= and retryAfter= only when the caller supplies them', () => {
     assert.equal(formatLogMeta(buildBridgeLogMeta({ contract: 1 }, {})), ' bridgeContract=1');
     const meta = buildBridgeLogMeta({ contract: 1, cached: 'no' }, { cached: 'none', retryAfter: 30, mapReason: 'both_pools_unusable' });
@@ -2332,7 +2330,7 @@ describe('buildBridgeLogMeta > cached と retryAfter (統合設計 v2.1 §4.2 �
 });
 
 // ---------------------------------------------------------------------------
-// 母艦裁定 D-150: ログの resetAt= と effectiveResetAt= を別名で並べる
+// ログの resetAt= と effectiveResetAt= を別名で並べる
 //
 // bridge 経路（529→403・529→429）のログ `resetAt=` は契約ヘッダ x-ombr-reset-at の
 // **生値**（Codex 側の週次）である。一方で本文の "Earliest recovery" は
@@ -2346,8 +2344,8 @@ describe('buildBridgeLogMeta > cached と retryAfter (統合設計 v2.1 §4.2 �
 //   (c) 候補がすべて無ければ effectiveResetAt は null で、ログにも出ない
 //   (d) 写像しなかった行のログ文字列は現行と1文字も変わらない
 // ---------------------------------------------------------------------------
-describe('effectiveResetAt > 本文へ実際に載る最早回復時刻をログの別名で出す (D-150)', () => {
-  // 契約ヘッダ（Codex 週次）は遅く、Claude 側の 5h 枠は早い、という本番で起きた形。
+describe('effectiveResetAt > 本文へ実際に載る最早回復時刻をログの別名で出す', () => {
+  // 契約ヘッダ（Codex 週次）は遅く、Claude 側の 5h 枠は早い、という実際に起きうる形。
   const weeklyHeaders = () => headers({ 'x-ombr-reset-at': LATER_RESET_AT });
 
   it('(a) bridge 経路: Claude 5h が早ければ effectiveResetAt は 5h 側・resetAt は生値のまま', () => {
@@ -2381,12 +2379,12 @@ describe('effectiveResetAt > 本文へ実際に載る最早回復時刻をログ
 
   // (a) の fixture は使用率ヘッダも cached も持たないため、effectiveResetAt を extra ループの
   // 先頭へ置いただけでも「隣接して見えて」しまう（resetAt との間に挟まりうるキーが1つも
-  // 値を持たないため）。本番の 529→429 経路では x-ombr-primary-used-percent などが載り、
+  // 値を持たないため）。実際の 529→429 経路では x-ombr-primary-used-percent などが載り、
   // cached は recoveryWait 有効時に必ず入る（openai-bridge.js の呼び出し側が
   // `parsed?.cached || 'none'` を足す）。この3キーは buildBridgeLogMeta では resetAt の
   // **後ろ**・extra ループの**前**に置かれるので、effectiveResetAt を extra 側に置くと
-  // 本番ログでは必ず非隣接になる。ここでは本番と同じ形の fixture で行全体をリテラル固定する。
-  it('(a2) 使用率ヘッダと cached が載る本番形でも resetAt の直後に並ぶ', () => {
+  // 実際のログでは必ず非隣接になる。ここでは実際と同じ形の fixture で行全体をリテラル固定する。
+  it('(a2) 使用率ヘッダと cached が載る実際の形でも resetAt の直後に並ぶ', () => {
     const parsed = parseBridgeContract(headers({
       'x-ombr-reset-at': LATER_RESET_AT,
       'x-ombr-cached': 'no',
@@ -2475,7 +2473,7 @@ describe('effectiveResetAt > 本文へ実際に載る最早回復時刻をログ
 
     assert.equal(decision.meta.effectiveResetAt, null);
     const line = formatLogMeta(buildBridgeLogMeta(parsed, decision.meta));
-    assert.equal(/effectiveResetAt/.test(line), false, '値が無いキーは出さない（§9.3 の既存規律）');
+    assert.equal(/effectiveResetAt/.test(line), false, '値が無いキーは出さない');
     assert.equal(
       line,
       ' bridgeContract=1 degradeReason=codex_pool_exhausted poolState=exhausted degradeScope=pool'

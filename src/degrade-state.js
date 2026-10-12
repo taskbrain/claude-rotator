@@ -1,55 +1,55 @@
-// 縮退写像の純関数群（設計書 §11.1 R3-1）。
+// 縮退写像の純関数群。
 // HTTP も fs も触らない。時刻は必ず呼び出し側から注入する（決定的にテストできる形にする）。
-// 出典: 設計書 §4.2 / §6.5 / §8.6 / §8.7 / §9.3、契約 v1.3 §C3・§C10。
+// 扱うのは bridge の応答ヘッダ x-ombr-* の解析・GPT プールの可否の学習・応答の写像・ログ項目の組み立て。
 //
 // zlib の同期展開だけは例外的に使う。I/O ではなく入力だけで決まる変換であり、上流の
 // 応答本文が圧縮されていると error.type を読めないためである（下の decodedBodyErrorType）。
 import zlib from 'node:zlib';
 
-// 設計書 §6.6 規律1: この形に合致しない値はログへ落とさない（メールアドレス混入の遮断）。
+// この形に合致しない値はログへ落とさない（メールアドレス混入の遮断）。
 const ACCOUNT_LABEL_PATTERN = /^[a-z0-9][a-z0-9_-]{0,31}$/;
 const INVALID_ACCOUNT_LABEL = '<invalid>';
-// 契約 §C3.2 の値域。Number()/Date.parse() の緩さ（16進・指数表記・存在しない日付の繰り上げ）に頼らない。
+// bridge の応答ヘッダの値域。Number()/Date.parse() の緩さ（16進・指数表記・存在しない日付の繰り上げ）に頼らない。
 const RFC3339_UTC_PATTERN = /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})(?:\.\d+)?Z$/;
 const DECIMAL_CONTRACT_PATTERN = /^\d{1,9}$/;
 const DECIMAL_STATUS_PATTERN = /^\d{3}$/;
 // 「0〜100 の10進数（小数第1位まで）」。小数2桁以上・指数表記・符号付きは受理しない。
 const USED_PERCENT_PATTERN = /^\d{1,3}(?:\.\d)?$/;
 
-// 契約 §C3.4 の列挙。これ以外の値は原文を保持せず 'unknown' へ正規化する（識別子の混入を遮断する）。
+// bridge が x-ombr-degrade-reason に返す理由の列挙。これ以外の値は原文を保持せず 'unknown' へ正規化する（識別子の混入を遮断する）。
 const DEGRADE_REASONS = new Set([
   'codex_pool_exhausted', 'codex_account_exhausted', 'codex_attempt_limit',
   'codex_needs_login', 'codex_pool_mixed', 'codex_no_account_for_model',
   'codex_upstream_overloaded', 'codex_upstream_error', 'codex_upstream_unreachable',
   'codex_upstream_timeout', 'bridge_internal_error', 'request_invalid', 'request_too_large',
-  // 契約 v1.5 で追加。rotator の扱いは codex_needs_login と完全に同じにする
+  // rotator の扱いは codex_needs_login と完全に同じにする
   // （403 を素通しし、(pool) は失効として学習する）。
   'codex_credentials_unavailable',
-  // 契約 v1.6.3 で追加。非 SSE 集約が総時間上限に達したときの 529（scope=model・pool-state 無し）。
+  // 非 SSE 集約が総時間上限に達したときの 529（scope=model・pool-state 無し）。
   // 列挙に載せるのは理由名をログへ残すためだけで、挙動は変えない（pool-state が無いので
-  // §C10.3 の学習には入らず、§8.7 条件①も満たさないため 403 への書換も起きない）。
+  // プールの可否の学習には入らず、403 への書換の条件（pool-state が exhausted／mixed）も満たさない）。
   'codex_aggregation_timeout',
 ]);
 const UNKNOWN_DEGRADE_REASON = 'unknown';
 
-// R-S9b（母艦裁定 D-197。語彙は D-199 で分割した）: 写像後の応答が「なぜ止まっているのか」を
+// 写像後の応答が「なぜ止まっているのか」を
 // 1本のヘッダで名乗る。語彙は rotator に既にある分類をそのまま写した3値だけで、新しい分類は
 // 作らない。読み手（bridge・運用者）が最初に知りたいのは「待てば回復するのか、人を呼ぶのか」
 // なので、資格情報起因はそこで2つに割る:
-//   quota_exhausted           … 共通枠／系統枠の枯渇（局所合成した 429 と上流 429 の写像＝
-//                               P-a〜P-c ほか）。待てば回復する。
+//   quota_exhausted           … 共通枠／系統枠の枯渇（局所合成した 429 と上流 429 の写像）。
+//                               待てば回復する。
 //   credential_cooldown       … 資格情報の更新が cooldown 中（isCredentialRefreshCooldown
 //                               ＝ oauth_refresh_rate_limit / oauth_refresh_retry）。待てば回復する。
 //   credential_login_required … 認証が失効している（isAuthExpiredReason ＝ oauth_refresh_failed /
 //                               authentication_error）。人が `claude-rotator login` を実行する
 //                               まで回復しない。
-// 包括値（credential_failure）は置かない。P-d が使う述語 `isCredentialUnavailable` は
+// 包括値（credential_failure）は置かない。使える口座が無いときの経路が使う述語 `isCredentialUnavailable` は
 // `isCredentialRefreshCooldown(reason) || isAuthExpiredReason(reason)`（src/proxy-server.js の
 // `isCredentialUnavailable`）
 // と定義されており、上の2述語の**和そのもの**なので、「資格情報起因だがどちらでもない」は
 // 構造上あり得ない。両方に該当したときは credential_login_required を優先する（人を呼ぶ側）。
 // 値は小文字スネークケース固定。写像するのは 429 だけなので、呼び出し側が分類を渡さない
-// 経路の既定は quota_exhausted である（資格情報起因になりうるのは P-d だけ）。
+// 経路の既定は quota_exhausted である（資格情報起因になりうるのは、使える口座が無いときの経路だけ）。
 export const DEGRADE_REASON_HEADER = 'x-claude-rotator-reason';
 export const DEGRADE_REASON_QUOTA_EXHAUSTED = 'quota_exhausted';
 export const DEGRADE_REASON_CREDENTIAL_COOLDOWN = 'credential_cooldown';
@@ -67,16 +67,16 @@ function classifiedDegradeReason(reason) {
 
 const POOL_STATES = new Set([
   'ok', 'degraded', 'exhausted', 'needs-login', 'mixed', 'no-account-for-model',
-  // 契約 v1.5。needs-login と同じ扱い（利用不可として学習するが 403 書換の根拠にはしない）。
+  // needs-login と同じ扱い（利用不可として学習するが 403 書換の根拠にはしない）。
   'credentials-unavailable',
 ]);
 const DEGRADE_SCOPES = new Set(['pool', 'model', 'account']);
 const UNUSABLE_POOL_STATES = new Set(['exhausted', 'needs-login', 'mixed', 'credentials-unavailable']);
 const AVAILABLE_POOL_STATES = new Set(['ok', 'degraded']);
-// 403 への書換を許すのは「いま返そうとしている応答」がこの2状態のときだけ（設計書 §8.7 条件①）。
+// 403 への書換を許すのは「いま返そうとしている応答」がこの2状態のときだけ（decideBridgeResponse の条件①）。
 const MAPPABLE_POOL_STATES = new Set(['exhausted', 'mixed']);
 
-// 契約 §C3.4「既定の scope」。導けない reason は model 扱い（= (pool) を汚さない安全側）。
+// reason ごとの既定の scope（x-ombr-degrade-scope が無いときに使う）。導けない reason は model 扱い（= (pool) を汚さない安全側）。
 const REASON_DEFAULT_SCOPE = new Map([
   ['codex_pool_exhausted', 'pool'],
   ['codex_account_exhausted', 'account'],
@@ -93,7 +93,7 @@ const REASON_DEFAULT_SCOPE = new Map([
   ['request_too_large', 'model'],
 ]);
 
-/** 契約 §C10.3 T7 の既定（bridge 側の枯渇キャッシュ既定 60,000ms と揃える）。 */
+/** resetAt を持たない unusable が解けるまでの既定の時間（bridge 側の枯渇キャッシュ既定 60,000ms と揃える）。 */
 export const DEFAULT_GPT_POOL_UNUSABLE_TTL_MS = 60000;
 
 function headerValue(headers, name) {
@@ -107,7 +107,7 @@ function enumValue(value, allowed) {
 }
 
 /**
- * x-ombr-account を検証する（設計書 §6.6 規律1）。
+ * x-ombr-account を検証する（形に合わない値をログへ落とさない）。
  * @returns {string|null} 合致すればその値、合致しなければ '<invalid>'、ヘッダが無ければ null。
  */
 export function sanitizeAccountLabel(value) {
@@ -116,7 +116,7 @@ export function sanitizeAccountLabel(value) {
 }
 
 /**
- * RFC3339（UTC）として厳密に検証する（契約 §C3.2）。
+ * RFC3339（UTC）として厳密に検証する。
  * Date.parse() は存在しない日付を繰り上げて受理する（'2028-02-30T00:00:00Z' → 3/1）ため、
  * 年月日が実在することを成分の突合で確かめる。不正なら null（＝resetAt 無しの unusable として TTL で解ける）。
  */
@@ -154,7 +154,7 @@ function contractValue(value) {
 }
 
 /**
- * 契約 §C3.4 の列挙値だけを受理する。列挙外は 'unknown' へ正規化し、原文は保持しない。
+ * DEGRADE_REASONS の列挙値だけを受理する。列挙外は 'unknown' へ正規化し、原文は保持しない。
  * bridge 側の不具合でメールアドレス等が混入しても、状態にもログにも残らないようにするため。
  */
 function degradeReasonValue(value) {
@@ -165,7 +165,7 @@ function degradeReasonValue(value) {
 /**
  * bridge の応答ヘッダ x-ombr-* を解析する。値域外・未知の値はすべて「不明」（null）へ倒す。
  * rawScope（ヘッダの値そのもの）と effectiveScope（reason から導いた既定を含む）を分けて返す
- * 理由は設計書 §6.5: 学習には effectiveScope、403 書換には rawScope しか使わない。
+ * 理由: 学習には effectiveScope、403 書換には rawScope しか使わない。
  */
 export function parseBridgeContract(headers) {
   const source = headers && typeof headers === 'object' ? headers : {};
@@ -198,10 +198,10 @@ function entryView(entry) {
 }
 
 /**
- * GPT プールの可否を保持する（契約 §C10.2・§C10.3）。メモリのみ・プロセス再起動で消えてよい。
+ * GPT プールの可否を保持する。メモリのみ・プロセス再起動で消えてよい。
  *
- * recoveryWaitEnabled は層1（T2b・T6b・キャッシュ非学習）の適用範囲を決める
- * （統合設計 v2.1 §2.1 案A）。**既定は false で、そのとき学習・失効は現行と1分岐も変わらない。**
+ * recoveryWaitEnabled は層1（T2b・T6b・キャッシュ非学習）の適用範囲を決める。
+ * **既定は false で、そのとき学習・失効は現行と1分岐も変わらない。**
  * 層1 は 403 書換の条件③（gptPoolState !== 'unusable'）を通じて応答バイトを変えうるので、
  * 「フラグ off ＝現行とバイト互換」を保つには層1 も同じフラグの配下に置くしかない。
  *
@@ -235,11 +235,10 @@ export function createGptPoolState({
 
   // T6（resetAt 到来）と T7（resetAt を持たない unusable が TTL 経過）だけが時間による解除。
   //
-  // T6b（recoveryWaitEnabled のときだけ・統合設計 v2.1 §2）: resetAt を持つ unusable にも
+  // T6b（recoveryWaitEnabled のときだけ）: resetAt を持つ unusable にも
   // 「学習から unusableTtlMs」の期限を重ね、min(resetAt, learnedAt + unusableTtlMs) で解く。
   // 現行は TTL が三項演算子の else 側（resetAt を持たない側）にしか効かないため、bridge が
-  // 返す週次の resetAt（5 日先）を学習すると自力では戻れない。2026-09-14〜15 の本番ログでは
-  // unusable から自力で戻った行が 0 件で、解けたのは再起動と reload の直後だけだった。
+  // 返す週次の resetAt（5 日先）を学習すると自力では戻れない。
   // **新しい設定キーは作らない**（既存 gptPoolUnusableTtlMs を使う）。
   // resetAt の原値は診断値として残し、改ざんしない（待機期限と枠の回復予測は別物）。
   const ttlDeadlineOf = entry => (
@@ -277,7 +276,7 @@ export function createGptPoolState({
 
   return {
     /**
-     * 1つの応答から学習する（契約 §C10.3 T1〜T10）。
+     * 1つの応答から学習する。
      * @param {ReturnType<typeof parseBridgeContract>|null} parsed 解析済みヘッダ。
      * @param {number|null} statusCode bridge が返した HTTP ステータス（不達なら null）。
      * @param {string|null} model 要求されたモデル名（(pool, model) 鍵。不明なら model 側は学習しない）。
@@ -285,14 +284,14 @@ export function createGptPoolState({
     observe(parsed, statusCode, model = null) {
       // 時間による解除（T6・T7）は観測の内容によらず反映する。学習はここから先だけで行う。
       expire(pool);
-      // 契約 §C3.7-1: x-ombr-contract の無い応答は「契約前の bridge」であり、
+      // x-ombr-contract の無い応答は「契約前の bridge」であり、
       // ステータスと本文だけで判断する現行挙動と同一にする（学習しない・モデル鍵も作らない）。
       if (!parsed || parsed.contract === null) return result(null);
       const forModel = modelEntry(model);
       expire(forModel);
       // T8（不達）・T9（pool-state を持たない応答。HTTP 200 を含む）はどちらの鍵も変えない。
       if (!parsed.poolState) {
-        // T2b（契約 v1.6.10 条文案 送付版 §A A-7・recoveryWaitEnabled のときだけ）。
+        // T2b（recoveryWaitEnabled のときだけ）。
         // 6条件をすべて満たす応答だけが「古い否定判定の反証」になる:
         //   (1) bridge からの生の HTTP 200      … statusCode === 200
         //   (2) x-ombr-upstream-status: 200     … 上流まで通った証拠
@@ -316,7 +315,7 @@ export function createGptPoolState({
         return result(null);
       }
       // 学習の入力になるのは HTTP 200（T2）と 4xx/5xx のエラー応答（T3〜T5・T10）だけ。
-      // 200 以外の 2xx・3xx・不達（null）・整数でない値からは何も学ばない（契約 §C10.3）。
+      // 200 以外の 2xx・3xx・不達（null）・整数でない値からは何も学ばない。
       const status = Number.isInteger(statusCode) ? statusCode : null;
       if (status !== 200 && (status === null || status < 400 || status > 599)) return result(null);
 
@@ -331,7 +330,7 @@ export function createGptPoolState({
       if (parsed.poolState === 'degraded') return result('T5');
       // T10: 1口座だけの事情はプールの可否を意味しない。
       if (parsed.effectiveScope === 'account') return result('T10');
-      // 層1（recoveryWaitEnabled のときだけ・統合設計 v2.1 §2 / 03 §3.3）: キャッシュ由来の
+      // 層1（recoveryWaitEnabled のときだけ）: キャッシュ由来の
       // 否定応答は、新規の unusable 学習にも既存 unusable の learnedAt 更新にも使わない。
       // bridge の枯渇キャッシュは公開 resetAt に上限を外しているため、古いキャッシュが
       // rotator の unusable を TTL ごとに再生産しうる。学習を新鮮な証拠に限れば、TTL が
@@ -369,7 +368,7 @@ export function createGptPoolState({
 }
 
 /**
- * Claude 側の台帳で「利用可能な口座が1つも無い」かを判定する（設計書 §4.2）。
+ * Claude 側の台帳で「利用可能な口座が1つも無い」かを判定する。
  * 判定根拠は isAvailable() であって getRoutingAvailability().state ではない。
  * 口座0件（インストール直後）は false を返し、写像そのものを起こさない。
  */
@@ -379,24 +378,24 @@ export function claudeAllUnusable(accountManager, modelFamily = null) {
   return !accounts.some(account => accountManager.isAvailable(account, modelFamily));
 }
 
-/** 待機指示に使う Retry-After（固定 30・10 進整数秒）。ノブもジッターも作らない（03 §4.3）。 */
+/** 待機指示に使う Retry-After（固定 30・10 進整数秒）。ノブもジッターも作らない。 */
 export const RECOVERY_WAIT_RETRY_AFTER_SECONDS = 30;
 
-/** Claude 側の空きの三値（統合設計 v2.1 §3.5）。 */
+/** Claude 側の空きの三値。 */
 export const CLAUDE_QUOTA_STATES = Object.freeze(['available', 'none', 'indeterminate']);
 
 /**
- * Claude 側の台帳の空きを**三値**で返す（統合設計 v2.1 §3.5）。
+ * Claude 側の台帳の空きを**三値**で返す。
  *
  * claudeAllUnusable() は「判定関数が無い」「口座0件」「判定中の例外」をすべて false
- * （＝空きあり）へ丸めるため、実際には死んでいる Claude へ退避して最終段の無音バックオフ
- * （M-6）に落ちる経路が残る。待機（429）の可否を決めるには「空きが無い」と「判定できない」
+ * （＝空きあり）へ丸めるため、実際には死んでいる Claude へ退避して最終段の無音バックオフに
+ * 落ちる経路が残る。待機（429）の可否を決めるには「空きが無い」と「判定できない」
  * を区別する必要があるので、判定不能を indeterminate として保持し、**available へは丸めない**。
  *
  * **既存の claudeAllUnusable() は 1 文字も変えない**（フラグ off の経路を動かさないため）。
  *
  * @param {{accounts?: Array, isAvailable?: Function}} accountManager 口座台帳。
- * @param {string|null} modelFamily 系列。共通枠で問うときは null（契約の条件2 と同じ引数）。
+ * @param {string|null} modelFamily 系列。共通枠で問うときは null。
  * @returns {'available'|'none'|'indeterminate'}
  */
 export function claudeQuotaState(accountManager, modelFamily = null) {
@@ -413,7 +412,7 @@ export function claudeQuotaState(accountManager, modelFamily = null) {
   }
 }
 
-/** 待機（429）へ倒してよい三値か。判定不能は待機側（統合設計 v2.1 §3.5 の表）。 */
+/** 待機（429）へ倒してよい三値か。判定不能は待機側。 */
 export function quotaWaits(quotaState) {
   return quotaState === 'none' || quotaState === 'indeterminate';
 }
@@ -425,9 +424,9 @@ function earliestResetAt(values) {
 }
 
 /**
- * Claude 側の台帳から「最も早い回復見込み時刻」を取り出す（設計書 §8.7 の本文生成）。
- * **全枯渇かどうかの判定には使わない**——判定は claudeAllUnusable（isAvailable）が正本であり
- * （§4.2）、ここで getRoutingAvailability を使うのは表示用の availableAt を読むためだけである。
+ * Claude 側の台帳から「最も早い回復見込み時刻」を取り出す（応答本文の回復見込みに使う）。
+ * **全枯渇かどうかの判定には使わない**——判定は claudeAllUnusable（isAvailable）が正本であり、
+ * ここで getRoutingAvailability を使うのは表示用の availableAt を読むためだけである。
  * 取得できなければ null を返し、本文は GPT 側の reset-at だけで組み立てられる。
  * @returns {string|null} RFC3339（UTC）。
  */
@@ -438,14 +437,14 @@ export function claudeEarliestResetAt(accountManager, modelFamily = null) {
 }
 
 /**
- * 403 / 529 の応答本文を作る（設計書 §8.7）。両プールが使えないときは最も早い回復見込みを添える。
+ * 403 / 529 の応答本文を作る。両プールが使えないときは最も早い回復見込みを添える。
  * @returns {string} JSON 文字列。
  */
 export function buildDegradeBody(status, { resetAts = [] } = {}) {
   // 旧実装は `const permission = status === 403` という**二値**で error.type と本文を同時に
   // 切り替えていた。そこへ 429 を渡すと overloaded_error ＋「All Claude accounts are
-  // exhausted.」が黙って付き、Claude Code の 529 系 3 連続 fallback 判定へ流れうる
-  // （統合設計 v2.1 §3.3）。ステータスと本文の型を矛盾させないため 3 状態で分岐する。
+  // exhausted.」が黙って付き、Claude Code の 529 系 3 連続 fallback 判定へ流れうる。
+  // ステータスと本文の型を矛盾させないため 3 状態で分岐する。
   const numeric = Number(status);
   // 403（明示停止）と 429（待機指示）はどちらも「Claude も Codex も使えない」局面なので
   // 同じ文にする。529 は Claude 側だけが枯れている（GPT へ退避できる）局面である。
@@ -469,7 +468,7 @@ export function buildDegradeBody(status, { resetAts = [] } = {}) {
   });
 }
 
-// 一時障害（bridge の不達・上流タイムアウト）で返す本文（03 §4.3）。
+// 一時障害（bridge の不達・上流タイムアウト）で返す本文。
 // 「exhausted」と書かない・reset を出さない——恒久的な枯渇ではないため。
 const TRANSIENT_WAIT_MESSAGE =
   'The Codex bridge is temporarily unreachable and no Claude account is available. Retrying automatically.';
@@ -477,7 +476,7 @@ const TRANSIENT_FALLBACK_MESSAGE =
   'The Codex bridge is temporarily unreachable. Retrying automatically.';
 
 /**
- * 一時障害で返す本文を作る（03 §4.3）。429（待機）と 529（退避）で文と型を分ける。
+ * 一時障害で返す本文を作る。429（待機）と 529（退避）で文と型を分ける。
  * @param {number} status 429 または 529。
  * @returns {string} JSON 文字列。
  */
@@ -502,7 +501,7 @@ function bodyErrorType(body) {
   }
 }
 
-// 合成した待機応答に残してはならないヘッダ（03 §4.3・統合設計 v2.1 §3.3）。
+// 合成した待機応答に残してはならないヘッダ。
 // 再試行監視が有効な Claude Code は 429／529 の待機時間に anthropic-ratelimit-unified-reset
 // を**最優先**し、Retry-After もバックオフも参照しない。5 日先の reset が残ると最大 6 時間
 // 無音で眠るため、除去は整形ではなく必須要件である。大小文字を問わずすべて落とす。
@@ -518,7 +517,7 @@ export function withoutRateLimitHeaders(headers) {
 
 /**
  * 待機（429）のヘッダを作る。元の Retry-After と anthropic-ratelimit-* をすべて落としてから、
- * 10 進整数秒の Retry-After を1つだけ付ける（03 §4.3）。
+ * 10 進整数秒の Retry-After を1つだけ付ける。
  * @param {object} headers 元のヘッダ。
  * @param {number} seconds 秒（既定 30）。
  */
@@ -538,30 +537,30 @@ function withoutBodyHeaders(headers) {
   return next;
 }
 
-// D-261（段 2・方式イ）: 写像条件は満たしたが、設定で写像を止めたことを表す mapReason。
+// 写像条件は満たしたが、設定で写像を止めたことを表す mapReason。
 // DEGRADE_REASONS（bridge との契約の語彙）には足さない——これは rotator のログにだけ
 // 出る名前であり、UPSTREAM_OVERLOAD_MAP_REASON と同じ扱いにする。
 const CLAUDE_EXHAUSTED_PASSTHROUGH_MAP_REASON = 'claude_exhausted_passthrough';
 
 /**
- * Claude 全枯渇の写像（設計書 §8.6・§8.7、契約 §C10.4）。7系統の終端経路すべてがこの関数を通る。
+ * Claude 全枯渇の写像。7系統の終端経路すべてがこの関数を通る。
  *
  * ctx は「枯渇」を2つの粒度で受け取る:
  *   - claudeAllUnusable       … **要求モデル系列**で全口座が使えないか（529 への写像の可否）
  *   - commonFamilyAllUnusable … **共通枠**（系列を問わない）で全口座が使えないか（403 への昇格の可否。
  *                               未指定は false 扱い＝403 へ昇格しない）
  * 両者が分かれているのは、Fable 週次サブキャップだけが全口座で切れている状態を
- * 「Claude がもう使えない」と誤認しないためである（§4.2）。その状態では Opus へ
+ * 「Claude がもう使えない」と誤認しないためである。その状態では Opus へ
  * 退避できるので 529 に留め、403（恒久拒否）へは昇格させない。
  *
  * recoveryWaitEnabled が真のときだけ、両プール全滅の帰結を 403（明示停止）から
- * **429 rate_limit_error ＋ Retry-After: 30**（待機）へ変える（統合設計 v2.1 §3.2 の 1〜3 行目）。
+ * **429 rate_limit_error ＋ Retry-After: 30**（待機）へ変える。
  * このとき Claude 側の空きは三値（commonFamilyQuotaState）で受け取り、**判定不能は待機側**
  * へ倒す。**bothUnusableStatus の値域（403／529）と既定 403 は変えない**——429 は設定値では
  * なくこの経路がコードで返す（フラグ有効時は本経路が bothUnusableStatus より優先する）。
  *
  * claudeExhaustedTo529 に**真偽値の false** を渡したときだけ、全枯渇の 429 を 529 へ
- * 写像せず、ステータス・ヘッダ・本文をどれも触らずに返す（母艦裁定 D-261・段 2 方式イ）。
+ * 写像せず、ステータス・ヘッダ・本文をどれも触らずに返す。
  * 合成 429 が運ぶ `anthropic-ratelimit-unified-*` は Claude Code が「週次上限」を判別する
  * 根拠そのものなので、素通しでは1バイトも落とさない。未指定は写像する側（現行）。
  *
@@ -586,7 +585,7 @@ export function mapClaudeExhaustion(candidate, ctx = {}) {
     return { ...candidate, degradeLog };
   }
 
-  // D-261（段 2・方式イ）: ここから下が写像の本体なので、素通しの判定はこの位置に置く。
+  // ここから下が写像の本体なので、素通しの判定はこの位置に置く。
   // 上の早期 return より後ろにあるのは、写像条件を満たさない要求（全枯渇でない等）の
   // degradeLog に mapReason を足さないためである——それをすると、写像と無関係な要求の
   // ログ行が1フィールド増える。candidate は分割代入で写すだけで、statusCode も headers も
@@ -625,7 +624,7 @@ export function mapClaudeExhaustion(candidate, ctx = {}) {
     : withoutBodyHeaders(candidate.headers);
   headers['content-type'] = 'application/json';
   headers['content-length'] = String(body.length);
-  // R-S9b（D-197）: ヘッダ組み立ての共通箇所に1本だけ置く。ここを通るのは写像した応答
+  // ヘッダ組み立ての共通箇所に1本だけ置く。ここを通るのは写像した応答
   // だけなので、写像しなかった応答（と degradeMapping が無効な構成）には付かない。
   // 403 でも 529 でも、将来この経路を通る別のステータスでも同じ1本が付く。
   const classified = classifiedDegradeReason(ctx.reason);
@@ -637,27 +636,25 @@ export function mapClaudeExhaustion(candidate, ctx = {}) {
     body,
     degradeLog: {
       ...degradeLog,
-      // R4-5: 403 で止めた行から「いつ回復するか」を本文を開かずに読めるようにする
-      // （設計書 §9.3 の resetAt）。両プール利用可能な 529 では回復時刻を持たない。
+      // 403 で止めた行から「いつ回復するか」を本文を開かずに読めるようにする
+      // （ログの resetAt）。両プール利用可能な 529 では回復時刻を持たない。
       resetAt: earliestResetAt(resetAts) || undefined,
       mappedFrom: from,
       mappedFromType: bodyErrorType(candidate.body),
       mappedTo: status,
       retryAfter: waits ? RECOVERY_WAIT_RETRY_AFTER_SECONDS : undefined,
       mapReason: waits || bothUnusable ? 'both_pools_unusable' : 'all_claude_accounts_exhausted',
-      // ログ行へ出すのは、呼び出し側が経路を明示的に分類したとき（P-d）だけ。既定の
+      // ログ行へ出すのは、呼び出し側が経路を明示的に分類したときだけ。既定の
       // quota_exhausted を毎回書くと、既存の写像行に意味の無いフィールドが1つ増える
-      // ので、値の無いキーは出さないという §9.2 の規律どおり省く（ヘッダには必ず付く）。
+      // ので、値の無いキーは出さないという規律どおり省く（ヘッダには必ず付く）。
       rotatorReason: classified || undefined,
     },
   };
 }
 
-// 母艦裁定 D-72（坂根氏の判断③）: Codex 側の「認証失効」だけは 403 を 529 へ写像する。
-// 「ログインが切れた場合は自動でローテーションして claude-rotator status には認証が
-// 切れているというメッセージだけ出す。止まるのが困るので止まらないように」。
-// 403 のままだと Claude Code はその場で停止する（M-5）。529 にすれば fallbackModel
-// （Opus 等）へ自動退避するので作業が止まらない。契約 §C3.4 が理由を2つに分けている
+// Codex 側の「認証失効」だけは 403 を 529 へ写像する。
+// 403 のままだと Claude Code はその場で停止する。529 にすれば fallbackModel
+// （Opus 等）へ自動退避するので作業が止まらない。bridge が理由を2つに分けている
 // のは「ログインし直せ」と「資格情報そのものを読めない」を取り違えさせないためなので、
 // 本文の文言だけは分ける（判定・ステータス・写像の記録はまったく同じ）。
 const AUTH_EXPIRED_REASONS = new Map([
@@ -666,8 +663,8 @@ const AUTH_EXPIRED_REASONS = new Map([
 ]);
 
 /**
- * 認証失効で返す 529 の本文を作る（設計書 §8.8 / D-72）。
- * @param {string} reason 契約 §C3.4 の理由名（AUTH_EXPIRED_REASONS の鍵）。
+ * 認証失効で返す 529 の本文を作る。
+ * @param {string} reason bridge が返した理由名（AUTH_EXPIRED_REASONS の鍵）。
  * @returns {string} JSON 文字列。
  */
 export function buildAuthDegradeBody(reason) {
@@ -678,13 +675,13 @@ export function buildAuthDegradeBody(reason) {
 }
 
 /**
- * gpt-* 経路で bridge の 403 を 529 へ書き換えるかを決める（母艦裁定 D-72）。
+ * gpt-* 経路で bridge の 403 を 529 へ書き換えるかを決める。
  * 条件は3つだけで、すべて成り立つときに限る:
  *   ①契約ヘッダ付きの応答であること（契約前 bridge・bridge 不達の 403 は素通し）
  *   ②いま返そうとしている応答が 403 であること
  *   ③理由が codex_needs_login または codex_credentials_unavailable であること
  * **scope は問わない**——pool でも model でも「止めない」という方針は変わらないため
- * （scope が効くのは (pool) を学習してよいかどうか＝§C10.3 T3 の側であり、そちらは変えない）。
+ * （scope が効くのは (pool) を学習してよいかどうか＝observe の側であり、そちらは変えない）。
  * codex_no_account_for_model の 403 は対象外である（設定の問題は退避しても解けない）。
  */
 export function decideAuthDegradeRewrite(parsed, ctx = {}) {
@@ -709,18 +706,18 @@ export function decideAuthDegradeRewrite(parsed, ctx = {}) {
 const TRANSIENT_DEGRADE_REASONS = new Set(['codex_upstream_timeout', 'codex_upstream_unreachable']);
 
 /**
- * gpt-* 経路で「待機（429）」へ倒すかを決める（統合設計 v2.1 §3.2・§4.1 案A）。
+ * gpt-* 経路で「待機（429）」へ倒すかを決める。
  *
  * **待機の条件から scope と pool-state を外してある。** bridge が使用率由来の 529 に
  * pool-state を付けない方針を採ると、pool-state を条件にした判定はその 529 を素通しし、
  * 死んだ Claude へ退避して最終段の無音バックオフへ落ちる。決め手は「bridge がいま拒否を
- * 返したこと」と「Claude 共通枠の三値」だけにする（学習側＝§C10.3 T3 は 1 文字も変えない）。
+ * 返したこと」と「Claude 共通枠の三値」だけにする（学習側＝observe は 1 文字も変えない）。
  *
- * **認証失効（codex_needs_login／codex_credentials_unavailable）は待機させない**
- * （母艦 L2 `C-20260915-3F-24` 案A）。R7 の 403→529 を維持する——人が codex login する
+ * **認証失効（codex_needs_login／codex_credentials_unavailable）は待機させない**。
+ * decideAuthDegradeRewrite の 403→529 を維持する——人が codex login する
  * まで自力回復しないモデルを 429 で叩き続けるより、529 で別モデルへ退避させるほうがよい。
  * decideAuthDegradeRewrite() はこの関数の**後**に走るので、順序に頼らず上流の実ステータスと
- * reason で判定する（そうしないと同じ応答が §3.2 の表の 2 行に同時に当たる）。
+ * reason で判定する（そうしないと同じ応答が待機の書換と認証失効の書換の両方に当たる）。
  *
  * @param {ReturnType<typeof parseBridgeContract>|null} parsed 解析済みヘッダ。
  * @param {{enabled?:boolean, upstreamStatus?:number, claudeQuotaState?:string,
@@ -728,7 +725,7 @@ const TRANSIENT_DEGRADE_REASONS = new Set(['codex_upstream_timeout', 'codex_upst
  */
 export function decideRecoveryWaitResponse(parsed, ctx = {}) {
   if (ctx.enabled !== true) return { rewrite: false, reason: 'disabled' };
-  // 契約 §C3.7-1: 契約ヘッダの無い応答は「契約前の bridge」であり一切書き換えない。
+  // 契約ヘッダの無い応答は「契約前の bridge」であり一切書き換えない。
   if (!parsed || parsed.contract === null) return { rewrite: false, reason: 'no-contract-header' };
   // 認証失効はステータスに依存せず除外する。bridge が 529 に codex_needs_login を
   // 付けてきた場合も、人が codex login するまで回復しないので待たせない（素通し）。
@@ -743,7 +740,7 @@ export function decideRecoveryWaitResponse(parsed, ctx = {}) {
   };
   if (status === 529) {
     if (!waits) return { rewrite: false, reason: 'claude-has-room' };
-    // D-150: 本文と同じ配列からログ用の effectiveResetAt を導く（上の
+    // 本文と同じ配列からログ用の effectiveResetAt を導く（上の
     // decideBridgeResponse と同じ理由・同じ作り方）。resetAt= は生値のまま残す。
     const resetAts = [ctx.gptResetAt, parsed.resetAt, ctx.claudeResetAt];
     return {
@@ -767,7 +764,7 @@ export function decideRecoveryWaitResponse(parsed, ctx = {}) {
     // Claude 側に空きがあるなら 529 にして退避させる（3 回で fallbackModel へ移る）。
     // 空きが無い／判定できないなら、要求した GPT 側で待つ。
     // この枝の本文（buildTransientDegradeBody）は回復見込み時刻を**持たない**ので、
-    // effectiveResetAt も出さない（D-150 の別名は「本文へ実際に載った値」を指す）。
+    // effectiveResetAt も出さない（effectiveResetAt は「本文へ実際に載った値」を指す）。
     const mapped = waits ? 429 : 529;
     return {
       rewrite: true,
@@ -791,8 +788,8 @@ export function decideRecoveryWaitResponse(parsed, ctx = {}) {
 }
 
 // ---------------------------------------------------------------------------
-// Claude 上流（Anthropic）が返す 529 overloaded の 429 写像（坂根氏 2026-09-18 の要件
-// 「ハイデマンドで Fable 5.1 が使えない時は、リトライが走る 429 になるように」）。
+// Claude 上流（Anthropic）が返す 529 overloaded の 429 写像（混雑でモデルが使えない
+// ときに、再試行される 429 にする）。
 //
 // Claude Code は 529 を 3 回で fallbackModel へ退避させるが、429 なら同じモデルのまま
 // 待って再試行する。混雑はモデル全体の事象で口座固有ではないので、**口座台帳には
@@ -920,7 +917,7 @@ export function mapUpstreamOverloaded(response, ctx = {}) {
   const body = Buffer.from(decision.body);
   // applyRecoveryWaitHeaders が上流の Retry-After と anthropic-ratelimit-*（unified-reset
   // を含む）を大小文字問わず全部落とす。残すと Claude Code がそのリセット時刻まで
-  // 無音で眠るため、除去は整形ではなく必須要件である（§3.3 と同じ事故）。
+  // 無音で眠るため、除去は整形ではなく必須要件である。
   const headers = applyRecoveryWaitHeaders(
     withoutBodyHeaders(response.headers),
     decision.retryAfterSeconds,
@@ -937,7 +934,7 @@ export function mapUpstreamOverloaded(response, ctx = {}) {
 }
 
 /**
- * gpt-* 経路で bridge の 529 を 403 へ書き換えるかを決める（設計書 §8.7 の4条件）。
+ * gpt-* 経路で bridge の 529 を 403 へ書き換えるかを決める（4条件）。
  * 4条件は ①現在の応答が 529 かつ pool-state が exhausted/mixed ②Claude 全枯渇
  * ③学習した (pool) が unusable ④rawScope === 'pool'（明示）。1つでも欠ければ 529 のまま素通しする。
  */
@@ -946,10 +943,10 @@ export function decideBridgeResponse(parsed, ctx = {}) {
   if (ctx.bothUnusableStatus !== undefined && ctx.bothUnusableStatus !== 403) {
     return { rewrite: false, reason: 'both-unusable-status-is-not-403' };
   }
-  // 契約 §C3.7-1・§C10 の後方互換原則: x-ombr-contract を持たない（または値が不正な）
+  // 後方互換の原則: x-ombr-contract を持たない（または値が不正な）
   // 応答は「契約前の bridge」であり、現行とまったく同じ意味に扱う＝一切書き換えない。
   // これが無いと、過去に学習した (pool)=unusable が TTL 内に残っているあいだ、
-  // 契約ヘッダを持たない 529 まで 403 へ書き換えてしまう（再検証 FAIL ①）。
+  // 契約ヘッダを持たない 529 まで 403 へ書き換えてしまう。
   if (!parsed || parsed.contract === null) return { rewrite: false, reason: 'no-contract-header' };
   if (Number(ctx.upstreamStatus) !== 529) return { rewrite: false, reason: 'status-not-529' };
   if (!MAPPABLE_POOL_STATES.has(parsed?.poolState)) {
@@ -958,7 +955,7 @@ export function decideBridgeResponse(parsed, ctx = {}) {
   if (parsed?.rawScope !== 'pool') return { rewrite: false, reason: 'scope-not-explicit-pool' };
   if (ctx.claudeAllUnusable !== true) return { rewrite: false, reason: 'claude-not-exhausted' };
   if (ctx.gptPoolState !== 'unusable') return { rewrite: false, reason: 'gpt-pool-not-unusable' };
-  // 母艦裁定 D-150: ログの resetAt= は契約ヘッダ x-ombr-reset-at の**生値**（Codex 側の
+  // ログの resetAt= は契約ヘッダ x-ombr-reset-at の**生値**（Codex 側の
   // 週次）であり、本文へ載る値（GPT 週次・契約ヘッダ・Claude 5h の3候補の最小）とは
   // 別物である。同じ名前で意味が違うため復旧見込みを取り違える読み方を招いた。
   // そこで本文と**同じ配列**から effectiveResetAt を導いてログへ並べて出す。
@@ -984,13 +981,13 @@ export function decideBridgeResponse(parsed, ctx = {}) {
   };
 }
 
-// ログ行は空白区切りの key=value なので、値に空白・改行を残さない（契約 §C3.1）。
+// ログ行は空白区切りの key=value なので、値に空白・改行を残さない。
 function logToken(value) {
   return String(value).replace(/\s+/g, '_').slice(0, 64);
 }
 
 /**
- * ログへ追記するフィールドを作る（設計書 §9.3）。値があるキーだけを、表の順序で載せる。
+ * ログへ追記するフィールドを作る。値があるキーだけを、決まった順序で載せる。
  * 何も無ければ空オブジェクトを返し、ログ行は現行とバイト単位で同一になる。
  */
 export function buildBridgeLogMeta(parsed, extra = {}) {
@@ -1009,7 +1006,7 @@ export function buildBridgeLogMeta(parsed, extra = {}) {
   put('accountLabel', parsed?.accountLabel);
   put('resetAt', parsed?.resetAt);
   // effectiveResetAt は resetAt（契約ヘッダの生値）の直後に置く。2つが隣同士で読めることが
-  // D-150 の目的（生値と本文へ実際に載った値の取り違え防止）。下の extra ループに入れると、
+  // 目的（生値と本文へ実際に載った値の取り違え防止）。下の extra ループに入れると、
   // 間に primaryUsedPercent／secondaryUsedPercent／cached が挟まって隣接しない。
   // 写像しない行では extra が空なので、この行は何も足さずログはバイト単位で現行と同一。
   put('effectiveResetAt', extra?.effectiveResetAt);
@@ -1017,12 +1014,12 @@ export function buildBridgeLogMeta(parsed, extra = {}) {
   put('secondaryUsedPercent', parsed?.secondaryUsedPercent);
   // cached は recoveryWait 有効時だけ呼び出し側が渡す（ヘッダが無いときは 'none'）。
   // 既存の bridgeCached はヘッダがあるときしか出ないため、「ヘッダが無かった」と
-  // 「写像機能が無効だった」を本番ログで区別できず、T2b の第3条件を監査できない。
+  // 「写像機能が無効だった」をログで区別できず、T2b の条件 (4)（cached が yes でない）を監査できない。
   put('cached', extra?.cached);
   for (const key of [
     'gptPoolState', 'gptModelState', 'claudePoolState',
     'mappedFrom', 'mappedFromType', 'mappedTo', 'retryAfter', 'mapReason', 'mapPath',
-    // R-S9b: 追記は必ず末尾へ（§9.2）。値を持たない既存の写像行は1文字も変わらない。
+    // 追記は必ず末尾へ。値を持たない既存の写像行は1文字も変わらない。
     'rotatorReason',
   ]) put(key, extra?.[key]);
   return meta;

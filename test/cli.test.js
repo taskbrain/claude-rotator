@@ -2071,14 +2071,14 @@ async function unusedCodexLoopbackPort() {
 }
 
 // ---------------------------------------------------------------------------
-// runtime-state の耐久書き込みと起動時の復元（R-S11 / 設計書 v1.5 §8・§8.1）
+// runtime-state の耐久書き込みと起動時の復元
 //
 // `runServer` は実サーバを起動しないと呼べないので、状態の入出力だけを2つの小さな
 // 関数として切り出し、ここで直接押さえる。実 Keychain・実サービスには触れない
 // （一時ディレクトリと差し替えた読み取り関数だけを使う）。
 // ---------------------------------------------------------------------------
 
-describe('runtime state wiring (R-S11)', () => {
+describe('runtime state wiring', () => {
   it('writes the runtime state durably, with a private parent directory', async () => {
     const sandbox = await mkdtemp(join(tmpdir(), 'claude-rotator-runtime-state-'));
     try {
@@ -2143,24 +2143,24 @@ describe('runtime state wiring (R-S11)', () => {
 });
 
 // ---------------------------------------------------------------------------
-// FU-99: `runServer` 自身の結線（設計書 v1.5 §8・§8.1・§5.2(b) ／ D-56-5・D-60-3・D-182）
+// `runServer` 自身の結線
 //
 // 切り出した `createRuntimeStateWriter` ／ `restoreRuntimeState` と `createProxyServer`
-// 側は上の R-S11 で個別に押さえてあるが、**それらを runServer が実際に繋いでいるか**は
-// 自動テストの外にあった（FU-99）。`runServer` は export されていないので、
+// 側は上の runtime state wiring で個別に押さえてあるが、**それらを runServer が実際に繋いでいるか**は
+// 自動テストの外にあった。`runServer` は export されていないので、
 // `bin/claude-rotator.js server` を子プロセスとして起動し、外から見える形で3点を押さえる。
 //
 //   ① `stateWriter: createRuntimeStateWriter(statePath)`（＝`writeJsonFileDurable`）:
 //      `runtime-state.json` が `runtimeStatePath()` の位置へ書かれ、**そのとき新規に
 //      作られた親ディレクトリが 0700**・ファイルが 0600 であること。`writeJsonFile` へ
-//      戻す回帰（D-56-5 の逆行）は `mkdir` に mode を渡さないので親ディレクトリに
+//      戻す回帰は `mkdir` に mode を渡さないので親ディレクトリに
 //      0700 が付かない（既定の 0777 & ~umask のまま）。
 //   ② `restoreRuntimeState` の戻り値2つが `createProxyServer` へ渡ること:
 //      保存された2件のうち、資格情報が別物になった口座（`credentialRevision` が config と
 //      食い違う `acct_a`）のバインドだけが落ち、もう1件が残る。`savedState` が渡らなければ
 //      0件、`credentialChangedAccountIds` が渡らなければ2件になるので、**片方だけの結線では
 //      この 1件 にならない**。
-//   ③ `eventHistory` が mode に連動すること（`src/cli.js` の AccountManager 構築時・D-182）:
+//   ③ `eventHistory` が mode に連動すること（`src/cli.js` の AccountManager 構築時）:
 //      `createProxyServer` 側の `setEventHistoryEnabled` は復元より**後**に走るため、構築時に
 //      渡し忘れると `mode:"on"` でも `events` が1件も復元されない。`mode` 未記載（off）では
 //      逆に復元されないことも確かめる（負の対照）。
@@ -2169,7 +2169,7 @@ describe('runtime state wiring (R-S11)', () => {
 // だけ）。それでも guard のシムを載せた PATH のまま起動し、guard ログが増えないことを
 // 確かめる。`HOME` ／ `XDG_*` ／ `CLAUDE_CONFIG_DIR` ／ `CLAUDE_ROTATOR_CONFIG` はすべて
 // 一時ディレクトリへ向け、実 Keychain（口座は `type:'apikey'` なので読み出し経路へ入らない）・
-// `~/.config/claude-rotator/`・本番 rotator（37891）には触れない。口座は合成ラベルと
+// `~/.config/claude-rotator/`・既定のポート（37891）で動く rotator には触れない。口座は合成ラベルと
 // `*@example.com`、セッション鍵は合成の12桁ハッシュだけを使う。
 // ---------------------------------------------------------------------------
 
@@ -2178,7 +2178,7 @@ const FU99_CONFIG_ACCOUNTS = Object.freeze([
   { id: 'acct_a', name: 'acct_a@example.com', type: 'apikey', credentialRevision: 'rev-a-2' },
   { id: 'acct_b', name: 'acct_b@example.com', type: 'apikey', credentialRevision: 'rev-b-1' },
 ]);
-// 保存側の `acct_a` だけ版を古くする＝資格情報が別物になった口座（§8 の破棄条件⑥・F3）。
+// 保存側の `acct_a` だけ版を古くする＝資格情報が別物になった口座。
 const FU99_SAVED_REVISIONS = Object.freeze({ acct_a: 'rev-a-1', acct_b: 'rev-b-1' });
 const FU99_SEEDED_EVENT_TYPE = 'seeded-switch';
 const FU99_CHANGED_SID = 'a1a1a1a1a1a1';
@@ -2191,7 +2191,7 @@ function fu99SavedState(nowMs) {
     version: 1,
     savedAt,
     currentAccount: 'acct_a',
-    // ③ の観測対象。`eventHistory` が真のときだけ復元される（D-56-6・D-182）。
+    // ③ の観測対象。`eventHistory` が真のときだけ復元される。
     events: [{ at: savedAt, type: FU99_SEEDED_EVENT_TYPE, account: 'acct_b' }],
     accounts: FU99_CONFIG_ACCOUNTS.map(account => ({
       id: account.id,
@@ -2222,7 +2222,7 @@ async function fu99StartServer({ home, sessionAffinity, guardLogPath }) {
   assert.notEqual(port, PRODUCTION_ROTATOR_PORT, '本番 rotator のポートは使わない');
   await mkdir(dirname(configPath), { recursive: true });
   await writeJsonFile(configPath, {
-    // port を 0 にすると `config.proxy?.port || DEFAULT_PORT` が本番ポートへ落ちるので、
+    // port を 0 にすると `config.proxy?.port || DEFAULT_PORT` が既定のポートへ落ちるので、
     // 必ず実ポートを書く。
     proxy: { host: '127.0.0.1', port },
     // 上流へは1件も送らない（叩くのは /internal/* だけである）。
@@ -2293,7 +2293,7 @@ function fu99WaitForOutput(child, pattern, timeoutMs = 15_000) {
   });
 }
 
-describe('runServer wiring (FU-99)', () => {
+describe('runServer wiring', () => {
   it('hands the durable writer, both restore results and the event-history flag to the proxy', async () => {
     const sandbox = await mkdtemp(join(tmpdir(), 'claude-rotator-runserver-'));
     // 起動した子プロセスが実サービスへ届いていないことの証拠（PATH のシムが書く）。
@@ -2331,7 +2331,7 @@ describe('runServer wiring (FU-99)', () => {
       assert.equal(
         (await stat(freshStateDir)).mode & 0o777,
         0o700,
-        '① 新規に作られた親ディレクトリは 0700。writeJsonFile へ戻す回帰では 0700 が付かない（D-56-5）',
+        '① 新規に作られた親ディレクトリは 0700。writeJsonFile へ戻す回帰では 0700 が付かない',
       );
 
       // --- ②③ 復元の結線: 保存ファイルを置いた状態で起動する ---
@@ -2353,12 +2353,12 @@ describe('runServer wiring (FU-99)', () => {
       assert.deepEqual(
         onStatus.sessionAffinity.sessionsByAccount,
         { acct_b: 1 },
-        '② 残るのは資格情報が変わっていない acct_b のバインドだけ（§8 の破棄条件⑥・F3）',
+        '② 残るのは資格情報が変わっていない acct_b のバインドだけ（資格情報が変わった口座のバインドは破棄される）',
       );
       assert.deepEqual(
         onStatus.events.filter(event => event.type === FU99_SEEDED_EVENT_TYPE),
         [fu99SavedState(nowMs).events[0]],
-        '③ mode:"on" では eventHistory が真で構築され、保存された events が復元される（D-182）',
+        '③ mode:"on" では eventHistory が真で構築され、保存された events が復元される',
       );
 
       // --- ③ の負の対照: 同じ保存ファイルを mode 未記載（＝off）で読み戻す ---
@@ -2373,7 +2373,7 @@ describe('runServer wiring (FU-99)', () => {
       assert.equal(
         'sessionAffinity' in offStatus,
         false,
-        '未記載構成では status に sessionAffinity キー自体が出ない（R7・D-56-6）',
+        '未記載構成では status に sessionAffinity キー自体が出ない',
       );
       assert.deepEqual(
         offStatus.events.filter(event => event.type === FU99_SEEDED_EVENT_TYPE),
@@ -2455,7 +2455,7 @@ describe('runServer wiring (FU-99)', () => {
 });
 
 // ---------------------------------------------------------------------------
-// server.log のローテーション閾値の配線（計画書 Task 4）
+// server.log のローテーション閾値の配線
 // ---------------------------------------------------------------------------
 
 describe('serverLogWriterOptions', () => {

@@ -1241,7 +1241,7 @@ describe('AccountManager', () => {
     assert.equal(picked.id, 'acct_2');
   });
 
-  it('does not permanently move currentIndex for a model-scoped-only switch (M2)', () => {
+  it('does not permanently move currentIndex for a model-scoped-only switch', () => {
     const manager = makeManagerWithFableExhaustedPrimary();
 
     const fablePicked = manager.getActiveAccount('fable');
@@ -1354,7 +1354,7 @@ describe('AccountManager', () => {
     ]);
   });
 
-  // 母艦裁定 D-72 で credential_error の期待だけを unknown → needs-login へ反転した
+  // credential_error の期待だけを unknown → needs-login へ反転した
   // （認証失効は時間では回復しないので「不明」と言わない）。並び順は変えていない——
   // needs-login は unknown とまったく同じ順位で扱う。
   it('reports unknown / needs-login after timed candidates when reset evidence or credentials are unusable', () => {
@@ -1404,7 +1404,7 @@ describe('AccountManager', () => {
   });
 
   // ---------------------------------------------------------------------------
-  // R7-3（母艦裁定 D-72 の 4(ii)）: 認証失効の口座だけを needs-login として報告する。
+  // 認証失効の口座だけを needs-login として報告する。
   // 他の error は現行どおり unknown のままであり、並び順も1つも動かさない。
   // ---------------------------------------------------------------------------
   it('reports needs-login only for an expired credential, never for another account error', () => {
@@ -1890,7 +1890,7 @@ describe('AccountManager', () => {
 });
 
 // ---------------------------------------------------------------------------
-// (c) 認証失敗の原因コードと検出時刻の保持（母艦裁定 C-20260915-3F-03）
+// 認証失敗の原因コードと検出時刻の保持
 //
 // 「認証が切れている」だけでは、いつ・何が原因で落ちたのかが分からず、
 // 再ログインすべきかどうかを人が判断できない。markError に details を足して
@@ -2475,7 +2475,7 @@ describe('account_switch log line', () => {
   });
 });
 
-describe('familyQuotaExhaustedOnly / isCommonQuotaExhausted (D-56-3 / 設計書 §5)', () => {
+describe('familyQuotaExhaustedOnly / isCommonQuotaExhausted', () => {
   const NOW = Date.parse('2026-06-04T09:00:00.000Z');
   const FABLE_RESET = '2026-06-06T09:00:00.000Z';
   const LATER = '2026-06-08T09:00:00.000Z';
@@ -2557,7 +2557,7 @@ describe('familyQuotaExhaustedOnly / isCommonQuotaExhausted (D-56-3 / 設計書 
       assert.equal(
         familyQuotaExhaustedOnly(manager.find(id), manager.switchThreshold, 'fable', NOW),
         false,
-        `${id}: the binding must not be treated as a sub-cap exhaustion (D-56-3)`,
+        `${id}: the binding must not be treated as a sub-cap exhaustion`,
       );
       assert.equal(
         isCommonQuotaExhausted(manager.find(id), manager.switchThreshold),
@@ -2587,7 +2587,7 @@ describe('familyQuotaExhaustedOnly / isCommonQuotaExhausted (D-56-3 / 設計書 
   });
 });
 
-describe('findOrNull (設計書 §5)', () => {
+describe('findOrNull', () => {
   function makeManager() {
     return new AccountManager({
       accounts: [{ id: 'acct_1', name: 'a@example.com', type: 'oauth' }],
@@ -2614,7 +2614,7 @@ describe('findOrNull (設計書 §5)', () => {
   });
 });
 
-describe('selectForNewAssignment (D-56-1 / D-60-4 / 設計書 §4.2)', () => {
+describe('selectForNewAssignment', () => {
   const NOW = Date.parse('2026-06-04T09:00:00.000Z');
   // 36h の週次リセット優先窓（DEFAULT_WEEKLY_RESET_PRIORITY_WINDOW_MS）の内と外。
   const SOON_WEEKLY = '2026-06-04T15:00:00.000Z'; // NOW + 6h  -> weeklyResetPriority = true
@@ -2646,7 +2646,7 @@ describe('selectForNewAssignment (D-56-1 / D-60-4 / 設計書 §4.2)', () => {
     return manager.bestAvailableSwitchCandidate({ excludeCurrent: false, modelFamily })?.account.id ?? null;
   }
 
-  it('§4.2 例①: prefers 90% headroom over an 11% account whose weekly window resets sooner', () => {
+  it('prefers 90% headroom over an 11% account whose weekly window resets sooner', () => {
     const manager = makeManager(['cand1', 'cand2']);
     setWindows(manager, 'cand1', { fiveHour: 0.11, weekly: 0.80, weeklyResetAt: SOON_WEEKLY });
     setWindows(manager, 'cand2', { fiveHour: 0.90, weekly: 0.95, weeklyResetAt: LATE_WEEKLY });
@@ -2654,7 +2654,7 @@ describe('selectForNewAssignment (D-56-1 / D-60-4 / 設計書 §4.2)', () => {
     assert.equal(
       existingComparatorPick(manager),
       'cand1',
-      '既存比較器は weeklyResetPriority が第0キーなので残 11% を無条件に先着させる（§4.2 (a)）',
+      '既存比較器は weeklyResetPriority が第0キーなので残 11% を無条件に先着させる',
     );
     assert.equal(
       manager.selectForNewAssignment({ assignStopUtilization: 0.9 })?.id,
@@ -2663,7 +2663,7 @@ describe('selectForNewAssignment (D-56-1 / D-60-4 / 設計書 §4.2)', () => {
     );
   });
 
-  it('§4.2 例②: never hands a new Fable session to an account whose Fable sub-cap is at 95%', () => {
+  it('never hands a new Fable session to an account whose Fable sub-cap is at 95%', () => {
     const manager = makeManager(['cand1', 'cand2']);
     setWindows(manager, 'cand1', { fiveHour: 0.80, weekly: 0.70, fableSubCap: 0.05 });
     setWindows(manager, 'cand2', { fiveHour: 0.60, weekly: 0.50, fableSubCap: 0.90 });
@@ -2671,7 +2671,7 @@ describe('selectForNewAssignment (D-56-1 / D-60-4 / 設計書 §4.2)', () => {
     assert.equal(
       existingComparatorPick(manager, 'fable'),
       'cand1',
-      '既存の maxUtilization は 5h/7d しか見ないので F7d 残 5% の口座を選ぶ（§4.2 (b)）',
+      '既存の maxUtilization は 5h/7d しか見ないので F7d 残 5% の口座を選ぶ',
     );
     assert.equal(
       manager.selectForNewAssignment({ modelFamily: 'fable', assignStopUtilization: 0.9 })?.id,
@@ -2685,7 +2685,7 @@ describe('selectForNewAssignment (D-56-1 / D-60-4 / 設計書 §4.2)', () => {
     );
   });
 
-  it('§4.2 例③: breaks an exact tie by the number of warm sessions already bound', () => {
+  it('breaks an exact tie by the number of warm sessions already bound', () => {
     const manager = makeManager(['cand1', 'cand2']);
     setWindows(manager, 'cand1', { fiveHour: 0.80, weekly: 0.70 });
     setWindows(manager, 'cand2', { fiveHour: 0.80, weekly: 0.70 });
@@ -2693,7 +2693,7 @@ describe('selectForNewAssignment (D-56-1 / D-60-4 / 設計書 §4.2)', () => {
     assert.equal(
       existingComparatorPick(manager),
       'cand1',
-      '既存比較器の最終キーは台帳順なので常に同じ口座へ寄る（§4.2 (c)）',
+      '既存比較器の最終キーは台帳順なので常に同じ口座へ寄る',
     );
     assert.equal(
       manager.selectForNewAssignment({
@@ -2713,7 +2713,7 @@ describe('selectForNewAssignment (D-56-1 / D-60-4 / 設計書 §4.2)', () => {
     );
   });
 
-  it('§4.2 例④: one missing window must not push a known candidate out of the band', () => {
+  it('one missing window must not push a known candidate out of the band', () => {
     const manager = makeManager(['cand1', 'cand2']);
     setWindows(manager, 'cand1', { fiveHour: 0.40, weekly: 0.60 });
     setWindows(manager, 'cand2', { fiveHour: 0.95 }); // 7d の利用率が取得できない
@@ -2726,11 +2726,11 @@ describe('selectForNewAssignment (D-56-1 / D-60-4 / 設計書 §4.2)', () => {
     assert.equal(
       manager.selectForNewAssignment({ assignStopUtilization: 0.9 })?.id,
       'cand1',
-      '欠測候補は帯域を決める前に分離されるので、帯域は既知の cand1 だけで決まる（D-60-4）',
+      '欠測候補は帯域を決める前に分離されるので、帯域は既知の cand1 だけで決まる',
     );
   });
 
-  it('disables the assign-stop gate when no account clears it (R1)', () => {
+  it('disables the assign-stop gate when no account clears it', () => {
     const manager = makeManager(['low', 'lower']);
     setWindows(manager, 'low', { fiveHour: 0.08, weekly: 0.90 });
     setWindows(manager, 'lower', { fiveHour: 0.02, weekly: 0.90 });
@@ -2759,10 +2759,10 @@ describe('selectForNewAssignment (D-56-1 / D-60-4 / 設計書 §4.2)', () => {
     assert.equal(manager.selectForNewAssignment({ excludeAccountIds: ['cand1', 'cand2'] }), null);
   });
 
-  it('reads an account object or a plain id in the exclusion set and ignores anything else (FU-60)', () => {
-    // 除外集合は口座 id（文字列）で渡すのが結線側の約束（R-S7）。口座オブジェクトが
+  it('reads an account object or a plain id in the exclusion set and ignores anything else', () => {
+    // 除外集合は口座 id（文字列）で渡すのが結線側の約束。口座オブジェクトが
     // 紛れ込んでも黙って一致しないまま通すのではなく id を取り出し、それ以外の値は
-    // 集合へ入れない——旧実装は任意の反復可能物をそのまま Set にしていた（FU-60）。
+    // 集合へ入れない——旧実装は任意の反復可能物をそのまま Set にしていた。
     const manager = makeManager(['cand1', 'cand2', 'cand3']);
     setWindows(manager, 'cand1', { fiveHour: 0.90, weekly: 0.90 });
     setWindows(manager, 'cand2', { fiveHour: 0.80, weekly: 0.80 });
@@ -2787,7 +2787,7 @@ describe('selectForNewAssignment (D-56-1 / D-60-4 / 設計書 §4.2)', () => {
     );
   });
 
-  // v1.7（判断6 案(a)・P-a）で週次リセット優先は第3キーへ降格した。5h 実消費と温かい
+  // 並べ替えの見直しで週次リセット優先は第3キーへ降格した。5h 実消費と温かい
   // バインド数が並んで初めて効くので、この回帰は 5h 側を同点にしたうえで帯域の差を
   // 7d 側で作る。差を 5h 側で作ると、降格した鍵まで到達せずに 5h の小さいほうが勝つ。
   it('lets the weekly-reset priority decide only inside the band, and only after the load keys tie', () => {
@@ -2802,12 +2802,12 @@ describe('selectForNewAssignment (D-56-1 / D-60-4 / 設計書 §4.2)', () => {
     );
   });
 
-  // --- v1.7（判断6 案(a)・P-a）で先頭へ置いた2つの鍵 ---------------------
+  // --- 並べ替えの見直しで先頭へ置いた2つの鍵 ---------------------
   //
-  // 帯域（best から 5 ポイント）・受入ゲート 0.90・欠測分離（D-60-4）・全滅時の
-  // ゲート解除（R1）は v1.6 のまま。**帯域の中の並べ替えだけ**を差し替える。
+  // 帯域（best から 5 ポイント）・受入ゲート 0.90・欠測分離・全滅時の
+  // ゲート解除は以前のまま。**帯域の中の並べ替えだけ**を差し替える。
 
-  it('P-a: ranks the band by the real 5h load before the残枠 keys', () => {
+  it('ranks the band by the real 5h load before the残枠 keys', () => {
     const manager = makeManager(['tight7d', 'busy5h']);
     // tight7d は 5h をほとんど使っていないが、週次が狭いので headroom.min は小さい。
     setWindows(manager, 'tight7d', { fiveHour: 0.90, weekly: 0.76 });
@@ -2821,7 +2821,7 @@ describe('selectForNewAssignment (D-56-1 / D-60-4 / 設計書 §4.2)', () => {
     );
   });
 
-  it('P-a: keeps the load key ahead of the warm count', () => {
+  it('keeps the load key ahead of the warm count', () => {
     const manager = makeManager(['lighter', 'idle']);
     setWindows(manager, 'lighter', { fiveHour: 0.80, weekly: 0.95 });
     setWindows(manager, 'idle', { fiveHour: 0.78, weekly: 0.95 });
@@ -2836,9 +2836,9 @@ describe('selectForNewAssignment (D-56-1 / D-60-4 / 設計書 §4.2)', () => {
     );
   });
 
-  it('P-a: sorts an unreadable 5h window last instead of treating it as idle', () => {
+  it('sorts an unreadable 5h window last instead of treating it as idle', () => {
     const manager = makeManager(['noFiveHour', 'knownLoad']);
-    // どちらも窓が1つ欠けているので、D-60-4 の分離では同じ組に入る。
+    // どちらも窓が1つ欠けているので、欠測の分離では同じ組に入る。
     setWindows(manager, 'noFiveHour', { weekly: 0.90 });
     setWindows(manager, 'knownLoad', { fiveHour: 0.86 });
 
@@ -2849,7 +2849,7 @@ describe('selectForNewAssignment (D-56-1 / D-60-4 / 設計書 §4.2)', () => {
     );
   });
 
-  it('P-a: reads an expired 5h window as zero load', () => {
+  it('reads an expired 5h window as zero load', () => {
     const manager = makeManager(['expired']);
     setWindows(manager, 'expired', { fiveHour: 0.05, weekly: 0.90 });
     const account = manager.find('expired');
@@ -2867,7 +2867,7 @@ describe('selectForNewAssignment (D-56-1 / D-60-4 / 設計書 §4.2)', () => {
     );
   });
 
-  // FU-58: 旧値（残 0.90 / 0.85）は ASSIGN_BAND_EPSILON を 0 にしても緑になり、
+  // 旧値（残 0.90 / 0.85）は ASSIGN_BAND_EPSILON を 0 にしても緑になり、
   // この回帰は epsilon を一度も踏んでいなかった。残枠を 0.06〜1.00 まで 1 ポイント
   // 刻みで振ると、95 組のうち 29 組で「ちょうど 5 ポイント下」の候補が帯域の外へ
   // 落ちる（1 - (1 - x) の往復で生じる二進小数の誤差）。0.30 / 0.25 はその 1 つだが、
@@ -2876,7 +2876,7 @@ describe('selectForNewAssignment (D-56-1 / D-60-4 / 設計書 §4.2)', () => {
   // 0.25000000000000006 になって候補の 0.25 をわずかに上回る。
   // 値を落ちる組へ差し替えて、epsilon が無いと 'best' が選ばれることを固定する。
   //
-  // v1.7（P-a）で並べ替えの第1キーが 5h 実消費になったため、残枠の差を 5h 側で作ると
+  // 並べ替えの見直しで第1キーが 5h 実消費になったため、残枠の差を 5h 側で作ると
   // 帯域へ入る前に第1キーで決着して epsilon を踏まない。差は 7d 側で作り、5h は同点に
   // 揃えて、帯域の中に残った 'edge' を週次リセット優先（第3キー）で選ばせる。
   it('keeps a candidate exactly five points below the best inside the band', () => {
@@ -2891,7 +2891,7 @@ describe('selectForNewAssignment (D-56-1 / D-60-4 / 設計書 §4.2)', () => {
     );
   });
 
-  it('uses candidates with a missing window only when no complete candidate is left (D-60-4)', () => {
+  it('uses candidates with a missing window only when no complete candidate is left', () => {
     const manager = makeManager(['knownSmall', 'missingLarge']);
     setWindows(manager, 'knownSmall', { fiveHour: 0.30, weekly: 0.40 });
     setWindows(manager, 'missingLarge', { fiveHour: 0.70 });
@@ -2911,7 +2911,7 @@ describe('selectForNewAssignment (D-56-1 / D-60-4 / 設計書 §4.2)', () => {
     );
   });
 
-  it('keeps an account whose windows are all missing as a candidate (R1)', () => {
+  it('keeps an account whose windows are all missing as a candidate', () => {
     const manager = makeManager(['unknown', 'known']);
 
     assert.equal(
@@ -2929,7 +2929,7 @@ describe('selectForNewAssignment (D-56-1 / D-60-4 / 設計書 §4.2)', () => {
     );
   });
 
-  it('returns null when every account is unavailable so the caller keeps the current exhausted path (R1)', () => {
+  it('returns null when every account is unavailable so the caller keeps the current exhausted path', () => {
     const manager = makeManager(['cand1', 'cand2']);
     setWindows(manager, 'cand1', { fiveHour: 0, weekly: 0.90 });
     setWindows(manager, 'cand2', { fiveHour: 0, weekly: 0.90 });
@@ -2937,8 +2937,8 @@ describe('selectForNewAssignment (D-56-1 / D-60-4 / 設計書 §4.2)', () => {
     assert.equal(manager.selectForNewAssignment({}), null);
   });
 
-  // P-b（設計書 v1.7 §4.3）は「結び付け先の利用率が drainStartUtilization 以上か」を
-  // 予約段で判定する。その利用率は選択側と同じ残枠の読み方でなければならないので、
+  // 予約段は「結び付け先の利用率が drainStartUtilization 以上か」を
+  // 判定する。その利用率は選択側と同じ残枠の読み方でなければならないので、
   // 台帳が持つ読み方をそのまま外へ出す（proxy 側で 5h/7d/サブキャップを数え直さない）。
   it('exposes the same headroom the selector uses so the reservation stage can read the utilisation', () => {
     const manager = makeManager(['cand1']);
@@ -2950,7 +2950,7 @@ describe('selectForNewAssignment (D-56-1 / D-60-4 / 設計書 §4.2)', () => {
       '非 Fable の要求では 5h/7d の残枠の小さいほう＝利用率 60%',
     );
     const fable = manager.assignmentHeadroomFor(manager.find('cand1'), 'fable');
-    // 残率は `1 - (1 - 0.05)` の往復なので二進小数の誤差が乗る（FU-58 と同じ理由）。
+    // 残率は `1 - (1 - 0.05)` の往復なので二進小数の誤差が乗る（帯域の epsilon の回帰と同じ理由）。
     assert.ok(
       Math.abs(fable.min - 0.05) < 1e-9 && fable.complete === true,
       `Fable の要求ではサブキャップも同列に数える＝利用率 95%: ${JSON.stringify(fable)}`,
@@ -3024,15 +3024,15 @@ describe('selectForNewAssignment (D-56-1 / D-60-4 / 設計書 §4.2)', () => {
     const after = manager.events.filter(event => event.type === 'quota-exhausted').length;
 
     assert.equal(before, 1, '枯渇は台帳へ取り込んだ時点で1件だけ積まれている');
-    assert.equal(after, 1, 'セレクタが同じ口座を何度評価しても quota-exhausted は増えない（I-3）');
+    assert.equal(after, 1, 'セレクタが同じ口座を何度評価しても quota-exhausted は増えない');
   });
 });
 
-describe('credential identity の戻り値 (D-60-3 / 設計書 §8.1)', () => {
+describe('credential identity の戻り値', () => {
   // sticky affinity は「口座 id は同じだが資格情報が別物になった」ことを自分では
   // 判定できない（台帳には同じ id の行が残る）。判定しているのは replaceAccounts と
-  // restoreState の内部だけなので、その結果を戻り値として外へ出す（D-60-3）。
-  // 受け取った側は該当口座の基本バインドと副バインドを両方破棄する（F3）。
+  // restoreState の内部だけなので、その結果を戻り値として外へ出す。
+  // 受け取った側は該当口座の基本バインドと副バインドを両方破棄する。
   function makeManager(accounts) {
     return new AccountManager({
       accounts,
@@ -3082,7 +3082,7 @@ describe('credential identity の戻り値 (D-60-3 / 設計書 §8.1)', () => {
     const manager = makeManager(LEDGER);
 
     // 口座が台帳から消えるのは credential_changed ではなく account_removed の事象で、
-    // affinity 側は prune が受け持つ（§8.1 の表）。ここには載せない。
+    // affinity 側は prune が受け持つ。ここには載せない。
     const changed = manager.replaceAccounts([
       { id: 'acct_1', name: 'a@example.com', type: 'oauth', accountUuid: 'uuid-1', credentialRevision: 'revision-1' },
       { id: 'acct_3', name: 'c@example.com', type: 'oauth', accountUuid: 'uuid-3', credentialRevision: 'revision-1' },
@@ -3122,7 +3122,7 @@ describe('credential identity の戻り値 (D-60-3 / 設計書 §8.1)', () => {
       accounts: [
         savedEntry('acct_1', { accountUuid: 'uuid-1', credentialRevision: 'revision-1' }),
         savedEntry('acct_2', { accountUuid: 'uuid-2', credentialRevision: 'revision-1' }),
-        // FU-64 以降、保存側に行が無い口座は「変わったかもしれない」側へ倒れる。
+        // 保存側に行が無い口座は「変わったかもしれない」側へ倒れる。
         // 「1件も変わっていない」を見るこのケースは台帳の3口座すべてを保存側にも置く。
         savedEntry('acct_3', { accountUuid: 'uuid-3', credentialRevision: 'revision-1' }),
       ],
@@ -3133,8 +3133,8 @@ describe('credential identity の戻り値 (D-60-3 / 設計書 §8.1)', () => {
   });
 
   it('returns an empty array for a non-object saved state', () => {
-    // U19 の唯一の注意点。早期 return が裸の `return;` のままだと、保存データが
-    // 壊れている F1 のときにだけ affinity が undefined を受け取る（正常系では
+    // 唯一の注意点。早期 return が裸の `return;` のままだと、保存データが
+    // 壊れているときにだけ affinity が undefined を受け取る（正常系では
     // 露見しない）。全 return 経路が配列であることを固定する。
     const manager = makeManager(LEDGER);
 
@@ -3149,16 +3149,16 @@ describe('credential identity の戻り値 (D-60-3 / 設計書 §8.1)', () => {
 });
 
 // ---------------------------------------------------------------------------
-// 保存側に対応する行が無い口座（R-S12 / FU-64・D-183）
+// 保存側に対応する行が無い口座
 //
 // `restoreState` は「保存時と資格情報が別物になった口座」の一覧を返し、sticky の表は
-// その口座へのバインドを捨てる（F3）。保存側の行が壊れている（id が文字列でない）
+// その口座へのバインドを捨てる。保存側の行が壊れている（id が文字列でない）
 // ときや、そもそも行が無いとき、旧実装は「変化なし」として黙って読み飛ばしていた。
 // 資格情報が同じである証拠がどこにも無いので、これらは安全側＝変わった側へ倒す。
 // バインドが無ければ evictAccounts は1行も落とさないので、実害は無い。
 // ---------------------------------------------------------------------------
 
-describe('保存側に対応エントリが無い口座 (R-S12 / FU-64・D-183)', () => {
+describe('保存側に対応エントリが無い口座', () => {
   const LEDGER = [
     { id: 'acct_1', name: 'a@example.com', type: 'oauth', accountUuid: 'uuid-1', credentialRevision: 'revision-1' },
     { id: 'acct_2', name: 'b@example.com', type: 'oauth', accountUuid: 'uuid-2', credentialRevision: 'revision-1' },
@@ -3220,19 +3220,19 @@ describe('保存側に対応エントリが無い口座 (R-S12 / FU-64・D-183)'
 });
 
 // ---------------------------------------------------------------------------
-// events の条件付き永続化とメモリ上限（R-S12 / D-56-6・設計書 §5.2(b)・§7.3）
+// events の条件付き永続化とメモリ上限
 //
 // `getStatus()` は `events` の先頭50件を返し、`src/monitor.js` はその先頭8件を描く。
 // 復元すれば再起動直後の status JSON と CLI 出力は「復元しない現行」と必ず変わるので、
 // 保存・復元もメモリ上限50件も **sticky が有効なときだけ** 行う。既定（`mode:"off"`）は
 // 1点も変えない——`runtime-state.json`・`/internal/status`・`claude-rotator status` の
-// すべてが現行とバイト同一である（上限を持たない現行の問題は U14 の別件として残す）。
+// すべてが現行とバイト同一である（上限を持たない現行の問題は別件として残す）。
 //
-// 台帳は sticky の表も mode 文字列も知らない（D-182）。受け取るのは「履歴として扱うか」の
+// 台帳は sticky の表も mode 文字列も知らない。受け取るのは「履歴として扱うか」の
 // 真偽値1つだけで、その値を決めるのは結線側（proxy-server / cli）である。
 // ---------------------------------------------------------------------------
 
-describe('events の条件付き永続化とメモリ上限 (R-S12 / D-56-6)', () => {
+describe('events の条件付き永続化とメモリ上限', () => {
   function makeManager(options = {}) {
     return new AccountManager({
       accounts: [
@@ -3326,7 +3326,7 @@ describe('events の条件付き永続化とメモリ上限 (R-S12 / D-56-6)', (
 });
 
 // ---------------------------------------------------------------------------
-// updateUsage のキャッシュ4分類と totalRequests の意味（計画書 Task 1 Step 4・(d)）
+// updateUsage のキャッシュ4分類と totalRequests の意味
 // ---------------------------------------------------------------------------
 
 describe('updateUsage / キャッシュ4分類と countRequest', () => {
