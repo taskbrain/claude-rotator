@@ -3,6 +3,7 @@ import http from 'node:http';
 import https from 'node:https';
 
 import {
+  commonQuotaEvidence,
   familyQuotaExhaustedOnly,
   isAuthExpiredReason,
   isCommonQuotaExhausted,
@@ -1761,6 +1762,8 @@ function createSessionAffinityRequest({
     gen: null,
     reservedId: null,
     pendingReason: null,
+    // `pendingReason` が `common_exhausted` のときだけ、その判定に使った台帳の値の根拠。
+    pendingEvidence: null,
     select: () => null,
     confirm: () => {},
     noteUpstreamQuota: () => {},
@@ -1798,6 +1801,8 @@ function createSessionAffinityRequest({
   let binding = null;
   let sendTo = null;
   let reason = null;
+  // 共通の枠が尽きて付け替えるときだけ、判定に使った台帳の値の根拠（`affinity_switch` 行の末尾へ）。
+  let evidence = null;
   // 猶予。0 なら待機は1度も起きない。
   let graceMs = 0;
   let graceAccountId = null;
@@ -1831,12 +1836,15 @@ function createSessionAffinityRequest({
     // 回復見込みが猶予より先・取得不能・`rebindGraceMs:0` なら待たずに付け替える
     // （無期限の待機を作らないための安全側の既定）。
     // 付け替えるのは使えなかった結び付け先だけである。
-    graceMs = quotaGraceWaitMs(bound, settings.rebindGraceMs, accountManager.now());
+    const now = accountManager.now();
+    graceMs = quotaGraceWaitMs(bound, settings.rebindGraceMs, now);
     if (graceMs > 0) {
       binding = bound;
       sendTo = bound;
       graceAccountId = bound.id;
     } else {
+      // 根拠は付け替え先を選ぶ前に、判定と同じ台帳の値から取る。
+      evidence = commonQuotaEvidence(bound, threshold, now);
       binding = assign([bound.id]);
       sendTo = binding;
       reason = binding ? 'common_exhausted' : null;
@@ -1849,7 +1857,7 @@ function createSessionAffinityRequest({
   }
 
   if (binding) {
-    const reserved = affinity.note(key, { account: binding.id, modelFamily, reason });
+    const reserved = affinity.note(key, { account: binding.id, modelFamily, reason, evidence });
     if (reserved) {
       state.gen = reserved.gen;
       state.aff = reserved.disposition;
@@ -1871,6 +1879,15 @@ function createSessionAffinityRequest({
     affinity.noteDefer(key, { account: account.id, waitMs });
     return waitMs;
   };
+  // 確定で付け替える理由を立てる。共通の枠のときは、判定と同じ時点の台帳の値から
+  // 根拠も取っておき、確定（`confirm`）が理由と一緒に渡して一緒に空へ戻す。
+  const notePendingRebind = previous => {
+    const now = accountManager.now();
+    state.pendingReason = quotaRebindReason(previous, threshold, modelFamily, now);
+    state.pendingEvidence = state.pendingReason === 'common_exhausted'
+      ? commonQuotaEvidence(previous, threshold, now)
+      : null;
+  };
   let pending = sendTo;
   let firstSelect = true;
   state.select = attemptedAccountIds => {
@@ -1881,7 +1898,7 @@ function createSessionAffinityRequest({
     // 2周目以降。表はここでは書かず、確定（②）が枠の枯渇由来のときだけ書き換える。
     const current = affinity.get(key, { modelFamily });
     const previous = current ? accountManager.findOrNull(current.bound) : null;
-    state.pendingReason = quotaRebindReason(previous, threshold, modelFamily, accountManager.now());
+    notePendingRebind(previous);
     pending = assign(attemptedAccountIds);
     return pending;
   };
@@ -1894,9 +1911,11 @@ function createSessionAffinityRequest({
       modelFamily,
       expectedGen: state.gen,
       reason: state.pendingReason,
+      evidence: state.pendingEvidence,
     });
     if (confirmed && confirmed.disposition !== 'stale') state.gen = confirmed.gen;
     state.pendingReason = null;
+    state.pendingEvidence = null;
   };
   // 反応的 429 の再試行の周は、選択を replay 対象に絞った既存経路が行うので
   // `select()` を経ずに確定へ入る。そのままだと付け替えの理由が立たず、表は果てた
@@ -1909,7 +1928,7 @@ function createSessionAffinityRequest({
     const current = affinity.get(key, { modelFamily });
     const previous = current ? accountManager.findOrNull(current.bound) : null;
     if (!previous || previous.id !== source.id) return;
-    state.pendingReason = quotaRebindReason(previous, threshold, modelFamily, accountManager.now());
+    notePendingRebind(previous);
   };
   return state;
 }

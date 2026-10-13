@@ -1,7 +1,12 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 
-import { AccountManager, familyQuotaExhaustedOnly, isCommonQuotaExhausted } from '../src/account-manager.js';
+import {
+  AccountManager,
+  commonQuotaEvidence,
+  familyQuotaExhaustedOnly,
+  isCommonQuotaExhausted,
+} from '../src/account-manager.js';
 import { parseRateLimitHeaders } from '../src/quota.js';
 
 describe('parseRateLimitHeaders', () => {
@@ -2584,6 +2589,125 @@ describe('familyQuotaExhaustedOnly / isCommonQuotaExhausted', () => {
       isCommonQuotaExhausted(manager.find('scoped'), manager.switchThreshold),
       isCommonQuotaExhausted(null, manager.switchThreshold),
     ], [true, true, true, false, false]);
+  });
+
+  it('commonQuotaEvidence names a header reading, its value and its age', () => {
+    const manager = makeManager(['header']);
+    manager.updateQuota('header', {
+      'anthropic-ratelimit-unified-5h-utilization': '1.02',
+      'anthropic-ratelimit-unified-5h-reset': String(Math.floor(Date.parse(LATER) / 1000)),
+      'anthropic-ratelimit-unified-7d-utilization': '0.4',
+    });
+
+    assert.deepEqual(
+      commonQuotaEvidence(manager.find('header'), manager.switchThreshold, NOW + 412_000),
+      { basis: ['5h'], util: 1.02, src: 'header', srcAgeMs: 412_000 },
+    );
+  });
+
+  it('commonQuotaEvidence names a poll reading and keeps the larger value when two windows are over', () => {
+    const manager = makeManager(['poll', 'both']);
+    manager.applyUsage('poll', {
+      five_hour: { utilization: 0.2, resets_at: LATER },
+      seven_day: { utilization: 1, resets_at: LATER },
+    });
+    manager.applyUsage('both', {
+      five_hour: { utilization: 1, resets_at: LATER },
+      seven_day: { utilization: 1.05, resets_at: LATER },
+    });
+
+    assert.deepEqual(
+      commonQuotaEvidence(manager.find('poll'), manager.switchThreshold, NOW),
+      { basis: ['7d'], util: 1, src: 'poll', srcAgeMs: 0 },
+    );
+    assert.deepEqual(
+      commonQuotaEvidence(manager.find('both'), manager.switchThreshold, NOW + 1_000),
+      { basis: ['5h', '7d'], util: 1.05, src: 'poll', srcAgeMs: 1_000 },
+    );
+  });
+
+  it('commonQuotaEvidence gives header and no age for the token and request rate limits', () => {
+    const manager = makeManager(['tokenRate', 'requestRate']);
+    manager.updateQuota('tokenRate', {
+      'anthropic-ratelimit-tokens-limit': '100',
+      'anthropic-ratelimit-tokens-remaining': '0',
+    });
+    manager.updateQuota('requestRate', {
+      'anthropic-ratelimit-requests-limit': '50',
+      'anthropic-ratelimit-requests-remaining': '0',
+    });
+
+    assert.deepEqual(
+      commonQuotaEvidence(manager.find('tokenRate'), manager.switchThreshold, NOW),
+      { basis: ['tokens'], util: 1, src: 'header', srcAgeMs: null },
+    );
+    assert.deepEqual(
+      commonQuotaEvidence(manager.find('requestRate'), manager.switchThreshold, NOW),
+      { basis: ['requests'], util: 1, src: 'header', srcAgeMs: null },
+    );
+  });
+
+  it('commonQuotaEvidence is null exactly when isCommonQuotaExhausted is false', () => {
+    const manager = makeManager(['healthy', 'scoped', 'fiveHour', 'unknownSource']);
+    manager.applyUsage('healthy', {
+      five_hour: { utilization: 0.2, resets_at: LATER },
+      seven_day: { utilization: 0.3, resets_at: LATER },
+    });
+    fableSubCapOnly(manager, 'scoped');
+    manager.applyUsage('fiveHour', { five_hour: { utilization: 1, resets_at: LATER } });
+    manager.applyUsage('unknownSource', { five_hour: { utilization: 1, resets_at: LATER } });
+    manager.find('unknownSource').quota.usageSource = 'something else';
+    manager.find('unknownSource').quota.usageUpdatedAt = NOW + 5_000;
+    // A ledger without a quota object counts as exhausted, with no window to name.
+    const noQuota = { id: 'noQuota', quota: null };
+
+    const accounts = [
+      manager.find('healthy'),
+      manager.find('scoped'),
+      manager.find('fiveHour'),
+      manager.find('unknownSource'),
+      noQuota,
+      null,
+    ];
+    for (const account of accounts) {
+      assert.equal(
+        commonQuotaEvidence(account, manager.switchThreshold, NOW) !== null,
+        isCommonQuotaExhausted(account, manager.switchThreshold),
+        `${account?.id ?? 'null'}: the evidence must exist exactly when the decision says exhausted`,
+      );
+    }
+    assert.equal(commonQuotaEvidence(manager.find('healthy'), manager.switchThreshold, NOW), null);
+    assert.equal(commonQuotaEvidence(manager.find('scoped'), manager.switchThreshold, NOW), null);
+    assert.equal(commonQuotaEvidence(null, manager.switchThreshold, NOW), null);
+    assert.deepEqual(
+      commonQuotaEvidence(noQuota, manager.switchThreshold, NOW),
+      { basis: [], util: null, src: null, srcAgeMs: null },
+    );
+    assert.deepEqual(
+      commonQuotaEvidence(manager.find('unknownSource'), manager.switchThreshold, NOW),
+      { basis: ['5h'], util: 1, src: null, srcAgeMs: null },
+      'an unknown source and a reading time ahead of the clock are left out rather than guessed',
+    );
+  });
+
+  it('commonQuotaEvidence reads the ledger without changing it', () => {
+    const manager = makeManager(['fiveHour']);
+    manager.applyUsage('fiveHour', { five_hour: { utilization: 1, resets_at: LATER } });
+    const account = manager.find('fiveHour');
+    const before = structuredClone(account.quota);
+    const statusBefore = account.status;
+    const eventsBefore = manager.events.length;
+
+    // A clock past the 5h reset would make `refreshQuotaState` clear the window;
+    // reading the evidence must not do that.
+    const pastReset = Date.parse(LATER) + 1;
+    assert.deepEqual(
+      commonQuotaEvidence(account, manager.switchThreshold, pastReset),
+      { basis: ['5h'], util: 1, src: 'poll', srcAgeMs: pastReset - NOW },
+    );
+    assert.deepEqual(account.quota, before);
+    assert.equal(account.status, statusBefore);
+    assert.equal(manager.events.length, eventsBefore);
   });
 });
 

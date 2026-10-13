@@ -1441,18 +1441,77 @@ function quotaBlocksModelFamily(quota, threshold, modelFamily) {
  * consider `weeklyScoped` — a model-scoped exhaustion is never "common".
  */
 function commonQuotaExhausted(quota, threshold) {
-  if (!quota) return true;
-  if (quota.unified5h != null && quota.unified5h >= threshold) return true;
-  if (quota.unified7d != null && quota.unified7d >= threshold) return true;
+  return commonQuotaWindowsOver(quota, threshold) !== null;
+}
+
+/**
+ * The common windows of `quota` that are at or over `threshold`, in the fixed
+ * order 5h, 7d, tokens, requests, each as `{ basis, utilization }`; null when
+ * none is. A missing quota counts as exhausted with no window to name, so it
+ * gives an empty list. `commonQuotaExhausted` is "this is not null", which is
+ * what keeps the decision and `commonQuotaEvidence` from ever disagreeing.
+ */
+function commonQuotaWindowsOver(quota, threshold) {
+  if (!quota) return [];
+  const over = [];
+  if (quota.unified5h != null && quota.unified5h >= threshold) {
+    over.push({ basis: '5h', utilization: quota.unified5h });
+  }
+  if (quota.unified7d != null && quota.unified7d >= threshold) {
+    over.push({ basis: '7d', utilization: quota.unified7d });
+  }
   if (quota.tokensLimit != null && quota.tokensRemaining != null) {
     const utilization = 1 - quota.tokensRemaining / quota.tokensLimit;
-    if (utilization >= threshold) return true;
+    if (utilization >= threshold) over.push({ basis: 'tokens', utilization });
   }
   if (quota.requestsLimit != null && quota.requestsRemaining != null) {
     const utilization = 1 - quota.requestsRemaining / quota.requestsLimit;
-    if (utilization >= threshold) return true;
+    if (utilization >= threshold) over.push({ basis: 'requests', utilization });
   }
-  return false;
+  return over.length > 0 ? over : null;
+}
+
+/**
+ * What made `isCommonQuotaExhausted(account, threshold)` true, read from the
+ * same ledger values; null exactly when it is false.
+ *
+ * - `basis`: the windows at or over the threshold (`5h`, `7d`, `tokens`,
+ *   `requests`, in that order; empty when the account has no quota at all).
+ * - `util`: the largest utilization among them (the ledger value for 5h and
+ *   7d; `1 - remaining/limit` for tokens and requests), unrounded.
+ * - `src` / `srcAgeMs`: where that value came from and how old it is at `now`.
+ *   The 5h and 7d values share one source and time per account
+ *   (`quota.usageSource` / `quota.usageUpdatedAt`), so a 5h reading carries the
+ *   source of the latest 5h-or-7d update. Token and request values only ever
+ *   come from response headers and their time is not kept, so they give
+ *   `header` and a null age.
+ *
+ * Reads only: it neither writes the ledger nor calls `refreshQuotaState`, so it
+ * sees exactly what the decision that called it saw.
+ */
+export function commonQuotaEvidence(account, threshold, now) {
+  if (!account) return null;
+  const quota = account.quota;
+  const over = commonQuotaWindowsOver(quota, threshold);
+  if (over === null) return null;
+  let top = null;
+  for (const window of over) {
+    if (!Number.isFinite(window.utilization)) continue;
+    if (top === null || window.utilization > top.utilization) top = window;
+  }
+  const evidence = { basis: over.map(window => window.basis), util: null, src: null, srcAgeMs: null };
+  if (top === null) return evidence;
+  evidence.util = top.utilization;
+  if (top.basis === 'tokens' || top.basis === 'requests') {
+    evidence.src = 'header';
+    return evidence;
+  }
+  evidence.src = USAGE_SOURCES.includes(quota.usageSource) ? quota.usageSource : null;
+  const ageMs = now - quota.usageUpdatedAt;
+  evidence.srcAgeMs = Number.isFinite(quota.usageUpdatedAt) && Number.isFinite(ageMs) && ageMs >= 0
+    ? ageMs
+    : null;
+  return evidence;
 }
 
 /**
