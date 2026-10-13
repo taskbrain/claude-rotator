@@ -13793,7 +13793,8 @@ describe('session affinity status section and event history', () => {
   });
 
   // 節の形は `{ mode, sessions, capacity, warmTtlMs, sessionsByAccount,
-  // warmSessionsByAccount, switchesByReason, evictionsByReason, requests, sidRate }` である。
+  // warmSessionsByAccount, switchesByReason, evictionsByReason, requests, sidRate,
+  // newAssignmentOrder }` である。
   // 後から足した2つ（warmTtlMs・warmSessionsByAccount）を status 側で直接押さえる——`summary()` が返していても節へ載せ
   // 忘れれば、README が約束した項目が欠ける。
   it('reports the warm window and the warm per-account counts in the status section', async () => {
@@ -13814,7 +13815,7 @@ describe('session affinity status section and event history', () => {
     assert.deepEqual(section.sessionsByAccount, { acct_a: 1, acct_b: 1 });
     assert.deepEqual(Object.keys(section), [
       'mode', 'sessions', 'capacity', 'warmTtlMs', 'sessionsByAccount',
-      'warmSessionsByAccount', 'switchesByReason', 'evictionsByReason', 'requests', 'sidRate',
+      'warmSessionsByAccount', 'switchesByReason', 'evictionsByReason', 'requests', 'sidRate', 'newAssignmentOrder',
     ], '決まった形どおりの並び');
   });
 
@@ -13916,6 +13917,170 @@ describe('session affinity status section and event history', () => {
     assert.equal((await reload()).status, 200);
 
     assert.equal(persisted.length, before, '変化が無ければ保存を増やさない');
+  });
+
+  // `newAssignmentOrder` is read-only: the section lists, per model family, the
+  // accounts a new keyed session would be bound to, in the order they are tried.
+  // The wiring tests below read the status, send one request with a fresh
+  // session key and compare the account on its `proxy` log line with the head.
+  describe('newAssignmentOrder', () => {
+    const THIRD_SESSION_ID = 'c63b99e4-2db5-4a7a-9f39-7e5a0c3d4261';
+    const FIVE_HOUR_RESET = '2026-09-16T12:00:00.000Z';
+    const WEEKLY_RESET = '2026-09-20T09:00:00.000Z';
+
+    function setUsage(accountManager, id, { fiveHour, weekly, fable = null }) {
+      accountManager.applyUsage(id, {
+        five_hour: { utilization: fiveHour, resets_at: FIVE_HOUR_RESET },
+        seven_day: { utilization: weekly, resets_at: WEEKLY_RESET },
+        ...(fable == null
+          ? {}
+          : { scoped_weekly: [{ key: 'fable', label: 'Fable', utilization: fable, resets_at: WEEKLY_RESET }] }),
+      });
+    }
+
+    function lastProxiedAccount(logLines) {
+      const line = logLines.filter(entry => / proxy account=\S+ /.test(entry)).at(-1);
+      return line ? / proxy account=(\S+) /.exec(line)[1] : null;
+    }
+
+    it('lists both families with rows made of account, accountName and overStopLine only', async () => {
+      const { ask, status } = await startStatus();
+
+      await ask({ sid: RAW_SESSION_ID });
+      const order = (await status()).body.sessionAffinity.newAssignmentOrder;
+
+      assert.deepEqual(Object.keys(order), ['fable', 'other']);
+      for (const family of ['fable', 'other']) {
+        assert.equal(order[family].length, 2, `${family}: both accounts are usable`);
+        for (const entry of order[family]) {
+          assert.deepEqual(Object.keys(entry), ['account', 'accountName', 'overStopLine']);
+          assert.equal(entry.accountName, `${entry.account}@example.com`);
+          assert.equal(typeof entry.overStopLine, 'boolean');
+        }
+      }
+    });
+
+    it('leads with the account that has fewer warm sessions when the usage is the same', async () => {
+      const { ask, status, logLines } = await startStatus();
+
+      // No usage has been read for either account, so only the warm session
+      // count separates them: the first session lands on acct_a.
+      await ask({ sid: RAW_SESSION_ID });
+      assert.equal(lastProxiedAccount(logLines), 'acct_a');
+
+      const order = (await status()).body.sessionAffinity.newAssignmentOrder;
+      assert.deepEqual(order.other.map(entry => entry.account), ['acct_b', 'acct_a']);
+
+      await ask({ sid: OTHER_SESSION_ID });
+      assert.equal(lastProxiedAccount(logLines), 'acct_b');
+    });
+
+    it('leaves a session that has gone cold out of the count while it is still in the table', async () => {
+      const { ask, status, reload, clock, logLines } = await startStatus({ reloadable: true });
+
+      await ask({ sid: RAW_SESSION_ID });
+      assert.equal(lastProxiedAccount(logLines), 'acct_a');
+      // Past the warm window the session no longer counts as warm, but its row
+      // stays in the table. The reload is what recounts the warm sessions here.
+      const { warmTtlMs } = (await status()).body.sessionAffinity;
+      clock.ms += warmTtlMs + 1;
+      assert.equal((await reload()).status, 200);
+
+      const section = (await status()).body.sessionAffinity;
+      assert.deepEqual(section.sessionsByAccount, { acct_a: 1 });
+      assert.deepEqual(section.warmSessionsByAccount, {});
+      // No account holds a warm session, so acct_a leads again. Counting every
+      // session in the table instead would put acct_b first.
+      assert.deepEqual(section.newAssignmentOrder.other.map(entry => entry.account), ['acct_a', 'acct_b']);
+
+      const linesBefore = logLines.length;
+      await ask({ sid: OTHER_SESSION_ID });
+      assert.equal(lastProxiedAccount(logLines.slice(linesBefore)), 'acct_a');
+    });
+
+    it('draws the assign-stop line from the configured assignStopUtilization', async () => {
+      const { ask, status, accountManager, logLines } = await startStatus({
+        sessionAffinity: { mode: 'on', assignStopUtilization: 0.5 },
+      });
+      // acct_a is 52% used and acct_b 48%. At the default line of 0.9 both are
+      // inside it and acct_a leads on its lighter 5h window; at 0.5 only acct_b is.
+      setUsage(accountManager, 'acct_a', { fiveHour: 0.1, weekly: 0.52 });
+      setUsage(accountManager, 'acct_b', { fiveHour: 0.4, weekly: 0.48 });
+
+      const order = (await status()).body.sessionAffinity.newAssignmentOrder;
+      assert.deepEqual(order.other, [
+        { account: 'acct_b', accountName: 'acct_b@example.com', overStopLine: false },
+        { account: 'acct_a', accountName: 'acct_a@example.com', overStopLine: true },
+      ]);
+
+      await ask({ sid: RAW_SESSION_ID });
+      assert.equal(lastProxiedAccount(logLines), 'acct_b');
+    });
+
+    it('orders each family by its own windows', async () => {
+      const { ask, status, accountManager, logLines } = await startStatus();
+      // acct_a has more room on the shared windows, but its Fable allowance is
+      // 60% used, which only a Fable request counts.
+      setUsage(accountManager, 'acct_a', { fiveHour: 0.1, weekly: 0.2, fable: 0.6 });
+      setUsage(accountManager, 'acct_b', { fiveHour: 0.3, weekly: 0.2 });
+
+      const first = (await status()).body.sessionAffinity.newAssignmentOrder;
+      assert.equal(first.other[0].account, 'acct_a');
+      assert.equal(first.fable[0].account, 'acct_b');
+
+      await ask({ sid: RAW_SESSION_ID });
+      assert.equal(lastProxiedAccount(logLines), 'acct_a');
+
+      const second = (await status()).body.sessionAffinity.newAssignmentOrder;
+      assert.equal(second.fable[0].account, 'acct_b');
+
+      await ask({ sid: THIRD_SESSION_ID, model: 'claude-fable-5' });
+      assert.equal(lastProxiedAccount(logLines), 'acct_b');
+    });
+
+    it('leaves the key out in observe mode', async () => {
+      const { ask, status } = await startStatus({ sessionAffinity: { mode: 'observe' } });
+
+      await ask({ sid: RAW_SESSION_ID });
+      const section = (await status()).body.sessionAffinity;
+
+      assert.equal(section.mode, 'observe');
+      assert.equal('newAssignmentOrder' in section, false);
+    });
+
+    it('drops the key once a reload turns the mode from on to observe', async () => {
+      const { ask, status, reload, holder } = await startStatus({ reloadable: true });
+
+      await ask({ sid: RAW_SESSION_ID });
+      assert.equal('newAssignmentOrder' in (await status()).body.sessionAffinity, true);
+      holder.sessionAffinity = { mode: 'observe' };
+
+      const fromReload = (await reload()).body.sessionAffinity;
+      const fromStatus = (await status()).body.sessionAffinity;
+
+      for (const [label, section] of [['reload', fromReload], ['status', fromStatus]]) {
+        assert.equal(section.mode, 'observe', label);
+        assert.equal('newAssignmentOrder' in section, false, label);
+      }
+    });
+
+    it('answers two consecutive status reads with the same body while the clock stands still', async () => {
+      const { ask, status, accountManager } = await startStatus();
+      setUsage(accountManager, 'acct_a', { fiveHour: 1, weekly: 0.2 });
+      setUsage(accountManager, 'acct_b', { fiveHour: 0.3, weekly: 0.2, fable: 0.6 });
+      await ask({ sid: RAW_SESSION_ID });
+
+      const first = await status();
+      const second = await status();
+
+      assert.equal(first.status, 200);
+      assert.deepEqual(
+        first.body.sessionAffinity.newAssignmentOrder.other.map(entry => entry.account),
+        ['acct_b'],
+        'acct_a has used up its 5h window and is not listed',
+      );
+      assert.equal(second.bodyText, first.bodyText);
+    });
   });
 
   it('persists the events only while the mode is not off', async () => {

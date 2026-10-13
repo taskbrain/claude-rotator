@@ -3150,6 +3150,251 @@ describe('selectForNewAssignment', () => {
     assert.equal(before, 1, '枯渇は台帳へ取り込んだ時点で1件だけ積まれている');
     assert.equal(after, 1, 'セレクタが同じ口座を何度評価しても quota-exhausted は増えない');
   });
+
+  // The order a status reader is shown. Row k is what the selector returns once
+  // the k-1 rows above it are excluded, so the expectations below are written
+  // out by account name instead of being derived from the selector.
+  describe('newAssignmentOrder', () => {
+    const row = (id, overStopLine) => ({ account: id, accountName: `${id}@example.com`, overStopLine });
+    const ids = order => order.map(entry => entry.account);
+
+    /** A (0.50 left), B (0.46 left, 3 warm sessions), C (0.42 left, idle 5h window). */
+    function makeRedrawnBandManager() {
+      const manager = makeManager(['acct_a', 'acct_b', 'acct_c']);
+      setWindows(manager, 'acct_a', { fiveHour: 0.50, weekly: 0.50 });
+      setWindows(manager, 'acct_b', { fiveHour: 0.50, weekly: 0.46 });
+      setWindows(manager, 'acct_c', { fiveHour: 0.90, weekly: 0.42 });
+      return manager;
+    }
+    const REDRAWN_BAND_WARM = { acct_b: 3 };
+
+    function assertMatchesSelectorUnderExclusion(manager, options) {
+      const order = manager.newAssignmentOrder(options);
+      for (let k = 0; k < order.length; k += 1) {
+        assert.equal(
+          manager.selectForNewAssignment({
+            ...options,
+            excludeAccountIds: ids(order).slice(0, k),
+          })?.id,
+          order[k].account,
+          `row ${k} must be the selector's answer once the ${k} rows above it are excluded`,
+        );
+      }
+      assert.equal(
+        manager.selectForNewAssignment({ ...options, excludeAccountIds: ids(order) }),
+        null,
+        'nothing is left once every listed account is excluded',
+      );
+      return order;
+    }
+
+    it('follows the band as it is redrawn after each exclusion, not one sorted band', () => {
+      const manager = makeRedrawnBandManager();
+
+      const order = manager.newAssignmentOrder({
+        assignStopUtilization: 0.9,
+        sessionCounts: REDRAWN_BAND_WARM,
+      });
+
+      // The first band holds A and B only; sorting it would give A, B, C. With A
+      // excluded the band is redrawn around B and now takes C in, and C wins it
+      // on the 5h load.
+      assert.deepEqual(order, [
+        row('acct_a', false),
+        row('acct_c', false),
+        row('acct_b', false),
+      ]);
+    });
+
+    it('lists, at every position, the account the selector returns with the rows above excluded', () => {
+      const redrawn = makeRedrawnBandManager();
+      assertMatchesSelectorUnderExclusion(redrawn, {
+        assignStopUtilization: 0.9,
+        sessionCounts: REDRAWN_BAND_WARM,
+      });
+      assertMatchesSelectorUnderExclusion(redrawn, {
+        modelFamily: 'fable',
+        assignStopUtilization: 0.5,
+        sessionCounts: new Map([['acct_a', 2]]),
+      });
+
+      const gated = makeManager(['out2', 'in2', 'out1', 'in1']);
+      setWindows(gated, 'in1', { fiveHour: 0.60, weekly: 0.90 });
+      setWindows(gated, 'in2', { fiveHour: 0.30, weekly: 0.90 });
+      setWindows(gated, 'out1', { fiveHour: 0.08, weekly: 0.90 });
+      setWindows(gated, 'out2', { fiveHour: 0.02, weekly: 0.90 });
+      const order = assertMatchesSelectorUnderExclusion(gated, { assignStopUtilization: 0.9 });
+      assert.equal(order.length, 4);
+    });
+
+    it('lists every account inside the assign-stop line first and marks the rest', () => {
+      const manager = makeManager(['out2', 'in2', 'out1', 'in1']);
+      setWindows(manager, 'in1', { fiveHour: 0.60, weekly: 0.90 });
+      setWindows(manager, 'in2', { fiveHour: 0.30, weekly: 0.90 });
+      setWindows(manager, 'out1', { fiveHour: 0.08, weekly: 0.90 });
+      setWindows(manager, 'out2', { fiveHour: 0.02, weekly: 0.90 });
+
+      assert.deepEqual(manager.newAssignmentOrder({ assignStopUtilization: 0.9 }), [
+        row('in1', false),
+        row('in2', false),
+        row('out1', true),
+        row('out2', true),
+      ]);
+      // The line is the setting, not a constant: at 0.5 only `in1` stays inside.
+      assert.deepEqual(manager.newAssignmentOrder({ assignStopUtilization: 0.5 }), [
+        row('in1', false),
+        row('in2', true),
+        row('out1', true),
+        row('out2', true),
+      ]);
+    });
+
+    it('marks every row when no account is inside the assign-stop line', () => {
+      const manager = makeManager(['low', 'lower']);
+      setWindows(manager, 'low', { fiveHour: 0.08, weekly: 0.90 });
+      setWindows(manager, 'lower', { fiveHour: 0.02, weekly: 0.90 });
+
+      const order = manager.newAssignmentOrder({ assignStopUtilization: 0.9 });
+
+      assert.deepEqual(order, [row('low', true), row('lower', true)]);
+      assert.equal(
+        order[0].account,
+        manager.selectForNewAssignment({ assignStopUtilization: 0.9 })?.id,
+        'the head is the account the selector picks with the line released',
+      );
+    });
+
+    it('marks an account whose windows could not be read the way the selector gates it', () => {
+      const manager = makeManager(['partial', 'unread', 'known']);
+      setWindows(manager, 'known', { fiveHour: 0.60, weekly: 0.90 });
+      setWindows(manager, 'partial', { fiveHour: 0.95 }); // the weekly window could not be read
+
+      // `unread` has no reading at all, so the selector never admits it through
+      // the line: it is reached only after both admitted accounts are excluded.
+      // `partial` clears the line on the one window it has.
+      assert.deepEqual(manager.newAssignmentOrder({ assignStopUtilization: 0.9 }), [
+        row('known', false),
+        row('partial', false),
+        row('unread', true),
+      ]);
+      assert.equal(
+        manager.selectForNewAssignment({
+          assignStopUtilization: 0.9,
+          excludeAccountIds: ['known'],
+        })?.id,
+        'partial',
+        'the selector keeps the line while `partial` is still inside it',
+      );
+
+      const allOutside = makeManager(['unread', 'out1']);
+      setWindows(allOutside, 'out1', { fiveHour: 0.08, weekly: 0.90 });
+      assert.deepEqual(allOutside.newAssignmentOrder({ assignStopUtilization: 0.9 }), [
+        row('out1', true),
+        row('unread', true),
+      ]);
+    });
+
+    it('marks an account that is past the line on its Fable allowance alone for Fable requests only', () => {
+      const manager = makeManager(['fable_tight', 'free']);
+      // `fable_tight` has the most room on both shared windows but only 5% of its
+      // Fable allowance left, which a Fable request counts and no other request does.
+      setWindows(manager, 'fable_tight', { fiveHour: 0.80, weekly: 0.90, fableSubCap: 0.05 });
+      setWindows(manager, 'free', { fiveHour: 0.78, weekly: 0.90, fableSubCap: 0.80 });
+
+      assert.deepEqual(
+        manager.newAssignmentOrder({ modelFamily: 'fable', assignStopUtilization: 0.9 }),
+        [row('free', false), row('fable_tight', true)],
+      );
+      assert.deepEqual(
+        manager.newAssignmentOrder({ modelFamily: null, assignStopUtilization: 0.9 }),
+        [row('fable_tight', false), row('free', false)],
+      );
+    });
+
+    it('marks an account whose usage is exactly on the assign-stop line', () => {
+      const manager = makeManager(['on_line', 'inside']);
+      // Half of the weekly window is used, which is the line itself once the line
+      // is set to 0.5. (0.5 is exact in binary, so the reading sits on the line
+      // and not a rounding step to either side of it.)
+      setWindows(manager, 'on_line', { fiveHour: 0.90, weekly: 0.50 });
+      setWindows(manager, 'inside', { fiveHour: 0.60, weekly: 0.51 });
+
+      // On the line counts as past it. `on_line` has the lighter 5h window and
+      // would lead if the line admitted it; it is listed last and marked instead.
+      assert.deepEqual(manager.newAssignmentOrder({ assignStopUtilization: 0.5 }), [
+        row('inside', false),
+        row('on_line', true),
+      ]);
+    });
+
+    it('leaves out every account that cannot take a request right now', () => {
+      const manager = makeManager(['exhausted', 'throttled', 'broken', 'fable_out', 'healthy']);
+      setWindows(manager, 'exhausted', { fiveHour: 0, weekly: 0.90 });
+      setWindows(manager, 'throttled', { fiveHour: 0.90, weekly: 0.90 });
+      setWindows(manager, 'broken', { fiveHour: 0.90, weekly: 0.90 });
+      setWindows(manager, 'fable_out', { fiveHour: 0.70, weekly: 0.90, fableSubCap: 0 });
+      setWindows(manager, 'healthy', { fiveHour: 0.80, weekly: 0.90 });
+      manager.markRateLimited('throttled', 60);
+      manager.markError('broken', 'authentication_error', 'OAuth token rejected');
+
+      // The Fable sub-cap blocks `fable_out` for Fable requests only.
+      assert.deepEqual(
+        manager.newAssignmentOrder({ modelFamily: 'fable', assignStopUtilization: 0.9 }),
+        [row('healthy', false)],
+      );
+      assert.deepEqual(
+        manager.newAssignmentOrder({ modelFamily: null, assignStopUtilization: 0.9 }),
+        [row('healthy', false), row('fable_out', false)],
+      );
+    });
+
+    it('returns an empty list when no account is usable', () => {
+      const manager = makeManager(['exhausted']);
+      setWindows(manager, 'exhausted', { fiveHour: 0, weekly: 0.90 });
+
+      assert.deepEqual(manager.newAssignmentOrder({ assignStopUtilization: 0.9 }), []);
+    });
+
+    it('changes neither the saved state nor the event log once the status has been read', () => {
+      const manager = makeManager(['exhausted', 'throttled', 'fable_out', 'healthy']);
+      setWindows(manager, 'exhausted', { fiveHour: 0, weekly: 0.90 });
+      setWindows(manager, 'throttled', { fiveHour: 0.90, weekly: 0.90 });
+      setWindows(manager, 'fable_out', { fiveHour: 0.70, weekly: 0.90, fableSubCap: 0 });
+      setWindows(manager, 'healthy', { fiveHour: 0.80, weekly: 0.90 });
+      manager.markRateLimited('throttled', 60);
+
+      // The status endpoint evaluates `getStatus()` before it builds the order.
+      manager.getStatus();
+      const stateBefore = JSON.stringify(manager.exportState());
+      const eventsBefore = manager.events.length;
+
+      const fable = manager.newAssignmentOrder({ modelFamily: 'fable', assignStopUtilization: 0.9 });
+      const other = manager.newAssignmentOrder({ modelFamily: null, assignStopUtilization: 0.9 });
+
+      assert.deepEqual(ids(fable), ['healthy']);
+      assert.deepEqual(ids(other), ['healthy', 'fable_out']);
+      assert.equal(JSON.stringify(manager.exportState()), stateBefore);
+      assert.equal(manager.events.length, eventsBefore);
+    });
+
+    it('reads the warm session counts from a plain object and from a Map alike', () => {
+      const manager = makeRedrawnBandManager();
+
+      const fromObject = manager.newAssignmentOrder({
+        assignStopUtilization: 0.9,
+        sessionCounts: { acct_a: 4, acct_b: 1 },
+      });
+      const fromMap = manager.newAssignmentOrder({
+        assignStopUtilization: 0.9,
+        sessionCounts: new Map([['acct_a', 4], ['acct_b', 1]]),
+      });
+
+      // B now has fewer warm sessions than A, so it leads the first band. With B
+      // excluded the band is drawn around A alone and C falls outside it.
+      assert.deepEqual(ids(fromObject), ['acct_b', 'acct_a', 'acct_c']);
+      assert.deepEqual(fromMap, fromObject);
+    });
+  });
 });
 
 describe('credential identity の戻り値', () => {

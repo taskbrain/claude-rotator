@@ -734,6 +734,17 @@ proxy request ログに出るのは `account`、`method`、`path`、`status`、`
 
 `/internal/status` には `sessionAffinity` 節が増えます（**`mode: "off"` ではキー自体がありません**）。内訳は `mode`、`sessions`（保持しているセッション数）、`capacity`（`maxSessions`）、`warmTtlMs`、`sessionsByAccount`（アカウント別のセッション数。**Fable 用の副バインドで1つのセッションが2つのアカウントに数えられるため、合計はセッション総数と一致しません**）、`warmSessionsByAccount`（そのうちキャッシュがまだ生きているとみなしているセッション数。`sessionsByAccount` との差が、冷えたまま表に残っているセッションです）、`switchesByReason`、`evictionsByReason`、`requests`（`proxied` = 転送したリクエスト数、`keyed` = うちセッション鍵が付いていた数）、`sidRate`（`keyed / proxied` を小数第4位で丸めた値。転送が0件なら `null`）です。`claude-rotator status` / `monitor` では、同じ内容を `Session Affinity` の行として表示します。
 
+`mode: "on"` のときだけ、この節に `newAssignmentOrder` が加わります（**`observe` と `off` ではキー自体がありません**）。セッション鍵の付いた新しいセッションをどのアカウントへ割り当てるかの順番で、Fable のリクエスト用の `fable` と、それ以外のリクエスト用の `other` の2本の配列です。各行は `account`（アカウントの ID）、`accountName`、`overStopLine` の3項目で、いま使えるアカウントだけが載ります。空の配列は、その系統でいま割り当てられるアカウントが無いことを表します。
+
+- 1番目は、いまセッション鍵付きの新しいセッションが来たときの割り当て先です。k番目は、上の k-1 個がそのリクエストで使えなかったときの割り当て先です。
+- `overStopLine` が `true` の行は、使用率が `assignStopUtilization` 以上か、使用率をまだ1つも読めていないアカウントです。`assignStopUtilization` の内側のアカウントが残っていないときにだけ選ばれます。`fable` の並びでは、使用率は Fable 固有枠も含めた、いちばんきつい枠で見ます。
+- **待ち行列ではありません。** 並びは読み取りのたびに作り直します。新しいセッションが入ったときや、使用率が変わったときに変わることがあります。
+- 固定済みのセッションは、結び付け先が使えるあいだはこの並びに従いません（キャッシュが失効したセッションを `drainStartUtilization` で移すときを除きます）。結び付け先を付け替えるとき、またはそのリクエストだけを別アカウントへ送るときは、結び付け先を除いて同じ選び方で選びます。
+- セッション鍵の無いリクエストはこの並びに従わず、従来どおりの選び方で処理されます。
+- 応答ヘッダで枯渇と分かった 429 の後は、試したアカウントを除いて同じ選び方で選び直します（新しいセッションなら、この並びの次のアカウントです）。Fable のリクエストで、使用量の照会で枯渇を確かめた後の1回の再送だけは、この並びではなく、セッション鍵の無いリクエストの自動切り替えと同じ比べ方で候補から選びます。
+
+`newAssignmentOrder` は JSON にだけ出ます。`status` / `monitor` の画面には表示しません。
+
 `mode` が `off` 以外のときは、`status` / `monitor` の `Events`（直近の切り替え・リクエスト）も `runtime-state.json` へ保存され、再起動後も残ります。保持するのは最新50件です。`mode: "off"` では保存も復元もしないため、`runtime-state.json` の内容は現行と同一です。
 
 共通の5時間枠 / 7日枠 / token枠 / request枠が100%に達すると、そのアカウントは全モデルで利用不可になり、利用可能な別アカウントへ `current` を切り替えます。Fable 固有枠だけが100%の場合は、Fable リクエストだけを別候補へ送り、Other で使える `current` は維持します。候補は通常、既知の `max(5h, 7d)` が最も低いアカウントです。ただし、7日枠の reset が近いアカウントは、reset 前に週次枠を使い切れるよう優先されます。この週次 reset 優先により、共通枠に余裕がある段階でも Usage API の再取得後に `current` が変わる場合があります。すべての候補が共通枠で exhausted の場合は、reset が最も近いアカウントを選び、Claude Code に最短再開時刻を含む limit message を返します。OAuth refresh failure、authentication error、一時的な throttle を理由に exhausted アカウントへ切り替えることはありません。
@@ -2070,6 +2081,17 @@ Enabling [Per-Session Account Pinning](#per-session-account-pinning-sessionaffin
 None of these lines contains a raw session id or a token (`sid` is the 12-digit hash). Accounts appear by account ID; if you registered an account without `--id`, that ID is the email address with symbols replaced by hyphens, so the address is effectively readable.
 
 `/internal/status` gains a `sessionAffinity` section (**the key itself is absent while `mode` is `"off"`**) containing `mode`, `sessions` (how many sessions are held), `capacity` (`maxSessions`), `warmTtlMs`, `sessionsByAccount` (sessions per account — **a Fable sub-binding makes one session count towards two accounts, so this never sums to the session total**), `warmSessionsByAccount` (how many of those are still treated as holding a cache; the difference from `sessionsByAccount` is what has gone cold while staying in the table), `switchesByReason`, `evictionsByReason`, `requests` (`proxied` = requests forwarded, `keyed` = how many of them carried a session key), and `sidRate` (`keyed / proxied`, rounded to four decimal places; `null` when nothing has been forwarded). `claude-rotator status` / `monitor` shows the same values as a `Session Affinity` block.
+
+Only while `mode` is `"on"`, the section also carries `newAssignmentOrder` (**the key itself is absent in `observe` and `off`**). It is the order in which a new session that carries a session key would be assigned to an account, as two arrays: `fable` for Fable requests and `other` for every other request. Each row has three fields — `account` (the account ID), `accountName`, and `overStopLine` — and only accounts that are usable right now are listed. An empty array means no account can take a new session of that family right now.
+
+- The first row is where a new session with a session key would be assigned right now. The k-th row is where it would be assigned if the k-1 rows above it could not be used for that request.
+- A row whose `overStopLine` is `true` is an account whose usage ratio is at or above `assignStopUtilization`, or none of whose usage windows has been read yet. It is chosen only when no account inside `assignStopUtilization` is left. In the `fable` array, the usage ratio is that of the tightest window, the Fable-specific allowance included.
+- **It is not a queue.** The order is rebuilt on every read, and it can change whenever a new session is assigned or a usage ratio changes.
+- A session that is already pinned does not follow this order while its bound account is usable (except when a session whose cache has expired is moved by `drainStartUtilization`). When its binding is moved, or when only that one request is sent through another account, the target is chosen the same way with the bound account excluded.
+- A request without a session key does not follow this order; it is routed exactly as it is today.
+- After a 429 whose response headers show the quota is exhausted, the request is re-routed the same way with the accounts already tried excluded (for a new session, that is the next row of this order). The one exception is a Fable request that is resent once after a usage lookup has confirmed the exhaustion: that resend does not use this order, and picks from its candidates with the same comparison as the automatic switch for requests without a session key.
+
+`newAssignmentOrder` appears only in the JSON. The `status` / `monitor` screens do not show it.
 
 While `mode` is anything other than `off`, the `Events` of `status` / `monitor` (the recent switches and requests) are persisted to `runtime-state.json` too and survive a restart, capped at the newest 50. With `mode: "off"` they are neither saved nor restored, so the contents of `runtime-state.json` stay identical to today's.
 
