@@ -96,6 +96,10 @@ const CONFIRM_REBIND_REASONS = new Set(['common_exhausted', 'family_exhausted'])
 // 退避の理由（`affinity_evict` の理由 ＋ reload で台帳から消えた口座）。
 const EVICT_REASONS = new Set(['ttl', 'capacity', 'credential_changed', 'account_removed']);
 const UNKNOWN_REASON = 'unknown';
+// `common_exhausted` の `affinity_switch` 行の末尾に足す根拠の語。ここに無い語・数でない値・
+// 負の経過時間は `-` にして出す（行に空白の混じる値を入れない）。
+const EVIDENCE_BASES = new Set(['5h', '7d', 'tokens', 'requests']);
+const EVIDENCE_SOURCES = new Set(['header', 'poll']);
 
 /**
  * 設定セクション `sessionAffinity` を正規化する。
@@ -232,23 +236,35 @@ export class SessionAffinity {
    * `affinity_stale` を1行出して捨てる。確定で付け替えるのは枠の枯渇由来の
    * 理由のときだけである。
    *
+   * `evidence` は付け替えの根拠（`commonQuotaEvidence` の戻り値の形
+   * `{ basis, util, src, srcAgeMs }`）。理由が `common_exhausted` で実際に付け替えたときだけ
+   * `affinity_switch` 行の末尾に `basis=` `util=` `src=` `srcAgeMs=` として足す。
+   * 渡さなければ行は従来と同じである。
+   *
    * @param {unknown} key セッション鍵。
    * @param {{account:string, modelFamily?:string|null, expectedGen?:number|null,
-   *          reason?:string|null, now?:number}} options
+   *          reason?:string|null, evidence?:object|null, now?:number}} options
    * @returns {object|null} `{ sid, account, gen, disposition, slot, switches, reason }`。
    *   `disposition` は proxy 行の `aff` と同じ語彙（`new` / `bound` / `switch`）に `stale` を足したもの。
    *   鍵が使えない、または口座が空なら `null`（表は1バイトも変えない）。
    */
-  note(key, { account, modelFamily = null, expectedGen = null, reason = null, now = this.now() } = {}) {
+  note(key, {
+    account,
+    modelFamily = null,
+    expectedGen = null,
+    reason = null,
+    evidence = null,
+    now = this.now(),
+  } = {}) {
     const hash = sidHash(key);
     if (!hash) return null;
     if (typeof account !== 'string' || account.length === 0) return null;
 
     const entry = this.lookup(hash, now);
     if (expectedGen === null || expectedGen === undefined) {
-      return this.reserve(hash, entry, { account, modelFamily, reason, now });
+      return this.reserve(hash, entry, { account, modelFamily, reason, evidence, now });
     }
-    return this.confirm(hash, entry, { account, modelFamily, reason, now, expectedGen });
+    return this.confirm(hash, entry, { account, modelFamily, reason, evidence, now, expectedGen });
   }
 
   /**
@@ -678,7 +694,7 @@ export class SessionAffinity {
     }
   }
 
-  reserve(hash, entry, { account, modelFamily, reason, now }) {
+  reserve(hash, entry, { account, modelFamily, reason, evidence, now }) {
     if (!entry) {
       const created = {
         home: account,
@@ -703,10 +719,10 @@ export class SessionAffinity {
     const bound = boundAccount(entry, modelFamily);
     if (bound === account) return result(hash, account, entry, 'bound', null, reason);
     // 予約で口座が変わるのは、選択側が新しい結び付け先を決めたときである。
-    return this.rebind(hash, entry, { account, modelFamily, reason, now, gen: entry.gen + 1 });
+    return this.rebind(hash, entry, { account, modelFamily, reason, evidence, now, gen: entry.gen + 1 });
   }
 
-  confirm(hash, entry, { account, modelFamily, reason, now, expectedGen }) {
+  confirm(hash, entry, { account, modelFamily, reason, evidence, now, expectedGen }) {
     if (!entry || entry.gen !== expectedGen) {
       // 待っているあいだに別の要求が新しいバインドを作った。遅着した確定は捨て、
       // この要求は送信済みの口座でそのまま完走させる。
@@ -728,10 +744,10 @@ export class SessionAffinity {
     // 枠の枯渇由来のときだけ付け替える。一時障害（認証失敗・throttled・error・上流 5xx・
     // 切断・timeout・短期レート制限）では表を書き換えない。
     if (!CONFIRM_REBIND_REASONS.has(reason)) return result(hash, bound, entry, 'bound', null, reason);
-    return this.rebind(hash, entry, { account, modelFamily, reason, now, gen: expectedGen + 1 });
+    return this.rebind(hash, entry, { account, modelFamily, reason, evidence, now, gen: expectedGen + 1 });
   }
 
-  rebind(hash, entry, { account, modelFamily, reason, now, gen }) {
+  rebind(hash, entry, { account, modelFamily, reason, evidence = null, now, gen }) {
     const from = boundAccount(entry, modelFamily);
     const slot = rebindSlot(entry, modelFamily, reason);
     // 口座の集合が変わるので、先に古い集合ぶんを引いてから書き換える。
@@ -754,7 +770,8 @@ export class SessionAffinity {
     this.write(
       now,
       `affinity_switch sid=${hash} from=${from} to=${account}`
-      + ` reason=${label} family=${modelFamily === 'fable' ? 'fable' : 'other'} switches=${entry.switches}`,
+      + ` reason=${label} family=${modelFamily === 'fable' ? 'fable' : 'other'} switches=${entry.switches}`
+      + (label === 'common_exhausted' ? evidenceFields(evidence) : ''),
     );
     this.markChanged();
     return result(hash, account, entry, 'switch', slot, label);
@@ -875,6 +892,19 @@ function result(hash, account, entry, disposition, slot, reason) {
     switches: entry.switches,
     reason: reason ?? null,
   };
+}
+
+// 共通の枠が尽きて付け替えた根拠の4欄。根拠が無ければ空文字を返し、行は1バイトも変わらない。
+// 欄が出るときは4つとも必ず出し、読めない値は `-` にする（キー名で読めば位置に依らない）。
+function evidenceFields(evidence) {
+  if (!evidence || typeof evidence !== 'object') return '';
+  const basis = Array.isArray(evidence.basis) ? evidence.basis.filter(word => EVIDENCE_BASES.has(word)) : [];
+  const util = Number.isFinite(evidence.util) ? String(evidence.util) : '-';
+  const src = EVIDENCE_SOURCES.has(evidence.src) ? evidence.src : '-';
+  const ageMs = Number.isFinite(evidence.srcAgeMs) && evidence.srcAgeMs >= 0
+    ? String(Math.floor(evidence.srcAgeMs))
+    : '-';
+  return ` basis=${basis.length > 0 ? basis.join(',') : '-'} util=${util} src=${src} srcAgeMs=${ageMs}`;
 }
 
 function accountIdsOf(accountManager) {

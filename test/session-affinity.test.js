@@ -345,6 +345,79 @@ describe('SessionAffinity generations', () => {
       + ' reason=common_exhausted family=other switches=1',
     ]);
   });
+
+  it('appends the evidence of a common-quota exhaustion at the end of the switch line', () => {
+    const { affinity, logger } = createAffinity();
+    const reserved = reserve(affinity, SESSION_ID, 'acct-a');
+
+    // 確定の経路。
+    affinity.note(SESSION_ID, {
+      account: 'acct-d',
+      expectedGen: reserved.gen,
+      reason: 'common_exhausted',
+      evidence: { basis: ['5h'], util: 0.99, src: 'poll', srcAgeMs: 412_000 },
+    });
+    // 予約の経路。窓が2つ越えたときは語を `,` でつなぐ。
+    reserve(affinity, SESSION_ID, 'acct-e', {
+      reason: 'common_exhausted',
+      evidence: { basis: ['5h', 'tokens'], util: 1.02, src: 'header', srcAgeMs: null },
+    });
+
+    assert.deepEqual(linesOf(logger, 'affinity_switch'), [
+      `2025-09-04T15:33:20.000Z affinity_switch sid=${sidHash(SESSION_ID)} from=acct-a to=acct-d`
+      + ' reason=common_exhausted family=other switches=1 basis=5h util=0.99 src=poll srcAgeMs=412000',
+      `2025-09-04T15:33:20.000Z affinity_switch sid=${sidHash(SESSION_ID)} from=acct-d to=acct-e`
+      + ' reason=common_exhausted family=other switches=2 basis=5h,tokens util=1.02 src=header srcAgeMs=-',
+    ]);
+  });
+
+  it('writes - for every evidence value that is not one of the fixed words or a usable number', () => {
+    const { affinity, logger } = createAffinity();
+    reserve(affinity, SESSION_ID, 'acct-a');
+
+    reserve(affinity, SESSION_ID, 'acct-b', {
+      reason: 'common_exhausted',
+      evidence: { basis: ['5h', 'x y', '7d=1'], util: Number.NaN, src: 'poll now', srcAgeMs: -5 },
+    });
+    reserve(affinity, SESSION_ID, 'acct-c', {
+      reason: 'common_exhausted',
+      evidence: { basis: [], util: null, src: null, srcAgeMs: Number.POSITIVE_INFINITY },
+    });
+
+    const lines = linesOf(logger, 'affinity_switch');
+    assert.deepEqual(lines, [
+      `2025-09-04T15:33:20.000Z affinity_switch sid=${sidHash(SESSION_ID)} from=acct-a to=acct-b`
+      + ' reason=common_exhausted family=other switches=1 basis=5h util=- src=- srcAgeMs=-',
+      `2025-09-04T15:33:20.000Z affinity_switch sid=${sidHash(SESSION_ID)} from=acct-b to=acct-c`
+      + ' reason=common_exhausted family=other switches=2 basis=- util=- src=- srcAgeMs=-',
+    ]);
+  });
+
+  it('leaves the switch line byte-identical without evidence or for any other reason', () => {
+    const withEvidence = createAffinity();
+    const without = createAffinity();
+    const evidence = { basis: ['5h'], util: 1, src: 'header', srcAgeMs: 0 };
+
+    // 根拠を null で渡しても、根拠の無い共通の枠の付け替えと同じ行になる。
+    reserve(withEvidence.affinity, SESSION_ID, 'acct-a');
+    reserve(without.affinity, SESSION_ID, 'acct-a');
+    reserve(withEvidence.affinity, SESSION_ID, 'acct-b', { reason: 'common_exhausted', evidence: null });
+    reserve(without.affinity, SESSION_ID, 'acct-b', { reason: 'common_exhausted' });
+    // ほかの理由では、根拠を渡しても行は変わらない。
+    for (const [account, options] of [
+      ['acct-c', { modelFamily: 'fable', reason: 'family_exhausted' }],
+      ['acct-d', { reason: 'cold_reassign' }],
+      ['acct-e', { reason: 'account_removed' }],
+    ]) {
+      reserve(withEvidence.affinity, SESSION_ID, account, { ...options, evidence });
+      reserve(without.affinity, SESSION_ID, account, options);
+    }
+
+    const expected = linesOf(without.logger, 'affinity_switch');
+    assert.equal(expected.length, 4);
+    assert.deepEqual(linesOf(withEvidence.logger, 'affinity_switch'), expected);
+    for (const line of expected) assert.match(line, / switches=\d+$/);
+  });
 });
 
 // ---------------------------------------------------------------------------

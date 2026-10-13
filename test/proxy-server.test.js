@@ -12006,7 +12006,11 @@ describe('session affinity wiring', () => {
     assert.match(stale[0], / myGen=1 curGen=2 dropped=acct_a$/);
     const switches = eventLines(logLines, 'affinity_switch');
     assert.equal(switches.length, 1);
-    assert.match(switches[0], / from=acct_a to=acct_b reason=common_exhausted family=other switches=1$/);
+    // 予約の経路。根拠は応答ヘッダから台帳へ書いた 5h の値である。
+    assert.match(
+      switches[0],
+      / from=acct_a to=acct_b reason=common_exhausted family=other switches=1 basis=5h util=1 src=header srcAgeMs=\d+$/,
+    );
 
     // 表は R2 が作ったバインド（acct_b）のままである。
     assert.equal((await ask({ sid: 'session-one' })).status, 200);
@@ -12254,7 +12258,11 @@ describe('session affinity rebind and terminal', () => {
     ]);
     const switches = eventLines(logLines, 'affinity_switch');
     assert.equal(switches.length, 1);
-    assert.match(switches[0], / from=acct_a to=acct_b reason=common_exhausted family=other switches=1$/);
+    // 429 の応答ヘッダが台帳の 5h を書き、確定の付け替えはその値を根拠にする。
+    assert.match(
+      switches[0],
+      / from=acct_a to=acct_b reason=common_exhausted family=other switches=1 basis=5h util=1 src=header srcAgeMs=\d+$/,
+    );
 
     exhausted = false;
     assert.equal((await ask({ sid: 'session-one' })).status, 200);
@@ -12387,7 +12395,10 @@ describe('session affinity rebind and terminal', () => {
     const switches = eventLines(logLines, 'affinity_switch');
     assert.equal(switches.length, 2);
     assert.match(switches[0], / from=acct_a to=acct_b reason=family_exhausted family=fable switches=1$/);
-    assert.match(switches[1], / from=acct_b to=acct_c reason=common_exhausted family=fable switches=2$/);
+    assert.match(
+      switches[1],
+      / from=acct_b to=acct_c reason=common_exhausted family=fable switches=2 basis=5h util=1 src=header srcAgeMs=\d+$/,
+    );
     assert.deepEqual(assignments, []);
   });
 
@@ -12423,8 +12434,14 @@ describe('session affinity rebind and terminal', () => {
     ], 'バインド先1 ＋ 再バインド候補2 を最後まで試す');
     const switches = eventLines(logLines, 'affinity_switch');
     assert.equal(switches.length, 2);
-    assert.match(switches[0], / from=acct_a to=acct_b reason=common_exhausted family=other switches=1$/);
-    assert.match(switches[1], / from=acct_b to=acct_c reason=common_exhausted family=other switches=2$/);
+    assert.match(
+      switches[0],
+      / from=acct_a to=acct_b reason=common_exhausted family=other switches=1 basis=5h util=1 src=header srcAgeMs=\d+$/,
+    );
+    assert.match(
+      switches[1],
+      / from=acct_b to=acct_c reason=common_exhausted family=other switches=2 basis=5h util=1 src=header srcAgeMs=\d+$/,
+    );
   });
 
   it('㉓: the exhausted terminal of a pinned session moves neither currentIndex nor the fallback-switch event', async () => {
@@ -12514,7 +12531,11 @@ describe('session affinity rebind and terminal', () => {
     assert.deepEqual(seen, ['Bearer token-acct_a', 'Bearer token-acct_b']);
     const switches = eventLines(logLines, 'affinity_switch');
     assert.equal(switches.length, 1);
-    assert.match(switches[0], / from=acct_a to=acct_b reason=common_exhausted family=fable switches=1$/);
+    // 枠の証拠を持たない 429 なので、Usage API で確かめた 5h の値が根拠になる。
+    assert.match(
+      switches[0],
+      / from=acct_a to=acct_b reason=common_exhausted family=fable switches=1 basis=5h util=1 src=poll srcAgeMs=\d+$/,
+    );
     assert.deepEqual(eventLines(logLines, 'account_switch'), [], 'currentIndex は動かない');
 
     // home が移ったので、非 Fable の要求も acct_b へ行く（副バインドは破棄）。
@@ -12970,7 +12991,11 @@ describe('session affinity rebind grace', () => {
     assert.deepEqual(eventLines(logLines, 'affinity_defer'), [], '猶予の経路へ入らない');
     const switches = eventLines(logLines, 'affinity_switch');
     assert.equal(switches.length, 1);
-    assert.match(switches[0], / from=acct_a to=acct_b reason=common_exhausted family=other switches=1$/);
+    // 予約の経路。根拠は Usage API の取得で台帳へ書いた 5h の値である。
+    assert.match(
+      switches[0],
+      / from=acct_a to=acct_b reason=common_exhausted family=other switches=1 basis=5h util=1 src=poll srcAgeMs=\d+$/,
+    );
     assert.ok(elapsedMs < 250, `待ってしまっている: ${elapsedMs}ms`);
   });
 
