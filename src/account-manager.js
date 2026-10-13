@@ -1145,6 +1145,59 @@ export class AccountManager {
     return assignmentHeadroom(account.quota || {}, modelFamily, this.now());
   }
 
+  /**
+   * The order in which the usable accounts would be handed a NEW session, for
+   * display only. Row 1 is what `selectForNewAssignment` returns right now; row
+   * k is what it returns once the k-1 accounts above it are excluded, which is
+   * where a new session goes when those accounts could not take its request.
+   *
+   * The rows are produced by calling the selector again with one more account
+   * excluded each time, never by sorting one band: the band is redrawn around
+   * the accounts that are left, so a sorted band would name an account the
+   * selector does not actually move on to.
+   *
+   * `overStopLine` is true for an account the assign-stop line does not admit -
+   * it has used at least `assignStopUtilization` of its tightest window, or none
+   * of its windows could be read. The selector reaches such an account only
+   * when no admitted account is left, so those rows always come last.
+   *
+   * Takes the same `modelFamily`, `assignStopUtilization` and `sessionCounts`
+   * as `selectForNewAssignment`, and touches the ledger no more than that
+   * selector does.
+   *
+   * @returns {Array<{account:string, accountName:string, overStopLine:boolean}>}
+   *   Every account usable for `modelFamily`; empty when there is none.
+   */
+  newAssignmentOrder({
+    modelFamily = null,
+    assignStopUtilization = DEFAULT_ASSIGN_STOP_UTILIZATION,
+    sessionCounts = null,
+  } = {}) {
+    const gate = normalizeAssignStopUtilization(assignStopUtilization);
+    const listed = new Set();
+    const order = [];
+    // One account per pass, so the ledger size bounds the loop. An account the
+    // exclusion set cannot hold (an empty id) would be returned again; stopping
+    // on a repeat keeps that from listing it twice.
+    for (let pass = 0; pass < this.accounts.length; pass += 1) {
+      const account = this.selectForNewAssignment({
+        modelFamily,
+        excludeAccountIds: order.map(entry => entry.account),
+        assignStopUtilization,
+        sessionCounts,
+      });
+      if (!account || listed.has(account)) break;
+      listed.add(account);
+      const headroom = this.assignmentHeadroomFor(account, modelFamily);
+      order.push({
+        account: account.id,
+        accountName: account.name,
+        overStopLine: !(headroom.min != null && headroom.min > 1 - gate),
+      });
+    }
+    return order;
+  }
+
   /** One ranking row for `selectForNewAssignment`. Reads the ledger, never writes it. */
   newAssignmentCandidate(account, index, modelFamily, now, sessionCounts) {
     const quota = account.quota || {};

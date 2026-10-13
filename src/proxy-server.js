@@ -443,6 +443,11 @@ export function createProxyServer({
     if (!sessionAffinity || sessionAffinitySettings?.mode === 'off') return null;
     const summary = sessionAffinity.summary();
     const { proxied, keyed } = affinityRequestCounts;
+    const newAssignmentOrderFor = modelFamily => accountManager.newAssignmentOrder({
+      modelFamily,
+      assignStopUtilization: sessionAffinitySettings.assignStopUtilization,
+      sessionCounts: summary.warmSessionsByAccount,
+    });
     return {
       mode: sessionAffinitySettings.mode,
       sessions: summary.sessions,
@@ -461,6 +466,17 @@ export function createProxyServer({
       evictionsByReason: summary.evictionsByReason,
       requests: { proxied, keyed },
       sidRate: proxied > 0 ? Math.round((keyed / proxied) * 10_000) / 10_000 : null,
+      // 新しいセッションの割り当て順（読み取り専用）。固定が効くのは `on` だけなので、
+      // `observe` ではキー自体を出さない。系統・割り当てを止める線・温かい数は、要求の
+      // 予約が選ぶ側へ渡すものと同じ表し方で渡す（温かい数は上の節と同じ値）。
+      ...(sessionAffinitySettings.mode === 'on'
+        ? {
+          newAssignmentOrder: {
+            fable: newAssignmentOrderFor('fable'),
+            other: newAssignmentOrderFor(null),
+          },
+        }
+        : {}),
     };
   }
   function statusJson(status = accountManager.getStatus()) {
