@@ -13975,6 +13975,29 @@ describe('session affinity status section and event history', () => {
       assert.equal(lastProxiedAccount(logLines), 'acct_b');
     });
 
+    it('leaves a session that has gone cold out of the count while it is still in the table', async () => {
+      const { ask, status, reload, clock, logLines } = await startStatus({ reloadable: true });
+
+      await ask({ sid: RAW_SESSION_ID });
+      assert.equal(lastProxiedAccount(logLines), 'acct_a');
+      // Past the warm window the session no longer counts as warm, but its row
+      // stays in the table. The reload is what recounts the warm sessions here.
+      const { warmTtlMs } = (await status()).body.sessionAffinity;
+      clock.ms += warmTtlMs + 1;
+      assert.equal((await reload()).status, 200);
+
+      const section = (await status()).body.sessionAffinity;
+      assert.deepEqual(section.sessionsByAccount, { acct_a: 1 });
+      assert.deepEqual(section.warmSessionsByAccount, {});
+      // No account holds a warm session, so acct_a leads again. Counting every
+      // session in the table instead would put acct_b first.
+      assert.deepEqual(section.newAssignmentOrder.other.map(entry => entry.account), ['acct_a', 'acct_b']);
+
+      const linesBefore = logLines.length;
+      await ask({ sid: OTHER_SESSION_ID });
+      assert.equal(lastProxiedAccount(logLines.slice(linesBefore)), 'acct_a');
+    });
+
     it('draws the assign-stop line from the configured assignStopUtilization', async () => {
       const { ask, status, accountManager, logLines } = await startStatus({
         sessionAffinity: { mode: 'on', assignStopUtilization: 0.5 },

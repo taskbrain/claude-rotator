@@ -467,8 +467,9 @@ export function createProxyServer({
       requests: { proxied, keyed },
       sidRate: proxied > 0 ? Math.round((keyed / proxied) * 10_000) / 10_000 : null,
       // 新しいセッションの割り当て順（読み取り専用）。固定が効くのは `on` だけなので、
-      // `observe` ではキー自体を出さない。系統・割り当てを止める線・温かい数は、要求の
-      // 予約が選ぶ側へ渡すものと同じ表し方で渡す（温かい数は上の節と同じ値）。
+      // `observe` ではキー自体を出さない。系統と割り当てを止める線は、要求の予約が選ぶ側へ
+      // 渡すのと同じ値を渡す。温かい数は、上の `warmSessionsByAccount` に出しているのと
+      // 同じ値を渡す（要求の予約は Map で渡すが、ここの入れ物は素のオブジェクト）。
       ...(sessionAffinitySettings.mode === 'on'
         ? {
           newAssignmentOrder: {

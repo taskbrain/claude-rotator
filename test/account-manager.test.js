@@ -3294,6 +3294,39 @@ describe('selectForNewAssignment', () => {
       ]);
     });
 
+    it('marks an account that is past the line on its Fable allowance alone for Fable requests only', () => {
+      const manager = makeManager(['fable_tight', 'free']);
+      // `fable_tight` has the most room on both shared windows but only 5% of its
+      // Fable allowance left, which a Fable request counts and no other request does.
+      setWindows(manager, 'fable_tight', { fiveHour: 0.80, weekly: 0.90, fableSubCap: 0.05 });
+      setWindows(manager, 'free', { fiveHour: 0.78, weekly: 0.90, fableSubCap: 0.80 });
+
+      assert.deepEqual(
+        manager.newAssignmentOrder({ modelFamily: 'fable', assignStopUtilization: 0.9 }),
+        [row('free', false), row('fable_tight', true)],
+      );
+      assert.deepEqual(
+        manager.newAssignmentOrder({ modelFamily: null, assignStopUtilization: 0.9 }),
+        [row('fable_tight', false), row('free', false)],
+      );
+    });
+
+    it('marks an account whose usage is exactly on the assign-stop line', () => {
+      const manager = makeManager(['on_line', 'inside']);
+      // Half of the weekly window is used, which is the line itself once the line
+      // is set to 0.5. (0.5 is exact in binary, so the reading sits on the line
+      // and not a rounding step to either side of it.)
+      setWindows(manager, 'on_line', { fiveHour: 0.90, weekly: 0.50 });
+      setWindows(manager, 'inside', { fiveHour: 0.60, weekly: 0.51 });
+
+      // On the line counts as past it. `on_line` has the lighter 5h window and
+      // would lead if the line admitted it; it is listed last and marked instead.
+      assert.deepEqual(manager.newAssignmentOrder({ assignStopUtilization: 0.5 }), [
+        row('inside', false),
+        row('on_line', true),
+      ]);
+    });
+
     it('leaves out every account that cannot take a request right now', () => {
       const manager = makeManager(['exhausted', 'throttled', 'broken', 'fable_out', 'healthy']);
       setWindows(manager, 'exhausted', { fiveHour: 0, weekly: 0.90 });

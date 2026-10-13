@@ -737,8 +737,8 @@ proxy request ログに出るのは `account`、`method`、`path`、`status`、`
 `mode: "on"` のときだけ、この節に `newAssignmentOrder` が加わります（**`observe` と `off` ではキー自体がありません**）。セッション鍵の付いた新しいセッションをどのアカウントへ割り当てるかの順番で、Fable のリクエスト用の `fable` と、それ以外のリクエスト用の `other` の2本の配列です。各行は `account`（アカウントの ID）、`accountName`、`overStopLine` の3項目で、いま使えるアカウントだけが載ります。空の配列は、その系統でいま割り当てられるアカウントが無いことを表します。
 
 - 1番目は、いまセッション鍵付きの新しいセッションが来たときの割り当て先です。k番目は、上の k-1 個がそのリクエストで使えなかったときの割り当て先です。
-- `overStopLine` が `true` の行は、使用率が `assignStopUtilization` 以上か、使用率をまだ読めていないアカウントです。`assignStopUtilization` の内側のアカウントが残っていないときにだけ選ばれます。
-- **待ち行列ではありません。** 新しいセッションが1つ入るたび、使用率が変わるたびに並びは変わります。
+- `overStopLine` が `true` の行は、使用率が `assignStopUtilization` 以上か、使用率をまだ1つも読めていないアカウントです。`assignStopUtilization` の内側のアカウントが残っていないときにだけ選ばれます。`fable` の並びでは、使用率は Fable 固有枠も含めた、いちばんきつい枠で見ます。
+- **待ち行列ではありません。** 並びは読み取りのたびに作り直します。新しいセッションが入ったときや、使用率が変わったときに変わることがあります。
 - 固定済みのセッションは、結び付け先が使えるあいだはこの並びに従いません（キャッシュが失効したセッションを `drainStartUtilization` で移すときを除きます）。結び付け先を付け替えるとき、またはそのリクエストだけを別アカウントへ送るときは、結び付け先を除いて同じ選び方で選びます。
 - セッション鍵の無いリクエストはこの並びに従わず、従来どおりの選び方で処理されます。
 - 応答ヘッダで枯渇と分かった 429 の後は、試したアカウントを除いて同じ選び方で選び直します（新しいセッションなら、この並びの次のアカウントです）。Fable のリクエストで、使用量の照会で枯渇を確かめた後の1回の再送だけは、この並びではなく、セッション鍵の無いリクエストの自動切り替えと同じ比べ方で候補から選びます。
@@ -2085,8 +2085,8 @@ None of these lines contains a raw session id or a token (`sid` is the 12-digit 
 Only while `mode` is `"on"`, the section also carries `newAssignmentOrder` (**the key itself is absent in `observe` and `off`**). It is the order in which a new session that carries a session key would be assigned to an account, as two arrays: `fable` for Fable requests and `other` for every other request. Each row has three fields — `account` (the account ID), `accountName`, and `overStopLine` — and only accounts that are usable right now are listed. An empty array means no account can take a new session of that family right now.
 
 - The first row is where a new session with a session key would be assigned right now. The k-th row is where it would be assigned if the k-1 rows above it could not be used for that request.
-- A row whose `overStopLine` is `true` is an account whose usage ratio is at or above `assignStopUtilization`, or whose usage has not been read yet. It is chosen only when no account inside `assignStopUtilization` is left.
-- **It is not a queue.** The order changes every time a new session is assigned and every time a usage ratio changes.
+- A row whose `overStopLine` is `true` is an account whose usage ratio is at or above `assignStopUtilization`, or none of whose usage windows has been read yet. It is chosen only when no account inside `assignStopUtilization` is left. In the `fable` array, the usage ratio is that of the tightest window, the Fable-specific allowance included.
+- **It is not a queue.** The order is rebuilt on every read, and it can change whenever a new session is assigned or a usage ratio changes.
 - A session that is already pinned does not follow this order while its bound account is usable (except when a session whose cache has expired is moved by `drainStartUtilization`). When its binding is moved, or when only that one request is sent through another account, the target is chosen the same way with the bound account excluded.
 - A request without a session key does not follow this order; it is routed exactly as it is today.
 - After a 429 whose response headers show the quota is exhausted, the request is re-routed the same way with the accounts already tried excluded (for a new session, that is the next row of this order). The one exception is a Fable request that is resent once after a usage lookup has confirmed the exhaustion: that resend does not use this order, and picks from its candidates with the same comparison as the automatic switch for requests without a session key.
