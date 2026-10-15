@@ -1558,3 +1558,46 @@ describe('SessionAffinity cold_reassign', () => {
     assert.deepEqual(affinity.summary().switchesByReason, {});
   });
 });
+
+// ---------------------------------------------------------------------------
+// 再ログインが要る失効での付け替え
+//
+// これも予約段だけの理由である。結び付け先の資格情報が人の再ログインまで戻らないなら、
+// 結び付けたままにしても要求ごとに迂回先が変わるだけなので、予約段で結び付けを移す。
+// 確定で付け替えてよい理由は枠の枯渇の2値のままで、この理由では動かさない。
+// ---------------------------------------------------------------------------
+
+describe('SessionAffinity reauth_required', () => {
+  it('counts and logs reauth_required as a known switch reason at the reservation stage', () => {
+    const { affinity, logger } = createAffinity();
+    reserve(affinity, SESSION_ID, 'acct-a');
+
+    const switched = reserve(affinity, SESSION_ID, 'acct-b', { reason: 'reauth_required' });
+
+    assert.equal(switched.disposition, 'switch');
+    assert.equal(switched.account, 'acct-b');
+    assert.equal(switched.reason, 'reauth_required', 'unknown へ落とさない');
+    assert.equal(affinity.get(SESSION_ID).home, 'acct-b');
+    assert.deepEqual(affinity.summary().switchesByReason, { reauth_required: 1 });
+    assert.match(
+      linesOf(logger, 'affinity_switch')[0],
+      / from=acct-a to=acct-b reason=reauth_required family=other switches=1$/,
+    );
+  });
+
+  it('refuses to move the binding when reauth_required arrives at the confirm stage', () => {
+    const { affinity } = createAffinity();
+    const reserved = reserve(affinity, SESSION_ID, 'acct-a');
+
+    const confirmed = affinity.note(SESSION_ID, {
+      account: 'acct-b',
+      expectedGen: reserved.gen,
+      reason: 'reauth_required',
+    });
+
+    assert.equal(confirmed.disposition, 'bound');
+    assert.equal(confirmed.account, 'acct-a', '確定では再ログインが要る失効を理由に付け替えない');
+    assert.equal(affinity.get(SESSION_ID).home, 'acct-a');
+    assert.deepEqual(affinity.summary().switchesByReason, {});
+  });
+});

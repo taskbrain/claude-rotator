@@ -6,6 +6,7 @@ import {
   commonQuotaEvidence,
   familyQuotaExhaustedOnly,
   isCommonQuotaExhausted,
+  requiresRelogin,
 } from '../src/account-manager.js';
 import { parseRateLimitHeaders } from '../src/quota.js';
 
@@ -2069,6 +2070,65 @@ describe('認証失敗の原因コードと検出時刻 (c)', () => {
 
     assert.equal(manager.accounts[0].errorReason, null);
     assert.equal(manager.getStatus().accounts[0].unavailableReason, null);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// 人が再ログインするまで戻らない失効
+//
+// 固定セッションの予約は、結び付け先がこの状態なら結び付けそのものを移す。
+// 再ログインを待たずに戻りうる失敗（上流の 401・結果が分からない更新・5xx・資格情報の
+// 更新の待ち）では偽を返し、結び付けはその要求の間だけ迂回する従来の扱いのまま残す。
+// ---------------------------------------------------------------------------
+describe('requiresRelogin', () => {
+  const buildManager = () => new AccountManager({
+    accounts: [{ id: 'acct_1', name: 'a@example.com', type: 'oauth' }],
+    now: () => Date.parse('2026-09-15T01:00:00.000Z'),
+  });
+
+  it('is true only for a refresh failure whose cause is NATIVE_REFRESH_REAUTH_REQUIRED or invalid_grant', () => {
+    for (const cause of ['NATIVE_REFRESH_REAUTH_REQUIRED', 'invalid_grant']) {
+      const manager = buildManager();
+      manager.markError('acct_1', 'oauth_refresh_failed', 'OAuth token refresh failed', { cause });
+
+      assert.equal(requiresRelogin(manager.accounts[0]), true, cause);
+    }
+  });
+
+  it('is false for an upstream 401, an unknown refresh outcome, a 5xx, a refresh cooldown and a healthy account', () => {
+    const cases = [
+      ['healthy', () => {}],
+      ['authentication_error', manager => manager.markError('acct_1', 'authentication_error', 'OAuth token rejected')],
+      // 種類が違えば、cause が同じでも再ログインが要る失効とは読まない。
+      ['authentication_error with a re-login cause', manager => manager.markError(
+        'acct_1', 'authentication_error', 'OAuth token rejected', { cause: 'NATIVE_REFRESH_REAUTH_REQUIRED' },
+      )],
+      ['NATIVE_REFRESH_OUTCOME_UNKNOWN', manager => manager.markError(
+        'acct_1', 'oauth_refresh_failed', 'OAuth token refresh failed', { cause: 'NATIVE_REFRESH_OUTCOME_UNKNOWN' },
+      )],
+      ['http-401', manager => manager.markError(
+        'acct_1', 'oauth_refresh_failed', 'OAuth token refresh failed', { cause: 'http-401' },
+      )],
+      ['http-500', manager => manager.markError(
+        'acct_1', 'oauth_refresh_failed', 'OAuth token refresh failed', { cause: 'http-500' },
+      )],
+      ['http-503', manager => manager.markError(
+        'acct_1', 'oauth_refresh_failed', 'OAuth token refresh failed', { cause: 'http-503' },
+      )],
+      ['refresh failure without a cause', manager => manager.markError(
+        'acct_1', 'oauth_refresh_failed', 'OAuth token refresh failed',
+      )],
+      ['refresh rate limit cooldown', manager => manager.markCredentialRefreshRateLimited('acct_1', 120)],
+      ['refresh retry cooldown', manager => manager.markCredentialRefreshDeferred('acct_1', 120)],
+    ];
+    for (const [label, apply] of cases) {
+      const manager = buildManager();
+      apply(manager);
+
+      assert.equal(requiresRelogin(manager.accounts[0]), false, label);
+    }
+    assert.equal(requiresRelogin(null), false, 'null');
+    assert.equal(requiresRelogin(undefined), false, 'undefined');
   });
 });
 

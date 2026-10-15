@@ -11701,7 +11701,7 @@ describe('サブキャップ 429 の非対称の是正', () => {
 // sticky affinity 本体の結線
 //
 // 試験名の頭の記号（①〜㉔・F9 など）は、このファイルの中で試験を指すための見出しである。
-// この describe の試験は ①②③④⑥⑦⑫⑬⑯㉑ ＋ `fam=` 1件 ＋ F9 1件。
+// この describe の試験は ①②③④⑥⑦⑫⑬⑯㉑ ＋ 再ログインが要る失効の3件 ＋ `fam=` 1件 ＋ F9 1件。
 // 既存ケースは1件も削除・書換しない。`mode:"off"`（既定・未記載）では proxy 行が
 // 追加前とバイト同一であること（`fam` 用の1件で固定する）。
 // ---------------------------------------------------------------------------
@@ -12044,6 +12044,128 @@ describe('session affinity wiring', () => {
     accountManager.markAuthenticated('acct_a');
     assert.equal((await ask({ sid: 'session-one' })).status, 200);
     assert.equal(seen.at(-1), 'Bearer token-acct_a-fresh');
+  });
+
+  // ---- 再ログインが要る失効 ----
+  // ㉑ の一時障害と違い、結び付け先の資格情報が人の再ログインまで戻らないときは、
+  // 予約の段で結び付けそのものを移す。結び付けを残したままだと、要求ごとに新規割当の
+  // 選び方で迂回先を選び直すことになり、その第1キー（5時間枠の使用率）が要求ごとに
+  // 変わるので送り先が定まらず、口座ごとのプロンプトのキャッシュが毎回外れる。
+
+  // 新規割当の選び方で `preferred` が `other` より先に選ばれる 5h の値を書く。
+  function preferAccount(accountManager, preferred, other) {
+    accountManager.updateQuota(preferred, { 'anthropic-ratelimit-unified-5h-utilization': '0.1' });
+    accountManager.updateQuota(other, { 'anthropic-ratelimit-unified-5h-utilization': '0.3' });
+  }
+
+  function markReloginRequired(accountManager, id) {
+    accountManager.markError(id, 'oauth_refresh_failed', 'OAuth token refresh failed', {
+      cause: 'NATIVE_REFRESH_REAUTH_REQUIRED',
+    });
+  }
+
+  it('moves the binding once when the bound account needs a new login and keeps the session there', async () => {
+    const { ask, seen, accountManager, secretStore, logLines } = await startAffinity({
+      accounts: ['acct_a', 'acct_b', 'acct_c'],
+      tokenRefresher: async () => {
+        throw Object.assign(
+          new Error('The stored OAuth refresh credential has expired and must be linked again'),
+          { code: 'NATIVE_REFRESH_REAUTH_REQUIRED' },
+        );
+      },
+    });
+
+    assert.equal((await ask({ sid: 'session-one' })).status, 200);
+    assert.equal(seen.at(-1), 'Bearer token-acct_a');
+
+    // 結び付け先のアクセストークンが切れ、その更新が「再ログインが要る」で失敗する状態にする。
+    await secretStore.set('acct_a', {
+      accessToken: 'token-acct_a',
+      refreshToken: 'refresh-acct_a',
+      expiresAt: 1,
+    });
+    // ほかの2口座の 5h の値を要求ごとに入れ替えながら、同じセッションで5回送る。
+    for (let request = 1; request <= 5; request += 1) {
+      if (request % 2 === 1) preferAccount(accountManager, 'acct_b', 'acct_c');
+      else preferAccount(accountManager, 'acct_c', 'acct_b');
+      assert.equal((await ask({ sid: 'session-one' })).status, 200, `request ${request}`);
+    }
+
+    assert.equal(
+      accountManager.find('acct_a').errorReason?.cause,
+      'NATIVE_REFRESH_REAUTH_REQUIRED',
+      '前提: 要求の中の更新の失敗が、再ログインが要る失効として記録されている',
+    );
+    // 1回目は更新の失敗を見つけた要求で、結び付けを変えずにその要求だけ acct_b で完走する。
+    // 2回目の予約で結び付けが acct_c へ移り、以後は 5h の値が入れ替わっても動かない。
+    assert.equal(seen.length, 6);
+    assert.equal(seen[1], 'Bearer token-acct_b');
+    assert.equal(new Set(seen.slice(2)).size, 1, `送り先が1つに定まる: ${seen.slice(2).join(', ')}`);
+    assert.equal(seen.at(-1), 'Bearer token-acct_c');
+    const switches = eventLines(logLines, 'affinity_switch');
+    assert.equal(switches.length, 1, switches.join('\n'));
+    assert.match(switches[0], / from=acct_a to=acct_c reason=reauth_required family=other switches=1$/);
+    assert.deepEqual(
+      proxyLines(logLines).slice(-4).map(line => line.split(' aff=')[1]),
+      ['switch fam=other', 'bound fam=other', 'bound fam=other', 'bound fam=other'],
+      '移した後の要求は結び付け先へそのまま送る',
+    );
+  });
+
+  it('does not move the session back after the account is logged in again', async () => {
+    const { ask, seen, accountManager, logLines } = await startAffinity();
+
+    assert.equal((await ask({ sid: 'session-one' })).status, 200);
+    markReloginRequired(accountManager, 'acct_a');
+    assert.equal((await ask({ sid: 'session-one' })).status, 200);
+    assert.equal(seen.at(-1), 'Bearer token-acct_b');
+
+    // 再ログインで acct_a が使えるようになり、新規割当なら acct_a が先に選ばれる状態にする。
+    accountManager.markAuthenticated('acct_a');
+    preferAccount(accountManager, 'acct_a', 'acct_b');
+    assert.equal((await ask({ sid: 'session-one' })).status, 200);
+    assert.equal((await ask({ sid: 'session-one' })).status, 200);
+    assert.deepEqual(seen.slice(-2), ['Bearer token-acct_b', 'Bearer token-acct_b'], '元の口座へ戻らない');
+
+    // 戻らないのは結び付けのためで、acct_a が使えないからではない（新しいセッションは acct_a へ行く）。
+    assert.equal((await ask({ sid: 'session-two' })).status, 200);
+    assert.equal(seen.at(-1), 'Bearer token-acct_a');
+    const switches = eventLines(logLines, 'affinity_switch');
+    assert.equal(switches.length, 1, switches.join('\n'));
+    assert.match(switches[0], / from=acct_a to=acct_b reason=reauth_required family=other switches=1$/);
+  });
+
+  it('sends two concurrent requests of one session to one account when the bound account needs a new login', async () => {
+    const secretStore = new GatedSecretStore();
+    const { ask, seen, accountManager, logLines } = await startAffinity({
+      accounts: ['acct_a', 'acct_b', 'acct_c'],
+      secretStore,
+    });
+
+    assert.equal((await ask({ sid: 'session-one' })).status, 200);
+    markReloginRequired(accountManager, 'acct_a');
+    preferAccount(accountManager, 'acct_b', 'acct_c');
+
+    const release = secretStore.openGate('acct_b');
+    const first = ask({ sid: 'session-one' }).catch(error => ({ error }));
+    const firstWaited = await waitFor(() => secretStore.entered.length === 1);
+    // 1本目が資格情報の解決で待つあいだに、新規割当なら acct_c が選ばれる状態へ変える。
+    // 結び付けが移っていなければ、2本目は acct_c を選び直してセッションが2口座へ割れる。
+    preferAccount(accountManager, 'acct_c', 'acct_b');
+    const second = ask({ sid: 'session-one' }).catch(error => ({ error }));
+    const secondWaited = await waitFor(() => secretStore.entered.length === 2);
+    release();
+    const firstResult = await first;
+    const secondResult = await second;
+
+    assert.ok(firstWaited, '1本目が資格情報の解決で待つ');
+    assert.ok(secondWaited, '2本目も同じ口座の解決へ入る');
+    assert.equal(firstResult.status, 200);
+    assert.equal(secondResult.status, 200);
+    assert.deepEqual(seen, ['Bearer token-acct_a', 'Bearer token-acct_b', 'Bearer token-acct_b']);
+    const switches = eventLines(logLines, 'affinity_switch');
+    assert.equal(switches.length, 1, switches.join('\n'));
+    assert.match(switches[0], / from=acct_a to=acct_b reason=reauth_required family=other switches=1$/);
   });
 
   it('records fam=fable / fam=other while affinity runs and keeps the line byte-identical while it is off', async () => {

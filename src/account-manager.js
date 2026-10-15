@@ -1464,6 +1464,25 @@ export function isAuthExpiredReason(reason) {
   return AUTH_EXPIRED_REASON_TYPES.has(reason?.type);
 }
 
+const RELOGIN_REQUIRED_CAUSES = new Set(['NATIVE_REFRESH_REAUTH_REQUIRED', 'invalid_grant']);
+
+/**
+ * True when the account's refresh credential itself can no longer be used (it
+ * expired or was refused), so the account stays unusable until a human runs
+ * `claude-rotator login` again: the refresh failed (`oauth_refresh_failed`)
+ * with the cause `NATIVE_REFRESH_REAUTH_REQUIRED` or `invalid_grant`.
+ *
+ * Narrower than `isAuthExpiredReason` on purpose. An upstream 401
+ * (`authentication_error`), a refresh whose outcome is unknown, an HTTP error
+ * status from a refresh, a failure with no recorded cause and the refresh
+ * cooldowns are all false here: none of them says that only a new login will
+ * bring the account back.
+ */
+export function requiresRelogin(account) {
+  const reason = account?.errorReason;
+  return reason?.type === 'oauth_refresh_failed' && RELOGIN_REQUIRED_CAUSES.has(reason.cause);
+}
+
 /**
  * Decides whether an account's quota gates a request of the given model family.
  * This evaluates every window directly (never a single classified "the" reason)
