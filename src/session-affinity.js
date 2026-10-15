@@ -84,7 +84,8 @@ const SID_HASH_PATTERN = /^[0-9a-f]{12}$/;
 // 結び付け先を付け替えてよい理由。ここに無い理由で付け替えたときは `unknown` と数える。
 // 一時的な理由（上流の 401 などの認証の失敗・throttled・下の `reauth_required` に当たらない
 // error・上流 5xx・切断・timeout・短期レート制限）では表を書き換えず、その要求だけ別の口座で
-// 完走させ、次の要求は元の口座へ戻す。確定で付け替えてよい理由は、下の
+// 完走させ、次の要求は元の口座が使えれば元へ戻す（使えない間の送り先は `noteDetour` の
+// 迂回先として1つに保つ）。確定で付け替えてよい理由は、下の
 // `CONFIRM_REBIND_REASONS` に絞る。
 // `cold_reassign` は冷えた固定の解放のために足した、予約段だけの理由である。
 // キャッシュが失効（`warmTtlMs` 超過）したセッションを、利用率の高い口座から空いている
@@ -183,6 +184,9 @@ function clampSetting(value, key) {
  * `gen` は「そのセッションのバインドが変わった回数」を数える単調増加の整数である。
  * 予約で控えた `gen` を確定へ渡すことで、`await` を挟んで遅れて着いた確定が
  * その間に別の要求が作った新しいバインドを上書きすることを防ぐ。
+ * 結び付け先が一時的に使えない間の迂回先 `detours` を持つことがあるが、保存しない。
+ * `detourGen` は迂回先を書いた回数と、結び付けを変えずに消した回数の和で、`gen` と別に数える
+ * （結び付けが変わって迂回先が消えるときは `gen` が進む）。
  *
  * 表の順序は recency（古い順）で保つ。溢れたときは先頭＝最も長く触られていないエントリを
  * 落とす（LRU）。
@@ -300,6 +304,64 @@ export class SessionAffinity {
   }
 
   /**
+   * 結び付け先が一時的に使えない間の迂回先を、系統ごとに1つ記録する。
+   *
+   * **結び付けは変えない。** 迂回先は「元の口座 → 迂回先」の組で、`get()` の `detour` に
+   * 出るのは `from` がいまの結び付け先と一致するときだけである。保存しない
+   * （`export()` は項目を明示して組み立てる）、温かい数にも数えない、ログも出さない。
+   * 迂回先を要求ごとに選び直すと、選び方の第1キー（5時間枠の使用率）が要求ごとに
+   * 変わるので、同じセッションの要求が口座から口座へ散り、口座ごとのプロンプトの
+   * キャッシュが毎回外れる。それを避けるためだけの記録である。
+   *
+   * 書くたびに `detourGen` を1つ進める。`expectedDetourGen` を渡すと、
+   * それが表の `detourGen` と一致するときだけ書く。`await` を挟んで遅れて着いた確定が、
+   * その間に消された迂回先や選び直された迂回先を古い口座で書き戻すことを防ぐ
+   * （迂回先の消去と選び直しは結び付けを変えないので、`gen` では見分けられない）。
+   *
+   * @param {unknown} key セッション鍵。
+   * @param {{from:string, to:string, modelFamily?:string|null, expectedGen:number,
+   *          expectedDetourGen?:number|null, now?:number}} options
+   *   `expectedGen` が表の `gen` と一致し、`expectedDetourGen` を渡したならそれも一致し、
+   *   `from` がいまの結び付け先で、`to` が `from` と違うときだけ書く。
+   * @returns {boolean} 書いたかどうか。
+   */
+  noteDetour(key, {
+    from,
+    to,
+    modelFamily = null,
+    expectedGen,
+    expectedDetourGen = null,
+    now = this.now(),
+  } = {}) {
+    const hash = sidHash(key);
+    const entry = hash ? this.lookup(hash, now) : null;
+    if (!entry || entry.gen !== expectedGen) return false;
+    if (expectedDetourGen !== null && detourGenOf(entry) !== expectedDetourGen) return false;
+    if (typeof to !== 'string' || to.length === 0 || to === from) return false;
+    if (boundAccount(entry, modelFamily) !== from) return false;
+    entry.detours ??= {};
+    entry.detours[detourSlot(modelFamily)] = { from, to };
+    entry.detourGen = detourGenOf(entry) + 1;
+    return true;
+  }
+
+  /**
+   * その系統の迂回先を消す。結び付け先が使えるようになり、元の口座へ戻るときに呼ぶ。
+   * 消したときは `detourGen` を1つ進める。
+   *
+   * @param {unknown} key セッション鍵。
+   * @param {{modelFamily?:string|null}} [options]
+   */
+  clearDetour(key, { modelFamily = null } = {}) {
+    const hash = sidHash(key);
+    const entry = hash ? this.entries.get(hash) : null;
+    const slot = detourSlot(modelFamily);
+    if (!entry?.detours?.[slot]) return;
+    delete entry.detours[slot];
+    entry.detourGen = detourGenOf(entry) + 1;
+  }
+
+  /**
    * TTL 切れ・容量超過・台帳から消えた口座を表から落とす。
    *
    * @param {{now?:number, knownAccountIds?:Iterable<string>|null}|number} [options]
@@ -354,6 +416,12 @@ export class SessionAffinity {
       if (targets.has(entry.home)) {
         evicted.push(this.dropEntry(hash, entry, reason, now));
         continue;
+      }
+      // 迂回先は記録だけなので、行き先か元の口座が対象なら黙って消す（退避の行は出さない）。
+      for (const [slot, detour] of Object.entries(entry.detours ?? {})) {
+        if (!targets.has(detour.to) && !targets.has(detour.from)) continue;
+        delete entry.detours[slot];
+        entry.detourGen = detourGenOf(entry) + 1;
       }
       for (const [family, accountId] of Object.entries(entry.families)) {
         if (!targets.has(accountId)) continue;
@@ -772,6 +840,11 @@ export class SessionAffinity {
       entry.families = {};
       entry.boundAt = now;
     }
+    // 結び付けが移れば、元の口座が使えない間の迂回先という前提も無くなる。消すのは
+    // 結び付けが移った範囲の迂回先だけで、系統の副バインドだけが移るときは、ほかの系統の
+    // 迂回先（元の口座が使えない間の送り先）は残す。`gen` が進むので `detourGen` は進めない。
+    if (slot === 'family') delete entry.detours?.[detourSlot(modelFamily)];
+    else delete entry.detours;
     entry.gen = gen;
     entry.switches += 1;
     this.refreshWarm(entry, now);
@@ -870,6 +943,8 @@ function snapshot(hash, entry, modelFamily) {
     sid: hash,
     home: entry.home,
     bound: boundAccount(entry, modelFamily),
+    detour: detourOf(entry, modelFamily),
+    detourGen: detourGenOf(entry),
     families: { ...entry.families },
     gen: entry.gen,
     boundAt: entry.boundAt,
@@ -882,6 +957,22 @@ function snapshot(hash, entry, modelFamily) {
 function boundAccount(entry, modelFamily) {
   const sub = modelFamily ? entry.families[modelFamily] : null;
   return sub ?? entry.home;
+}
+
+// 迂回先は `boundAccount` と同じ系統の分け方で持つ（系統の無い要求は空文字の欄）。
+function detourSlot(modelFamily) {
+  return modelFamily || '';
+}
+
+// 記録した `from` がいまの結び付け先と違えば、その迂回先は前提を失っているので出さない。
+function detourOf(entry, modelFamily) {
+  const detour = entry.detours?.[detourSlot(modelFamily)];
+  return detour && detour.from === boundAccount(entry, modelFamily) ? detour.to : null;
+}
+
+// 迂回先を一度も記録していない行は 0。
+function detourGenOf(entry) {
+  return entry.detourGen ?? 0;
 }
 
 // 付け替える範囲は「いま使えなかった結び付け先」に限る。

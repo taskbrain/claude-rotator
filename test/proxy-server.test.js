@@ -11701,7 +11701,7 @@ describe('サブキャップ 429 の非対称の是正', () => {
 // sticky affinity 本体の結線
 //
 // 試験名の頭の記号（①〜㉔・F9 など）は、このファイルの中で試験を指すための見出しである。
-// この describe の試験は ①②③④⑥⑦⑫⑬⑯㉑ ＋ 再ログインが要る失効の3件 ＋ `fam=` 1件 ＋ F9 1件。
+// この describe の試験は ①②③④⑥⑦⑫⑬⑯㉑ ＋ 再ログインが要る失効の3件 ＋ 迂回先の7件 ＋ `fam=` 1件 ＋ F9 1件。
 // 既存ケースは1件も削除・書換しない。`mode:"off"`（既定・未記載）では proxy 行が
 // 追加前とバイト同一であること（`fam` 用の1件で固定する）。
 // ---------------------------------------------------------------------------
@@ -12048,9 +12048,8 @@ describe('session affinity wiring', () => {
 
   // ---- 再ログインが要る失効 ----
   // ㉑ の一時障害と違い、結び付け先の資格情報が人の再ログインまで戻らないときは、
-  // 予約の段で結び付けそのものを移す。結び付けを残したままだと、要求ごとに新規割当の
-  // 選び方で迂回先を選び直すことになり、その第1キー（5時間枠の使用率）が要求ごとに
-  // 変わるので送り先が定まらず、口座ごとのプロンプトのキャッシュが毎回外れる。
+  // 予約の段で結び付けそのものを移す。結び付けを残したままだと、戻る見込みの無い口座に
+  // 結び付けたまま、迂回先へ送り続けることになる。
 
   // 新規割当の選び方で `preferred` が `other` より先に選ばれる 5h の値を書く。
   function preferAccount(accountManager, preferred, other) {
@@ -12166,6 +12165,206 @@ describe('session affinity wiring', () => {
     const switches = eventLines(logLines, 'affinity_switch');
     assert.equal(switches.length, 1, switches.join('\n'));
     assert.match(switches[0], / from=acct_a to=acct_b reason=reauth_required family=other switches=1$/);
+  });
+
+  // ---- 一時的に使えない結び付け先の迂回先 ----
+  // 結び付け先が一時的に使えない間（throttled・資格情報の更新の cooldown など）は、結び付けを
+  // 変えずにその要求だけ別の口座へ送る。その送り先を要求ごとに新規割当の選び方で選び直すと、
+  // 第1キー（5時間枠の使用率）が要求ごとに変わるので送り先が散り、口座ごとのプロンプトの
+  // キャッシュが毎回外れる。迂回先はセッションごとに1つに保つ。
+
+  // 口座ごとの 5h の値を書く。値の小さい口座ほど新規割当で先に選ばれる。
+  function setFiveHour(accountManager, values) {
+    for (const [id, utilization] of Object.entries(values)) {
+      accountManager.updateQuota(id, { 'anthropic-ratelimit-unified-5h-utilization': utilization });
+    }
+  }
+
+  for (const [label, makeUnavailable] of [
+    ['throttled', (accountManager, id) => accountManager.markRateLimited(id, 300)],
+    [
+      'in the credential refresh cooldown',
+      (accountManager, id) => accountManager.markCredentialRefreshRateLimited(id, 300),
+    ],
+  ]) {
+    it(`keeps one detour while the bound account is ${label}`, async () => {
+      const { ask, seen, accountManager, logLines } = await startAffinity({
+        accounts: ['acct_a', 'acct_b', 'acct_c'],
+      });
+
+      assert.equal((await ask({ sid: 'session-one' })).status, 200);
+      assert.equal(seen.at(-1), 'Bearer token-acct_a');
+      makeUnavailable(accountManager, 'acct_a');
+      // ほかの2口座の 5h の値を要求ごとに入れ替えながら、同じセッションで5回送る。
+      for (let request = 1; request <= 5; request += 1) {
+        if (request % 2 === 1) preferAccount(accountManager, 'acct_b', 'acct_c');
+        else preferAccount(accountManager, 'acct_c', 'acct_b');
+        assert.equal((await ask({ sid: 'session-one' })).status, 200, `request ${request}`);
+      }
+
+      assert.equal(accountManager.isAvailable(accountManager.find('acct_a')), false, '前提: 結び付け先は使えないまま');
+      assert.deepEqual(seen.slice(1), Array(5).fill('Bearer token-acct_b'), `送り先が1つに定まる: ${seen.join(', ')}`);
+      assert.deepEqual(eventLines(logLines, 'affinity_switch'), [], '結び付けは動かない');
+    });
+  }
+
+  it('goes back to the bound account once it recovers and then picks the detour afresh', async () => {
+    const clock = { ms: Date.now() };
+    const { ask, seen, accountManager, logLines } = await startAffinity({
+      accounts: ['acct_a', 'acct_b', 'acct_c'],
+      clock,
+    });
+
+    assert.equal((await ask({ sid: 'session-one' })).status, 200);
+    accountManager.markRateLimited('acct_a', 60);
+    preferAccount(accountManager, 'acct_b', 'acct_c');
+    assert.equal((await ask({ sid: 'session-one' })).status, 200);
+    assert.equal(seen.at(-1), 'Bearer token-acct_b');
+
+    clock.ms += 61_000;
+    assert.equal((await ask({ sid: 'session-one' })).status, 200);
+    assert.equal(seen.at(-1), 'Bearer token-acct_a', '回復した結び付け先へ戻る');
+
+    // 戻った時点で前の迂回先は捨てている。次に使えなくなったときは、その時の選び方で選ぶ。
+    accountManager.markRateLimited('acct_a', 60);
+    preferAccount(accountManager, 'acct_c', 'acct_b');
+    assert.equal((await ask({ sid: 'session-one' })).status, 200);
+    assert.equal(seen.at(-1), 'Bearer token-acct_c');
+    assert.deepEqual(eventLines(logLines, 'affinity_switch'), []);
+  });
+
+  it('picks a new detour once when the detour stops being usable and keeps it', async () => {
+    const { ask, seen, accountManager, logLines } = await startAffinity({
+      accounts: ['acct_a', 'acct_b', 'acct_c', 'acct_d'],
+    });
+
+    assert.equal((await ask({ sid: 'session-one' })).status, 200);
+    assert.equal(seen.at(-1), 'Bearer token-acct_a');
+    accountManager.markRateLimited('acct_a', 300);
+    setFiveHour(accountManager, { acct_b: '0.1', acct_c: '0.3', acct_d: '0.3' });
+    assert.equal((await ask({ sid: 'session-one' })).status, 200);
+    assert.equal(seen.at(-1), 'Bearer token-acct_b');
+
+    // 迂回先も使えなくなった。残る2口座の 5h の値を要求ごとに入れ替えながら4回送る。
+    accountManager.markRateLimited('acct_b', 300);
+    for (let request = 1; request <= 4; request += 1) {
+      if (request % 2 === 1) setFiveHour(accountManager, { acct_c: '0.1', acct_d: '0.3' });
+      else setFiveHour(accountManager, { acct_c: '0.3', acct_d: '0.1' });
+      assert.equal((await ask({ sid: 'session-one' })).status, 200, `request ${request}`);
+    }
+
+    assert.deepEqual(seen.slice(2), Array(4).fill('Bearer token-acct_c'), `選び直しは1回だけ: ${seen.join(', ')}`);
+    assert.deepEqual(eventLines(logLines, 'affinity_switch'), []);
+  });
+
+  it('sends two concurrent requests of one session to one detour', async () => {
+    const secretStore = new GatedSecretStore();
+    const { ask, seen, accountManager, logLines } = await startAffinity({
+      accounts: ['acct_a', 'acct_b', 'acct_c'],
+      secretStore,
+    });
+
+    assert.equal((await ask({ sid: 'session-one' })).status, 200);
+    accountManager.markRateLimited('acct_a', 300);
+    preferAccount(accountManager, 'acct_b', 'acct_c');
+
+    const release = secretStore.openGate('acct_b');
+    const first = ask({ sid: 'session-one' }).catch(error => ({ error }));
+    const firstWaited = await waitFor(() => secretStore.entered.length === 1);
+    // 1本目が資格情報の解決で待つあいだに、新規割当なら acct_c が選ばれる状態へ変える。
+    // 迂回先を予約の同期区間で記録していなければ、2本目は acct_c を選んでセッションが2口座へ割れる。
+    preferAccount(accountManager, 'acct_c', 'acct_b');
+    const second = ask({ sid: 'session-one' }).catch(error => ({ error }));
+    const secondWaited = await waitFor(() => secretStore.entered.length === 2);
+    release();
+    const firstResult = await first;
+    const secondResult = await second;
+
+    assert.ok(firstWaited, '1本目が資格情報の解決で待つ');
+    assert.ok(secondWaited, '2本目も同じ口座の解決へ入る');
+    assert.equal(firstResult.status, 200);
+    assert.equal(secondResult.status, 200);
+    assert.deepEqual(seen, ['Bearer token-acct_a', 'Bearer token-acct_b', 'Bearer token-acct_b']);
+    assert.deepEqual(eventLines(logLines, 'affinity_switch'), []);
+  });
+
+  // 確定の段は資格情報の解決の後に来る。その間に迂回先が消されたり選び直されたりしたら、
+  // 遅れて来た確定は古い迂回先を書き戻さない。
+  it('does not bring back a dropped detour when a request that waited on it confirms late', async () => {
+    const clock = { ms: Date.now() };
+    const secretStore = new GatedSecretStore();
+    const { ask, seen, accountManager, logLines } = await startAffinity({
+      accounts: ['acct_a', 'acct_b', 'acct_c'],
+      secretStore,
+      clock,
+    });
+
+    assert.equal((await ask({ sid: 'session-one' })).status, 200);
+    accountManager.markRateLimited('acct_a', 60);
+    preferAccount(accountManager, 'acct_b', 'acct_c');
+
+    const release = secretStore.openGate('acct_b');
+    const first = ask({ sid: 'session-one' }).catch(error => ({ error }));
+    const firstWaited = await waitFor(() => secretStore.entered.length === 1);
+    // 1本目が acct_b の資格情報の解決で待つ間に結び付け先が回復し、2本目は元へ戻って迂回先を捨てる。
+    clock.ms += 61_000;
+    assert.equal((await ask({ sid: 'session-one' })).status, 200);
+    assert.equal(seen.at(-1), 'Bearer token-acct_a', '回復した結び付け先へ戻る');
+    release();
+    assert.equal((await first).status, 200);
+
+    // 結び付け先がまた使えなくなった。新規割当の選び方はいま acct_c を先に選ぶ。
+    accountManager.markRateLimited('acct_a', 60);
+    preferAccount(accountManager, 'acct_c', 'acct_b');
+    assert.equal((await ask({ sid: 'session-one' })).status, 200);
+
+    assert.ok(firstWaited, '1本目が資格情報の解決で待つ');
+    assert.deepEqual(seen, [
+      'Bearer token-acct_a',
+      'Bearer token-acct_a',
+      'Bearer token-acct_b',
+      'Bearer token-acct_c',
+    ], `捨てた迂回先は戻らず、その時の選び方で選び直す: ${seen.join(', ')}`);
+    assert.deepEqual(eventLines(logLines, 'affinity_switch'), []);
+  });
+
+  it('keeps the detour picked again while a request that waited on the old one confirms late', async () => {
+    const secretStore = new GatedSecretStore();
+    const { ask, seen, accountManager, logLines } = await startAffinity({
+      accounts: ['acct_a', 'acct_b', 'acct_c', 'acct_d'],
+      secretStore,
+    });
+
+    assert.equal((await ask({ sid: 'session-one' })).status, 200);
+    accountManager.markRateLimited('acct_a', 300);
+    setFiveHour(accountManager, { acct_b: '0.1', acct_c: '0.3', acct_d: '0.3' });
+    assert.equal((await ask({ sid: 'session-one' })).status, 200);
+    assert.equal(seen.at(-1), 'Bearer token-acct_b');
+
+    const release = secretStore.openGate('acct_b');
+    const first = ask({ sid: 'session-one' }).catch(error => ({ error }));
+    const firstWaited = await waitFor(() => secretStore.entered.length === 1);
+    // 1本目が迂回先 acct_b の資格情報の解決で待つ間に acct_b も使えなくなり、2本目が acct_c を選ぶ。
+    accountManager.markRateLimited('acct_b', 300);
+    setFiveHour(accountManager, { acct_c: '0.1', acct_d: '0.3' });
+    assert.equal((await ask({ sid: 'session-one' })).status, 200);
+    assert.equal(seen.at(-1), 'Bearer token-acct_c');
+    release();
+    assert.equal((await first).status, 200);
+
+    // 新規割当の選び方はいま acct_d を先に選ぶ。迂回先が acct_c のままなら、選び直さない。
+    setFiveHour(accountManager, { acct_c: '0.3', acct_d: '0.1' });
+    assert.equal((await ask({ sid: 'session-one' })).status, 200);
+
+    assert.ok(firstWaited, '1本目が資格情報の解決で待つ');
+    assert.deepEqual(seen, [
+      'Bearer token-acct_a',
+      'Bearer token-acct_b',
+      'Bearer token-acct_c',
+      'Bearer token-acct_b',
+      'Bearer token-acct_c',
+    ], `遅れて来た確定は、新しく選んだ迂回先を古い口座で上書きしない: ${seen.join(', ')}`);
+    assert.deepEqual(eventLines(logLines, 'affinity_switch'), []);
   });
 
   it('records fam=fable / fam=other while affinity runs and keeps the line byte-identical while it is off', async () => {

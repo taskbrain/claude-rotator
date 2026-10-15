@@ -1779,6 +1779,7 @@ function createSessionAffinityRequest({
     pinned: settings.mode === 'on' && key !== null,
     gen: null,
     reservedId: null,
+    detourGen: null,
     pendingReason: null,
     // `pendingReason` が `common_exhausted` のときだけ、その判定に使った台帳の値の根拠。
     pendingEvidence: null,
@@ -1824,6 +1825,8 @@ function createSessionAffinityRequest({
   // 猶予。0 なら待機は1度も起きない。
   let graceMs = 0;
   let graceAccountId = null;
+  // 一時的に使えない結び付け先の迂回先を、この要求で選び直したか。
+  let detourChosen = false;
   if (!entry) {
     binding = assign(null);
     sendTo = binding;
@@ -1841,10 +1844,11 @@ function createSessionAffinityRequest({
   } else if (accountManager.isAvailable(bound, modelFamily)) {
     binding = bound;
     sendTo = bound;
+    // 結び付け先へ戻ったので、使えなかった間の迂回先は捨てる。
+    affinity.clearDetour(key, { modelFamily });
   } else if (requiresRelogin(bound)) {
     // 結び付け先の資格情報が、人が再ログインするまで戻らない形で失効した。結び付けを
-    // 残すと要求ごとに迂回先を選び直すことになり、選び方の第1キー（5時間枠の使用率）が
-    // 要求ごとに変わるので送り先が定まらず、プロンプトのキャッシュが毎回外れる。
+    // 残すと、戻る見込みの無い口座に結び付けたまま、迂回先へ送り続けることになる。
     // そこで予約段で結び付けそのものを移す。再ログインの後も元へは戻さない。
     // 行き先が無ければ結び付けは書かず、この要求は終端の応答へ落ちる。
     binding = assign([bound.id]);
@@ -1880,8 +1884,19 @@ function createSessionAffinityRequest({
     // ほかの理由（上流の 401 などの認証の失敗・結果が分からない資格情報の更新・throttled・
     // 資格情報 cooldown・短期レート制限など）: 再ログインを待たずに結び付け先が戻りうるので、
     // バインドは変えず、この要求だけ別の口座で完走させる。
+    // 送り先は、使えない間の迂回先をセッションごとに1つに保って使い回す。要求ごとに
+    // 選び直すと、選び方の第1キー（5時間枠の使用率）が要求ごとに変わるので送り先が
+    // 散り、口座ごとのプロンプトのキャッシュが毎回外れる。迂回先が使えなくなったときだけ
+    // 選び直し、下の予約の後にこの同期区間のうちに記録する（同じセッションの同時の要求も
+    // 同じ迂回先を読む）。
     binding = bound;
-    sendTo = assign([bound.id]);
+    const detour = accountManager.findOrNull(entry.detour);
+    if (detour && detour.id !== bound.id && accountManager.isAvailable(detour, modelFamily)) {
+      sendTo = detour;
+    } else {
+      sendTo = assign([bound.id]);
+      detourChosen = Boolean(sendTo);
+    }
   }
 
   if (binding) {
@@ -1890,6 +1905,16 @@ function createSessionAffinityRequest({
       state.gen = reserved.gen;
       state.aff = reserved.disposition;
       state.reservedId = reserved.account;
+      if (detourChosen) {
+        affinity.noteDetour(key, {
+          from: reserved.account,
+          to: sendTo.id,
+          modelFamily,
+          expectedGen: reserved.gen,
+        });
+      }
+      // 予約を終えた時点の迂回先の版。確定の段はこれが変わっていないときだけ迂回先を書く。
+      state.detourGen = affinity.get(key, { modelFamily })?.detourGen ?? null;
       // 応答が終わるまで表の行を保持し、`close` / `abort` でも必ず解放する。
       const release = affinity.hold(key);
       res.once('close', release);
@@ -1917,6 +1942,7 @@ function createSessionAffinityRequest({
       : null;
   };
   let pending = sendTo;
+  const firstSendId = sendTo?.id ?? null;
   let firstSelect = true;
   state.select = attemptedAccountIds => {
     if (firstSelect) {
@@ -1942,6 +1968,24 @@ function createSessionAffinityRequest({
       evidence: state.pendingEvidence,
     });
     if (confirmed && confirmed.disposition !== 'stale') state.gen = confirmed.gen;
+    // 結び付けを変えずに、予約で決めた1周目の送り先とも違う口座へ送ったとき（2周目以降）は、
+    // その口座を迂回先にする。1周目の送り先は予約の段で記録済みなので書かない。
+    // 世代と迂回先の版が予約のときのままのときだけ書くので、資格情報の解決を待つ間に
+    // 付け替えた要求や、迂回先を捨てた・選び直した要求があれば書かない。
+    if (
+      confirmed?.disposition === 'bound'
+      && confirmed.account !== account.id
+      && account.id !== firstSendId
+    ) {
+      const written = affinity.noteDetour(key, {
+        from: confirmed.account,
+        to: account.id,
+        modelFamily,
+        expectedGen: confirmed.gen,
+        expectedDetourGen: state.detourGen,
+      });
+      if (written) state.detourGen = affinity.get(key, { modelFamily })?.detourGen ?? null;
+    }
     state.pendingReason = null;
     state.pendingEvidence = null;
   };

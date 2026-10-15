@@ -1563,7 +1563,7 @@ describe('SessionAffinity cold_reassign', () => {
 // 再ログインが要る失効での付け替え
 //
 // これも予約段だけの理由である。結び付け先の資格情報が人の再ログインまで戻らないなら、
-// 結び付けたままにしても要求ごとに迂回先が変わるだけなので、予約段で結び付けを移す。
+// 結び付けたままにしても迂回先へ送り続けるだけなので、予約段で結び付けを移す。
 // 確定で付け替えてよい理由は枠の枯渇の2値のままで、この理由では動かさない。
 // ---------------------------------------------------------------------------
 
@@ -1599,5 +1599,144 @@ describe('SessionAffinity reauth_required', () => {
     assert.equal(confirmed.account, 'acct-a', '確定では再ログインが要る失効を理由に付け替えない');
     assert.equal(affinity.get(SESSION_ID).home, 'acct-a');
     assert.deepEqual(affinity.summary().switchesByReason, {});
+  });
+});
+
+// ---------------------------------------------------------------------------
+// 一時的に使えない結び付け先の迂回先
+//
+// 結び付けは変えずに、使えない間の送り先をセッションごとに1つ記録する。保存の形にも
+// 温かい数にも出さず、付け替え・退避・行き先の口座の退避で消える。
+// ---------------------------------------------------------------------------
+
+describe('SessionAffinity detour', () => {
+  function withDetour() {
+    const created = createAffinity();
+    const reserved = reserve(created.affinity, SESSION_ID, 'acct-a');
+    const written = created.affinity.noteDetour(SESSION_ID, {
+      from: 'acct-a',
+      to: 'acct-b',
+      expectedGen: reserved.gen,
+    });
+    return { ...created, reserved, written };
+  }
+
+  it('keeps the detour out of the saved table and the warm counts without moving the binding', () => {
+    const { affinity, logger, written } = withDetour();
+
+    assert.equal(written, true);
+    const current = affinity.get(SESSION_ID);
+    assert.equal(current.detour, 'acct-b');
+    assert.equal(current.home, 'acct-a', '結び付けは変えない');
+    assert.deepEqual(
+      affinity.export().entries.map(record => Object.keys(record).sort()),
+      [['a', 'k', 's', 't']],
+      '保存の形は変わらない',
+    );
+    assert.deepEqual(Object.fromEntries(affinity.warmSessionCounts()), { 'acct-a': 1 }, '迂回先は温かい数に数えない');
+    assert.deepEqual(affinity.summary().sessionsByAccount, { 'acct-a': 1 });
+    assert.deepEqual(linesOf(logger, 'affinity_switch'), []);
+  });
+
+  it('writes the detour only while the generation still matches', () => {
+    const { affinity, reserved } = withDetour();
+
+    const stale = affinity.noteDetour(SESSION_ID, {
+      from: 'acct-a',
+      to: 'acct-c',
+      expectedGen: reserved.gen - 1,
+    });
+    assert.equal(stale, false);
+    assert.equal(affinity.get(SESSION_ID).detour, 'acct-b', '古い世代の確定は迂回先を書き換えない');
+
+    const updated = affinity.noteDetour(SESSION_ID, {
+      from: 'acct-a',
+      to: 'acct-c',
+      expectedGen: reserved.gen,
+    });
+    assert.equal(updated, true);
+    assert.equal(affinity.get(SESSION_ID).detour, 'acct-c');
+  });
+
+  it('drops the detour when the binding moves', () => {
+    const { affinity } = withDetour();
+
+    reserve(affinity, SESSION_ID, 'acct-c', { reason: 'common_exhausted' });
+    assert.equal(affinity.get(SESSION_ID).home, 'acct-c');
+    assert.equal(affinity.get(SESSION_ID).detour, null);
+
+    // 元の口座へ戻っても、前の迂回先は出てこない（記録ごと消えている）。
+    reserve(affinity, SESSION_ID, 'acct-a', { reason: 'common_exhausted' });
+    assert.equal(affinity.get(SESSION_ID).home, 'acct-a');
+    assert.equal(affinity.get(SESSION_ID).detour, null);
+  });
+
+  it('keeps the other family\'s detour when only the Fable sub-binding moves', () => {
+    const { affinity } = withDetour();
+    const fable = affinity.get(SESSION_ID, { modelFamily: 'fable' });
+    affinity.noteDetour(SESSION_ID, {
+      from: 'acct-a',
+      to: 'acct-d',
+      modelFamily: 'fable',
+      expectedGen: fable.gen,
+    });
+
+    reserve(affinity, SESSION_ID, 'acct-c', { modelFamily: 'fable', reason: 'family_exhausted' });
+
+    assert.equal(affinity.get(SESSION_ID, { modelFamily: 'fable' }).bound, 'acct-c');
+    assert.equal(affinity.get(SESSION_ID, { modelFamily: 'fable' }).detour, null);
+    assert.equal(affinity.get(SESSION_ID).bound, 'acct-a');
+    assert.equal(affinity.get(SESSION_ID).detour, 'acct-b', 'Fable 以外の迂回先は残る');
+  });
+
+  it('does not let a write that read the detour before it changed bring an older one back', () => {
+    const { affinity, reserved } = withDetour();
+
+    const beforeClear = affinity.get(SESSION_ID);
+    affinity.clearDetour(SESSION_ID);
+    const revived = affinity.noteDetour(SESSION_ID, {
+      from: 'acct-a',
+      to: 'acct-b',
+      expectedGen: reserved.gen,
+      expectedDetourGen: beforeClear.detourGen,
+    });
+    assert.equal(revived, false);
+    assert.equal(affinity.get(SESSION_ID).detour, null, '消した迂回先を戻さない');
+
+    const beforeReplace = affinity.get(SESSION_ID);
+    assert.equal(affinity.noteDetour(SESSION_ID, {
+      from: 'acct-a',
+      to: 'acct-c',
+      expectedGen: reserved.gen,
+      expectedDetourGen: beforeReplace.detourGen,
+    }), true);
+    const overwritten = affinity.noteDetour(SESSION_ID, {
+      from: 'acct-a',
+      to: 'acct-b',
+      expectedGen: reserved.gen,
+      expectedDetourGen: beforeReplace.detourGen,
+    });
+    assert.equal(overwritten, false);
+    assert.equal(affinity.get(SESSION_ID).detour, 'acct-c', '新しく選んだ迂回先を古い口座で上書きしない');
+  });
+
+  it('drops the detour with the evicted session', () => {
+    const { affinity, clock } = withDetour();
+
+    clock.ms += 21_600_001;
+    assert.equal(affinity.prune().length, 1);
+    reserve(affinity, SESSION_ID, 'acct-a');
+
+    assert.equal(affinity.get(SESSION_ID).detour, null);
+  });
+
+  it('drops the detour when its account is evicted and keeps the binding', () => {
+    const { affinity } = withDetour();
+
+    assert.deepEqual(affinity.evictAccounts(['acct-b']), [], '迂回先だけなら退避の行は出さない');
+
+    const current = affinity.get(SESSION_ID);
+    assert.equal(current.home, 'acct-a');
+    assert.equal(current.detour, null);
   });
 });
