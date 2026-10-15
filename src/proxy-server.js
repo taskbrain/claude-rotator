@@ -9,6 +9,7 @@ import {
   isCommonQuotaExhausted,
   isCredentialRefreshCooldown,
   isUnifiedQuotaExhaustion,
+  requiresRelogin,
 } from './account-manager.js';
 import { readCurrentClaudeCredentials } from './claude-credentials.js';
 import {
@@ -1840,6 +1841,15 @@ function createSessionAffinityRequest({
   } else if (accountManager.isAvailable(bound, modelFamily)) {
     binding = bound;
     sendTo = bound;
+  } else if (requiresRelogin(bound)) {
+    // 結び付け先の資格情報が、人が再ログインするまで戻らない形で失効した。結び付けを
+    // 残すと要求ごとに迂回先を選び直すことになり、選び方の第1キー（5時間枠の使用率）が
+    // 要求ごとに変わるので送り先が定まらず、プロンプトのキャッシュが毎回外れる。
+    // そこで予約段で結び付けそのものを移す。再ログインの後も元へは戻さない。
+    // 行き先が無ければ結び付けは書かず、この要求は終端の応答へ落ちる。
+    binding = assign([bound.id]);
+    sendTo = binding;
+    reason = binding ? 'reauth_required' : null;
   } else if (familyQuotaExhaustedOnly(bound, threshold, modelFamily, accountManager.now())) {
     // 当該系統枠だけが枯れた: その系統専用の副バインドを1つ作る。
     binding = assign([bound.id]);
@@ -1867,8 +1877,9 @@ function createSessionAffinityRequest({
       reason = binding ? 'common_exhausted' : null;
     }
   } else {
-    // 認証失敗・throttled・資格情報 cooldown・短期レート制限: バインドは変えず、
-    // この要求だけ別の口座で完走させる。
+    // ほかの理由（上流の 401 などの認証の失敗・結果が分からない資格情報の更新・throttled・
+    // 資格情報 cooldown・短期レート制限など）: 再ログインを待たずに結び付け先が戻りうるので、
+    // バインドは変えず、この要求だけ別の口座で完走させる。
     binding = bound;
     sendTo = assign([bound.id]);
   }

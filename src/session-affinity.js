@@ -81,14 +81,25 @@ const SESSION_AFFINITY_RANGES = Object.freeze({
 
 const SID_HASH_PATTERN = /^[0-9a-f]{12}$/;
 
-// 結び付け先を付け替えてよい理由。確定でこの3つ以外の理由が
-// 来たときは表を書き換えない——認証失敗・throttled・error・上流 5xx・切断・timeout・短期
-// レート制限は、その要求だけ別の口座で完走させ、次の要求は元の口座へ戻す。
+// 結び付け先を付け替えてよい理由。ここに無い理由で付け替えたときは `unknown` と数える。
+// 一時的な理由（上流の 401 などの認証の失敗・throttled・下の `reauth_required` に当たらない
+// error・上流 5xx・切断・timeout・短期レート制限）では表を書き換えず、その要求だけ別の口座で
+// 完走させ、次の要求は元の口座へ戻す。確定で付け替えてよい理由は、下の
+// `CONFIRM_REBIND_REASONS` に絞る。
 // `cold_reassign` は冷えた固定の解放のために足した、予約段だけの理由である。
 // キャッシュが失効（`warmTtlMs` 超過）したセッションを、利用率の高い口座から空いている
 // 口座へ動かす——**移すものが無いので費用はゼロ**であり、温かいセッションはこの線では
 // 1本も動かない。
-const REBIND_REASONS = new Set(['common_exhausted', 'family_exhausted', 'account_removed', 'cold_reassign']);
+// `reauth_required` も予約段だけの理由である。結び付け先の資格情報が、人が再ログイン
+// するまで戻らない形で失効したとき（更新が `NATIVE_REFRESH_REAUTH_REQUIRED` か
+// `invalid_grant` で失敗）に、結び付けそのものを移す。再ログインの後も元へは戻さない。
+const REBIND_REASONS = new Set([
+  'common_exhausted',
+  'family_exhausted',
+  'account_removed',
+  'cold_reassign',
+  'reauth_required',
+]);
 // 確定で付け替えてよい理由は枠の枯渇の2値だけである。台帳から口座が
 // 消えたことは予約段（`affinity_switch`）と退避段（`affinity_evict`）の事象であって、
 // 送信直前にバインドを動かす理由にはならない。
