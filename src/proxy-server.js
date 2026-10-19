@@ -41,6 +41,7 @@ import {
   normalizeObservability,
   observationLogFields,
   parseUsageObservation,
+  requestClassFromHeader,
   upstreamAcceptEncoding,
 } from './usage-observation.js';
 import { buildUsageEvent, createUsageEventWriter, usageFromObservation } from './usage-events.js';
@@ -4773,6 +4774,7 @@ function buildObservationLog({ req, body, observation, upstreamResponse, observa
       ovs: headerValue(upstreamResponse.headers['anthropic-ratelimit-unified-overage-status']),
       ovu: headerValue(upstreamResponse.headers['anthropic-ratelimit-unified-overage-in-use']),
     },
+    requestClass: requestClassFromHeader(req.headers?.['x-claude-code-request-class']),
   };
 }
 

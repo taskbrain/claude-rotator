@@ -710,6 +710,7 @@ Webhook は Slack 互換の Incoming Webhook（`{"text": "..."}` を JSON で PO
 | `u5hReset` / `u7dReset` | 各枠の reset 時刻（エポック秒）。 |
 | `enc` | 上流応答の `content-encoding`（`gzip` / `br` / `deflate` / 無圧縮は `-`）。 |
 | `usageParse` | **usage を数えられなかったときだけ**出ます。`ok` のときは出ません。 |
+| `rc` | **`x-claude-code-request-class` 見出しが付いた要求だけ**、行の最末尾（猶予の5項目より後ろ）に出ます。Claude Code が `CLAUDE_CODE_GATEWAY_HINT_HEADERS=1` のときに送る見出しの値で、`main` / `subagent` / `workflow` / `compaction` / `auxiliary` のどれか、ほかの値は `other` になります（受け取った字そのものは出しません）。見出しが無ければ出ず、行は従来とバイト単位で同一です。見出しは上流へそのまま送ります。 |
 
 `usageParse` の値は `unsupported-encoding`（この Node では解けない符号化・知らない符号化が1段でも混じったとき・5段以上の重ねがけ）、`too-large`（`maxBodyBytes` 超）、`unparsable`（解凍に失敗したとき、または JSON でも SSE でもない）、`no-usage`（429 / 401 など usage を含まない応答）です。**黙って 0 件にせず、必ず理由が行に残ります。**
 
@@ -2170,6 +2171,8 @@ scripts/cache-report.sh --by sid --json            # machine-readable; --log <pa
 ```
 
 Only when an upstream response carries a usage-limit grace header (`anthropic-ratelimit-unified-grace-5h-utilization` / `anthropic-ratelimit-unified-grace-7d-utilization`), five more fields are appended at the end of the proxy line: `g5h` / `g7d` (the 5-hour / 7-day grace utilization; `-` for the one that is missing), `ustat` (`anthropic-ratelimit-unified-status`), `ovs` (`anthropic-ratelimit-unified-overage-status`), and `ovu` (`anthropic-ratelimit-unified-overage-in-use`); `ustat` / `ovs` / `ovu` are `-` when their header is absent. When neither grace header is present (or neither is a number), nothing is appended and the line is byte-for-byte unchanged. Like the cache fields, they are written only while `observability.requestLog.enabled` is `true` (the default).
+
+Only when a request carries the `x-claude-code-request-class` header (Claude Code sends it when `CLAUDE_CODE_GATEWAY_HINT_HEADERS=1` is set), `rc` is appended at the very end of the proxy line, after the grace fields: one of `main` / `subagent` / `workflow` / `compaction` / `auxiliary`, or `other` for any other value (the received text itself is never written). Without the header nothing is appended and the line is byte-for-byte unchanged. The header is forwarded upstream unchanged. Like the cache fields, `rc` is written only while `observability.requestLog.enabled` is `true` (the default).
 
 The only fields written to the proxy request log are `account`, `method`, `path`, `status`, `durationMs`, `outcome`, `requestId`, and, on a timeout/network error, `errorType`. Internal proxy errors are logged as a short `proxy-error method=... path=... error=...` line. Tokens, the `Authorization` header, API keys, request bodies, and response bodies are never logged.
 

@@ -406,7 +406,32 @@ export function observationLogFields(observationLog, affinityLog = null) {
       `ovu=${logToken(grace.ovu)}`,
     );
   }
+  // 要求の種類は見出しがあった要求だけ最末尾へ足す。値は requestClassFromHeader が
+  // 決まった語へ寄せたものなので、受け取った字そのものは行に出ない。
+  if (typeof observationLog.requestClass === 'string') {
+    fields.push(`rc=${observationLog.requestClass}`);
+  }
   return ` ${fields.join(' ')}`;
+}
+
+const REQUEST_CLASSES = new Set(['main', 'subagent', 'workflow', 'compaction', 'auxiliary']);
+
+/**
+ * `x-claude-code-request-class` 見出しの値を、ログに書く決まった語へ寄せる。
+ *
+ * 前後の空白を落として小文字にし、`main`・`subagent`・`workflow`・`compaction`・
+ * `auxiliary` ならその語、空でないほかの字は `other` を返す。見出しが無い・空・字で
+ * ないときは `null`（行に何も足さない）。配列なら1つめを使う。
+ *
+ * @param {string|string[]|undefined} value
+ * @returns {'main'|'subagent'|'workflow'|'compaction'|'auxiliary'|'other'|null}
+ */
+export function requestClassFromHeader(value) {
+  const raw = Array.isArray(value) ? value[0] : value;
+  if (typeof raw !== 'string') return null;
+  const word = raw.trim().toLowerCase();
+  if (word === '') return null;
+  return REQUEST_CLASSES.has(word) ? word : 'other';
 }
 
 /**
