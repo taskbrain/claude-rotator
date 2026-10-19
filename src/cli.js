@@ -11,6 +11,7 @@ import { isDeepStrictEqual, promisify } from 'node:util';
 import { AccountManager } from './account-manager.js';
 import { createAlertSender } from './alert-sender.js';
 import { createAlertWatch, normalizeAlertSettings } from './alert-watch.js';
+import { attachDriftWatch } from './drift-watch.js';
 import {
   createDefaultConfig,
   DEFAULT_PORT,
@@ -21,7 +22,8 @@ import {
   proxyListenHost,
   saveConfig,
 } from './config.js';
-import { createProxyServer, defaultTokenRefresher } from './proxy-server.js';
+import { createProxyServer, defaultTokenRefresher, isCanonicalFableModelId } from './proxy-server.js';
+import { isFableScopeIdentity } from './quota.js';
 import { createServerLogWriter } from './log-rotation.js';
 import { normalizeObservability } from './usage-observation.js';
 import { usageEventsDir } from './usage-events.js';
@@ -75,7 +77,7 @@ import {
   runtimeStatePath,
   xdgConfigHome,
 } from './paths.js';
-import { readJsonFile, removeStaleTmpFiles, writeJsonFileDurable } from './json-file.js';
+import { readJsonFile, removeStaleTmpFiles, writeJsonFile, writeJsonFileDurable } from './json-file.js';
 import { normalizeSessionAffinity } from './session-affinity.js';
 
 const execFileAsync = promisify(execFile);
@@ -368,10 +370,14 @@ async function runServer({ write }) {
   // one that happens while the server is still coming up — reaches the log.
   const logPath = join(dirname(getConfigPath()), 'server.log');
   const logWriter = process.stdout.isTTY ? null : createServerLogWriter(serverLogWriterOptions(config, logPath));
-  const logger = line => {
+  const baseLogger = line => {
     if (logWriter) logWriter.write(line);
     else write(`${line}\n`);
   };
+  // 行はまずログへ書き、下でつないだ後は drift の見張り（proxy 行を読む）へも渡す。
+  // server 全体で使う logger はこれ1つ。
+  const driftLink = attachDriftWatch({ baseLogger });
+  const logger = driftLink.logger;
   const secretStore = createSecretStore();
   const accountManager = new AccountManager({
     accounts: config.accounts,
@@ -407,6 +413,18 @@ async function runServer({ write }) {
     loadSettings: () => loadConfig().then(nextConfig => nextConfig?.alerts),
     logger,
   });
+  // 版・モデル・キャッシュの変化の見張り。起動のときに `alerts` の節が有効なときだけ作る。
+  // 知らせは alertWatch の口から出し、状態は設定のフォルダの drift-watch.json に置く。
+  const driftStatePath = join(dirname(getConfigPath()), 'drift-watch.json');
+  driftLink.connect({
+    enabled: normalizeAlertSettings(config.alerts).enabled,
+    alertWatch,
+    accountManager,
+    isListedModel: isCanonicalFableModelId,
+    isListedScope: isFableScopeIdentity,
+    readState: () => readJsonFile(driftStatePath, null),
+    writeState: state => writeJsonFile(driftStatePath, state),
+  });
   const server = createProxyServer({
     accountManager,
     secretStore,
@@ -440,12 +458,14 @@ async function runServer({ write }) {
     resolve,
   ));
   write(`claude-rotator listening on ${proxyBaseUrl(config)}\n`);
-  alertWatch.start();
+  // alertWatch を始めた後に drift の見張りを始める（つないでいないときは alertWatch だけ）。
+  driftLink.start();
   try {
     await waitForShutdown(server);
   } finally {
-    // 見張りを先に止める（送り直しの待ちも止まる）。ログを閉じた後に行を書かせない。
-    alertWatch.stop();
+    // 見張りを先に止める（drift の状態を書いた後に alertWatch を止め、送り直しの待ちも止まる）。
+    // ログを閉じた後に行を書かせない。
+    await driftLink.stop();
     logWriter?.close();
   }
 }

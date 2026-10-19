@@ -679,6 +679,35 @@ Webhook は Slack 互換の Incoming Webhook（`{"text": "..."}` を JSON で PO
 
 - URL が漏れたときは、受け口を作ったサービスの側でその Webhook を消して作り直し、新しい URL でファイルを置き直してください。次の送信から新しい URL を使います。
 
+#### 版・モデル・キャッシュの変化の知らせ
+
+server の起動のときに `alerts` の節が有効（2つのキーのどちらかが有効）なら、Claude Code の版・モデル名・週の枠の名前を初めて見たときと、キャッシュの外れや要求の大きさがいつもと大きく違ったときにも、同じ macOS の通知と Webhook で知らせます。起動のときに節が無効なら、この見張りは作られず、何も数えず・書かず・送りません（再読込で節を足しても、この見張りは次の起動から動きます）。動いている間に再読込で節を無効にすると、その間は数えず・書かず・送りません。設定のキーは増えません（しきい値は固定です）。
+
+見張りは `proxy` 行の `model`・`in`・`cr`・`cc`・`ua` を読むので、`observability.requestLog.enabled` が `true`（既定）のときだけ数えます（[キャッシュ観測](#キャッシュ観測observability)）。数えるのは `/v1/messages` への要求のうち、`status=200`・`outcome=ok` で usage を読めた行だけです。行の `account` は読みません。
+
+**最初の24時間は覚えるだけです。** 状態のファイルが無い起動から24時間は、見た値を覚えるだけで知らせません（最初の起動では、動いている版・モデル・枠の名前の全部が「初めて」になるためです）。
+
+知らせる物:
+
+- **Claude Code の新しい版** — `ua` の版が、覚えた版の中で最も新しい版より新しい（数ごとに比べます）。覚えた版より古い版は覚えるだけです。版ごとに1回。
+- **初めて見るモデル名** — 応答が名乗ったモデル名（`model`）が、覚えた名前にも、claude-rotator が組み込みで持つ決まったモデル名の一覧にも無い。名前ごとに1回。
+- **初めて見る週の枠の名前** — アカウントの台帳にある週の枠（`weeklyScoped`）の名前が、覚えた名前にも、組み込みの一覧にも無い。名前ごとに1回。
+- **キャッシュの外れが多い** — その1時間の外れの率 `(in + cc) ÷ (in + cc + cr)` が、基準の2倍以上。
+- **要求の大きさの中央値が違う** — 1要求あたりの `in + cc + cr` の中央値が、基準の1.75倍以上か、1/1.75 以下。
+- **要求の大きさの95パーセンタイルが違う** — 同じく95パーセンタイルが、基準の2倍以上か、半分以下。
+
+下の3つは、モデルごとと、`ua` のある要求ではモデルと版の組ごとに、UTC の1時間ごとに判定します。基準は、前の7日の同じ時間帯の値の中央値です。判定するのは、その1時間の要求が500件以上（95パーセンタイルは1000件以上）あり、前の7日の同じ時間帯のうち同じ件数の条件を満たした日が3日以上あるときだけです。起動した時間と、止めていた後に戻った時間は途中なので判定しません。外れは外れ始めたときに1回知らせ、判定した時が2回続けて基準の内に戻るか、最後の判定から24時間たつまで、同じものを知らせ直しません。同じ時間に、モデルごとの判定がある指標で外れているときは、そのモデルの版ごとの判定のうち同じ指標のものは知らせません。
+
+初めて見る値の知らせは1時間に10件までで、超えた分は覚えるだけにします。知らせの文は英語で、版・モデル名・枠の名前・比・百分率・要求の大きさ（千トークン）・その1時間の要求の件数だけを載せ、アカウントの名前・id・セッション ID・パス・URL・本文は載せません。この知らせの文からは `<`・`>`・`&` を外します。Slack はこれらの字を印として読み、知らせの文には要求から来た値が入りうるためです（置き換えると macOS の通知でその字がそのまま見えるので、置き換えずに外します）。60秒の間に生じた知らせを1通にまとめるのは、ほかの知らせと同じです。
+
+状態は設定ファイルと同じフォルダの `drift-watch.json`（所有者だけが読み書きできる権限）に置きます。持つのは、覚えた版・モデル名・枠の名前、モデルごとの1時間ごとの集計（8日分）、知らせている外れだけで、アカウントの id・名前・セッション ID・パスは持ちません。再起動しても同じ値は知らせ直さず、覚えるだけの24時間もやり直しません。server を止めて `drift-watch.json` を消すと、覚えた値と集計を忘れ、次の起動から24時間は再び覚えるだけになります。読めない・形が違うファイルは、下の1行を残して新しい状態で始めます（覚えるだけの24時間もやり直します）。server は止まりません。
+
+`server.log` に出る行（この見張りが動いているときだけ）:
+
+- `drift-watch notice kind=<kind> key=<key> result=<queued|rejected|limit>` — 知らせごとに1行。`queued` は送る列に入れた、`rejected` は入れなかった（同じ知らせを既に受けた・文が決まりに合わないなど）、`limit` は1時間の上限で覚えるだけにした、の意味です。送りが失敗しても、何を知らせたかがここに残ります。`kind` は `client-version`・`model-name`・`limit-scope`・`cache-miss`・`request-size-p50`・`request-size-p95` のどれかです。
+- `drift-watch state=ignored reason=<unreadable|format>` — 状態のファイルを読めなかった（`unreadable`）か、形が違った（`format`）ので、新しい状態で始めた。
+- `drift-watch state-write result=failed errorType=<code>` — 状態のファイルを書けなかった（同じ `errorType` が続く間は1回だけ）。
+
 ## ログと切り替え診断
 
 `status` / `monitor` の Events には、直近の proxy request が表示されます。
@@ -695,7 +724,7 @@ Webhook は Slack 互換の Incoming Webhook（`{"text": "..."}` を JSON で PO
 各 proxy request のトークン内訳・モデル・セッション指紋・枠の使用率を、**既存の `proxy` 行の末尾へ追記**します。新しい行種別は増えません。既定で有効です。
 
 ```text
-… outcome=ok model=claude-opus-5-1 sid=ab12cd34ef56 in=10 out=20 cr=99000 cc=1500 c1h=1500 c5m=0 u5h=0.76 u5hReset=1789012345 u7d=0.33 u7dReset=1789098765 enc=gzip
+… outcome=ok model=claude-opus-5-1 sid=ab12cd34ef56 in=10 out=20 cr=99000 cc=1500 c1h=1500 c5m=0 u5h=0.76 u5hReset=1789012345 u7d=0.33 u7dReset=1789098765 enc=gzip hdrMs=412
 ```
 
 | フィールド | 意味 |
@@ -710,7 +739,12 @@ Webhook は Slack 互換の Incoming Webhook（`{"text": "..."}` を JSON で PO
 | `u5hReset` / `u7dReset` | 各枠の reset 時刻（エポック秒）。 |
 | `enc` | 上流応答の `content-encoding`（`gzip` / `br` / `deflate` / 無圧縮は `-`）。 |
 | `usageParse` | **usage を数えられなかったときだけ**出ます。`ok` のときは出ません。 |
-| `rc` | **`x-claude-code-request-class` 見出しが付いた要求だけ**、行の最末尾（猶予の5項目より後ろ）に出ます。Claude Code が `CLAUDE_CODE_GATEWAY_HINT_HEADERS=1` のときに送る見出しの値で、`main` / `subagent` / `workflow` / `compaction` / `auxiliary` のどれか、ほかの値は `other` になります（受け取った字そのものは出しません）。見出しが無ければ出ず、行は従来とバイト単位で同一です。見出しは上流へそのまま送ります。 |
+| `rc` | **`x-claude-code-request-class` 見出しが付いた要求だけ**、猶予の5項目より後ろに出ます（`rc` の後ろには `ua`・`beta`・`effort`・`effortMsg`・`hdrMs` がこの順に続きます）。Claude Code が `CLAUDE_CODE_GATEWAY_HINT_HEADERS=1` のときに送る見出しの値で、`main` / `subagent` / `workflow` / `compaction` / `auxiliary` のどれか、ほかの値は `other` になります（受け取った字そのものは出しません）。見出しが無ければ出ず、行は従来とバイト単位で同一です。見出しは上流へそのまま送ります。 |
+| `ua` | **`user-agent` 見出しが Claude Code の形（`claude-cli/<数>.<数>.<数>` で始まり、その後ろが終わり・空白・`(` のどれか）の要求だけ**、`rc` より後ろに出ます。値は Claude Code の版（例 `2.1.303`）です。ほかの形（版のすぐ後ろに字が続く・数が4つあるなど）では出ません。値が無ければ出ず、行は従来とバイト単位で同一です。 |
+| `beta` | **`anthropic-beta` 見出しが付いた要求だけ**、`rc`・`ua` より後ろに出ます。クライアントから受け取った見出しの字そのものではなく、その字を整えずにとった SHA-256 の16進の先頭8字です（例 `7c896b7a`）。見出しの字は行に出しません。見出しが無い・空白だけのときは出ず、行は従来とバイト単位で同一です。 |
+| `effort` | **要求の本文の一番上に `output_config.effort`（Claude Code が送る深さ）がある要求だけ**、猶予の5項目と `rc`・`ua`・`beta` より後ろに出ます。前後の空白を落として小文字にした値が `low` / `medium` / `high` / `xhigh` / `max` のどれかならその語、ほかの値は `other` になります（受け取った字そのものは出しません）。無い・空・文字列でないときは出ません。アカウントの選び方には使いません。 |
+| `effortMsg` | **要求の `messages` に、`output_config.effort` を持つ `role: "system"` の項目（会話の途中で深さを変える項目）がある要求だけ**、`effort` の後ろに出ます。後ろから見て最初のその項目の値を、`effort` と同じ規則で書きます。項目の文章は読みません。 |
+| `hdrMs` | その行の上流の応答の見出し（ステータスとヘッダ）を受け取るまでのミリ秒。数え始めは `durationMs` と同じなので、`durationMs` 以下です。観測の欄が付く行には必ず、`effortMsg` の後ろ（観測の欄の最後）に出ます。接続できなかった行や手元で作った応答の行には、`effort` / `effortMsg` とともに出ません。 |
 
 `usageParse` の値は `unsupported-encoding`（この Node では解けない符号化・知らない符号化が1段でも混じったとき・5段以上の重ねがけ）、`too-large`（`maxBodyBytes` 超）、`unparsable`（解凍に失敗したとき、または JSON でも SSE でもない）、`no-usage`（429 / 401 など usage を含まない応答）です。**黙って 0 件にせず、必ず理由が行に残ります。**
 
@@ -2153,6 +2187,35 @@ The settings are read again when the resident server restarts or on `POST /inter
 
 - If the URL leaks, delete the webhook on the service that issued it, create a new one, and replace the file with the new URL. The next send uses the new URL.
 
+##### Notices About Version, Model, and Cache Changes
+
+When the `alerts` section is on at server start (either of its two keys is on), the same macOS notification and webhook also report the first time a Claude Code version, a model name, or a weekly limit scope name is seen, and an hour in which cache misses or request sizes are far from usual. When the section is off at start, this watch is not created and counts, writes, and sends nothing (adding the section by a reload starts it from the next server start). While it runs, turning the section off by a reload stops it from counting, writing, and sending. No settings keys are added (the thresholds are fixed).
+
+The watch reads `model`, `in`, `cr`, `cc`, and `ua` from the `proxy` lines, so it counts only while `observability.requestLog.enabled` is `true` (the default; see [Logs and Rotation Diagnostics](#logs-and-rotation-diagnostics)). It counts only `/v1/messages` lines with `status=200` and `outcome=ok` whose usage was read. It does not read the `account` field.
+
+**The first 24 hours only learn.** For 24 hours from a start without a state file, values seen are only remembered and nothing is reported (on the first start, every running version, model, and scope name would be "new").
+
+What is reported:
+
+- **A new Claude Code version** — the `ua` version is newer than the newest version remembered (compared number by number). A version older than that is only remembered. Once per version.
+- **A model name seen for the first time** — the model name the response gave (`model`) is neither remembered nor on the fixed list of model names built into claude-rotator. Once per name.
+- **A weekly limit scope name seen for the first time** — a weekly scope (`weeklyScoped`) name in the account ledger is neither remembered nor on the built-in list. Once per name.
+- **More cache misses** — the hour's miss rate `(in + cc) / (in + cc + cr)` is at least 2 times the baseline.
+- **A different median request size** — the median of `in + cc + cr` per request is at least 1.75 times the baseline, or at most 1/1.75 of it.
+- **A different 95th percentile request size** — the 95th percentile of the same is at least 2 times the baseline, or at most half of it.
+
+The last three are judged per UTC hour, per model and, for requests with `ua`, per model and version. The baseline is the median of the values for the same hour of the day over the previous 7 days. An hour is judged only when it has at least 500 requests (1000 for the 95th percentile) and at least 3 of the previous 7 days have the same hour meeting the same count. The hour of a start, and the hour of coming back after a stop, are partial and not judged. A change is reported once when it starts, and the same one is not reported again until two judged hours in a row are back within the baseline or 24 hours have passed since its last judgment. When a model's own judgment is off on a measure in the same hour, the per-version judgments of that model on the same measure are not reported.
+
+First-time notices are limited to 10 per hour; the rest are only remembered. The text is in English and carries only versions, model names, scope names, ratios, percentages, request sizes in thousands of tokens, and the hour's request count; account names, ids, session ids, paths, URLs, and bodies are never included. `<`, `>`, and `&` are removed from these notice texts, because Slack reads those characters as markup and a notice text can carry values that came from requests (replacing them with escapes would show the escapes as is in the macOS notification, so they are removed instead). As with the other alerts, notices that come up within 60 seconds go out as one message.
+
+The state is kept in `drift-watch.json` in the same folder as the config file (readable and writable by the owner only). It holds only the remembered versions, model names, and scope names, per-model hourly totals (8 days), and the open changes; no account ids or names, session ids, or paths. A restart does not report the same values again and does not restart the 24-hour learning period. Stopping the server and deleting `drift-watch.json` forgets the remembered values and totals, and the next start learns for 24 hours again. A file that cannot be read or has the wrong shape is replaced by a new state, with one line below (the 24-hour learning period starts again). The server keeps running.
+
+Lines in `server.log` (only while this watch runs):
+
+- `drift-watch notice kind=<kind> key=<key> result=<queued|rejected|limit>` — one line per notice. `queued` means it was put in the send queue, `rejected` that it was not (the same notice was already taken, the text does not meet the rules, and so on), and `limit` that the hourly limit made it only remembered. Even when a send fails, this line shows what was reported. `kind` is one of `client-version`, `model-name`, `limit-scope`, `cache-miss`, `request-size-p50`, and `request-size-p95`.
+- `drift-watch state=ignored reason=<unreadable|format>` — the state file could not be read (`unreadable`) or had the wrong shape (`format`), so a new state was started.
+- `drift-watch state-write result=failed errorType=<code>` — the state file could not be written (once while the same `errorType` repeats).
+
 ### Logs and Rotation Diagnostics
 
 `status` / `monitor`'s Events show the most recent proxy requests:
@@ -2174,7 +2237,11 @@ scripts/cache-report.sh --by sid --json            # machine-readable; --log <pa
 
 Only when an upstream response carries a usage-limit grace header (`anthropic-ratelimit-unified-grace-5h-utilization` / `anthropic-ratelimit-unified-grace-7d-utilization`), five more fields are appended at the end of the proxy line: `g5h` / `g7d` (the 5-hour / 7-day grace utilization; `-` for the one that is missing), `ustat` (`anthropic-ratelimit-unified-status`), `ovs` (`anthropic-ratelimit-unified-overage-status`), and `ovu` (`anthropic-ratelimit-unified-overage-in-use`); `ustat` / `ovs` / `ovu` are `-` when their header is absent. When neither grace header is present (or neither is a number), nothing is appended and the line is byte-for-byte unchanged. Like the cache fields, they are written only while `observability.requestLog.enabled` is `true` (the default).
 
-Only when a request carries the `x-claude-code-request-class` header (Claude Code sends it when `CLAUDE_CODE_GATEWAY_HINT_HEADERS=1` is set), `rc` is appended at the very end of the proxy line, after the grace fields: one of `main` / `subagent` / `workflow` / `compaction` / `auxiliary`, or `other` for any other value (the received text itself is never written). Without the header nothing is appended and the line is byte-for-byte unchanged. The header is forwarded upstream unchanged. Like the cache fields, `rc` is written only while `observability.requestLog.enabled` is `true` (the default).
+Only when a request carries the `x-claude-code-request-class` header (Claude Code sends it when `CLAUDE_CODE_GATEWAY_HINT_HEADERS=1` is set), `rc` is appended to the proxy line after the grace fields (`ua`, `beta`, `effort`, `effortMsg`, and `hdrMs` follow it, in that order): one of `main` / `subagent` / `workflow` / `compaction` / `auxiliary`, or `other` for any other value (the received text itself is never written). Without the header nothing is appended and the line is byte-for-byte unchanged. The header is forwarded upstream unchanged. Like the cache fields, `rc` is written only while `observability.requestLog.enabled` is `true` (the default).
+
+Only when the `user-agent` header has Claude Code's form (it starts with `claude-cli/<number>.<number>.<number>`, followed by the end, a space, or `(`), `ua` is appended after `rc`: the Claude Code version, such as `2.1.303`. Any other form (more characters right after the version, four numbers, and so on) appends nothing. Only when a request carries the `anthropic-beta` header, `beta` is appended after `rc` and `ua`: not the header text received from the client, but the first 8 hex characters of the SHA-256 of that text taken as is (for example `7c896b7a`); the header text itself is never written. Without a value (no header, or only whitespace) nothing is appended and the line is byte-for-byte unchanged. Like the cache fields, `ua` and `beta` are written only while `observability.requestLog.enabled` is `true` (the default).
+
+Two more fields come from the request body, only when it carries them: `effort` (the top-level `output_config.effort`, the effort level Claude Code sends) and `effortMsg` (from the last `role: "system"` entry in `messages` that has an `output_config.effort`, which changes the effort in the middle of a conversation). Each is trimmed and lowercased and written as one of `low` / `medium` / `high` / `xhigh` / `max`, or `other` for any other value (the received text itself is never written, and the message text is never read); when the value is missing, empty, or not a string, the field is not written. Neither is used to pick an account. Every proxy line that carries the cache fields ends with `hdrMs`: the milliseconds from the start of that upstream attempt (the same start as `durationMs`) until the upstream response status and headers arrived, so it is never larger than `durationMs`. The three come after the grace fields, `rc`, `ua`, and `beta`, in the order `effort`, `effortMsg`, `hdrMs`, and like the cache fields they are written only while `observability.requestLog.enabled` is `true` (the default). Lines without the cache fields, such as a connection failure or a locally generated response, carry none of them.
 
 The only fields written to the proxy request log are `account`, `method`, `path`, `status`, `durationMs`, `outcome`, `requestId`, and, on a timeout/network error, `errorType`. Internal proxy errors are logged as a short `proxy-error method=... path=... requestSeq=... error=...` line. `requestSeq` is always written: it is the request's arrival number (it restarts from 1 on each start and counts every request, including those to `/internal/*`, so numbers can skip). For an error after an account was chosen, `account` (the id of the last account chosen for the request, the same value as on the proxy line) follows, and `sid` (the same 12-character hash as on the proxy line) is added when session affinity extracted a session key. `error=` is always the last field. A request over the body-size limit is logged as `proxy-error method=... path=... requestSeq=... error=request_too_large limitBytes=...`. The raw session id and account names are never written. Tokens, the `Authorization` header, API keys, request bodies, and response bodies are never logged.
 

@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 
 import { AccountManager } from '../src/account-manager.js';
 import {
+  ALERT_MAX_NOTICE_KEYS,
   ALERT_MAX_QUEUED_MESSAGES,
   createAlertWatch,
   normalizeAlertSettings,
@@ -653,5 +654,192 @@ describe('W8 queue limit', () => {
     watch.stop();
     assert.equal(watch.statusSection().queued, 0);
     assert.equal(fake.calls.stop, 1);
+  });
+});
+
+describe('generic notices', () => {
+  const NOTICE = 'claude-rotator: first time seeing model example-model.';
+  const notice = (key = 'one', text = NOTICE, kind = 'example-kind') => ({ kind, key, text });
+  const lines = text => text.split('\n');
+
+  it('refuses a notice while the alerts section is off, with no timer and no send', async () => {
+    const { watch, clock, fake } = setup({ settings: null });
+    watch.start();
+    assert.equal(watch.notice(notice()), false);
+    assert.equal(clock.size(), 0, 'no timer');
+    clock.advance(2 * MINUTE);
+    await settle();
+    assert.deepEqual(fake.calls, { notifyMac: [], postWebhook: [], checkWebhookFile: [], stop: 0 });
+    watch.stop();
+  });
+
+  it('accepts a notice and sends its text unchanged to the webhook and the Mac after 60 seconds', async () => {
+    const { watch, clock, fake } = setup();
+    watch.start();
+    await settle();
+    assert.equal(watch.notice(notice()), true);
+    clock.advance(MINUTE - 1);
+    await settle();
+    assert.equal(fake.calls.postWebhook.length, 0, 'held for the batch window');
+    clock.advance(1);
+    await settle();
+    assert.deepEqual(texts(fake), [NOTICE]);
+    assert.deepEqual(fake.calls.notifyMac.map(call => call.body), [NOTICE]);
+    watch.stop();
+  });
+
+  it('refuses the same kind and key a second time, and accepts another key or kind', () => {
+    const { watch } = setup();
+    watch.start();
+    assert.equal(watch.notice(notice('one')), true);
+    assert.equal(watch.notice(notice('one')), false);
+    assert.equal(watch.notice(notice('one', 'claude-rotator: another text.')), false, 'the text is not part of the key');
+    assert.equal(watch.notice(notice('two')), true);
+    assert.equal(watch.notice(notice('one', NOTICE, 'other-kind')), true);
+    watch.stop();
+  });
+
+  it('refuses a built-in kind, non-ASCII or multi-line text, text over 300 characters and a key with a space', () => {
+    const { watch } = setup();
+    watch.start();
+    for (const kind of ['relogin', 'failing', 'expiry', 'dispersion']) {
+      assert.equal(watch.notice(notice('one', NOTICE, kind)), false, kind);
+    }
+    assert.equal(watch.notice(notice('one', 'claude-rotator: café.')), false);
+    assert.equal(watch.notice(notice('one', 'claude-rotator: first line.\nsecond line.')), false);
+    assert.equal(watch.notice(notice('one', 'x'.repeat(301))), false);
+    assert.equal(watch.notice(notice('with space')), false);
+    for (const bad of [undefined, null, 'text', {}, { kind: 'example-kind', key: 'one' }, { kind: 'Example', key: 'one', text: NOTICE }]) {
+      assert.equal(watch.notice(bad), false);
+    }
+    assert.doesNotThrow(() => watch.notice());
+    assert.equal(watch.notice(notice('one', 'x'.repeat(300))), true, 'nothing above was remembered');
+    watch.stop();
+  });
+
+  it('puts a notice after the relogin lines of the same batch, leaving those lines as they were', async () => {
+    const run = async withNotice => {
+      const { watch, clock, fake } = setup();
+      watch.start();
+      await settle();
+      watch.noteRefreshFailed('alpha-example', 'NATIVE_REFRESH_REAUTH_REQUIRED');
+      if (withNotice) assert.equal(watch.notice(notice()), true);
+      clock.advance(MINUTE);
+      await settle();
+      const out = { slack: texts(fake), mac: fake.calls.notifyMac.map(call => call.body) };
+      watch.stop();
+      return out;
+    };
+    const plain = await run(false);
+    const mixed = await run(true);
+    assert.equal(mixed.slack.length, 1, 'one message');
+    assert.equal(mixed.mac.length, 1, 'one message');
+    assert.deepEqual(lines(mixed.slack[0]), [...lines(plain.slack[0]), NOTICE]);
+    assert.deepEqual(lines(mixed.mac[0]), [...lines(plain.mac[0]), NOTICE]);
+  });
+
+  it('keeps the status section keys the same after a notice is sent', async () => {
+    const { watch, clock, fake } = setup();
+    watch.start();
+    await settle();
+    const shape = section => ({
+      top: Object.keys(section),
+      active: Object.keys(section.active),
+      lastDelivery: Object.keys(section.lastDelivery),
+    });
+    const before = shape(watch.statusSection());
+    assert.equal(watch.notice(notice()), true);
+    clock.advance(MINUTE);
+    await settle();
+    assert.equal(fake.calls.postWebhook.length, 1);
+    const after = watch.statusSection();
+    assert.deepEqual(shape(after), before);
+    assert.equal(after.lastDelivery.webhook.result, 'ok');
+    assert.equal(after.queued, 0);
+    assert.equal(after.dropped, 0);
+    watch.stop();
+  });
+
+  it('sends nothing when stopped before the batch goes out, stops the sender once and refuses later notices', async () => {
+    const { watch, clock, fake } = setup();
+    watch.start();
+    await settle();
+    assert.equal(watch.notice(notice()), true);
+    watch.stop();
+    assert.equal(watch.notice(notice('two')), false);
+    clock.advance(2 * MINUTE);
+    await settle();
+    assert.equal(fake.calls.postWebhook.length, 0);
+    assert.equal(fake.calls.notifyMac.length, 0);
+    assert.equal(fake.calls.stop, 1);
+  });
+
+  it('delivers a relogin message and a notice one at a time through the same queue', async () => {
+    const waiting = [];
+    let inFlight = 0;
+    let maxInFlight = 0;
+    const { watch, clock, fake } = setup({
+      sender: {
+        webhook: () => {
+          inFlight += 1;
+          maxInFlight = Math.max(maxInFlight, inFlight);
+          return new Promise(resolve => waiting.push(() => {
+            inFlight -= 1;
+            resolve({ result: 'ok', reason: null });
+          }));
+        },
+      },
+    });
+    watch.start();
+    await settle();
+    watch.noteRefreshFailed('alpha-example', 'NATIVE_REFRESH_REAUTH_REQUIRED');
+    clock.advance(MINUTE);
+    await settle();
+    assert.equal(fake.calls.postWebhook.length, 1);
+    assert.equal(watch.notice(notice()), true);
+    clock.advance(MINUTE);
+    await settle();
+    assert.equal(fake.calls.postWebhook.length, 1, 'the second message waits for the first');
+    assert.equal(watch.statusSection().queued, 1);
+    waiting.shift()();
+    await settle();
+    assert.equal(fake.calls.postWebhook.length, 2);
+    assert.match(texts(fake)[0], /need a new login/);
+    assert.equal(texts(fake)[1], NOTICE);
+    waiting.shift()();
+    await settle();
+    assert.equal(maxInFlight, 1);
+    assert.equal(watch.statusSection().queued, 0);
+    watch.stop();
+  });
+
+  it('remembers at most a fixed number of keys, forgetting the oldest first', () => {
+    const { watch } = setup();
+    watch.start();
+    assert.equal(ALERT_MAX_NOTICE_KEYS, 512);
+    for (let i = 0; i < ALERT_MAX_NOTICE_KEYS; i += 1) {
+      assert.equal(watch.notice(notice(`key-${i}`)), true);
+    }
+    assert.equal(watch.notice(notice('key-0')), false, 'still remembered at the limit');
+    assert.equal(watch.notice(notice(`key-${ALERT_MAX_NOTICE_KEYS}`)), true);
+    assert.equal(watch.notice(notice('key-0')), true, 'the oldest key was forgotten');
+    assert.equal(watch.notice(notice('key-2')), false, 'newer keys are still remembered');
+    watch.stop();
+  });
+
+  it('removes the characters Slack reads as markup (<, > and &) instead of escaping them', async () => {
+    const { watch, clock, fake } = setup();
+    watch.start();
+    await settle();
+    assert.equal(watch.notice(notice('one', 'claude-rotator: model <!channel> & <https://example.invalid/x|link>.')), true);
+    assert.equal(watch.notice(notice('two', '<&>')), false, 'nothing is left to send');
+    assert.equal(watch.notice({ kind: 'example-kind', key: 'a<b', text: NOTICE }), false);
+    assert.equal(watch.notice({ kind: 'a&b', key: 'three', text: NOTICE }), false);
+    clock.advance(MINUTE);
+    await settle();
+    const expected = 'claude-rotator: model !channel  https://example.invalid/x|link.';
+    assert.deepEqual(texts(fake), [expected]);
+    assert.deepEqual(fake.calls.notifyMac.map(call => call.body), [expected]);
+    watch.stop();
   });
 });

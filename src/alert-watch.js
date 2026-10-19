@@ -58,8 +58,18 @@ export const ALERT_DISPERSION_CLEAR_RATE = 0.01;
 export const ALERT_DISPERSION_MIN_PAIRS = 300;
 /** Messages waiting for the sender. Overflow drops the oldest and is counted. */
 export const ALERT_MAX_QUEUED_MESSAGES = 20;
+/** `notice()` keys remembered for de-duplication. Past this, the oldest is forgotten. */
+export const ALERT_MAX_NOTICE_KEYS = 512;
 
 const MAX_TEXT_LENGTH = 3000;
+const NOTICE_KIND_PATTERN = /^[a-z][a-z0-9-]{0,31}$/;
+const NOTICE_KEY_PATTERN = /^[A-Za-z0-9._:@|+-]{1,160}$/;
+const NOTICE_TEXT_PATTERN = /^[\x20-\x7e]{1,300}$/;
+const BUILT_IN_KINDS = new Set(['relogin', 'failing', 'expiry', 'dispersion']);
+// Slack reads <, > and & as markup (links, mentions, escapes). A notice text can
+// carry values taken from requests, so these characters are removed rather than
+// escaped: an escape such as &amp; would show up as is in the Mac notification.
+const MARKUP_CHARACTERS = /[<>&]/g;
 const MAC_TITLE = 'claude-rotator';
 const WEBHOOK_FILE_PROBLEMS = new Set([
   'missing', 'not-absolute', 'type', 'mode', 'owner', 'size', 'format', 'scheme', 'read',
@@ -128,6 +138,8 @@ export function createAlertWatch({
   let sweepTimer = null;
   let flushTimer = null;
   let pending = [];
+  let notices = [];
+  const noticeKeys = new Set();
   const accounts = new Map();
   const dispersionOwner = { id: null, dispersion: null, rate: null, changes: 0, pairs: 0 };
   const queue = [];
@@ -176,6 +188,18 @@ export function createAlertWatch({
     setDispersionSource(fn) {
       dispersionSource = typeof fn === 'function' ? fn : null;
     },
+    /**
+     * Queues one short message from another watch. It goes out with the next
+     * batch, after the lines of the four alerts above, through the same sender.
+     * Returns false (never throws) when the watch is off or stopped, when a
+     * field does not fit its form, or when the same kind and key came before.
+     *
+     * @param {{kind: string, key: string, text: string}} input
+     * @returns {boolean}
+     */
+    notice(input) {
+      return guard(() => acceptNotice(input)) === true;
+    },
     statusSection() {
       try {
         return buildStatusSection();
@@ -213,6 +237,7 @@ export function createAlertWatch({
         stopped = true;
         clearTimers();
         pending = [];
+        notices = [];
         queue.length = 0;
         sender?.stop?.();
       });
@@ -245,6 +270,8 @@ export function createAlertWatch({
     if (!current.enabled) {
       clearTimers();
       pending = [];
+      notices = [];
+      noticeKeys.clear();
       queue.length = 0;
       accounts.clear();
       dispersionOwner.dispersion = null;
@@ -490,13 +517,33 @@ export function createAlertWatch({
     }
   }
 
+  function acceptNotice(input) {
+    if (!active()) return false;
+    const { kind, key, text } = input && typeof input === 'object' ? input : {};
+    if (typeof kind !== 'string' || !NOTICE_KIND_PATTERN.test(kind) || BUILT_IN_KINDS.has(kind)) return false;
+    if (typeof key !== 'string' || !NOTICE_KEY_PATTERN.test(key)) return false;
+    if (typeof text !== 'string') return false;
+    const clean = text.replace(MARKUP_CHARACTERS, '');
+    if (!NOTICE_TEXT_PATTERN.test(clean)) return false;
+    const dedupKey = `${kind}:${key}`;
+    if (noticeKeys.has(dedupKey)) return false;
+    noticeKeys.add(dedupKey);
+    // A Set keeps insertion order, so the first value is the oldest key.
+    while (noticeKeys.size > ALERT_MAX_NOTICE_KEYS) noticeKeys.delete(noticeKeys.values().next().value);
+    notices.push(clean);
+    scheduleFlush();
+    return true;
+  }
+
   function flush() {
     const items = pending;
     pending = [];
+    const noticeTexts = notices;
+    notices = [];
     if (!active()) return;
     const t = now();
     const live = items.filter(item => item.owner.id === null || accounts.get(item.owner.id) === item.owner);
-    if (live.length === 0) return;
+    if (live.length === 0 && noticeTexts.length === 0) return;
     for (const item of live) {
       const alert = item.type === 'new' ? item.owner[item.kind] : null;
       if (alert?.phase === 'pending') {
@@ -504,12 +551,12 @@ export function createAlertWatch({
         alert.lastNotifiedAt = t;
       }
     }
-    enqueueMessage(composeMessage(live, t));
+    enqueueMessage(composeMessage(live, t, noticeTexts));
   }
 
   // ---- message text ----
 
-  function composeMessage(items, t) {
+  function composeMessage(items, t, noticeTexts = []) {
     const slack = [];
     const mac = [];
     const ids = (type, kind) => unique(items
@@ -561,6 +608,10 @@ export function createAlertWatch({
     }
     if (ids('recovery', 'dispersion').length > 0) {
       const line = `claude-rotator: routing is back to normal (${percent(dispersionOwner.rate)}%).`;
+      slack.push(line);
+      mac.push(line);
+    }
+    for (const line of noticeTexts) {
       slack.push(line);
       mac.push(line);
     }

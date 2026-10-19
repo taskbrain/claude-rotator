@@ -13,6 +13,7 @@ import { promisify } from 'node:util';
 import zlib from 'node:zlib';
 
 import { AccountManager } from '../src/account-manager.js';
+import { OAUTH_BETA_HEADER } from '../src/oauth.js';
 import { MemorySecretStore } from '../src/secret-store.js';
 import { createProxyServer } from '../src/proxy-server.js';
 import { createUsageEventWriter, USAGE_EVENTS_FILENAME } from '../src/usage-events.js';
@@ -732,5 +733,78 @@ describe('usage-events.jsonl from forwardOnce', () => {
     assert.equal(events[0].outcome, 'upstream-error');
     assert.equal(events[0].statusCode, 200);
     assert.equal(events[0].usage, null);
+  });
+});
+
+describe('proxy line ua= and beta= from the client request headers', () => {
+  const CLIENT_HEADERS = {
+    'user-agent': 'claude-cli/2.1.303 (external, cli, workload/UA-MARKER-42)',
+    'anthropic-beta': 'example-capability,second-capability',
+  };
+
+  function okUpstream(seenBeta = []) {
+    return (req, res) => {
+      seenBeta.push(req.headers['anthropic-beta']);
+      res.writeHead(200, { 'content-type': 'application/json', 'request-id': 'req_client_fields' });
+      res.end(JSON.stringify({ id: 'msg_c', model: 'claude-sonnet-4-5', usage: { input_tokens: 5, output_tokens: 6 } }));
+    };
+  }
+
+  // The proxy line is written after the response, so wait until it shows up.
+  async function proxyLine(lines, { timeoutMs = 2000 } = {}) {
+    await waitFor(() => lines.some(line => / proxy /.test(line)), { timeoutMs });
+    const found = lines.filter(line => / proxy /.test(line));
+    assert.equal(found.length, 1, found.join('\n'));
+    return found[0];
+  }
+
+  async function send({ headers, accounts, secrets }) {
+    const dir = await tempDir();
+    const lines = [];
+    const seenBeta = [];
+    const { proxy } = await startProxy({
+      dir,
+      accounts,
+      secrets,
+      logger: line => lines.push(line),
+      upstreamHandler: okUpstream(seenBeta),
+    });
+    const response = await requestRaw(`${proxy.url}/v1/messages`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', ...headers },
+      body: JSON.stringify({ model: 'claude-sonnet-4-5' }),
+    });
+    assert.equal(response.status, 200);
+    const line = await proxyLine(lines);
+    const events = await readEvents(dir);
+    return { line, lines, events, seenBeta };
+  }
+
+  it('ends the proxy line (apart from hdrMs) with the client version and the beta digest, never the raw user-agent text', async () => {
+    const { line, lines } = await send({ headers: CLIENT_HEADERS });
+    assert.ok(line.replace(/ hdrMs=\d+$/, '').endsWith(' ua=2.1.303 beta=7c896b7a'), line);
+    for (const each of lines) assert.doesNotMatch(each, /UA-MARKER/);
+  });
+
+  it('adds neither field without the two headers and keeps the usage event keys unchanged', async () => {
+    const withHeaders = await send({ headers: CLIENT_HEADERS });
+    const without = await send({ headers: {} });
+    assert.doesNotMatch(without.line, / ua=/);
+    assert.doesNotMatch(without.line, / beta=/);
+    assert.equal(withHeaders.events.length, 1);
+    assert.equal(without.events.length, 1);
+    assert.deepEqual(Object.keys(without.events[0]).sort(), Object.keys(withHeaders.events[0]).sort());
+  });
+
+  it('digests the beta value the client sent, not the one sent upstream for an OAuth account', async () => {
+    const { line, seenBeta } = await send({
+      headers: CLIENT_HEADERS,
+      accounts: [{ id: 'acct_1', name: 'a@example.com', type: 'oauth' }],
+      secrets: {
+        acct_1: { accessToken: 'access-token-1', refreshToken: 'refresh-token-1', expiresAt: Date.now() + 2 * 60 * 60 * 1000 },
+      },
+    });
+    assert.deepEqual(seenBeta, [`example-capability,second-capability,${OAUTH_BETA_HEADER}`]);
+    assert.ok(line.replace(/ hdrMs=\d+$/, '').endsWith(' beta=7c896b7a'), line);
   });
 });

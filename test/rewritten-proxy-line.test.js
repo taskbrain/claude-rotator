@@ -109,7 +109,7 @@ describe('proxy line of a rewritten 429', () => {
     const line = lines[0];
     assert.match(
       line,
-      / status=529 .* upstreamStatus=429 gptPoolState=unknown claudePoolState=all-exhausted mappedFrom=429 (?:mappedFromType=\S+ )?mappedTo=529 mapReason=all_claude_accounts_exhausted mapPath=e .* g5h=0\.02 g7d=0 ustat=allowed_warning ovs=rejected ovu=false$/,
+      / status=529 .* upstreamStatus=429 gptPoolState=unknown claudePoolState=all-exhausted mappedFrom=429 (?:mappedFromType=\S+ )?mappedTo=529 mapReason=all_claude_accounts_exhausted mapPath=e .* g5h=0\.02 g7d=0 ustat=allowed_warning ovs=rejected ovu=false(?: hdrMs=\d+)?$/,
     );
     // The header-time rewrite happens before the upstream body is read, so this
     // pattern does not check mappedFromType (the field may or may not be there).
@@ -122,7 +122,7 @@ describe('proxy line of a rewritten 429', () => {
     assert.equal(response.status, 529);
     const lines = proxyLines(logLines);
     assert.equal(lines.length, 1, lines.join('\n'));
-    assert.match(lines[0], / status=529 .* mappedTo=529 mapReason=all_claude_accounts_exhausted mapPath=e .* usageParse=no-usage$/);
+    assert.match(lines[0], / status=529 .* mappedTo=529 mapReason=all_claude_accounts_exhausted mapPath=e .* usageParse=no-usage(?: hdrMs=\d+)?$/);
     assert.ok(!lines[0].includes(' g5h='), lines[0]);
   });
 
@@ -137,9 +137,9 @@ describe('proxy line of a rewritten 429', () => {
     const line = lines[0];
     assert.match(
       line,
-      / status=403 .* upstreamStatus=429 resetAt=\S+ gptPoolState=unusable claudePoolState=all-exhausted mappedFrom=429 (?:mappedFromType=\S+ )?mappedTo=403 mapReason=both_pools_unusable mapPath=e .* g5h=0\.02 g7d=0 ustat=allowed_warning ovs=rejected ovu=false$/,
+      / status=403 .* upstreamStatus=429 resetAt=\S+ gptPoolState=unusable claudePoolState=all-exhausted mappedFrom=429 (?:mappedFromType=\S+ )?mappedTo=403 mapReason=both_pools_unusable mapPath=e .* g5h=0\.02 g7d=0 ustat=allowed_warning ovs=rejected ovu=false(?: hdrMs=\d+)?$/,
     );
-    assert.ok(line.endsWith(GRACE_TAIL), line);
+    assert.ok(line.replace(/ hdrMs=\d+$/, '').endsWith(GRACE_TAIL), line);
     assert.deepEqual(line.match(STATUS_AND_OUTCOME), [' status=403', ' outcome=rate-limit-passthrough']);
   });
 

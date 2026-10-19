@@ -17,8 +17,9 @@
 // The table below duplicates strings from src/. The test suite checks that
 // every string in the table still appears in the source file it names,
 // compares the exported OAuth and session id header constants by value, and
-// compares the refresh child's environment variables and the canonical Fable
-// ids in both directions.
+// compares the refresh child's environment variables, the canonical Fable ids
+// and the quoted x-claude-code-* request header names in src/ in both
+// directions.
 //
 // Usage: node scripts/claude-update-compat.js <path-to-binary>
 // Exit codes: 0 ok, 1 warn, 2 unknown, 64 usage error.
@@ -211,6 +212,14 @@ export const STRING_CHECKS = Object.freeze([
     caseInsensitive: false,
     sources: ['src/proxy-server.js'],
     strings: ['/v1/messages'],
+  },
+  {
+    id: 'request-class-header',
+    description: 'Request header the proxy reads to set the request class it logs as rc=',
+    weight: 'low',
+    caseInsensitive: true,
+    sources: ['src/proxy-server.js'],
+    strings: ['x-claude-code-request-class'],
   },
 ]);
 
