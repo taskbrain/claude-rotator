@@ -68,8 +68,8 @@ class AccountFileLock {
     this.localProcessIdentityPromise = null;
   }
 
-  async run(accountId, operation) {
-    const lease = await this.acquire(accountId);
+  async run(accountId, operation, { acquireTimeoutMs } = {}) {
+    const lease = await this.acquire(accountId, { acquireTimeoutMs });
     try {
       return await operation(lease);
     } finally {
@@ -77,8 +77,13 @@ class AccountFileLock {
     }
   }
 
-  async acquire(accountId) {
+  async acquire(accountId, { acquireTimeoutMs } = {}) {
     assertSafeAccountId(accountId);
+    // A per-call bound may only shorten the store bound; anything that is not
+    // a finite non-negative number falls back to the store bound.
+    const timeoutMs = Number.isFinite(acquireTimeoutMs) && acquireTimeoutMs >= 0
+      ? Math.min(acquireTimeoutMs, this.acquireTimeoutMs)
+      : this.acquireTimeoutMs;
     await ensureDirectoryDurable(this.lockDir, 0o700);
     await chmod(this.lockDir, 0o700);
     const lockPath = join(this.lockDir, `${accountId}.lock`);
@@ -92,7 +97,7 @@ class AccountFileLock {
         now: this.now(),
         processIdentityImpl: this.processIdentityImpl,
       })) {
-        await this.waitForRetry(accountId, startedAt);
+        await this.waitForRetry(accountId, startedAt, timeoutMs);
         continue;
       }
 
@@ -124,7 +129,7 @@ class AccountFileLock {
                 ownerProcessIdentity,
               });
             }
-            await this.waitForRetry(accountId, startedAt);
+            await this.waitForRetry(accountId, startedAt, timeoutMs);
             continue;
           }
         } catch (error) {
@@ -178,14 +183,14 @@ class AccountFileLock {
         continue;
       }
 
-      await this.waitForRetry(accountId, startedAt);
+      await this.waitForRetry(accountId, startedAt, timeoutMs);
     }
   }
 
-  async waitForRetry(accountId, startedAt) {
+  async waitForRetry(accountId, startedAt, timeoutMs) {
     const elapsedMs = this.monotonicNow() - startedAt;
-    if (elapsedMs >= this.acquireTimeoutMs) throw lockTimeoutError(accountId);
-    await this.sleepImpl(Math.min(this.retryMs, this.acquireTimeoutMs - elapsedMs));
+    if (elapsedMs >= timeoutMs) throw lockTimeoutError(accountId);
+    await this.sleepImpl(Math.min(this.retryMs, timeoutMs - elapsedMs));
   }
 
   async localProcessIdentity() {
@@ -1142,12 +1147,12 @@ export class LinuxFileSecretStore {
     return this.getUnlocked(accountId);
   }
 
-  async getOperational(accountId) {
+  async getOperational(accountId, { lockAcquireTimeoutMs } = {}) {
     return this.accountLock.run(accountId, async () => cloneSecret(await assertOperationalCredential(
       this.refreshIntents,
       accountId,
       await this.getUnlocked(accountId),
-    )));
+    )), { acquireTimeoutMs: lockAcquireTimeoutMs });
   }
 
   async getUnlocked(accountId) {
@@ -1350,12 +1355,12 @@ export class MacOSKeychainSecretStore {
     return this.getUnlocked(accountId);
   }
 
-  async getOperational(accountId) {
+  async getOperational(accountId, { lockAcquireTimeoutMs } = {}) {
     return this.accountLock.run(accountId, async () => cloneSecret(await assertOperationalCredential(
       this.refreshIntents,
       accountId,
       await this.getUnlocked(accountId),
-    )));
+    )), { acquireTimeoutMs: lockAcquireTimeoutMs });
   }
 
   async getUnlocked(accountId) {
