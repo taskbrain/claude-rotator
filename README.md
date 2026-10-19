@@ -671,10 +671,10 @@ Webhook は Slack 互換の Incoming Webhook（`{"text": "..."}` を JSON で PO
 
 - macOS の通知には、「スクリプトエディタ」（Script Editor）の通知の許可が要ります。スクリプトエディタで `display notification "test"` を1回実行して許可し、システム設定 → 通知 → スクリプトエディタで通知を許可してください。集中モードの間は出ないことがあり、出なかったことは claude-rotator からは分かりません（`/internal/status` の `alerts.lastDelivery.mac` の `exited-0` は、`osascript` が終了コード0で終わったことだけを表します）。
 - 受け口の側で Webhook が無効になった場合（取り消し・チャンネルのアーカイブなど）は、`webhook:` は `usable` のままで、`last webhook: rejected-<状態コード> (<理由>)` のように最後の送信の結果に出ます。
-- 試しに送るコマンドはありません。届くかどうかは、ご自身の端末から1回だけ送って確かめてください（URL がシェルの履歴に残らない形です）:
+- 試しに送るコマンドはありません。届くかどうかは、ご自身の端末から1回だけ送って確かめてください（URL は、コマンドの引数（`ps` の出力）にもシェルの履歴にも載りません）:
 
   ```bash
-  curl -X POST -H 'Content-type: application/json' --data '{"text":"test"}' "$(cat /path/to/webhook-url)"
+  { printf 'url = "'; tr -d '[:space:]' < /path/to/webhook-url; printf '"\n'; } | curl -K - -X POST -H 'Content-type: application/json' --data '{"text":"test"}'
   ```
 
 - URL が漏れたときは、受け口を作ったサービスの側でその Webhook を消して作り直し、新しい URL でファイルを置き直してください。次の送信から新しい URL を使います。
@@ -2142,10 +2142,10 @@ The settings are read again when the resident server restarts or on `POST /inter
 
 - macOS notifications need permission for Script Editor. Run `display notification "test"` once in Script Editor and allow it, then allow notifications for Script Editor under System Settings → Notifications. They may not show during a Focus mode, and claude-rotator cannot tell when one did not show (`exited-0` in `alerts.lastDelivery.mac` of `/internal/status` only means `osascript` exited with code 0).
 - When the receiving side turns the webhook off (revoked, channel archived, and so on), `webhook:` still reads `usable`; it shows in the result of the last delivery instead, such as `last webhook: rejected-<status code> (<reason>)`.
-- There is no command that sends a test alert. To check delivery, send once from your own terminal (the URL stays out of your shell history):
+- There is no command that sends a test alert. To check delivery, send once from your own terminal (the URL appears neither in the command's arguments, which `ps` shows, nor in your shell history):
 
   ```bash
-  curl -X POST -H 'Content-type: application/json' --data '{"text":"test"}' "$(cat /path/to/webhook-url)"
+  { printf 'url = "'; tr -d '[:space:]' < /path/to/webhook-url; printf '"\n'; } | curl -K - -X POST -H 'Content-type: application/json' --data '{"text":"test"}'
   ```
 
 - If the URL leaks, delete the webhook on the service that issued it, create a new one, and replace the file with the new URL. The next send uses the new URL.
