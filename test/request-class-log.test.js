@@ -131,7 +131,7 @@ describe('proxy line rc= from x-claude-code-request-class', () => {
 
     assert.equal(response.status, 200);
     const line = await proxyLine(lines);
-    assert.ok(line.endsWith(' rc=auxiliary'), line);
+    assert.ok(line.replace(/ hdrMs=\d+$/, '').endsWith(' rc=auxiliary'), line);
     assert.equal(upstreamSeen.length, 1);
     assert.equal(upstreamSeen[0]['x-claude-code-request-class'], 'auxiliary');
   });
@@ -144,7 +144,7 @@ describe('proxy line rc= from x-claude-code-request-class', () => {
     assert.equal(response.status, 200);
     const line = await proxyLine(lines);
     assert.doesNotMatch(line, / rc=/);
-    assert.match(line, / enc=\S+$/);
+    assert.match(line, / enc=\S+(?: hdrMs=\d+)?$/);
   });
 
   it('maps an unknown value to rc=other and never writes body or header text to any line', async () => {
@@ -162,7 +162,7 @@ describe('proxy line rc= from x-claude-code-request-class', () => {
 
     assert.equal(response.status, 200);
     const line = await proxyLine(lines);
-    assert.ok(line.endsWith(' rc=other'), line);
+    assert.ok(line.replace(/ hdrMs=\d+$/, '').endsWith(' rc=other'), line);
     for (const logged of lines) {
       assert.doesNotMatch(logged, /BODY-MARKER/);
       assert.doesNotMatch(logged, /HEADER-MARKER/);

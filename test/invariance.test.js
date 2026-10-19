@@ -1896,6 +1896,7 @@ function normalizeLogLines(lines) {
   return lines.map(line => line
     .replace(/^\d{4}-\d{2}-\d{2}T[\d:.]+Z/, '<ts>')
     .replace(/durationMs=\d+/g, 'durationMs=<n>')
+    .replace(/hdrMs=\d+/g, 'hdrMs=<n>')
     .replace(/127\.0\.0\.1:\d+/g, '127.0.0.1:<port>'));
 }
 

@@ -14971,7 +14971,7 @@ describe('cache observability', () => {
     const { usage } = accountManager.getStatus().accounts[0];
     assert.equal(usage.totalRequests, 0);
     assert.equal(usage.totalCacheReadTokens, 0);
-    assert.match(proxyLine(logLines), / enc=snappy usageParse=unsupported-encoding$/);
+    assert.match(proxyLine(logLines), / enc=snappy usageParse=unsupported-encoding(?: hdrMs=\d+)?$/);
   });
 
   it('proxy 行の末尾へ決まった順序で観測を追記する', async () => {
@@ -14996,7 +14996,7 @@ describe('cache observability', () => {
     await waitForStatus(() => proxyLine(logLines), line => line !== undefined);
     assert.match(
       proxyLine(logLines),
-      / model=claude-opus-5-1 sid=[0-9a-f]{12} in=10 out=20 cr=99000 cc=1500 c1h=1500 c5m=0 u5h=0\.76 u5hReset=1789012345 u7d=0\.33 u7dReset=1789098765 enc=gzip$/,
+      / model=claude-opus-5-1 sid=[0-9a-f]{12} in=10 out=20 cr=99000 cc=1500 c1h=1500 c5m=0 u5h=0\.76 u5hReset=1789012345 u7d=0\.33 u7dReset=1789098765 enc=gzip(?: hdrMs=\d+)?$/,
     );
     // 生のセッション id はどこにも出さない。
     assert.ok(!logLines.join('\n').includes('synthetic-session-0001'));
@@ -15029,7 +15029,7 @@ describe('cache observability', () => {
     await waitForStatus(() => proxyLine(logLines), line => line !== undefined);
     assert.match(
       proxyLine(logLines),
-      / u7dReset=1789098765 enc=gzip g5h=0\.02 g7d=0 ustat=allowed_warning ovs=rejected ovu=false$/,
+      / u7dReset=1789098765 enc=gzip g5h=0\.02 g7d=0 ustat=allowed_warning ovs=rejected ovu=false(?: hdrMs=\d+)?$/,
     );
   });
 
@@ -15054,7 +15054,7 @@ describe('cache observability', () => {
       });
       await waitForStatus(() => proxyLine(logLines), line => line !== undefined);
       // 時刻・所要時間は要求ごとに変わるので、比較は outcome= 以降に限る。
-      return proxyLine(logLines).replace(/^.* outcome=/, 'outcome=');
+      return proxyLine(logLines).replace(/^.* outcome=/, 'outcome=').replace(/ hdrMs=\d+$/, '');
     };
 
     const plain = await runOnce({});
