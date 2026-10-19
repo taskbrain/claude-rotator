@@ -31,6 +31,7 @@ npm レジストリでは配布していません（`package.json` は `"private
 - [OAuth認証情報の自動更新](#oauth認証情報の自動更新)
 - [設定ファイルと環境変数](#設定ファイルと環境変数)
   - [セッション単位のアカウント固定（sessionAffinity）](#セッション単位のアカウント固定sessionaffinity)
+  - [再ログインなどの知らせ（alerts）](#再ログインなどの知らせalerts)
 - [ログと切り替え診断](#ログと切り替え診断)
   - [キャッシュ観測（`observability`）](#キャッシュ観測observability)
   - [使用量イベント（`usage-events.jsonl`）](#使用量イベントusage-eventsjsonl)
@@ -390,6 +391,7 @@ Events
 - Usage API がモデル別週次枠（`limits[]`）を返す場合は、`7d Fable` のような追加行がさらに表示されます。
 - `requests:` はそのアカウントで proxy が転送した累計リクエスト数です。
 - [セッション単位のアカウント固定](#セッション単位のアカウント固定sessionaffinity)（`sessionAffinity`）を有効にしている場合は、アカウントカードの下に `Session Affinity` の行が追加され、`mode`、保持しているセッション数と上限、セッション鍵が付いていたリクエストの割合、アカウント別・切り替え理由別・退避理由別の内訳を表示します（`mode: "off"` では1行も表示しません）。
+- [再ログインなどの知らせ](#再ログインなどの知らせalerts)（`alerts`）を設定している場合は、`Events` の上に `Alerts` の行が1行加わり、macOS の通知の有無（`mac: on` / `off`）、Webhook の状態（`off` / `usable` / `unusable (<分類>)`）、いま続いている知らせの数（`needs login`・`failing`・`expiring soon`・`dispersion`。無ければ `none`）を表示します。最後の Webhook の送信がうまくいかなかった場合は `last webhook:` にその結果を、送り待ち・捨てた知らせがあれば `queued:` / `dropped:` を足します（`alerts` を書いていなければ1行も表示しません）。
 - `Events` には直近の切り替え・リクエスト・エラーが最大8件表示されます。
 
 十分に広い端末では `Routing availability` とアカウントカードを横2列にし、全行が収まらない場合は情報を切り捨てず縦1列へ戻します。`monitor` は端末のリサイズにも追従します。
@@ -628,6 +630,55 @@ claude-rotator status
 
 **`runtime-state.json` の書き込み方式の変更は `mode` に連動しません。** 本機能の追加にあわせて、`runtime-state.json` は「一時ファイルへ書く → `fsync` → `rename` → 親ディレクトリを `sync`」（パーミッションは `0600`）の順で保存するようになりました。電源断やカーネルパニックで直前の保存がまるごと失われることを防ぐためで、**同じ書き込み経路を共有するアカウント台帳の保存も同時に耐久化されます。** この結線は `mode` の値を見ないため、**`mode` を `"off"` に戻しても、`POST /internal/reload` を呼んでも残ります**（切戻しで消える変更ではありません）。書き込む内容は変わらないので `runtime-state.json` の中身は現行と同一で、`fsync` が2回増える分だけ1回の保存にかかる時間が延びます。
 
+### 再ログインなどの知らせ（`alerts`）
+
+`alerts` は、人の手当てが要る状態を macOS の通知と Webhook で知らせるための任意のセクションです。
+
+**既定は無効です。** このセクションを書かなければ（または2つのキーがどちらも無効なら）何も送らず、このセクションによる `status` の出力・`/internal/status`・ログの変化もありません。`sessionAffinity` の `mode` が `"on"` のときに `/internal/status` の `sessionAffinity` 節へ加わるキーは、このセクションの有無とは関係なく加わります（[セッション単位のアカウント固定](#セッション単位のアカウント固定sessionaffinity)）。
+
+```json
+"alerts": {
+  "macNotification": true,
+  "webhookUrlFile": "/path/to/webhook-url"
+}
+```
+
+| キー | 既定値 | 意味 |
+|---|---|---|
+| `alerts.macNotification` | `false` | 真偽値の `true` のときだけ macOS の通知を出します（`osascript` を使います。macOS 以外では何もしません） |
+| `alerts.webhookUrlFile` | なし | Webhook の URL を書いたファイルの**絶対パス**。URL そのものは `config.json` に書きません |
+
+Webhook は Slack 互換の Incoming Webhook（`{"text": "..."}` を JSON で POST して受け取るもの）を想定しています。URL のファイルの決まり:
+
+- 中身は `https://` で始まる URL の1行だけにします。
+- claude-rotator を動かす利用者が持ち主で、持ち主だけが読める権限（`chmod 600`）にします。グループやほかの利用者が読める・シンボリックリンク・4 KiB を超える・`https` でない・利用者名やパスワードを含む、のどれかに当たると使えません。
+- 送るたびに読み直します。ファイルを置き直せば、次の送信から新しい URL を使います。
+- 使えないときは送らず、`server.log` に `alert-config warning=<分類>` を1行出し、`status` の `Alerts` の行に `webhook: unusable (<分類>)` と出します。分類は `missing`・`not-absolute`・`type`・`mode`・`owner`・`size`・`format`・`scheme`・`read` です。URL とファイルのパスは、ログにも画面にも出しません。
+
+知らせの種類:
+
+- **再ログインが要る** — アカウントの資格情報の更新が、再ログインしないと直らない形で失敗した。
+- **更新の失敗が続く** — 資格情報の更新の失敗や `error` の状態が、正常に戻らないまま30分続いた。
+- **期限が近い** — 分かっている資格情報の期限まで24時間を切った（期限ごとに1回）。3日以内に切れるアカウントも並べます。
+- **送り先の散らばり** — `sessionAffinity` の `mode` が `on` のとき、同じセッションの続きのリクエストが前と別のアカウントへ送られた割合が、直近60分で 2% 以上になった（続きのリクエストが300件未満の間は判定せず、1% 未満で戻ります）。
+- **回復と念押し** — 再ログインが要る・更新の失敗が続く・送り先の散らばりを知らせた後に直れば、回復の知らせを送ります。6時間たっても続いているものは、頭に `Still unresolved:` を付けてまとめて送り直します。
+
+60秒の間に生じた知らせは1通にまとめます。文は英語です。Webhook の本文にはアカウント id の先頭3字だけを、macOS の通知には id の全部と `claude-rotator login --id <id>` を載せます。アカウント名・トークン・セッション ID は載せません。
+
+設定は常駐 server の再起動か `POST /internal/reload`（`claude-rotator login` の後にも走ります）で読み直します。
+
+**注意:**
+
+- macOS の通知には、「スクリプトエディタ」（Script Editor）の通知の許可が要ります。スクリプトエディタで `display notification "test"` を1回実行して許可し、システム設定 → 通知 → スクリプトエディタで通知を許可してください。集中モードの間は出ないことがあり、出なかったことは claude-rotator からは分かりません（`/internal/status` の `alerts.lastDelivery.mac` の `exited-0` は、`osascript` が終了コード0で終わったことだけを表します）。
+- 受け口の側で Webhook が無効になった場合（取り消し・チャンネルのアーカイブなど）は、`webhook:` は `usable` のままで、`last webhook: rejected-<状態コード> (<理由>)` のように最後の送信の結果に出ます。
+- 試しに送るコマンドはありません。届くかどうかは、ご自身の端末から1回だけ送って確かめてください（URL は、コマンドの引数（`ps` の出力）にもシェルの履歴にも載りません）:
+
+  ```bash
+  { printf 'url = "'; tr -d '[:space:]' < /path/to/webhook-url; printf '"\n'; } | curl -K - -X POST -H 'Content-type: application/json' --data '{"text":"test"}'
+  ```
+
+- URL が漏れたときは、受け口を作ったサービスの側でその Webhook を消して作り直し、新しい URL でファイルを置き直してください。次の送信から新しい URL を使います。
+
 ## ログと切り替え診断
 
 `status` / `monitor` の Events には、直近の proxy request が表示されます。
@@ -735,7 +786,7 @@ proxy request ログに出るのは `account`、`method`、`path`、`status`、`
 
 `/internal/status` には `sessionAffinity` 節が増えます（**`mode: "off"` ではキー自体がありません**）。内訳は `mode`、`sessions`（保持しているセッション数）、`capacity`（`maxSessions`）、`warmTtlMs`、`sessionsByAccount`（アカウント別のセッション数。**Fable 用の副バインドで1つのセッションが2つのアカウントに数えられるため、合計はセッション総数と一致しません**）、`warmSessionsByAccount`（そのうちキャッシュがまだ生きているとみなしているセッション数。`sessionsByAccount` との差が、冷えたまま表に残っているセッションです）、`switchesByReason`、`evictionsByReason`、`requests`（`proxied` = 転送したリクエスト数、`keyed` = うちセッション鍵が付いていた数）、`sidRate`（`keyed / proxied` を小数第4位で丸めた値。転送が0件なら `null`）です。`claude-rotator status` / `monitor` では、同じ内容を `Session Affinity` の行として表示します。
 
-`mode: "on"` のときだけ、この節に `newAssignmentOrder` が加わります（**`observe` と `off` ではキー自体がありません**）。セッション鍵の付いた新しいセッションをどのアカウントへ割り当てるかの順番で、Fable のリクエスト用の `fable` と、それ以外のリクエスト用の `other` の2本の配列です。各行は `account`（アカウントの ID）、`accountName`、`overStopLine` の3項目で、いま使えるアカウントだけが載ります。空の配列は、その系統でいま割り当てられるアカウントが無いことを表します。
+`mode: "on"` のときだけ、この節に `newAssignmentOrder`・`detoursByAccount`・`dispersion` の3つが加わります（**`observe` と `off` ではキー自体がありません**）。`newAssignmentOrder` は、セッション鍵の付いた新しいセッションをどのアカウントへ割り当てるかの順番で、Fable のリクエスト用の `fable` と、それ以外のリクエスト用の `other` の2本の配列です。各行は `account`（アカウントの ID）、`accountName`、`overStopLine` の3項目で、いま使えるアカウントだけが載ります。空の配列は、その系統でいま割り当てられるアカウントが無いことを表します。
 
 - 1番目は、いまセッション鍵付きの新しいセッションが来たときの割り当て先です。k番目は、上の k-1 個がそのリクエストで使えなかったときの割り当て先です。
 - `overStopLine` が `true` の行は、使用率が `assignStopUtilization` 以上か、使用率をまだ1つも読めていないアカウントです。`assignStopUtilization` の内側のアカウントが残っていないときにだけ選ばれます。`fable` の並びでは、使用率は Fable 固有枠も含めた、いちばんきつい枠で見ます。
@@ -744,7 +795,12 @@ proxy request ログに出るのは `account`、`method`、`path`、`status`、`
 - セッション鍵の無いリクエストはこの並びに従わず、従来どおりの選び方で処理されます。
 - 応答ヘッダで枯渇と分かった 429 の後は、試したアカウントを除いて同じ選び方で選び直します（新しいセッションなら、この並びの次のアカウントです）。Fable のリクエストで、使用量の照会で枯渇を確かめた後の1回の再送だけは、この並びではなく、セッション鍵の無いリクエストの自動切り替えと同じ比べ方で候補から選びます。
 
-`newAssignmentOrder` は JSON にだけ出ます。`status` / `monitor` の画面には表示しません。
+残りの2つは、送り先がアカウントの間で散らばっていないかを見るためのものです。
+
+- `detoursByAccount` — いま迂回中のセッションの数を、迂回先のアカウントごとに数えたものです（1つのセッションは、1つのアカウントにつき1回だけ数えます）。迂回先は `warmSessionsByAccount` に入らないので、迂回先が1つのアカウントに集まっていないかはこの数で見ます。
+- `dispersion` — セッション鍵の付いたリクエストで、同じセッションの1つ前のリクエストがあるもののうち、実際に送ったアカウントが前と変わった割合です（直近60分）。`windowMs`（数える窓の長さ。`3600000`）、`pairs`（前のリクエストがあるリクエストの数）、`changes`（そのうち送り先が前と変わった数）、`rate`（`changes / pairs`。`pairs` が0なら `null`）の4項目です。数えた値は保存しないので、再起動すると0から数え直します。
+
+この3つは JSON にだけ出ます。`status` / `monitor` の画面には表示しません。
 
 `mode` が `off` 以外のときは、`status` / `monitor` の `Events`（直近の切り替え・リクエスト）も `runtime-state.json` へ保存され、再起動後も残ります。保持するのは最新50件です。`mode: "off"` では保存も復元もしないため、`runtime-state.json` の内容は現行と同一です。
 
@@ -1429,6 +1485,7 @@ This package is not published to the npm registry (`package.json` sets `"private
 - [Automatic OAuth Credential Refresh](#automatic-oauth-credential-refresh)
 - [Configuration and Environment Variables](#configuration-and-environment-variables)
   - [Per-Session Account Pinning (sessionAffinity)](#per-session-account-pinning-sessionaffinity)
+  - [Alerts for Re-Login and Other Problems (alerts)](#alerts-for-re-login-and-other-problems-alerts)
 - [Logs and Rotation Diagnostics](#logs-and-rotation-diagnostics)
   - [Per-Request Usage Events (usage-events.jsonl)](#per-request-usage-events-usage-eventsjsonl)
 - [Switching Codex Accounts (codex-rotator)](#switching-codex-accounts-codex-rotator)
@@ -1819,6 +1876,7 @@ What each line means:
 - If the Usage API returns model-scoped weekly limits (`limits[]`), an extra row appears, such as `7d Fable`.
 - `requests:` is the cumulative number of requests the proxy has forwarded for that account.
 - When [Per-Session Account Pinning](#per-session-account-pinning-sessionaffinity) (`sessionAffinity`) is enabled, a `Session Affinity` block appears below the account cards showing the `mode`, the number of sessions held and the capacity, the share of forwarded requests that carried a session key, and the per-account, per-switch-reason, and per-eviction-reason breakdowns (nothing is printed while `mode` is `"off"`).
+- When [alerts](#alerts-for-re-login-and-other-problems-alerts) (`alerts`) are configured, one `Alerts` line appears above `Events` showing whether macOS notifications are on (`mac: on` / `off`), the webhook state (`off` / `usable` / `unusable (<class>)`), and the count of alerts that are currently active (`needs login`, `failing`, `expiring soon`, `dispersion`, or `none`). If the last webhook delivery did not succeed, its result is added as `last webhook:`, and `queued:` / `dropped:` are added when alerts are waiting or were dropped (nothing is printed while `alerts` is not written).
 - `Events` shows up to the 8 most recent switches, requests, and errors.
 
 On a wide terminal, `Routing availability` and account cards use two columns. If every line does not fit, the renderer falls back to one vertical column without truncating information. `monitor` also responds to terminal resizing.
@@ -2044,6 +2102,55 @@ The three values of `mode`:
 
 **The change to how `runtime-state.json` is written does not follow `mode`.** Alongside this feature, `runtime-state.json` is now saved as "write a temporary file → `fsync` → `rename` → `sync` the parent directory" (with `0600` permissions), so a power loss or a kernel panic can no longer lose the previous save wholesale. **The account ledger shares the same writer, so it becomes durable at the same time.** That wiring never looks at `mode`, so **it stays in place after you set `mode` back to `"off"` and after `POST /internal/reload`** — it is not one of the changes a rollback removes. What is written is unchanged, so the contents of `runtime-state.json` stay identical to today; each save just costs two more `fsync` calls.
 
+#### Alerts for Re-Login and Other Problems (`alerts`)
+
+`alerts` is an optional section that reports states needing a human through macOS notifications and a webhook.
+
+**Disabled by default.** If you do not write this section (or both keys are off), nothing is sent, and this section changes nothing in the `status` output, `/internal/status`, or the logs. The keys that the `sessionAffinity` section of `/internal/status` gains while `sessionAffinity.mode` is `"on"` are added whether or not this section exists (see [Per-Session Account Pinning](#per-session-account-pinning-sessionaffinity)).
+
+```json
+"alerts": {
+  "macNotification": true,
+  "webhookUrlFile": "/path/to/webhook-url"
+}
+```
+
+| Key | Default | Meaning |
+|---|---|---|
+| `alerts.macNotification` | `false` | Shows macOS notifications only when it is the boolean `true` (through `osascript`; does nothing on other platforms) |
+| `alerts.webhookUrlFile` | none | **Absolute path** of the file that holds the webhook URL. The URL itself is never written into `config.json` |
+
+The webhook is expected to be a Slack-compatible incoming webhook (one that accepts `{"text": "..."}` POSTed as JSON). Rules for the URL file:
+
+- It holds only the URL, on one line, starting with `https://`.
+- It is owned by the user running claude-rotator and readable by the owner only (`chmod 600`). It is not used if it is readable by the group or others, is a symbolic link, is larger than 4 KiB, is not `https`, or carries a user name or password.
+- It is read again on every send. Replace the file and the next send uses the new URL.
+- When it cannot be used, nothing is sent, `server.log` gets one `alert-config warning=<class>` line, and the `Alerts` line of `status` shows `webhook: unusable (<class>)`. The classes are `missing`, `not-absolute`, `type`, `mode`, `owner`, `size`, `format`, `scheme`, and `read`. Neither the URL nor the file path is written to the logs or the screen.
+
+Kinds of alerts:
+
+- **Needs a new login** — refreshing an account's credential failed in a way that only a new login fixes.
+- **Refresh keeps failing** — credential refresh failures or the `error` state have lasted 30 minutes without returning to normal.
+- **Expiring soon** — a known credential expiry is less than 24 hours away (once per expiry). Accounts expiring within 3 days are listed too.
+- **Requests spreading across accounts** — with `sessionAffinity` `mode` set to `on`, the share of follow-up requests of a session that went to a different account than the previous request reached 2% or more over the last 60 minutes (not judged while there are fewer than 300 follow-up requests; it clears below 1%).
+- **Recovery and reminders** — after a needs-a-new-login, refresh-keeps-failing, or spreading alert, a recovery message is sent once it is fixed. Anything still active after 6 hours is sent again, together, prefixed with `Still unresolved:`.
+
+Alerts that come up within 60 seconds go out as one message. The text is in English. The webhook text carries only the first 3 characters of an account id; the macOS notification carries the whole id and `claude-rotator login --id <id>`. Account names, tokens, and session ids are never included.
+
+The settings are read again when the resident server restarts or on `POST /internal/reload` (which `claude-rotator login` also triggers).
+
+**Notes:**
+
+- macOS notifications need permission for Script Editor. Run `display notification "test"` once in Script Editor and allow it, then allow notifications for Script Editor under System Settings → Notifications. They may not show during a Focus mode, and claude-rotator cannot tell when one did not show (`exited-0` in `alerts.lastDelivery.mac` of `/internal/status` only means `osascript` exited with code 0).
+- When the receiving side turns the webhook off (revoked, channel archived, and so on), `webhook:` still reads `usable`; it shows in the result of the last delivery instead, such as `last webhook: rejected-<status code> (<reason>)`.
+- There is no command that sends a test alert. To check delivery, send once from your own terminal (the URL appears neither in the command's arguments, which `ps` shows, nor in your shell history):
+
+  ```bash
+  { printf 'url = "'; tr -d '[:space:]' < /path/to/webhook-url; printf '"\n'; } | curl -K - -X POST -H 'Content-type: application/json' --data '{"text":"test"}'
+  ```
+
+- If the URL leaks, delete the webhook on the service that issued it, create a new one, and replace the file with the new URL. The next send uses the new URL.
+
 ### Logs and Rotation Diagnostics
 
 `status` / `monitor`'s Events show the most recent proxy requests:
@@ -2085,7 +2192,7 @@ None of these lines contains a raw session id or a token (`sid` is the 12-digit 
 
 `/internal/status` gains a `sessionAffinity` section (**the key itself is absent while `mode` is `"off"`**) containing `mode`, `sessions` (how many sessions are held), `capacity` (`maxSessions`), `warmTtlMs`, `sessionsByAccount` (sessions per account — **a Fable sub-binding makes one session count towards two accounts, so this never sums to the session total**), `warmSessionsByAccount` (how many of those are still treated as holding a cache; the difference from `sessionsByAccount` is what has gone cold while staying in the table), `switchesByReason`, `evictionsByReason`, `requests` (`proxied` = requests forwarded, `keyed` = how many of them carried a session key), and `sidRate` (`keyed / proxied`, rounded to four decimal places; `null` when nothing has been forwarded). `claude-rotator status` / `monitor` shows the same values as a `Session Affinity` block.
 
-Only while `mode` is `"on"`, the section also carries `newAssignmentOrder` (**the key itself is absent in `observe` and `off`**). It is the order in which a new session that carries a session key would be assigned to an account, as two arrays: `fable` for Fable requests and `other` for every other request. Each row has three fields — `account` (the account ID), `accountName`, and `overStopLine` — and only accounts that are usable right now are listed. An empty array means no account can take a new session of that family right now.
+Only while `mode` is `"on"`, the section also carries three more keys: `newAssignmentOrder`, `detoursByAccount`, and `dispersion` (**the keys themselves are absent in `observe` and `off`**). `newAssignmentOrder` is the order in which a new session that carries a session key would be assigned to an account, as two arrays: `fable` for Fable requests and `other` for every other request. Each row has three fields — `account` (the account ID), `accountName`, and `overStopLine` — and only accounts that are usable right now are listed. An empty array means no account can take a new session of that family right now.
 
 - The first row is where a new session with a session key would be assigned right now. The k-th row is where it would be assigned if the k-1 rows above it could not be used for that request.
 - A row whose `overStopLine` is `true` is an account whose usage ratio is at or above `assignStopUtilization`, or none of whose usage windows has been read yet. It is chosen only when no account inside `assignStopUtilization` is left. In the `fable` array, the usage ratio is that of the tightest window, the Fable-specific allowance included.
@@ -2094,7 +2201,12 @@ Only while `mode` is `"on"`, the section also carries `newAssignmentOrder` (**th
 - A request without a session key does not follow this order; it is routed exactly as it is today.
 - After a 429 whose response headers show the quota is exhausted, the request is re-routed the same way with the accounts already tried excluded (for a new session, that is the next row of this order). The one exception is a Fable request that is resent once after a usage lookup has confirmed the exhaustion: that resend does not use this order, and picks from its candidates with the same comparison as the automatic switch for requests without a session key.
 
-`newAssignmentOrder` appears only in the JSON. The `status` / `monitor` screens do not show it.
+The other two show whether requests are being scattered across accounts.
+
+- `detoursByAccount` — how many sessions are on a detour right now, counted per detour account (a session counts at most once per account). Detours are not counted in `warmSessionsByAccount`, so this is where you see whether detours are piling up on one account.
+- `dispersion` — among requests carrying a session key whose session already had a previous request, the share that was actually sent to a different account from the previous one (over the last 60 minutes). It has four fields: `windowMs` (the length of the window, `3600000`), `pairs` (requests that had a previous request), `changes` (how many of those went to a different account), and `rate` (`changes / pairs`; `null` when `pairs` is 0). The counts are not saved, so they start again from zero after a restart.
+
+These three appear only in the JSON. The `status` / `monitor` screens do not show them.
 
 While `mode` is anything other than `off`, the `Events` of `status` / `monitor` (the recent switches and requests) are persisted to `runtime-state.json` too and survive a restart, capped at the newest 50. With `mode: "off"` they are neither saved nor restored, so the contents of `runtime-state.json` stay identical to today's.
 

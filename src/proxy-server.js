@@ -153,6 +153,9 @@ export function createProxyServer({
   usageEventsDir = null,
   // 試験用の注入口（書込の停滞・chmod 失敗を再現する writer を渡す）。本番は渡さない。
   usageEventWriter: injectedUsageEventWriter = null,
+  // 知らせの見張り（src/alert-watch.js の createAlertWatch の戻り値）。本番は src/cli.js の
+  // runServer が渡す。既定は見張り無しで、応答もログも現行とバイト単位で同一になる。
+  alertWatch = null,
 }) {
   assertLoopbackProxyHost(config.proxy?.host || '127.0.0.1');
   const upstream = config.upstream || 'https://api.anthropic.com';
@@ -210,6 +213,21 @@ export function createProxyServer({
       },
     },
   });
+  // 見張りを呼ぶ唯一の口。見張りの誤り（投げる・拒否する Promise を返す）は握りつぶし、
+  // Promise を返しても待たない——見張りが壊れても遅れても、要求は待たされず結果も変わらない。
+  const callAlertWatch = (method, ...args) => {
+    if (!alertWatch) return undefined;
+    try {
+      const result = alertWatch[method]?.(...args);
+      if (typeof result?.then === 'function') {
+        result.then(undefined, () => {});
+        return undefined;
+      }
+      return result;
+    } catch {
+      return undefined;
+    }
+  };
   const coordinatedTokenRefresher = createSingleFlightTokenRefresher(
     refreshTokenWithCredentialSafety,
     {
@@ -217,8 +235,16 @@ export function createProxyServer({
       // store. Do not let a completed refresh result cross a later account
       // relink that happens to present the old refresh token.
       retentionMs: 0,
+      // 見張りへは口座の id・失敗の分類・更新用の資格情報の期限の数だけを渡す。
+      // context と refreshed はトークンを持つので、そのものは渡さない。
       onSuccess({ context, refreshed, rotated }) {
         logger?.(`${new Date().toISOString()} credential-refresh account=${context?.accountId || 'unknown'} result=success rotated=${rotated} expiresAt=${formatCredentialExpiry(refreshed.expiresAt)}`);
+        // 更新の結果に期限が無いときは、保管庫に残る元の期限（`{ ...currentSecret, ...refreshed }`）を渡す。
+        callAlertWatch('noteRefreshSucceeded', alertAccountId(context), {
+          refreshCredentialExpiresAt: refreshCredentialExpiry(
+            refreshed?.refreshTokenExpiresAt ?? context?.refreshTokenExpiresAt,
+          ),
+        });
       },
       onFailure({ context, error, deferred = false }) {
         const retry = error?.retryAfterMs
@@ -229,6 +255,10 @@ export function createProxyServer({
           : '';
         const result = deferred ? 'deferred' : 'failed';
         logger?.(`${new Date().toISOString()} credential-refresh account=${context?.accountId || 'unknown'} result=${result} errorType=${credentialRefreshErrorType(error)}${retry}${retrySource}`);
+        // 古い資格情報で送り続ける間も要求ごとに呼ばれる。同じ状態の重複は見張りが抑える。
+        callAlertWatch('noteRefreshFailed', alertAccountId(context), credentialRefreshErrorType(error), {
+          refreshCredentialExpiresAt: refreshCredentialExpiry(context?.refreshTokenExpiresAt),
+        });
       },
     },
   );
@@ -472,19 +502,37 @@ export function createProxyServer({
       // `observe` ではキー自体を出さない。系統と割り当てを止める線は、要求の予約が選ぶ側へ
       // 渡すのと同じ値を渡す。温かい数は、上の `warmSessionsByAccount` に出しているのと
       // 同じ値を渡す（要求の予約は Map で渡すが、ここの入れ物は素のオブジェクト）。
+      // 送り先の散らばりを測る2つ（`on` だけ）。`detoursByAccount` は迂回中のセッションの数を
+      // 迂回先の口座ごとに数えたもの、`dispersion` は同じセッションの続く要求で、実際に送った
+      // 口座が前の要求と変わった割合（直近60分）である。
       ...(sessionAffinitySettings.mode === 'on'
         ? {
           newAssignmentOrder: {
             fable: newAssignmentOrderFor('fable'),
             other: newAssignmentOrderFor(null),
           },
+          detoursByAccount: summary.detoursByAccount,
+          dispersion: sessionAffinity.dispersion(),
         }
         : {}),
     };
   }
+  // status JSON の末尾へ足す `alerts` 節。見張りが無い・`alerts` の設定が無いときは
+  // キー自体を出さないので、その構成の JSON は現行とバイト同一である。
   function statusJson(status = accountManager.getStatus()) {
     const section = sessionAffinityStatusSection();
-    return section ? { ...status, sessionAffinity: section } : status;
+    const withAffinity = section ? { ...status, sessionAffinity: section } : status;
+    const alerts = callAlertWatch('statusSection');
+    return alerts && typeof alerts === 'object' ? { ...withAffinity, alerts } : withAffinity;
+  }
+
+  // 見張りの結線。口座の状態が変わるたびに台帳の行を渡し、散らばりは `on` の表から読ませる。
+  // 見張りが無ければ何も登録しない。
+  if (alertWatch) {
+    accountManager.setStateListener((account, details) => callAlertWatch('onAccountState', account, details));
+    callAlertWatch('setDispersionSource', () => (
+      sessionAffinity && sessionAffinitySettings?.mode === 'on' ? sessionAffinity.dispersion() : null
+    ));
   }
 
   // GPT プール状態。プロセス内メモリだけで持ち、
@@ -765,6 +813,9 @@ export function createProxyServer({
           config.observability = nextObservability;
           observabilitySettings = normalizeObservability(nextObservability);
         }
+        // 知らせの設定（`alerts` 節）は見張りが自分で読み直す。待たない——見張りの遅れで
+        // reload の応答を止めない。
+        callAlertWatch('reload');
         // Reconcile in the background instead of awaiting it (or replacing
         // the shared operationalStateCheck gate other requests await): each
         // account's reconcile can block on that account's file lock for up
@@ -1756,7 +1807,8 @@ function createAffinityRequestCounts() {
  * 1要求分の sticky affinity。
  *
  * 返すのは ①proxy 行へ足す `sid` / `aff` / `fam` ②`select()`＝口座の選択
- * ③`confirm()`＝予約の確定 ④応答が終わったときの表の行の解放、の4つだけを持つ小さな状態である。
+ * ③`confirm()`＝予約の確定 ④応答が終わったときの表の行の解放、の4つと、`on` の鍵のある
+ * 要求だけに置く `noteSent()`（送り先の散らばりの数え）を持つ小さな状態である。
  * `mode:"off"` では呼び出し側が表を作らないので、この関数は `null` を返す。
  * `mode:"observe"` は鍵の抽出とログだけを行い、口座の選択は現行のまま。
  *
@@ -1790,6 +1842,10 @@ function createSessionAffinityRequest({
     beginQuotaGrace: () => 0,
   };
   if (!state.pinned) return state;
+
+  // 送り先の散らばりの数え。要求の記録（recordProxyRequest）が実際に送った口座で呼ぶ。
+  // 鍵のある `on` の要求にだけ置くので、`observe` と鍵の無い要求は数えない。
+  state.noteSent = accountId => affinity.noteSent(key, accountId);
 
   // 温かい数の償却掃除。冷えることは事象を伴わないので、要求の流れに
   // 乗せて 1,000 本に1回だけ掃除する。**新しいタイマーは作らない。**
@@ -3539,6 +3595,18 @@ function normalizeCredentialExpiry(expiresAt) {
   return value < 1e12 ? value * 1000 : value;
 }
 
+// 見張りへ渡す期限は数（ミリ秒）だけ。分からなければ null。
+function refreshCredentialExpiry(expiresAt) {
+  if (expiresAt == null) return null;
+  const value = normalizeCredentialExpiry(expiresAt);
+  return value != null && value > 0 ? value : null;
+}
+
+// 見張りへ渡す口座は id の字だけ。
+function alertAccountId(context) {
+  return typeof context?.accountId === 'string' ? context.accountId : null;
+}
+
 function hasUsableAccessToken(secret, now = Date.now()) {
   if (!secret?.accessToken) return false;
   const expiresAt = normalizeCredentialExpiry(secret.expiresAt);
@@ -4408,6 +4476,8 @@ function recordProxyRequest({
     durationMs,
     errorType,
   });
+  // 送り先の散らばりを数える（`on` の鍵のある要求だけ。ログの行は足さない）。
+  affinityLog?.noteSent?.(account.id);
   writeProxyLog(logger, event, degradeLog, affinityLog, observationLog);
 }
 

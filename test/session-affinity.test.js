@@ -1740,3 +1740,128 @@ describe('SessionAffinity detour', () => {
     assert.equal(current.detour, null);
   });
 });
+
+// ---------------------------------------------------------------------------
+// 送り先の散らばりの数え
+//
+// 同じセッションの続く要求で、実際に送った口座が前の要求と変わった割合を、直近60分
+// （10分ごとの6区画）で数える。前の送り先は表の行だけに持ち、保存しない。ログも出さない。
+// ---------------------------------------------------------------------------
+
+describe('SessionAffinity dispersion', () => {
+  const OTHER_SESSION = '0d6f1f4e-5b2a-4c7e-9a10-3e8b7c6d5f42';
+  // 10分の区画の始まりに揃えた時刻から数える（区画の境を手で決めた値で確かめるため）。
+  const SLOT_START = Math.ceil(START_MS / 600_000) * 600_000;
+
+  it('counts a request only when the same session sent one before, and a change only when the account differs', () => {
+    const { affinity, logger } = createAffinity({ startMs: SLOT_START });
+    reserve(affinity, SESSION_ID, 'acct-a');
+    reserve(affinity, OTHER_SESSION, 'acct-b');
+
+    affinity.noteSent(SESSION_ID, 'acct-a');
+    affinity.noteSent(OTHER_SESSION, 'acct-b');
+    assert.deepEqual(affinity.dispersion(), { windowMs: 3_600_000, pairs: 0, changes: 0, rate: null }, '初めの1本は前が無い');
+
+    affinity.noteSent(SESSION_ID, 'acct-a');
+    affinity.noteSent(SESSION_ID, 'acct-c');
+    affinity.noteSent(OTHER_SESSION, 'acct-b');
+    affinity.noteSent(SESSION_ID, 'acct-c');
+    assert.deepEqual(affinity.dispersion(), { windowMs: 3_600_000, pairs: 4, changes: 1, rate: 0.25 });
+    assert.deepEqual(logger.lines.filter(line => !line.includes(' affinity_bind ')), [], '数えるだけで行は出さない');
+  });
+
+  it('ignores a session that is not in the table and a request without an account', () => {
+    const { affinity } = createAffinity({ startMs: SLOT_START });
+    reserve(affinity, SESSION_ID, 'acct-a');
+
+    affinity.noteSent(OTHER_SESSION, 'acct-a');
+    affinity.noteSent(OTHER_SESSION, 'acct-b');
+    affinity.noteSent('', 'acct-a');
+    affinity.noteSent(SESSION_ID, '');
+    affinity.noteSent(SESSION_ID, null);
+    affinity.noteSent(SESSION_ID, 'acct-a');
+    affinity.noteSent(SESSION_ID, 'acct-a');
+
+    assert.equal(affinity.size, 1, '表に行を作らない');
+    assert.deepEqual(affinity.dispersion(), { windowMs: 3_600_000, pairs: 1, changes: 0, rate: 0 });
+  });
+
+  it('keeps six ten-minute slots, so a pair leaves the window when its slot is six slots old', () => {
+    const { affinity, clock } = createAffinity({ startMs: SLOT_START });
+    reserve(affinity, SESSION_ID, 'acct-a');
+    affinity.noteSent(SESSION_ID, 'acct-a');
+    affinity.noteSent(SESSION_ID, 'acct-b');
+
+    clock.ms = SLOT_START + 30 * 60_000;
+    affinity.noteSent(SESSION_ID, 'acct-b');
+    assert.deepEqual(affinity.dispersion(), { windowMs: 3_600_000, pairs: 2, changes: 1, rate: 0.5 });
+
+    clock.ms = SLOT_START + 60 * 60_000 - 1;
+    assert.equal(affinity.dispersion().pairs, 2, '最初の区画はまだ窓の中');
+
+    clock.ms = SLOT_START + 60 * 60_000;
+    assert.deepEqual(affinity.dispersion(), { windowMs: 3_600_000, pairs: 1, changes: 0, rate: 0 }, '最初の区画が抜ける');
+
+    clock.ms = SLOT_START + 7 * 60 * 60_000;
+    affinity.noteSent(SESSION_ID, 'acct-a');
+    assert.deepEqual(affinity.dispersion(), { windowMs: 3_600_000, pairs: 1, changes: 1, rate: 1 }, '古い区画は残らない');
+  });
+
+  it('saves neither the previous account nor the counts', () => {
+    const { affinity } = createAffinity({ startMs: SLOT_START });
+    reserve(affinity, SESSION_ID, 'acct-a');
+    affinity.noteSent(SESSION_ID, 'acct-a');
+    affinity.noteSent(SESSION_ID, 'acct-b');
+
+    const saved = affinity.export();
+    assert.deepEqual(saved.entries.map(record => Object.keys(record).sort()), [['a', 'k', 's', 't']], '保存の形は変わらない');
+
+    const { affinity: restored } = createAffinity({ startMs: SLOT_START });
+    restored.restore(saved, { knownAccountIds: ['acct-a', 'acct-b'] });
+    assert.deepEqual(restored.dispersion(), { windowMs: 3_600_000, pairs: 0, changes: 0, rate: null });
+    restored.noteSent(SESSION_ID, 'acct-c');
+    assert.equal(restored.dispersion().pairs, 0, '再起動の後の最初の1本は前が無い');
+  });
+});
+
+describe('SessionAffinity detoursByAccount', () => {
+  const SECOND = '0d6f1f4e-5b2a-4c7e-9a10-3e8b7c6d5f42';
+  const THIRD = '7a3c9e21-4f6b-4d8a-b2c1-9e0f5a6b7c8d';
+
+  function detour(affinity, key, from, to, modelFamily = null) {
+    const current = affinity.get(key, { modelFamily });
+    return affinity.noteDetour(key, { from, to, modelFamily, expectedGen: current.gen });
+  }
+
+  it('counts the sessions that are on a detour, per detour account, once per session', () => {
+    const { affinity } = createAffinity();
+    reserve(affinity, SESSION_ID, 'acct-a');
+    reserve(affinity, SECOND, 'acct-a');
+    reserve(affinity, THIRD, 'acct-a');
+    assert.deepEqual(affinity.summary().detoursByAccount, {});
+
+    detour(affinity, SESSION_ID, 'acct-a', 'acct-b');
+    detour(affinity, SESSION_ID, 'acct-a', 'acct-b', 'fable');
+    detour(affinity, SECOND, 'acct-a', 'acct-b');
+    detour(affinity, THIRD, 'acct-a', 'acct-c');
+
+    assert.deepEqual(affinity.summary().detoursByAccount, { 'acct-b': 2, 'acct-c': 1 });
+
+    affinity.clearDetour(THIRD);
+    assert.deepEqual(affinity.summary().detoursByAccount, { 'acct-b': 2 }, '消した迂回先は数えない');
+  });
+
+  it('does not count a detour that no longer starts from the current binding', () => {
+    const { affinity } = createAffinity();
+    reserve(affinity, SESSION_ID, 'acct-a');
+    reserve(affinity, SESSION_ID, 'acct-d', { modelFamily: 'fable', reason: 'family_exhausted' });
+    assert.equal(detour(affinity, SESSION_ID, 'acct-d', 'acct-e', 'fable'), true);
+    assert.deepEqual(affinity.summary().detoursByAccount, { 'acct-e': 1 });
+
+    // Fable の副バインドの口座が台帳から消えると、Fable の結び付け先は home へ戻り、
+    // acct-d からの迂回先は前提を失う（get() にも出ない）。
+    affinity.prune({ knownAccountIds: ['acct-a', 'acct-e'] });
+    assert.equal(affinity.get(SESSION_ID, { modelFamily: 'fable' }).detour, null);
+    assert.deepEqual(affinity.summary().detoursByAccount, {});
+  });
+});

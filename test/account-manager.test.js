@@ -4035,3 +4035,93 @@ describe('quota usage freshness (usageUpdatedAt / usageSource)', () => {
     assert.equal(quota.usageUpdatedAt, 1_700_000_000_000);
   });
 });
+
+describe('setStateListener', () => {
+  const twoAccounts = () => [
+    { id: 'acct_1', name: 'one', credentialRevision: 'rev-1' },
+    { id: 'acct_2', name: 'two', credentialRevision: 'rev-2' },
+  ];
+
+  it('calls the listener with the ledger row after each state change, once per call', () => {
+    const manager = new AccountManager({ accounts: twoAccounts(), now: () => 1_700_000_000_000 });
+    const calls = [];
+    manager.setStateListener((account, details) => {
+      calls.push({ account, details, status: account.status, errorReason: account.errorReason });
+    });
+
+    manager.markError('acct_1', 'oauth_refresh_failed', null, { cause: 'invalid_grant' });
+    assert.equal(calls.length, 1);
+    assert.equal(calls[0].account, manager.find('acct_1'), 'the row itself, not a copy');
+    assert.equal(calls[0].details, undefined);
+    assert.equal(calls[0].status, 'error', 'called after the row was changed');
+    assert.equal(calls[0].errorReason.cause, 'invalid_grant');
+
+    manager.markCredentialRefreshDeferred('acct_2', 30);
+    assert.equal(calls.length, 2);
+    assert.equal(calls[1].account, manager.find('acct_2'));
+    assert.equal(calls[1].status, 'throttled');
+
+    manager.markAuthenticated('acct_1');
+    assert.equal(calls.length, 3);
+    assert.equal(calls[2].account, manager.find('acct_1'));
+    assert.equal(calls[2].errorReason, null);
+  });
+
+  it('reports every row after a reload and flags only the accounts whose credential changed', () => {
+    const manager = new AccountManager({ accounts: twoAccounts(), now: () => 1_700_000_000_000 });
+    const calls = [];
+    manager.setStateListener((account, details) => calls.push({ id: account.id, account, details }));
+
+    const changed = manager.replaceAccounts([
+      { id: 'acct_1', name: 'one', credentialRevision: 'rev-1b' },
+      { id: 'acct_2', name: 'two', credentialRevision: 'rev-2' },
+      { id: 'acct_3', name: 'three', credentialRevision: 'rev-3' },
+    ]);
+
+    assert.deepEqual(changed, ['acct_1']);
+    assert.deepEqual(calls.map(call => [call.id, call.details]), [
+      ['acct_1', { credentialChanged: true }],
+      ['acct_2', { credentialChanged: false }],
+      ['acct_3', { credentialChanged: false }],
+    ]);
+    for (const call of calls) {
+      assert.equal(call.account, manager.find(call.id), 'the rows of the new ledger');
+    }
+  });
+
+  it('keeps the ledger change and the caller intact when the listener throws', () => {
+    const manager = new AccountManager({ accounts: twoAccounts(), now: () => 1_700_000_000_000 });
+    let calls = 0;
+    manager.setStateListener(() => {
+      calls += 1;
+      throw new Error('listener failure');
+    });
+
+    assert.doesNotThrow(() => manager.markError('acct_1', 'oauth_refresh_failed', null, { cause: 'invalid_grant' }));
+    assert.equal(manager.find('acct_1').status, 'error');
+    assert.equal(manager.events[0].type, 'account-error');
+    assert.doesNotThrow(() => manager.markCredentialRefreshRateLimited('acct_2', 60));
+    assert.equal(manager.find('acct_2').status, 'throttled');
+    assert.doesNotThrow(() => manager.markAuthenticated('acct_1'));
+    assert.equal(manager.find('acct_1').status, 'ready');
+    let changed;
+    assert.doesNotThrow(() => {
+      changed = manager.replaceAccounts([{ id: 'acct_1', name: 'one', credentialRevision: 'rev-1b' }]);
+    });
+    assert.deepEqual(changed, ['acct_1']);
+    assert.deepEqual(manager.accounts.map(account => account.id), ['acct_1']);
+    assert.equal(calls, 4);
+  });
+
+  it('calls nothing without a listener, and a non-function clears it', () => {
+    const manager = new AccountManager({ accounts: twoAccounts(), now: () => 1_700_000_000_000 });
+    let calls = 0;
+    manager.setStateListener(() => {
+      calls += 1;
+    });
+    manager.setStateListener('not a function');
+    manager.markError('acct_1', 'account_error');
+    manager.markAuthenticated('acct_1');
+    assert.equal(calls, 0);
+  });
+});

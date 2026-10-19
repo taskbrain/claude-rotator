@@ -36,6 +36,10 @@ export function renderStatus(status, options = {}) {
   // "off" - so the default configuration prints exactly what it prints today.
   lines.push(...renderAffinitySection(status.sessionAffinity));
 
+  // Alerts line. Drawn only when the status JSON carries the section, which
+  // /internal/status omits while no alert channel is configured.
+  lines.push(...renderAlertsLine(status.alerts));
+
   lines.push('Events');
   for (const event of (status.events || []).slice(0, 8)) {
     lines.push(renderEvent(event));
@@ -334,4 +338,67 @@ function affinityCounts(counts) {
 
 function affinityNumber(value) {
   return typeof value === 'number' && Number.isFinite(value) ? value : null;
+}
+
+// ---------------------------------------------------------------------------
+// Alerts line of `claude-rotator status`.
+//
+// `status.alerts` is absent while no alert channel is configured, and then
+// nothing is drawn. The section carries no account id or name, no webhook URL
+// and no file path; this line prints only fixed words, counts and short result
+// tokens that match ALERT_TOKEN, so an unexpected string is dropped, not shown.
+//
+// A webhook the receiving side has turned off (revoked, channel archived) still
+// reads "usable": that only shows in the result of the last delivery, so a
+// result other than "ok" is printed on the same line.
+// ---------------------------------------------------------------------------
+
+const ALERTS_SECTION_LABEL = 'Alerts';
+const ALERT_TOKEN = /^[a-z0-9_-]{1,64}$/i;
+const ALERT_WEBHOOK_STATES = new Set(['off', 'usable', 'unusable']);
+const ALERT_ACTIVE_COUNTS = [
+  ['needsLogin', 'needs login'],
+  ['failing', 'failing'],
+  ['expiringSoon', 'expiring soon'],
+];
+
+function renderAlertsLine(alerts) {
+  if (!alerts || typeof alerts !== 'object' || Array.isArray(alerts)) return [];
+  const parts = [
+    `mac: ${alerts.macNotification === true ? 'on' : 'off'}`,
+    `webhook: ${alertsWebhookState(alerts)}`,
+    `active: ${alertsActive(alerts.active)}`,
+  ];
+  const last = alerts.lastDelivery?.webhook;
+  const result = alertToken(last?.result);
+  if (result && result !== 'ok') {
+    const reason = alertToken(last.reason);
+    parts.push(`last webhook: ${result}${reason ? ` (${reason})` : ''}`);
+  }
+  for (const key of ['queued', 'dropped']) {
+    const count = affinityNumber(alerts[key]);
+    if (count) parts.push(`${key}: ${count}`);
+  }
+  return [`${terminalPadEnd(ALERTS_SECTION_LABEL, AFFINITY_HEADER_WIDTH)}${parts.join('  ')}`, ''];
+}
+
+function alertsWebhookState(alerts) {
+  const state = ALERT_WEBHOOK_STATES.has(alerts.webhook) ? alerts.webhook : 'unknown';
+  const problem = state === 'unusable' ? alertToken(alerts.webhookProblem) : null;
+  return problem ? `${state} (${problem})` : state;
+}
+
+function alertsActive(active) {
+  if (!active || typeof active !== 'object' || Array.isArray(active)) return 'none';
+  const items = [];
+  for (const [key, label] of ALERT_ACTIVE_COUNTS) {
+    const count = affinityNumber(active[key]);
+    if (count) items.push(`${label} ${count}`);
+  }
+  if (active.dispersion === true) items.push('dispersion');
+  return items.length > 0 ? items.join(', ') : 'none';
+}
+
+function alertToken(value) {
+  return typeof value === 'string' && ALERT_TOKEN.test(value) ? value : null;
 }
