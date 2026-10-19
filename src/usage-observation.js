@@ -8,6 +8,7 @@
 // 浅いマージ事故を起こすため、`session-affinity.js` / `openai-bridge.js` と同じく
 // 自前モジュールで正規化して `Object.freeze` した値を返す。
 
+import { createHash } from 'node:crypto';
 import zlib from 'node:zlib';
 import { promisify } from 'node:util';
 
@@ -411,7 +412,49 @@ export function observationLogFields(observationLog, affinityLog = null) {
   if (typeof observationLog.requestClass === 'string') {
     fields.push(`rc=${observationLog.requestClass}`);
   }
+  // クライアントの版と anthropic-beta の要約は、値があるときだけ最末尾へ足す。
+  // どちらも null なら何も足さず、行は前の版とバイトまで同じ。
+  if (typeof observationLog.clientVersion === 'string') {
+    fields.push(`ua=${logToken(observationLog.clientVersion)}`);
+  }
+  if (typeof observationLog.betaDigest === 'string') {
+    fields.push(`beta=${logToken(observationLog.betaDigest)}`);
+  }
   return ` ${fields.join(' ')}`;
+}
+
+const CLIENT_VERSION_PATTERN = /^claude-cli\/(\d{1,4}\.\d{1,4}\.\d{1,6})(?=$|[\s(])/;
+
+/**
+ * User-Agent から Claude Code の版（`claude-cli/<数.数.数>`）だけを取り出す。
+ *
+ * 版の後ろが行の終わりか空白か `(` のときだけ当たる。後ろに字が付く形
+ * （`-beta` など）や4つの数の形は当たらない。配列なら1つめを使う。
+ * User-Agent のほかの字（`(...)` の中身など）は返さない。
+ *
+ * @param {string|string[]|undefined} value
+ * @returns {string|null}
+ */
+export function clientVersionFromUserAgent(value) {
+  const raw = Array.isArray(value) ? value[0] : value;
+  if (typeof raw !== 'string') return null;
+  const match = CLIENT_VERSION_PATTERN.exec(raw);
+  return match ? match[1] : null;
+}
+
+/**
+ * `anthropic-beta` 見出しの値を、受け取った字のまま（整えずに）UTF-8 の sha256 に
+ * して、16進の先頭8字を返す。値そのものは行に出さない。
+ *
+ * 配列なら `', '` でつなぐ。空白を除いて空になる値と、字でない値は `null`。
+ *
+ * @param {string|string[]|undefined} value
+ * @returns {string|null}
+ */
+export function betaHeaderDigest(value) {
+  const raw = Array.isArray(value) ? value.join(', ') : value;
+  if (typeof raw !== 'string' || raw.trim() === '') return null;
+  return createHash('sha256').update(raw, 'utf8').digest('hex').slice(0, 8);
 }
 
 const REQUEST_CLASSES = new Set(['main', 'subagent', 'workflow', 'compaction', 'auxiliary']);

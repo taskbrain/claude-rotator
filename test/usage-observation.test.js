@@ -12,6 +12,8 @@ import zlib from 'node:zlib';
 import { promisify } from 'node:util';
 
 import {
+  betaHeaderDigest,
+  clientVersionFromUserAgent,
   DEFAULT_OBSERVABILITY,
   normalizeObservability,
   observationLogFields,
@@ -717,5 +719,95 @@ describe('observationLogFields / 要求の種類（rc=）', () => {
       requestClass: 'compaction',
     });
     assert.ok(rendered.endsWith(' ovu=false rc=compaction'), rendered);
+  });
+});
+
+describe('clientVersionFromUserAgent', () => {
+  it('claude-cli/ の後ろの3つの数の版を返す', () => {
+    assert.equal(clientVersionFromUserAgent('claude-cli/2.1.303 (external, cli)'), '2.1.303');
+    assert.equal(clientVersionFromUserAgent('claude-cli/2.1.303'), '2.1.303');
+    assert.equal(clientVersionFromUserAgent('claude-cli/2.1.303 (external, sdk-ts, agent-sdk/0.1.0)'), '2.1.303');
+  });
+
+  it('配列なら1つめを使う', () => {
+    assert.equal(clientVersionFromUserAgent(['claude-cli/2.1.303 (x)']), '2.1.303');
+  });
+
+  it('形の違う User-Agent と、字でない値は null', () => {
+    for (const value of [
+      'claude-code/2.1.201 (cli)',
+      'node',
+      'claude-cli/2.1',
+      'claude-cli/2.1.303-beta (x)',
+      'claude-cli/2.1.303.4',
+      undefined,
+    ]) {
+      assert.equal(clientVersionFromUserAgent(value), null, String(value));
+    }
+  });
+});
+
+describe('betaHeaderDigest', () => {
+  it('受け取った字のまま（整えずに）sha256 の先頭8字を返す', () => {
+    assert.equal(betaHeaderDigest('example-capability,second-capability'), '7c896b7a');
+    // 空白を整えないので、同じ値の並びでも別の字になる。
+    assert.equal(betaHeaderDigest('example-capability, second-capability'), '1b476f22');
+  });
+
+  it('空・空白だけ・無いときは null', () => {
+    assert.equal(betaHeaderDigest(''), null);
+    assert.equal(betaHeaderDigest('   '), null);
+    assert.equal(betaHeaderDigest(undefined), null);
+  });
+});
+
+describe('observationLogFields / クライアントの版と beta の見出し（ua=・beta=）', () => {
+  const base = {
+    model: 'claude-opus-5-1',
+    sid: 'ab12cd34ef56',
+    inputTokens: 10,
+    outputTokens: 20,
+    cacheReadTokens: 99000,
+    cacheCreationTokens: 1500,
+    cacheCreation1hTokens: 1500,
+    cacheCreation5mTokens: 0,
+    quota: { unified5h: 0.76, unified5hReset: 1789012345, unified7d: 0.33, unified7dReset: 1789098765 },
+    encoding: 'gzip',
+    parse: 'ok',
+  };
+  // 既存テスト「決まった順序どおりに追記する」の期待と同じ字。
+  const WITHOUT_CLIENT = ' model=claude-opus-5-1 sid=ab12cd34ef56 in=10 out=20 cr=99000 cc=1500 c1h=1500 c5m=0'
+    + ' u5h=0.76 u5hReset=1789012345 u7d=0.33 u7dReset=1789098765 enc=gzip';
+
+  it('両方あるときは末尾に ua= と beta= をこの順で足す', () => {
+    const rendered = observationLogFields({ ...base, clientVersion: '2.1.303', betaDigest: '7c896b7a' });
+    assert.ok(rendered.endsWith(' ua=2.1.303 beta=7c896b7a'), rendered);
+    assert.equal(rendered, `${WITHOUT_CLIENT} ua=2.1.303 beta=7c896b7a`);
+  });
+
+  it('beta だけなら beta= だけを足し、ua= は出ない', () => {
+    const rendered = observationLogFields({ ...base, clientVersion: null, betaDigest: '7c896b7a' });
+    assert.ok(rendered.endsWith(' beta=7c896b7a'), rendered);
+    assert.doesNotMatch(rendered, / ua=/);
+  });
+
+  it('両方 null なら行は前の版とバイトまで同じ', () => {
+    const rendered = observationLogFields({ ...base, clientVersion: null, betaDigest: null });
+    assert.equal(rendered, WITHOUT_CLIENT);
+    assert.equal(Buffer.compare(Buffer.from(rendered), Buffer.from(WITHOUT_CLIENT)), 0);
+  });
+
+  it('ua= と beta= は enc= と猶予の欄より後ろに来る', () => {
+    const rendered = observationLogFields({
+      ...base,
+      grace: { g5h: 0.02, g7d: 0, ustat: 'allowed_warning', ovs: 'rejected', ovu: 'false' },
+      clientVersion: '2.1.303',
+      betaDigest: '7c896b7a',
+    });
+    const tokens = rendered.trim().split(' ');
+    const at = prefix => tokens.findIndex(token => token.startsWith(prefix));
+    assert.ok(at('ua=') > at('enc='), rendered);
+    assert.ok(at('ua=') > at('ovu='), rendered);
+    assert.ok(at('beta=') > at('ua='), rendered);
   });
 });
