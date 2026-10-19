@@ -27,6 +27,7 @@ import {
   refreshAccessToken,
 } from './oauth.js';
 import { createNativeClaudeRefresher } from './native-claude-refresher.js';
+import { createRefreshLogFields } from './refresh-log-fields.js';
 import { isFableScopeIdentity, parseRateLimitHeaders } from './quota.js';
 import { duplicateRefreshTokenAccountIds } from './secret-store.js';
 // 観測整備（PR #42）が sticky から切り出した純関数。実装は `./session-key.js` の
@@ -228,6 +229,7 @@ export function createProxyServer({
       return undefined;
     }
   };
+  const refreshLogFields = createRefreshLogFields();
   const coordinatedTokenRefresher = createSingleFlightTokenRefresher(
     refreshTokenWithCredentialSafety,
     {
@@ -238,7 +240,7 @@ export function createProxyServer({
       // 見張りへは口座の id・失敗の分類・更新用の資格情報の期限の数だけを渡す。
       // context と refreshed はトークンを持つので、そのものは渡さない。
       onSuccess({ context, refreshed, rotated }) {
-        logger?.(`${new Date().toISOString()} credential-refresh account=${context?.accountId || 'unknown'} result=success rotated=${rotated} expiresAt=${formatCredentialExpiry(refreshed.expiresAt)}`);
+        logger?.(`${new Date().toISOString()} credential-refresh account=${context?.accountId || 'unknown'} result=success rotated=${rotated} expiresAt=${formatCredentialExpiry(refreshed.expiresAt)}${refreshLogFields.success({ context, refreshed })}`);
         // 更新の結果に期限が無いときは、保管庫に残る元の期限（`{ ...currentSecret, ...refreshed }`）を渡す。
         callAlertWatch('noteRefreshSucceeded', alertAccountId(context), {
           refreshCredentialExpiresAt: refreshCredentialExpiry(
@@ -254,7 +256,7 @@ export function createProxyServer({
           ? ` retrySource=${error.retryAfterSource}`
           : '';
         const result = deferred ? 'deferred' : 'failed';
-        logger?.(`${new Date().toISOString()} credential-refresh account=${context?.accountId || 'unknown'} result=${result} errorType=${credentialRefreshErrorType(error)}${retry}${retrySource}`);
+        logger?.(`${new Date().toISOString()} credential-refresh account=${context?.accountId || 'unknown'} result=${result} errorType=${credentialRefreshErrorType(error)}${retry}${retrySource}${refreshLogFields.failure({ context, error, deferred })}`);
         // 古い資格情報で送り続ける間も要求ごとに呼ばれる。同じ状態の重複は見張りが抑える。
         callAlertWatch('noteRefreshFailed', alertAccountId(context), credentialRefreshErrorType(error), {
           refreshCredentialExpiresAt: refreshCredentialExpiry(context?.refreshTokenExpiresAt),
