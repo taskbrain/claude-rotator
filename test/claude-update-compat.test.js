@@ -9,7 +9,7 @@ import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { readSync } from 'node:fs';
-import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, readdir, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -238,9 +238,11 @@ test('header names match in any case; other strings are case-sensitive', async t
     replace: {
       'x-claude-code-session-id': 'X-Claude-Code-Session-Id',
       'anthropic-ratelimit-unified-status': 'Anthropic-RateLimit-Unified-Status',
+      'x-claude-code-request-class': 'X-Claude-Code-Request-Class',
     },
   })));
   assertAllOk(header);
+  assert.equal(checkById(header, 'request-class-header').status, 'ok');
 
   const lowered = inspectDistribution(await writeFixture(dir, fixtureText({
     replace: { ANTHROPIC_BASE_URL: 'anthropic_base_url' },
@@ -514,6 +516,19 @@ test('strings the rotator sets but does not export match the table in both direc
   assert.ok(set, 'CANONICAL_FABLE_MODEL_IDS was not found');
   const ids = extracted([...set[1].matchAll(/'([^']+)'/g)].map(match => match[1]), 'CANONICAL_FABLE_MODEL_IDS');
   assert.deepEqual(ids.sort(), [...FABLE_CHECK.known].sort());
+});
+
+test('the Claude Code request header names quoted in src/ match the table in both directions', async () => {
+  const names = (await readdir(join(REPO_ROOT, 'src'), { recursive: true })).filter(name => name.endsWith('.js'));
+  const quoted = new Set();
+  for (const name of names) {
+    const text = await sourceText(join('src', name));
+    for (const match of text.matchAll(/['"](x-claude-code-[a-z0-9-]+)['"]/gi)) quoted.add(match[1].toLowerCase());
+  }
+  const fromTable = STRING_CHECKS.filter(check => check.caseInsensitive)
+    .flatMap(check => check.strings)
+    .filter(value => value.startsWith('x-claude-code-'));
+  assert.deepEqual(extracted([...quoted], 'quoted x-claude-code- header names in src/').sort(), [...fromTable].sort());
 });
 
 test('strings outside the checked set never appear in the checks', async t => {
