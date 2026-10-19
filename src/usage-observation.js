@@ -407,18 +407,26 @@ export function observationLogFields(observationLog, affinityLog = null) {
       `ovu=${logToken(grace.ovu)}`,
     );
   }
-  // 要求の種類は見出しがあった要求だけ最末尾へ足す。値は requestClassFromHeader が
+  // 要求の種類は見出しがあった要求だけ猶予の欄より後ろへ足す。値は requestClassFromHeader が
   // 決まった語へ寄せたものなので、受け取った字そのものは行に出ない。
   if (typeof observationLog.requestClass === 'string') {
     fields.push(`rc=${observationLog.requestClass}`);
   }
-  // クライアントの版と anthropic-beta の要約は、値があるときだけ最末尾へ足す。
+  // クライアントの版と anthropic-beta の要約は、値があるときだけ rc= の後ろへ足す。
   // どちらも null なら何も足さず、行は前の版とバイトまで同じ。
   if (typeof observationLog.clientVersion === 'string') {
     fields.push(`ua=${logToken(observationLog.clientVersion)}`);
   }
   if (typeof observationLog.betaDigest === 'string') {
     fields.push(`beta=${logToken(observationLog.betaDigest)}`);
+  }
+  // 要求の深さは本文に値があった要求だけ足す。値は effortFromRequest が決まった語へ寄せたもの。
+  if (typeof observationLog.effort === 'string') fields.push(`effort=${observationLog.effort}`);
+  if (typeof observationLog.effortMsg === 'string') fields.push(`effortMsg=${observationLog.effortMsg}`);
+  // 上流の応答の見出しを受け取るまでのミリ秒。観測の欄がある行は上流の応答を受け取っているので、
+  // 呼び出し側は常に値を渡す（数でなければ何も足さない）。
+  if (Number.isSafeInteger(observationLog.headersMs) && observationLog.headersMs >= 0) {
+    fields.push(`hdrMs=${observationLog.headersMs}`);
   }
   return ` ${fields.join(' ')}`;
 }
@@ -455,6 +463,54 @@ export function betaHeaderDigest(value) {
   const raw = Array.isArray(value) ? value.join(', ') : value;
   if (typeof raw !== 'string' || raw.trim() === '') return null;
   return createHash('sha256').update(raw, 'utf8').digest('hex').slice(0, 8);
+}
+
+const EFFORT_LEVELS = new Set(['low', 'medium', 'high', 'xhigh', 'max']);
+
+/**
+ * 要求の本文の `output_config.effort` の値を、ログに書く決まった語へ寄せる。
+ *
+ * 前後の空白を落として小文字にし、`low`・`medium`・`high`・`xhigh`・`max` ならその語、
+ * 空でないほかの字は `other` を返す。無い・空・字でないときは `null`（行に何も足さない）。
+ *
+ * @param {unknown} value
+ * @returns {'low'|'medium'|'high'|'xhigh'|'max'|'other'|null}
+ */
+export function effortFromRequest(value) {
+  if (typeof value !== 'string') return null;
+  const word = value.trim().toLowerCase();
+  if (word === '') return null;
+  return EFFORT_LEVELS.has(word) ? word : 'other';
+}
+
+/**
+ * 解析済みの要求の本文から、ログに書く深さを2つ取り出す。
+ *
+ * - `effort`: 本文の一番上の `output_config.effort`。
+ * - `effortMsg`: `messages` を後ろから見て、最初に `output_config.effort` を持つ
+ *   `role: "system"` の項目の値（会話の途中で深さを変える項目）。
+ *
+ * どちらも effortFromRequest で寄せる。項目の文章（`content` など）は読まない。
+ *
+ * @param {unknown} body `JSON.parse` 済みの要求の本文。
+ * @returns {{effort: string|null, effortMsg: string|null}}
+ */
+export function requestEffortFromBody(body) {
+  const source = plainObject(body);
+  const messages = Array.isArray(source.messages) ? source.messages : [];
+  let messageEffort;
+  for (let index = messages.length - 1; index >= 0; index -= 1) {
+    const message = plainObject(messages[index]);
+    const outputConfig = plainObject(message.output_config);
+    if (message.role === 'system' && outputConfig.effort !== undefined) {
+      messageEffort = outputConfig.effort;
+      break;
+    }
+  }
+  return {
+    effort: effortFromRequest(plainObject(source.output_config).effort),
+    effortMsg: effortFromRequest(messageEffort),
+  };
 }
 
 const REQUEST_CLASSES = new Set(['main', 'subagent', 'workflow', 'compaction', 'auxiliary']);

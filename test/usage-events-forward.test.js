@@ -780,9 +780,9 @@ describe('proxy line ua= and beta= from the client request headers', () => {
     return { line, lines, events, seenBeta };
   }
 
-  it('ends the proxy line with the client version and the beta digest, never the raw user-agent text', async () => {
+  it('ends the proxy line (apart from hdrMs) with the client version and the beta digest, never the raw user-agent text', async () => {
     const { line, lines } = await send({ headers: CLIENT_HEADERS });
-    assert.ok(line.endsWith(' ua=2.1.303 beta=7c896b7a'), line);
+    assert.ok(line.replace(/ hdrMs=\d+$/, '').endsWith(' ua=2.1.303 beta=7c896b7a'), line);
     for (const each of lines) assert.doesNotMatch(each, /UA-MARKER/);
   });
 
@@ -805,6 +805,6 @@ describe('proxy line ua= and beta= from the client request headers', () => {
       },
     });
     assert.deepEqual(seenBeta, [`example-capability,second-capability,${OAUTH_BETA_HEADER}`]);
-    assert.ok(line.endsWith(' beta=7c896b7a'), line);
+    assert.ok(line.replace(/ hdrMs=\d+$/, '').endsWith(' beta=7c896b7a'), line);
   });
 });
