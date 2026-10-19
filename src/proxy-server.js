@@ -37,6 +37,8 @@ import {
   sidHash as observationSidHash,
 } from './session-key.js';
 import {
+  betaHeaderDigest,
+  clientVersionFromUserAgent,
   DEFAULT_OBSERVABILITY,
   normalizeObservability,
   observationLogFields,
@@ -1781,7 +1783,7 @@ function requestModelFamily(body) {
 // (e.g. `claude-fable-5-20260818`, `claude-fable-5-1-20260901`) is
 // deliberately excluded.
 const CANONICAL_FABLE_MODEL_IDS = new Set(['claude-fable-5', 'claude-fable-5-1']);
-function isCanonicalFableModelId(value) {
+export function isCanonicalFableModelId(value) {
   return CANONICAL_FABLE_MODEL_IDS.has(value);
 }
 
@@ -4810,6 +4812,9 @@ function buildObservationLog({
       ovu: headerValue(upstreamResponse.headers['anthropic-ratelimit-unified-overage-in-use']),
     },
     requestClass: requestClassFromHeader(req.headers?.['x-claude-code-request-class']),
+    // クライアントが送った見出しで数える（OAuth の口座で上流へ足す値は含めない）。
+    clientVersion: clientVersionFromUserAgent(req.headers?.['user-agent']),
+    betaDigest: betaHeaderDigest(req.headers?.['anthropic-beta']),
     // 本文の深さは口座選びと同じ1回の解析で取った値。ここで本文を読み直さない。
     effort: requestEffort?.effort ?? null,
     effortMsg: requestEffort?.effortMsg ?? null,
