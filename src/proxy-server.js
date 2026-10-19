@@ -1850,8 +1850,18 @@ function createSessionAffinityRequest({
     // 結び付け先の資格情報が、人が再ログインするまで戻らない形で失効した。結び付けを
     // 残すと、戻る見込みの無い口座に結び付けたまま、迂回先へ送り続けることになる。
     // そこで予約段で結び付けそのものを移す。再ログインの後も元へは戻さない。
+    // 失効に最初に当たった要求が迂回先へ送ってあれば、その口座が使え、新規割当を止める線の
+    // 下にある限り、それを移し先にする。選び直すと1回目と2回目の送り先が違いうり、
+    // キャッシュの書き直しが2回になる。
     // 行き先が無ければ結び付けは書かず、この要求は終端の応答へ落ちる。
-    binding = assign([bound.id]);
+    // 線の読み方は新規割当の選び方（`selectForNewAssignment`）と同じにする。
+    const detour = accountManager.findOrNull(entry.detour);
+    let keepDetour = Boolean(detour) && detour.id !== bound.id && accountManager.isAvailable(detour, modelFamily);
+    if (keepDetour) {
+      const headroom = accountManager.assignmentHeadroomFor(detour, modelFamily);
+      keepDetour = headroom.min != null && headroom.min > 1 - settings.assignStopUtilization;
+    }
+    binding = keepDetour ? detour : assign([bound.id]);
     sendTo = binding;
     reason = binding ? 'reauth_required' : null;
   } else if (familyQuotaExhaustedOnly(bound, threshold, modelFamily, accountManager.now())) {
