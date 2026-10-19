@@ -695,7 +695,7 @@ Webhook は Slack 互換の Incoming Webhook（`{"text": "..."}` を JSON で PO
 各 proxy request のトークン内訳・モデル・セッション指紋・枠の使用率を、**既存の `proxy` 行の末尾へ追記**します。新しい行種別は増えません。既定で有効です。
 
 ```text
-… outcome=ok model=claude-opus-5-1 sid=ab12cd34ef56 in=10 out=20 cr=99000 cc=1500 c1h=1500 c5m=0 u5h=0.76 u5hReset=1789012345 u7d=0.33 u7dReset=1789098765 enc=gzip
+… outcome=ok model=claude-opus-5-1 sid=ab12cd34ef56 in=10 out=20 cr=99000 cc=1500 c1h=1500 c5m=0 u5h=0.76 u5hReset=1789012345 u7d=0.33 u7dReset=1789098765 enc=gzip hdrMs=412
 ```
 
 | フィールド | 意味 |
@@ -710,7 +710,10 @@ Webhook は Slack 互換の Incoming Webhook（`{"text": "..."}` を JSON で PO
 | `u5hReset` / `u7dReset` | 各枠の reset 時刻（エポック秒）。 |
 | `enc` | 上流応答の `content-encoding`（`gzip` / `br` / `deflate` / 無圧縮は `-`）。 |
 | `usageParse` | **usage を数えられなかったときだけ**出ます。`ok` のときは出ません。 |
-| `rc` | **`x-claude-code-request-class` 見出しが付いた要求だけ**、行の最末尾（猶予の5項目より後ろ）に出ます。Claude Code が `CLAUDE_CODE_GATEWAY_HINT_HEADERS=1` のときに送る見出しの値で、`main` / `subagent` / `workflow` / `compaction` / `auxiliary` のどれか、ほかの値は `other` になります（受け取った字そのものは出しません）。見出しが無ければ出ず、行は従来とバイト単位で同一です。見出しは上流へそのまま送ります。 |
+| `rc` | **`x-claude-code-request-class` 見出しが付いた要求だけ**、猶予の5項目より後ろに出ます。Claude Code が `CLAUDE_CODE_GATEWAY_HINT_HEADERS=1` のときに送る見出しの値で、`main` / `subagent` / `workflow` / `compaction` / `auxiliary` のどれか、ほかの値は `other` になります（受け取った字そのものは出しません）。見出しが無ければ出ず、行は従来とバイト単位で同一です。見出しは上流へそのまま送ります。 |
+| `effort` | **要求の本文の一番上に `output_config.effort`（Claude Code が送る深さ）がある要求だけ**、猶予の5項目と `rc` より後ろに出ます。前後の空白を落として小文字にした値が `low` / `medium` / `high` / `xhigh` / `max` のどれかならその語、ほかの値は `other` になります（受け取った字そのものは出しません）。無い・空・文字列でないときは出ません。アカウントの選び方には使いません。 |
+| `effortMsg` | **要求の `messages` に、`output_config.effort` を持つ `role: "system"` の項目（会話の途中で深さを変える項目）がある要求だけ**、`effort` の後ろに出ます。後ろから見て最初のその項目の値を、`effort` と同じ規則で書きます。項目の文章は読みません。 |
+| `hdrMs` | その行の上流の応答の見出し（ステータスとヘッダ）を受け取るまでのミリ秒。数え始めは `durationMs` と同じなので、`durationMs` 以下です。観測の欄が付く行には必ず、`effortMsg` の後ろ（観測の欄の最後）に出ます。接続できなかった行や手元で作った応答の行には、`effort` / `effortMsg` とともに出ません。 |
 
 `usageParse` の値は `unsupported-encoding`（この Node では解けない符号化・知らない符号化が1段でも混じったとき・5段以上の重ねがけ）、`too-large`（`maxBodyBytes` 超）、`unparsable`（解凍に失敗したとき、または JSON でも SSE でもない）、`no-usage`（429 / 401 など usage を含まない応答）です。**黙って 0 件にせず、必ず理由が行に残ります。**
 
@@ -2172,7 +2175,9 @@ scripts/cache-report.sh --by sid --json            # machine-readable; --log <pa
 
 Only when an upstream response carries a usage-limit grace header (`anthropic-ratelimit-unified-grace-5h-utilization` / `anthropic-ratelimit-unified-grace-7d-utilization`), five more fields are appended at the end of the proxy line: `g5h` / `g7d` (the 5-hour / 7-day grace utilization; `-` for the one that is missing), `ustat` (`anthropic-ratelimit-unified-status`), `ovs` (`anthropic-ratelimit-unified-overage-status`), and `ovu` (`anthropic-ratelimit-unified-overage-in-use`); `ustat` / `ovs` / `ovu` are `-` when their header is absent. When neither grace header is present (or neither is a number), nothing is appended and the line is byte-for-byte unchanged. Like the cache fields, they are written only while `observability.requestLog.enabled` is `true` (the default).
 
-Only when a request carries the `x-claude-code-request-class` header (Claude Code sends it when `CLAUDE_CODE_GATEWAY_HINT_HEADERS=1` is set), `rc` is appended at the very end of the proxy line, after the grace fields: one of `main` / `subagent` / `workflow` / `compaction` / `auxiliary`, or `other` for any other value (the received text itself is never written). Without the header nothing is appended and the line is byte-for-byte unchanged. The header is forwarded upstream unchanged. Like the cache fields, `rc` is written only while `observability.requestLog.enabled` is `true` (the default).
+Only when a request carries the `x-claude-code-request-class` header (Claude Code sends it when `CLAUDE_CODE_GATEWAY_HINT_HEADERS=1` is set), `rc` is appended to the proxy line after the grace fields: one of `main` / `subagent` / `workflow` / `compaction` / `auxiliary`, or `other` for any other value (the received text itself is never written). Without the header nothing is appended and the line is byte-for-byte unchanged. The header is forwarded upstream unchanged. Like the cache fields, `rc` is written only while `observability.requestLog.enabled` is `true` (the default).
+
+Two more fields come from the request body, only when it carries them: `effort` (the top-level `output_config.effort`, the effort level Claude Code sends) and `effortMsg` (from the last `role: "system"` entry in `messages` that has an `output_config.effort`, which changes the effort in the middle of a conversation). Each is trimmed and lowercased and written as one of `low` / `medium` / `high` / `xhigh` / `max`, or `other` for any other value (the received text itself is never written, and the message text is never read); when the value is missing, empty, or not a string, the field is not written. Neither is used to pick an account. Every proxy line that carries the cache fields ends with `hdrMs`: the milliseconds from the start of that upstream attempt (the same start as `durationMs`) until the upstream response status and headers arrived, so it is never larger than `durationMs`. The three come after the grace fields and `rc`, in the order `effort`, `effortMsg`, `hdrMs`, and like the cache fields they are written only while `observability.requestLog.enabled` is `true` (the default). Lines without the cache fields, such as a connection failure or a locally generated response, carry none of them.
 
 The only fields written to the proxy request log are `account`, `method`, `path`, `status`, `durationMs`, `outcome`, `requestId`, and, on a timeout/network error, `errorType`. Internal proxy errors are logged as a short `proxy-error method=... path=... error=...` line. Tokens, the `Authorization` header, API keys, request bodies, and response bodies are never logged.
 

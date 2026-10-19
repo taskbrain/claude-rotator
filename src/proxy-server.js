@@ -42,6 +42,7 @@ import {
   observationLogFields,
   parseUsageObservation,
   requestClassFromHeader,
+  requestEffortFromBody,
   upstreamAcceptEncoding,
 } from './usage-observation.js';
 import { buildUsageEvent, createUsageEventWriter, usageFromObservation } from './usage-events.js';
@@ -2216,13 +2217,19 @@ function awaitQuotaGrace(req, res, waitMs) {
   });
 }
 
-function routingModelFamily(body) {
+// 口座選びの系統と、proxy の行に書く深さを、本文の1回の解析から取る。
+// 系統は model だけで決め、深さの有無で変わらない。
+function routingRequestFacts(body) {
+  let parsed;
   try {
-    const model = JSON.parse(body.toString('utf8'))?.model;
-    return isFableRoutingModelId(model) ? 'fable' : null;
+    parsed = JSON.parse(body.toString('utf8'));
   } catch {
-    return null;
+    return { modelFamily: null, requestEffort: null };
   }
+  return {
+    modelFamily: isFableRoutingModelId(parsed?.model) ? 'fable' : null,
+    requestEffort: requestEffortFromBody(parsed),
+  };
 }
 
 function safeUsageObservation(usage, threshold, nowMs) {
@@ -2796,7 +2803,7 @@ async function forwardWithRotation({
   // Routing uses the lenient matcher: a dated/numbered Fable id
   // suffix must still route away from a Fable-exhausted account, unlike the
   // strict `requestModelFamily` used to gate reactive Usage confirmation.
-  const modelFamily = routingModelFamily(body);
+  const { modelFamily, requestEffort } = routingRequestFacts(body);
   // 鍵の抽出と予約は、最初の `await` より前のこの同期区間で終える。
   // Node は単一スレッドなのでここへ他の要求は割り込めない（ロックは要らない）。
   // 鍵の抽出が `shouldRouteToOpenAiBridge` より後であることも重要で、gpt-* 宛の要求は
@@ -2909,6 +2916,7 @@ async function forwardWithRotation({
         exhaustionMapper: mapExhaustion,
         upstreamOverloadMapper,
         affinityLog: affinityRequest,
+        requestEffort,
         observability,
         usageEvents,
       })) return;
@@ -3110,6 +3118,7 @@ async function forwardWithRotation({
       exhaustionMapper: mapExhaustion,
       upstreamOverloadMapper,
       affinityLog: affinityRequest,
+      requestEffort,
       observability,
       usageEvents,
     });
@@ -3163,6 +3172,7 @@ async function forwardWithRotation({
         exhaustionMapper: mapExhaustion,
         upstreamOverloadMapper,
         affinityLog: affinityRequest,
+        requestEffort,
         observability,
         usageEvents,
       });
@@ -3248,6 +3258,7 @@ async function forwardWithRotation({
       exhaustionMapper: mapExhaustion,
       upstreamOverloadMapper,
       affinityLog: affinityRequest,
+      requestEffort,
       observability,
       usageEvents,
     })) return;
@@ -3275,6 +3286,8 @@ async function forwardCurrentUnavailableAccount({
   exhaustionMapper = null,
   upstreamOverloadMapper = null,
   affinityLog = null,
+  // proxy の行に書く要求の深さ（routingRequestFacts の requestEffort）。
+  requestEffort = null,
   observability = DEFAULT_OBSERVABILITY,
   usageEvents = null,
 }) {
@@ -3355,6 +3368,7 @@ async function forwardCurrentUnavailableAccount({
     exhaustionMapper,
     upstreamOverloadMapper,
     affinityLog,
+    requestEffort,
     observability,
     usageEvents,
   });
@@ -3812,6 +3826,8 @@ async function forwardOnceInner({
   upstreamConnectRetryDelayMs,
   exhaustionMapper = null,
   upstreamOverloadMapper = null,
+  // proxy の行に書く要求の深さ（routingRequestFacts の requestEffort）。
+  requestEffort = null,
   observability = DEFAULT_OBSERVABILITY,
   // forwardOnce() が計測するときだけ渡る。null なら何も記録しない。
   usageEventState = null,
@@ -3819,6 +3835,8 @@ async function forwardOnceInner({
   const target = configuredUpstreamTarget(req.url, upstream);
   const headers = buildUpstreamHeaders(req.headers, account, secret, observability);
   const startedAt = Date.now();
+  // 上流の応答の見出しを受け取った時刻。startedAt と同じ時計で測り、proxy の行の hdrMs= にする。
+  let headersAtMs = null;
   let outcome = 'ok';
   let bufferedPassthrough = false;
   // 上流 529 は本文を見るまで overloaded_error か判別できない（ヘッダに型情報が無い）。
@@ -3878,6 +3896,7 @@ async function forwardOnceInner({
         logger?.(`${new Date().toISOString()} upstream-connect-retry account=${account.id} method=${req.method} path=${target.pathname} attempt=${attempt}/${maxAttempts} errorType=${error.code || error.name}`);
       },
       onResponse(upstreamRes) {
+        headersAtMs = Date.now();
         if (usageEventState) {
           usageEventState.statusCode = upstreamRes.statusCode ?? null;
           usageEventState.requestId = headerValue(upstreamRes.headers['request-id'])
@@ -4096,7 +4115,15 @@ async function forwardOnceInner({
       durationMs,
       degradeLog,
       observationLog: observability.requestLog.enabled
-        ? buildObservationLog({ req, body, observation, upstreamResponse, observability })
+        ? buildObservationLog({
+          req,
+          body,
+          observation,
+          upstreamResponse,
+          observability,
+          requestEffort,
+          headersMs: headersAtMs === null ? null : Math.max(0, headersAtMs - startedAt),
+        })
         : null,
     });
   }
@@ -4742,7 +4769,15 @@ function applyUsageObservation(accountManager, accountId, observation) {
  * `onResponse` で同じ解析をしているが、そちらは口座台帳を更新する副作用つきなので、
  * ログ用には副作用の無いこの関数を別に呼ぶ。reset はミリ秒で返るのでエポック秒へ直す。
  */
-function buildObservationLog({ req, body, observation, upstreamResponse, observability }) {
+function buildObservationLog({
+  req,
+  body,
+  observation,
+  upstreamResponse,
+  observability,
+  requestEffort = null,
+  headersMs = null,
+}) {
   const quota = parseRateLimitHeaders(upstreamResponse.headers);
   // 既定では要求本文を読まない。本文は数百 KB〜数 MB あり、JSON.parse の追加1回が
   // 要求ごとの実コストになる。まずヘッダ付与率を測ってから有効化を決める。
@@ -4775,6 +4810,10 @@ function buildObservationLog({ req, body, observation, upstreamResponse, observa
       ovu: headerValue(upstreamResponse.headers['anthropic-ratelimit-unified-overage-in-use']),
     },
     requestClass: requestClassFromHeader(req.headers?.['x-claude-code-request-class']),
+    // 本文の深さは口座選びと同じ1回の解析で取った値。ここで本文を読み直さない。
+    effort: requestEffort?.effort ?? null,
+    effortMsg: requestEffort?.effortMsg ?? null,
+    headersMs,
   };
 }
 
