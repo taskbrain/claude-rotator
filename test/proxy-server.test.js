@@ -11702,8 +11702,9 @@ describe('サブキャップ 429 の非対称の是正', () => {
 // sticky affinity 本体の結線
 //
 // 試験名の頭の記号（①〜㉔・F9 など）は、このファイルの中で試験を指すための見出しである。
-// この describe の試験は ①②③④⑥⑦⑫⑬⑯㉑ ＋ 再ログインが要る失効の3件 ＋ 迂回先の7件 ＋ `fam=` 1件 ＋ F9 1件。
-// 既存ケースは1件も削除・書換しない。`mode:"off"`（既定・未記載）では proxy 行が
+// この describe の試験は ①②③④⑥⑦⑫⑬⑯㉑ ＋ 再ログインが要る失効の7件 ＋ 迂回先の7件 ＋ `fam=` 1件 ＋ F9 1件。
+// 既存ケースは、再ログインの1件の移し先を迂回先へ移す仕様に合わせて変えたほかは、削除・書換しない。
+// `mode:"off"`（既定・未記載）では proxy 行が
 // 追加前とバイト同一であること（`fam` 用の1件で固定する）。
 // ---------------------------------------------------------------------------
 describe('session affinity wiring', () => {
@@ -12097,14 +12098,14 @@ describe('session affinity wiring', () => {
       '前提: 要求の中の更新の失敗が、再ログインが要る失効として記録されている',
     );
     // 1回目は更新の失敗を見つけた要求で、結び付けを変えずにその要求だけ acct_b で完走する。
-    // 2回目の予約で結び付けが acct_c へ移り、以後は 5h の値が入れ替わっても動かない。
+    // 2回目の予約で結び付けがその acct_b へ移り、以後は 5h の値が入れ替わっても動かない。
     assert.equal(seen.length, 6);
     assert.equal(seen[1], 'Bearer token-acct_b');
     assert.equal(new Set(seen.slice(2)).size, 1, `送り先が1つに定まる: ${seen.slice(2).join(', ')}`);
-    assert.equal(seen.at(-1), 'Bearer token-acct_c');
+    assert.equal(seen.at(-1), 'Bearer token-acct_b');
     const switches = eventLines(logLines, 'affinity_switch');
     assert.equal(switches.length, 1, switches.join('\n'));
-    assert.match(switches[0], / from=acct_a to=acct_c reason=reauth_required family=other switches=1$/);
+    assert.match(switches[0], / from=acct_a to=acct_b reason=reauth_required family=other switches=1$/);
     assert.deepEqual(
       proxyLines(logLines).slice(-4).map(line => line.split(' aff=')[1]),
       ['switch fam=other', 'bound fam=other', 'bound fam=other', 'bound fam=other'],
@@ -12167,6 +12168,100 @@ describe('session affinity wiring', () => {
     assert.equal(switches.length, 1, switches.join('\n'));
     assert.match(switches[0], / from=acct_a to=acct_b reason=reauth_required family=other switches=1$/);
   });
+
+  // 結び付け先の失効に最初に当たった要求は、結び付けを変えずに別の口座で完走し、その口座を
+  // 迂回先として残す。結び付けを移すときにその迂回先を移し先にすれば、1回目と2回目の送り先が
+  // 同じになり、キャッシュの書き直しは1回で済む。
+  async function startWithReloginDetour() {
+    const started = await startAffinity({
+      accounts: ['acct_a', 'acct_b', 'acct_c'],
+      tokenRefresher: async () => {
+        throw Object.assign(
+          new Error('The stored OAuth refresh credential has expired and must be linked again'),
+          { code: 'NATIVE_REFRESH_REAUTH_REQUIRED' },
+        );
+      },
+    });
+    const { ask, seen, accountManager, secretStore } = started;
+    assert.equal((await ask({ sid: 'session-one' })).status, 200);
+    await secretStore.set('acct_a', {
+      accessToken: 'token-acct_a',
+      refreshToken: 'refresh-acct_a',
+      expiresAt: 1,
+    });
+    preferAccount(accountManager, 'acct_b', 'acct_c');
+    assert.equal((await ask({ sid: 'session-one' })).status, 200);
+    assert.deepEqual(seen, ['Bearer token-acct_a', 'Bearer token-acct_b'], '前提: 最初の要求は acct_b で完走する');
+    assert.equal(
+      accountManager.find('acct_a').errorReason?.cause,
+      'NATIVE_REFRESH_REAUTH_REQUIRED',
+      '前提: 結び付け先は再ログインが要る失効として記録されている',
+    );
+    return started;
+  }
+
+  it('moves the binding to the detour of the first failed request when the bound account needs a new login', async () => {
+    const { ask, seen, accountManager, logLines } = await startWithReloginDetour();
+
+    // 新規割当なら acct_c が選ばれる状態にしても、迂回先の acct_b へ移す。
+    preferAccount(accountManager, 'acct_c', 'acct_b');
+    assert.equal((await ask({ sid: 'session-one' })).status, 200);
+    assert.equal((await ask({ sid: 'session-one' })).status, 200);
+
+    assert.deepEqual(seen.slice(1), Array(3).fill('Bearer token-acct_b'), `送り先が1回目と同じ: ${seen.join(', ')}`);
+    const switches = eventLines(logLines, 'affinity_switch');
+    assert.equal(switches.length, 1, switches.join('\n'));
+    assert.match(switches[0], / from=acct_a to=acct_b reason=reauth_required family=other switches=1$/);
+  });
+
+  it('picks the new binding afresh when the bound account needs a new login and no detour is kept', async () => {
+    const clock = { ms: Date.now() };
+    const { ask, seen, accountManager, logLines } = await startAffinity({
+      accounts: ['acct_a', 'acct_b', 'acct_c'],
+      clock,
+    });
+
+    assert.equal((await ask({ sid: 'session-one' })).status, 200);
+    // 一時的に使えない間に acct_b を迂回先にし、結び付け先が戻ったところで迂回先を捨てる。
+    accountManager.markRateLimited('acct_a', 60);
+    preferAccount(accountManager, 'acct_b', 'acct_c');
+    assert.equal((await ask({ sid: 'session-one' })).status, 200);
+    clock.ms += 61_000;
+    assert.equal((await ask({ sid: 'session-one' })).status, 200);
+    assert.deepEqual(seen, ['Bearer token-acct_a', 'Bearer token-acct_b', 'Bearer token-acct_a']);
+
+    markReloginRequired(accountManager, 'acct_a');
+    preferAccount(accountManager, 'acct_c', 'acct_b');
+    assert.equal((await ask({ sid: 'session-one' })).status, 200);
+
+    assert.equal(seen.at(-1), 'Bearer token-acct_c', '捨てた迂回先ではなく、選び直した口座へ移す');
+    const switches = eventLines(logLines, 'affinity_switch');
+    assert.equal(switches.length, 1, switches.join('\n'));
+    assert.match(switches[0], / from=acct_a to=acct_c reason=reauth_required family=other switches=1$/);
+  });
+
+  for (const [label, makeUnfit] of [
+    [
+      'over the assign-stop line',
+      accountManager => accountManager.updateQuota('acct_b', {
+        'anthropic-ratelimit-unified-5h-utilization': '0.95',
+      }),
+    ],
+    ['not usable', accountManager => accountManager.markRateLimited('acct_b', 300)],
+  ]) {
+    it(`picks the new binding afresh when the detour of the first failed request is ${label}`, async () => {
+      const { ask, seen, accountManager, logLines } = await startWithReloginDetour();
+
+      accountManager.updateQuota('acct_c', { 'anthropic-ratelimit-unified-5h-utilization': '0.3' });
+      makeUnfit(accountManager);
+      assert.equal((await ask({ sid: 'session-one' })).status, 200);
+
+      assert.equal(seen.at(-1), 'Bearer token-acct_c');
+      const switches = eventLines(logLines, 'affinity_switch');
+      assert.equal(switches.length, 1, switches.join('\n'));
+      assert.match(switches[0], / from=acct_a to=acct_c reason=reauth_required family=other switches=1$/);
+    });
+  }
 
   // ---- 一時的に使えない結び付け先の迂回先 ----
   // 結び付け先が一時的に使えない間（throttled・資格情報の更新の cooldown など）は、結び付けを
