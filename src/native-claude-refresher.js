@@ -12,7 +12,7 @@ import {
   writeFile,
 } from 'node:fs/promises';
 import { tmpdir, userInfo } from 'node:os';
-import { delimiter, isAbsolute, join, resolve } from 'node:path';
+import { basename, delimiter, isAbsolute, join, resolve } from 'node:path';
 import { performance } from 'node:perf_hooks';
 
 import { claudeKeychainServiceName } from './claude-keychain.js';
@@ -35,6 +35,8 @@ const SAFE_KEYCHAIN_ACCOUNT_RE = /^[a-zA-Z0-9._-]+$/;
 const FALLBACK_KEYCHAIN_ACCOUNT = 'claude-code-user';
 const DEFAULT_KEYCHAIN_TIMEOUT_MS = 5_000;
 const NATIVE_CLAUDE_TERMINATION_GRACE_MS = 2_000;
+const CLAUDE_VERSION_RE = /^\d+\.\d+\.\d+(?:-[0-9A-Za-z.]+)?$/;
+const MAX_CLAUDE_VERSION_LENGTH = 64;
 
 export class NativeClaudeRefreshError extends Error {
   constructor(message, code, {
@@ -47,6 +49,35 @@ export class NativeClaudeRefreshError extends Error {
     this.retryAfterMs = retryAfterMs;
     this.retryAfterSource = retryAfterSource;
   }
+}
+
+// What a refresh saw, for the refresh log only: expiry numbers, where the login
+// expiry came from, and the version of the binary that ran. Kept beside the
+// result or error object instead of on it, so the stored credential and the
+// error keep exactly their own keys. Never holds a token or anything derived
+// from one.
+const refreshObservations = new WeakMap();
+
+export function nativeRefreshObservation(target) {
+  if ((typeof target !== 'object' && typeof target !== 'function') || target === null) return null;
+  return refreshObservations.get(target) ?? null;
+}
+
+function recordRefreshObservation(target, observation) {
+  try {
+    refreshObservations.set(target, Object.freeze({ ...observation }));
+  } catch {
+    // Observation is best effort and must never change the refresh outcome.
+  }
+}
+
+// The version is the last part of the pinned binary path when that part is a
+// version as a whole (the native installer keeps each release under
+// `versions/<version>`). Anything else is `unknown`; the path itself is never kept.
+function nativeClaudeVersion(pinnedCommand) {
+  if (!isNonEmptyString(pinnedCommand) || !isAbsolute(pinnedCommand)) return 'unknown';
+  const name = basename(pinnedCommand);
+  return name.length <= MAX_CLAUDE_VERSION_LENGTH && CLAUDE_VERSION_RE.test(name) ? name : 'unknown';
 }
 
 export function createNativeClaudeRefresher(options = {}) {
@@ -90,6 +121,7 @@ export async function refreshWithNativeClaudeCode(refreshToken, context = {}, {
     realpathImpl,
   });
   const commandArgs = validateCommand(configuredCommand, args, execFileImpl);
+  const claudeVersion = nativeClaudeVersion(configuredCommand);
   if (
     typeof removeImpl !== 'function'
     || typeof openImpl !== 'function'
@@ -115,6 +147,7 @@ export async function refreshWithNativeClaudeCode(refreshToken, context = {}, {
   let credentialStorage = null;
   let result;
   let primaryError = null;
+  let childWroteRefreshExpiry = false;
 
   try {
     sandbox = await mkdtemp(join(configuredTempRoot, TEMP_DIRECTORY_PREFIX));
@@ -234,6 +267,8 @@ export async function refreshWithNativeClaudeCode(refreshToken, context = {}, {
         refreshed,
         normalizeNow(now),
       );
+      // Validation already rejected an unusable value, so a present key is valid.
+      childWroteRefreshExpiry = refreshed.refreshTokenExpiresAt != null;
     } catch {
       throw new NativeClaudeRefreshError(
         'Native Claude OAuth credential refresh outcome is unknown',
@@ -266,7 +301,25 @@ export async function refreshWithNativeClaudeCode(refreshToken, context = {}, {
     }
   }
 
-  if (primaryError) throw primaryError;
+  if (primaryError) {
+    recordRefreshObservation(primaryError, { claudeVersion });
+    throw primaryError;
+  }
+  try {
+    const refreshTokenExpiresAt = result.refreshTokenExpiresAt ?? null;
+    let source = 'absent';
+    if (childWroteRefreshExpiry) source = 'received';
+    else if (refreshTokenExpiresAt != null) source = 'carried';
+    recordRefreshObservation(result, {
+      refreshTokenExpiresAt,
+      previousRefreshTokenExpiresAt: previous.refreshTokenExpiresAt ?? null,
+      accessExpiresAt: result.expiresAt,
+      source,
+      claudeVersion,
+    });
+  } catch {
+    // Observation is best effort and must never change the refresh outcome.
+  }
   return result;
 }
 
@@ -312,10 +365,15 @@ function validatePreviousCredential(refreshToken, context, now) {
     metadata.scopes = [...CLAUDE_AI_OAUTH_SCOPES];
   }
   if (metadata.refreshTokenExpiresAt != null && metadata.refreshTokenExpiresAt <= now) {
-    throw new NativeClaudeRefreshError(
+    const error = new NativeClaudeRefreshError(
       'The stored OAuth refresh credential has expired and must be linked again',
       'NATIVE_REFRESH_REAUTH_REQUIRED',
     );
+    recordRefreshObservation(error, {
+      refreshTokenExpiresAt: metadata.refreshTokenExpiresAt,
+      accessExpiresAt: expiresAt,
+    });
+    throw error;
   }
 
   return {
