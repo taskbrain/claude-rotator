@@ -16,6 +16,7 @@ import {
   normalizeObservability,
   observationLogFields,
   parseUsageObservation,
+  requestClassFromHeader,
   upstreamAcceptEncoding,
 } from '../src/usage-observation.js';
 
@@ -650,5 +651,71 @@ describe('observationLogFields / 猶予（grace）', () => {
       observationLogFields(failed).endsWith(' usageParse=unsupported-encoding g5h=0.1 g7d=- ustat=allowed ovs=rejected ovu=false'),
       observationLogFields(failed),
     );
+  });
+});
+
+describe('requestClassFromHeader', () => {
+  it('決まった5語はその語を返す', () => {
+    for (const word of ['main', 'subagent', 'workflow', 'compaction', 'auxiliary']) {
+      assert.equal(requestClassFromHeader(word), word);
+    }
+  });
+
+  it('前後の空白を落とし、小文字にそろえる', () => {
+    assert.equal(requestClassFromHeader(' Compaction '), 'compaction');
+  });
+
+  it('空でないほかの字は other に寄せる（受け取った字を行に出さない）', () => {
+    assert.equal(requestClassFromHeader('something-else'), 'other');
+  });
+
+  it('無い・空・字でないときは null', () => {
+    for (const value of ['', undefined, null, 42]) {
+      assert.equal(requestClassFromHeader(value), null);
+    }
+  });
+
+  it('配列なら1つめを使う', () => {
+    assert.equal(requestClassFromHeader(['main', 'x']), 'main');
+  });
+});
+
+describe('observationLogFields / 要求の種類（rc=）', () => {
+  const base = {
+    model: 'claude-opus-5-1',
+    sid: 'ab12cd34ef56',
+    inputTokens: 10,
+    outputTokens: 20,
+    cacheReadTokens: 99000,
+    cacheCreationTokens: 1500,
+    cacheCreation1hTokens: 1500,
+    cacheCreation5mTokens: 0,
+    quota: { unified5h: 0.76, unified5hReset: 1789012345, unified7d: 0.33, unified7dReset: 1789098765 },
+    encoding: 'gzip',
+    parse: 'ok',
+  };
+  // 既存テスト「決まった順序どおりに追記する」の期待と同じ字。
+  const WITHOUT_CLASS = ' model=claude-opus-5-1 sid=ab12cd34ef56 in=10 out=20 cr=99000 cc=1500 c1h=1500 c5m=0'
+    + ' u5h=0.76 u5hReset=1789012345 u7d=0.33 u7dReset=1789098765 enc=gzip';
+
+  it('requestClass が字のときだけ末尾に rc= を足す', () => {
+    const rendered = observationLogFields({ ...base, requestClass: 'auxiliary' });
+    assert.ok(rendered.endsWith(' rc=auxiliary'), rendered);
+    assert.equal(rendered, `${WITHOUT_CLASS} rc=auxiliary`);
+  });
+
+  it('requestClass が null なら行は前の版とバイトまで同じ', () => {
+    const rendered = observationLogFields({ ...base, requestClass: null });
+    assert.equal(rendered, WITHOUT_CLASS);
+    assert.equal(Buffer.compare(Buffer.from(rendered), Buffer.from(WITHOUT_CLASS)), 0);
+  });
+
+  it('猶予の欄があるときも rc= は ovu= の後に来る', () => {
+    const rendered = observationLogFields({
+      ...base,
+      grace: { g5h: 0.02, g7d: 0, ustat: 'allowed_warning', ovs: 'rejected', ovu: 'false' },
+      requestClass: 'compaction',
+    });
+    assert.ok(rendered.endsWith(' ovu=false rc=compaction'), rendered);
   });
 });
