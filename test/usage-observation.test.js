@@ -13,10 +13,12 @@ import { promisify } from 'node:util';
 
 import {
   DEFAULT_OBSERVABILITY,
+  effortFromRequest,
   normalizeObservability,
   observationLogFields,
   parseUsageObservation,
   requestClassFromHeader,
+  requestEffortFromBody,
   upstreamAcceptEncoding,
 } from '../src/usage-observation.js';
 
@@ -717,5 +719,138 @@ describe('observationLogFields / 要求の種類（rc=）', () => {
       requestClass: 'compaction',
     });
     assert.ok(rendered.endsWith(' ovu=false rc=compaction'), rendered);
+  });
+});
+
+describe('effortFromRequest', () => {
+  it('決まった5語はその語を返す', () => {
+    for (const word of ['low', 'medium', 'high', 'xhigh', 'max']) {
+      assert.equal(effortFromRequest(word), word);
+    }
+  });
+
+  it('前後の空白を落とし、小文字にそろえる', () => {
+    assert.equal(effortFromRequest(' XHigh '), 'xhigh');
+    assert.equal(effortFromRequest('MAX'), 'max');
+    assert.equal(effortFromRequest('\tLow\n'), 'low');
+  });
+
+  it('空でないほかの字は other に寄せる（受け取った字を行に出さない）', () => {
+    assert.equal(effortFromRequest('adaptive'), 'other');
+    assert.equal(effortFromRequest('EFFORT-MARKER-5e0b'), 'other');
+  });
+
+  it('無い・空・字でないときは null', () => {
+    for (const value of ['', '   ', undefined, null, 0, 3, true, {}, { effort: 'high' }, ['high']]) {
+      assert.equal(effortFromRequest(value), null, String(value));
+    }
+  });
+});
+
+describe('requestEffortFromBody', () => {
+  it('一番上の output_config.effort を effort にする', () => {
+    assert.deepEqual(
+      requestEffortFromBody({ model: 'claude-opus-5-1', output_config: { effort: 'High' } }),
+      { effort: 'high', effortMsg: null },
+    );
+  });
+
+  it('messages を後ろから見て、最初に output_config.effort を持つ role:system の値を effortMsg にする', () => {
+    const body = {
+      messages: [
+        { role: 'system', output_config: { effort: 'max' } },
+        { role: 'user', content: 'MESSAGE-MARKER-1', output_config: { effort: 'low' } },
+        { role: 'system', content: 'MESSAGE-MARKER-2', output_config: { effort: 'medium' } },
+        { role: 'system', content: 'MESSAGE-MARKER-3', output_config: { timing: 'x' } },
+        { role: 'assistant', content: 'MESSAGE-MARKER-4' },
+      ],
+    };
+    assert.deepEqual(requestEffortFromBody(body), { effort: null, effortMsg: 'medium' });
+  });
+
+  it('effortMsg も effort と同じ規則で寄せる', () => {
+    assert.equal(requestEffortFromBody({ messages: [{ role: 'system', output_config: { effort: 'adaptive' } }] }).effortMsg, 'other');
+    assert.equal(requestEffortFromBody({ messages: [{ role: 'system', output_config: { effort: '' } }] }).effortMsg, null);
+  });
+
+  it('形の違う本文では両方とも null', () => {
+    for (const body of [
+      null,
+      undefined,
+      'text',
+      42,
+      [],
+      {},
+      { output_config: 'high', messages: 'not a list' },
+      { output_config: null, messages: [null, 'text', 7, { role: 'system', output_config: null }] },
+      { output_config: ['high'], messages: [{ role: 'system', output_config: ['low'] }] },
+    ]) {
+      assert.deepEqual(requestEffortFromBody(body), { effort: null, effortMsg: null }, JSON.stringify(body));
+    }
+  });
+});
+
+describe('observationLogFields / 要求の深さと見出しの時刻（effort=・effortMsg=・hdrMs=）', () => {
+  const base = {
+    model: 'claude-opus-5-1',
+    sid: 'ab12cd34ef56',
+    inputTokens: 10,
+    outputTokens: 20,
+    cacheReadTokens: 99000,
+    cacheCreationTokens: 1500,
+    cacheCreation1hTokens: 1500,
+    cacheCreation5mTokens: 0,
+    quota: { unified5h: 0.76, unified5hReset: 1789012345, unified7d: 0.33, unified7dReset: 1789098765 },
+    encoding: 'gzip',
+    parse: 'ok',
+  };
+  // 既存テスト「決まった順序どおりに追記する」の期待と同じ字。
+  const WITHOUT_NEW_FIELDS = ' model=claude-opus-5-1 sid=ab12cd34ef56 in=10 out=20 cr=99000 cc=1500 c1h=1500 c5m=0'
+    + ' u5h=0.76 u5hReset=1789012345 u7d=0.33 u7dReset=1789098765 enc=gzip';
+
+  // 欄の並びを見るのは enc=（と猶予の欄）より後ろかと、3つの欄どうしの順だけ。ほかの末尾の欄との順は見ない。
+  function assertTail(rendered, tail) {
+    assert.ok(rendered.startsWith(WITHOUT_NEW_FIELDS), rendered);
+    let from = rendered.indexOf(' ovu=') >= 0 ? rendered.indexOf(' ovu=') : WITHOUT_NEW_FIELDS.length - 1;
+    for (const field of tail) {
+      const at = rendered.indexOf(` ${field}`, from + 1);
+      assert.ok(at > from, `${field} の位置: ${rendered}`);
+      from = at;
+    }
+  }
+
+  it('3つとも null なら行は前の版とバイトまで同じ', () => {
+    const rendered = observationLogFields({ ...base, effort: null, effortMsg: null, headersMs: null });
+    assert.equal(Buffer.compare(Buffer.from(rendered), Buffer.from(WITHOUT_NEW_FIELDS)), 0, rendered);
+  });
+
+  it('effort= effortMsg= hdrMs= の順で enc= より後ろに足す', () => {
+    const rendered = observationLogFields({ ...base, effort: 'xhigh', effortMsg: 'low', headersMs: 812 });
+    assertTail(rendered, ['effort=xhigh', 'effortMsg=low', 'hdrMs=812']);
+  });
+
+  it('猶予の欄と rc= があるときも、3つは猶予の欄より後ろに来る', () => {
+    const rendered = observationLogFields({
+      ...base,
+      grace: { g5h: 0.02, g7d: 0, ustat: 'allowed_warning', ovs: 'rejected', ovu: 'false' },
+      requestClass: 'main',
+      effort: 'high',
+      effortMsg: 'other',
+      headersMs: 0,
+    });
+    assertTail(rendered, ['effort=high', 'effortMsg=other', 'hdrMs=0']);
+    assert.ok(rendered.includes(' rc=main'), rendered);
+  });
+
+  it('値のある欄だけを出す', () => {
+    assertTail(observationLogFields({ ...base, effortMsg: 'max' }), ['effortMsg=max']);
+    const onlyTiming = observationLogFields({ ...base, headersMs: 5 });
+    assert.equal(onlyTiming, `${WITHOUT_NEW_FIELDS} hdrMs=5`);
+  });
+
+  it('hdrMs は 0 以上の整数のときだけ出す', () => {
+    for (const headersMs of [-1, 1.5, NaN, Infinity, '12', undefined]) {
+      assert.equal(observationLogFields({ ...base, headersMs }), WITHOUT_NEW_FIELDS, String(headersMs));
+    }
   });
 });
