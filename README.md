@@ -768,7 +768,7 @@ Claude Code は `accept-encoding: gzip, deflate, br, zstd` を送ります。上
 
 なお、アカウント切り替えの `account_switch` 行は別機能（session affinity 側）が出しています。ここでは扱いません。
 
-proxy request ログに出るのは `account`、`method`、`path`、`status`、`durationMs`、`outcome`、`requestId`、timeout/network error 時の `errorType` だけです。内部 proxy error は `proxy-error method=... path=... error=...` として短い原因を出します。token / Authorization header / API key / request body / response body は出しません。
+proxy request ログに出るのは `account`、`method`、`path`、`status`、`durationMs`、`outcome`、`requestId`、timeout/network error 時の `errorType` だけです。内部 proxy error は `proxy-error method=... path=... requestSeq=... error=...` として短い原因を出します。`requestSeq` は要求の到着の番号で、いつも出します（起動ごとに 1 から数え、`/internal/*` への要求も含めて全部の要求を数えるので、番号は飛びます）。アカウントを選んだ後の誤りでは、続けて `account`（その要求で最後に選んだアカウントの id。proxy 行と同じ値）を出し、`sessionAffinity` がセッションの鍵を取り出せたときは、さらに `sid`（proxy 行と同じ 12 桁のハッシュ）を出します。`error=` はいつも行の最後の欄です。本文の上限を超えた要求の行は `proxy-error method=... path=... requestSeq=... error=request_too_large limitBytes=...` です。生のセッション id とアカウント名は出しません。token / Authorization header / API key / request body / response body は出しません。
 
 [セッション単位のアカウント固定](#セッション単位のアカウント固定sessionaffinity)（`sessionAffinity`）を有効にすると、次の追記と行が増えます。**`mode: "off"`（既定）ではこれらは1行も出ず、proxy request ログの行も現行とバイト単位で同一です。**
 
@@ -813,6 +813,8 @@ Claude Code からの正確なモデル ID `claude-fable-5` または `claude-fa
 切り替え可能なアカウントがなくローカルで 429 を返す場合も、Claude Code が 5時間枠は `session limit`、7日枠は `weekly limit` として扱える unified rate-limit ヘッダーを返します。rotator 独自の補足情報は JSON の `details.rotator_message` に入ります。
 
 retryable な上流 5xx / 529 / `x-should-retry` 付きレスポンス、または上流アイドルタイムアウトが起きた場合も、アカウント切り替えは行いません。上流の error body または proxy の timeout error を可能な限りそのまま返します。ただし `openaiBridge.degradeMapping.upstreamOverloadTo429` を `true` にしたときだけ、上流の 529 `overloaded_error` は 429 ＋ `Retry-After` へ書き換えます（アカウント切り替えを行わない点は変わりません）。詳細は [設定ファイルと環境変数](#設定ファイルと環境変数) の「GPT モデルとの相互退避」を参照してください。
+
+リクエストを上流へ送る前に、そのアカウントの資格情報を読むためのローカルのロックを最大45秒待っても取れなかった場合は、502 ではなく 429 `rate_limit_error` と `Retry-After: 5` を返します。この 429 は claude-rotator 自身が返すもので、アカウントの使用量の上限に達したことを意味しません。`anthropic-ratelimit-*` ヘッダーは付けず、上流へは送らず、別アカウントへの切り替えもアカウントの状態の変更も行いません（`degradeMapping` の書き換えの対象にもなりません）。Fable の上限を再確認して別アカウントへ再送する途中でこの待ちが切れた場合は、従来どおり再送前の上流の応答を返します。再試行の回数に上限のあるクライアントでは、ロックの取り合いが長く続くと、再試行を使い切ってエラーが表示されることがあります。
 
 Usage API の再取得は、デフォルトでは 15 分ごとの定期 polling と、100% 到達済みの枠がリセットされる時刻の直後に実行されます。間隔は [設定ファイルと環境変数](#設定ファイルと環境変数) の `usagePolling.intervalMs` で変更できます。Claude Code 側の早期リセットや一時的な状態変化を確認したい場合は、次の手動コマンドで全登録アカウントを即時再確認します。
 
@@ -2174,7 +2176,7 @@ Only when an upstream response carries a usage-limit grace header (`anthropic-ra
 
 Only when a request carries the `x-claude-code-request-class` header (Claude Code sends it when `CLAUDE_CODE_GATEWAY_HINT_HEADERS=1` is set), `rc` is appended at the very end of the proxy line, after the grace fields: one of `main` / `subagent` / `workflow` / `compaction` / `auxiliary`, or `other` for any other value (the received text itself is never written). Without the header nothing is appended and the line is byte-for-byte unchanged. The header is forwarded upstream unchanged. Like the cache fields, `rc` is written only while `observability.requestLog.enabled` is `true` (the default).
 
-The only fields written to the proxy request log are `account`, `method`, `path`, `status`, `durationMs`, `outcome`, `requestId`, and, on a timeout/network error, `errorType`. Internal proxy errors are logged as a short `proxy-error method=... path=... error=...` line. Tokens, the `Authorization` header, API keys, request bodies, and response bodies are never logged.
+The only fields written to the proxy request log are `account`, `method`, `path`, `status`, `durationMs`, `outcome`, `requestId`, and, on a timeout/network error, `errorType`. Internal proxy errors are logged as a short `proxy-error method=... path=... requestSeq=... error=...` line. `requestSeq` is always written: it is the request's arrival number (it restarts from 1 on each start and counts every request, including those to `/internal/*`, so numbers can skip). For an error after an account was chosen, `account` (the id of the last account chosen for the request, the same value as on the proxy line) follows, and `sid` (the same 12-character hash as on the proxy line) is added when session affinity extracted a session key. `error=` is always the last field. A request over the body-size limit is logged as `proxy-error method=... path=... requestSeq=... error=request_too_large limitBytes=...`. The raw session id and account names are never written. Tokens, the `Authorization` header, API keys, request bodies, and response bodies are never logged.
 
 Enabling [Per-Session Account Pinning](#per-session-account-pinning-sessionaffinity) (`sessionAffinity`) adds the following fields and lines. **With `mode: "off"` (the default) none of them is written, and the proxy request log line stays byte-identical to today's.**
 
@@ -2219,6 +2221,8 @@ The weekly-reset priority window defaults to within 36 hours of reset, and can b
 Even when no account is available to switch to and the proxy returns a local 429, Claude Code still receives the same unified rate-limit headers it understands, treating a 5-hour exhaustion as a `session limit` and a 7-day exhaustion as a `weekly limit`. Rotator-specific detail is added under the JSON's `details.rotator_message`.
 
 The proxy never switches accounts for a retryable upstream 5xx/529, a response carrying `x-should-retry`, or an upstream idle timeout. It passes the upstream error body, or the proxy's own timeout error, straight through wherever possible instead. The one exception is `openaiBridge.degradeMapping.upstreamOverloadTo429: true`, which rewrites an upstream 529 `overloaded_error` into 429 with `Retry-After` (accounts are still never switched); see "Cross-Degradation with GPT Models" under Configuration.
+
+If the local lock that guards an account's stored credentials cannot be acquired within 45 seconds before a request is sent upstream, the proxy answers with 429 `rate_limit_error` and `Retry-After: 5` instead of 502. This 429 comes from claude-rotator itself and does not mean the account has reached its usage limit: it carries no `anthropic-ratelimit-*` headers, nothing is sent upstream, and the proxy neither switches accounts nor changes any account's state (the `degradeMapping` rewrites do not apply to it either). If the wait runs out while a request is being resent to another account after a Fable limit was confirmed, the proxy returns the earlier upstream response as before. A client that caps its number of retries may still show an error once it runs out of retries if the lock stays contended for a long time.
 
 By default the Usage API is refetched on a 15-minute periodic poll, and again right after a window that had reached 100% is expected to reset. The interval can be changed with `usagePolling.intervalMs` in [Configuration and Environment Variables](#configuration-and-environment-variables). To force an immediate recheck of every registered account — for example, to confirm an early Claude Code-side reset or some other transient state change — run:
 

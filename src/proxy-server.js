@@ -115,6 +115,12 @@ const SCOPED_USAGE_PRESERVE_PREFIX = 'scoped_weekly_preserve:';
 const DEFAULT_RESET_CHECK_DELAY_MS = 1000;
 const MAX_TIMER_DELAY_MS = 2_147_483_647;
 const MIN_USABLE_ACCESS_TOKEN_LIFETIME_MS = 60_000;
+// 要求の道の資格情報の読み（3か所）だけが口座のロックを待つ長さ。店の既定より短くし、
+// 待ち切れなければ 502 ではなく 429 と Retry-After で試し直しを促す。
+const REQUEST_PATH_SECRET_LOCK_WAIT_MS = 45_000;
+const SECRET_LOCK_BUSY_RETRY_AFTER_SECONDS = 5;
+// 上の読みから来たロックの時間切れだけに付ける印。モジュールの外へは出さない。
+const REQUEST_PATH_LOCK_WAIT_EXPIRED = Symbol('request-path-lock-wait-expired');
 // バインドが変わってから runtime-state.json へ合流するまでの上限。
 // 表そのものは persistState が走るたびに載るので、この時計は「要求の完了を待たない」
 // ための予備であり（長時間 SSE・reload 以外の掃除）、新しいファイルは作らない。
@@ -641,8 +647,19 @@ export function createProxyServer({
     });
   };
 
+  // proxy-error の行の path= と error= の間に入れる欄。requestSeq は到着の番号でいつも書き、
+  // account（その要求で最後に選んだ口座の id）と sid（結び付けの 12 桁のハッシュ）は値があるときだけ書く。
+  const proxyErrorFields = (req, context) => {
+    const fields = [`requestSeq=${requestArrivalOrder.get(req)}`];
+    if (context?.account) fields.push(`account=${context.account}`);
+    if (context?.sid) fields.push(`sid=${context.sid}`);
+    return fields.join(' ');
+  };
+
   const server = http.createServer(async (req, res) => {
     requestArrivalOrder.set(req, ++requestArrivalCount);
+    // 外側の catch から読めるよう try の前に作る。forwardWithRotation が値を入れる。
+    const proxyErrorContext = { account: null, sid: null };
     // 上限を超えた要求より後に同じ接続で届いた要求（本文を読まない要求も含む）。
     if (arrivedAfterTooLarge(req)) {
       req.resume();
@@ -958,6 +975,7 @@ export function createProxyServer({
           : {}),
         observability: observabilitySettings,
         usageEventWriter,
+        proxyErrorContext,
       });
       await persistState();
     } catch (error) {
@@ -966,13 +984,15 @@ export function createProxyServer({
       if (error?.code === REQUEST_AFTER_TOO_LARGE) return;
       if (error?.code === REQUEST_BODY_TOO_LARGE && arrivedAfterTooLarge(req)) return;
       if (error?.code === REQUEST_BODY_TOO_LARGE && !res.headersSent) {
-        logger?.(`${new Date().toISOString()} proxy-error method=${req.method} path=${safeRequestPath(req.url)} error=request_too_large limitBytes=${error.limitBytes}`);
+        logger?.(`${new Date().toISOString()} proxy-error method=${req.method} path=${safeRequestPath(req.url)} ${proxyErrorFields(req, proxyErrorContext)} error=request_too_large limitBytes=${error.limitBytes}`);
         sendRequestTooLarge(req, res, { ...requestBodyDrain, logger });
         return;
       }
       const message = shortErrorMessage(error);
-      logger?.(`${new Date().toISOString()} proxy-error method=${req.method} path=${safeRequestPath(req.url)} error=${message}`);
-      if (!res.headersSent) {
+      logger?.(`${new Date().toISOString()} proxy-error method=${req.method} path=${safeRequestPath(req.url)} ${proxyErrorFields(req, proxyErrorContext)} error=${message}`);
+      if (!res.headersSent && error?.[REQUEST_PATH_LOCK_WAIT_EXPIRED] === true) {
+        sendSecretLockBusy(res);
+      } else if (!res.headersSent) {
         sendJson(res, 502, {
           type: 'error',
           error: { type: 'proxy_error', message },
@@ -2495,6 +2515,7 @@ async function resolveReactiveReplaySecret({
   currentCredentialReader,
   allowLiveClaudeCodeCredentials = true,
   signal = null,
+  lockAcquireTimeoutMs = null,
 }) {
   throwIfOperationAborted(signal);
   if (account.id === 'current' || account.credentialSource === 'claude-code-current') {
@@ -2505,7 +2526,11 @@ async function resolveReactiveReplaySecret({
     throwIfOperationAborted(signal);
     return secret;
   }
-  const secret = await getOperationalSecret(secretStore, account.id);
+  const secret = await getOperationalSecret(
+    secretStore,
+    account.id,
+    lockAcquireTimeoutMs == null ? null : { lockAcquireTimeoutMs },
+  );
   throwIfOperationAborted(signal);
   return secret;
 }
@@ -2780,6 +2805,7 @@ async function forwardWithRotation({
   sessionAffinityCounts = null,
   observability = DEFAULT_OBSERVABILITY,
   usageEventWriter = null,
+  proxyErrorContext = null,
 }) {
   // 論理要求1件につき1つ。forwardOnce() を呼ぶたびに attempt が1つ進む（401 後の再送・
   // 口座の切り替え・利用不可口座での実送信を含む）。writer が無ければ null で、計測しない。
@@ -2810,6 +2836,7 @@ async function forwardWithRotation({
     affinity: sessionAffinity,
     settings: sessionAffinitySettings,
   });
+  if (proxyErrorContext && affinityRequest?.sid) proxyErrorContext.sid = affinityRequest.sid;
   // sid 付与率の母数。ここを通る要求だけを数えるので、gpt-* 宛の要求
   // （openai-bridge へ分岐して本関数へ来ない）は分母にも分子にも入らない。
   if (affinityRequest && sessionAffinityCounts) {
@@ -2911,10 +2938,12 @@ async function forwardWithRotation({
         affinityLog: affinityRequest,
         observability,
         usageEvents,
+        proxyErrorContext,
       })) return;
       sendUnavailableAccounts(res, accountManager, mapExhaustion, { req, logger, affinityLog: affinityRequest });
       return;
     }
+    if (proxyErrorContext) proxyErrorContext.account = account.id;
 
     // 猶予は「選択の直後・資格情報の解決の前」に置く。
     // 予約は `createSessionAffinityRequest` の同期区間で済んでいるので、
@@ -2951,6 +2980,7 @@ async function forwardWithRotation({
           secretStore,
           currentCredentialReader,
           allowLiveClaudeCodeCredentials,
+          lockAcquireTimeoutMs: REQUEST_PATH_SECRET_LOCK_WAIT_MS,
         })
         : await resolveSecretForAccount({
           account,
@@ -2959,6 +2989,7 @@ async function forwardWithRotation({
           currentProfileFetcher,
           allowLiveClaudeCodeCredentials,
           logger,
+          lockAcquireTimeoutMs: REQUEST_PATH_SECRET_LOCK_WAIT_MS,
         });
     } catch (error) {
       if (reactiveQuotaRetryUsed && lastRetryableResponse) {
@@ -3250,6 +3281,7 @@ async function forwardWithRotation({
       affinityLog: affinityRequest,
       observability,
       usageEvents,
+      proxyErrorContext,
     })) return;
     sendUnavailableAccounts(res, accountManager, mapExhaustion, { req, logger, affinityLog: affinityRequest });
   }
@@ -3277,6 +3309,7 @@ async function forwardCurrentUnavailableAccount({
   affinityLog = null,
   observability = DEFAULT_OBSERVABILITY,
   usageEvents = null,
+  proxyErrorContext = null,
 }) {
   if (sendCurrentQuotaUnavailableResponse({
     req,
@@ -3290,6 +3323,7 @@ async function forwardCurrentUnavailableAccount({
 
   const account = accountManager.getFallbackAccount();
   if (!account) return false;
+  if (proxyErrorContext) proxyErrorContext.account = account.id;
 
   let secret;
   try {
@@ -3300,6 +3334,7 @@ async function forwardCurrentUnavailableAccount({
       currentProfileFetcher,
       allowLiveClaudeCodeCredentials,
       logger,
+      lockAcquireTimeoutMs: REQUEST_PATH_SECRET_LOCK_WAIT_MS,
     });
   } catch (caught) {
     if (caught?.code !== 'NATIVE_REFRESH_OUTCOME_UNKNOWN') throw caught;
@@ -3469,6 +3504,7 @@ async function resolveSecretForAccount({
   liveCredentialLoader = null,
   allowLiveClaudeCodeCredentials = true,
   logger,
+  lockAcquireTimeoutMs = null,
 }) {
   throwIfOperationAborted(signal);
   if (account.type === 'apikey') {
@@ -3485,7 +3521,11 @@ async function resolveSecretForAccount({
     return secret;
   }
 
-  const stored = await getOperationalSecret(secretStore, account.id);
+  const stored = await getOperationalSecret(
+    secretStore,
+    account.id,
+    lockAcquireTimeoutMs == null ? null : { lockAcquireTimeoutMs },
+  );
   throwIfOperationAborted(signal);
   if (!allowLiveClaudeCodeCredentials || !account.accountUuid) return stored;
 
@@ -3570,9 +3610,15 @@ function requireSecretStoreRefreshIfUnchanged(secretStore) {
   return secretStore.refreshIfUnchanged.bind(secretStore);
 }
 
-function getOperationalSecret(secretStore, accountId) {
+// options を渡すのは要求の道の読みだけ。そのときのロックの時間切れにだけ印を付けて投げ直し、
+// 外側の受けが 429 を返せるようにする（文と code は変えない）。印を付けるのはここだけにする。
+function getOperationalSecret(secretStore, accountId, options = null) {
   if (typeof secretStore?.getOperational === 'function') {
-    return secretStore.getOperational(accountId);
+    if (options == null) return secretStore.getOperational(accountId);
+    return new Promise(resolve => resolve(secretStore.getOperational(accountId, options))).catch(error => {
+      if (error?.code === 'SECRET_STORE_LOCK_TIMEOUT') error[REQUEST_PATH_LOCK_WAIT_EXPIRED] = true;
+      throw error;
+    });
   }
   return secretStore.get(accountId);
 }
@@ -4940,6 +4986,22 @@ function sendRequestTooLarge(req, res, {
 function sendJson(res, status, body) {
   res.writeHead(status, { 'Content-Type': 'application/json' });
   res.end(JSON.stringify(body));
+}
+
+// 要求の道の読みが口座のロックを待ち切れなかったときの 429。claude-rotator 自身の応答で、
+// 口座の枠の上限ではないので、ratelimit の見出しも口座の id も載せず、degradeMapping の写像にも通さない。
+function sendSecretLockBusy(res) {
+  res.writeHead(429, {
+    'Content-Type': 'application/json',
+    'Retry-After': String(SECRET_LOCK_BUSY_RETRY_AFTER_SECONDS),
+  });
+  res.end(JSON.stringify({
+    type: 'error',
+    error: {
+      type: 'rate_limit_error',
+      message: "claude-rotator timed out waiting for this account's local lock; retry shortly.",
+    },
+  }));
 }
 
 /**

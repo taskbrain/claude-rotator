@@ -1444,6 +1444,180 @@ describe('MacOSKeychainSecretStore', () => {
   });
 });
 
+describe('per-call account-lock wait bound', () => {
+  // A lock directory owned by this live test process is never treated as
+  // stale, so every acquisition attempt has to wait until its bound expires.
+  async function holdLiveLock(lockDir, name) {
+    const lockPath = join(lockDir, name);
+    await mkdir(lockPath, { recursive: true, mode: 0o700 });
+    await writeFile(join(lockPath, 'owner.json'), JSON.stringify({
+      token: `held-by-test-${name}`,
+      pid: process.pid,
+      hostname: hostname(),
+      acquiredAt: 0,
+    }), { mode: 0o600 });
+  }
+
+  // Virtual clock: sleeping advances time instantly, so the tests measure the
+  // bound that was applied without waiting in real time.
+  function virtualClock() {
+    const clock = { now: 0 };
+    clock.options = {
+      now: () => clock.now,
+      monotonicNow: () => clock.now,
+      sleepImpl: async milliseconds => { clock.now += milliseconds; },
+    };
+    return clock;
+  }
+
+  const isLockTimeout = error => error.code === 'SECRET_STORE_LOCK_TIMEOUT';
+
+  it('bounds a Linux operational read by a shorter per-call wait', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'claude-rotator-per-call-lock-'));
+    const accountsDir = join(dir, 'accounts');
+    await holdLiveLock(join(accountsDir, '.locks'), 'acct_1.lock');
+    const clock = virtualClock();
+    const store = new LinuxFileSecretStore({
+      accountsDir,
+      lockAcquireTimeoutMs: 10_000,
+      ...clock.options,
+    });
+
+    await assert.rejects(
+      () => store.getOperational('acct_1', { lockAcquireTimeoutMs: 50 }),
+      isLockTimeout,
+    );
+    assert.equal(clock.now, 50);
+
+    clock.now = 0;
+    await assert.rejects(
+      () => store.getOperational('acct_1', { lockAcquireTimeoutMs: 0 }),
+      isLockTimeout,
+    );
+    assert.equal(clock.now, 0);
+  });
+
+  it('never extends the store bound when the per-call wait is longer', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'claude-rotator-per-call-lock-'));
+    const accountsDir = join(dir, 'accounts');
+    await holdLiveLock(join(accountsDir, '.locks'), 'acct_1.lock');
+    const clock = virtualClock();
+    const store = new LinuxFileSecretStore({
+      accountsDir,
+      lockAcquireTimeoutMs: 100,
+      ...clock.options,
+    });
+
+    await assert.rejects(
+      () => store.getOperational('acct_1', { lockAcquireTimeoutMs: 10_000 }),
+      isLockTimeout,
+    );
+    assert.equal(clock.now, 100);
+  });
+
+  it('keeps the store bound for reads without a per-call wait and for every writer', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'claude-rotator-per-call-lock-'));
+    const accountsDir = join(dir, 'accounts');
+    const lockDir = join(accountsDir, '.locks');
+    await holdLiveLock(lockDir, 'acct_1.lock');
+    const clock = virtualClock();
+    const store = new LinuxFileSecretStore({
+      accountsDir,
+      lockAcquireTimeoutMs: 200,
+      ...clock.options,
+    });
+    const secret = { accessToken: 'unused-access', refreshToken: 'unused-refresh' };
+    const accountLockCalls = {
+      'getOperational without options': () => store.getOperational('acct_1'),
+      set: () => store.set('acct_1', secret),
+      refreshIfUnchanged: () => store.refreshIfUnchanged(
+        'acct_1',
+        secret,
+        async () => assert.fail('the exchange must not run without the lock'),
+      ),
+      compareAndSet: () => store.compareAndSet('acct_1', secret, secret),
+    };
+
+    for (const [label, call] of Object.entries(accountLockCalls)) {
+      clock.now = 0;
+      await assert.rejects(call, isLockTimeout, label);
+      assert.equal(clock.now, 200, label);
+    }
+
+    await holdLiveLock(join(lockDir, '.credential-set'), 'all.lock');
+    clock.now = 0;
+    await assert.rejects(
+      () => store.runCredentialSetExclusive(
+        async () => assert.fail('the operation must not run without the lock'),
+      ),
+      isLockTimeout,
+    );
+    assert.equal(clock.now, 200);
+  });
+
+  it('bounds a macOS operational read by a shorter per-call wait', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'claude-rotator-per-call-lock-'));
+    const lockDir = join(dir, 'locks');
+    await holdLiveLock(lockDir, 'acct_1.lock');
+    const clock = virtualClock();
+    const store = new MacOSKeychainSecretStore({
+      ...createFakeKeychainStoreOptions(lockDir),
+      lockAcquireTimeoutMs: 10_000,
+      ...clock.options,
+    });
+
+    await assert.rejects(
+      () => store.getOperational('acct_1', { lockAcquireTimeoutMs: 50 }),
+      isLockTimeout,
+    );
+    assert.equal(clock.now, 50);
+  });
+
+  it('ignores per-call waits that are not finite non-negative numbers', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'claude-rotator-per-call-lock-'));
+    const accountsDir = join(dir, 'accounts');
+    await holdLiveLock(join(accountsDir, '.locks'), 'acct_1.lock');
+    const clock = virtualClock();
+    const store = new LinuxFileSecretStore({
+      accountsDir,
+      lockAcquireTimeoutMs: 200,
+      ...clock.options,
+    });
+
+    for (const value of ['50', -1, Number.NaN, Number.POSITIVE_INFINITY, null, undefined]) {
+      clock.now = 0;
+      await assert.rejects(
+        () => store.getOperational('acct_1', { lockAcquireTimeoutMs: value }),
+        isLockTimeout,
+        String(value),
+      );
+      assert.equal(clock.now, 200, String(value));
+    }
+  });
+
+  it('applies the per-call wait while a live recovery intent blocks the account', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'claude-rotator-per-call-lock-'));
+    const accountsDir = join(dir, 'accounts');
+    const lockDir = join(accountsDir, '.locks');
+    const intentName = `.acct_1+${process.pid}.held-by-test.recovery`;
+    await holdLiveLock(lockDir, intentName);
+    const clock = virtualClock();
+    const store = new LinuxFileSecretStore({
+      accountsDir,
+      lockAcquireTimeoutMs: 10_000,
+      ...clock.options,
+    });
+
+    await assert.rejects(
+      () => store.getOperational('acct_1', { lockAcquireTimeoutMs: 50 }),
+      isLockTimeout,
+    );
+    assert.equal(clock.now, 50);
+    assert.ok((await readdir(lockDir)).includes(intentName));
+    assert.equal((await readdir(lockDir)).includes('acct_1.lock'), false);
+  });
+});
+
 describe('createSecretStore', () => {
   it('selects Linux file storage on linux', () => {
     const store = createSecretStore({ platform: 'linux', home: '/home/alice', env: {} });
