@@ -76,6 +76,7 @@ export class AccountManager {
     this.switchThreshold = normalizeSwitchThreshold(switchThreshold);
     this.rotationPolicy = normalizeRotationPolicy(rotationPolicy);
     this.eventHistoryEnabled = eventHistory === true;
+    this.stateListener = null;
     this.events = [];
     this.quotaHeaderRejectRecordedAt = new Map();
     this.accounts = accounts.map((account, index) => this.createAccount(account, index));
@@ -314,6 +315,7 @@ export class AccountManager {
       retryAfterSeconds: event.retryAfterSeconds ?? retryAfterSeconds,
       reason: account.temporaryUnavailableReason,
     });
+    this.notifyStateListener(account);
   }
 
   /**
@@ -347,6 +349,7 @@ export class AccountManager {
       account: account.id,
       reason: account.errorReason,
     });
+    this.notifyStateListener(account);
   }
 
   markAuthenticated(accountOrId) {
@@ -358,6 +361,30 @@ export class AccountManager {
       account.temporaryUnavailableReason = null;
     }
     if (account.status === 'error' || credentialThrottled) account.status = 'ready';
+    this.notifyStateListener(account);
+  }
+
+  /**
+   * Register the one function told about account state changes (the alert
+   * watch). It is called with the ledger row after `markError`,
+   * `markTemporaryUnavailable`, `markAuthenticated`, and for every row after
+   * `replaceAccounts` with `{ credentialChanged }`. The row carries no
+   * credential material. Anything but a function clears it.
+   *
+   * @param {((account: object, details?: {credentialChanged: boolean}) => void)|null} listener
+   */
+  setStateListener(listener) {
+    this.stateListener = typeof listener === 'function' ? listener : null;
+  }
+
+  // A listener failure must never change the ledger or reach the caller.
+  notifyStateListener(account, details) {
+    if (!this.stateListener || !account) return;
+    try {
+      this.stateListener(account, details);
+    } catch {
+      // Swallowed on purpose: the state change itself is already done.
+    }
   }
 
   recordProxyRequest(meta) {
@@ -436,6 +463,12 @@ export class AccountManager {
       reason: 'accounts-replaced',
       trigger: 'reload',
     });
+    if (this.stateListener) {
+      const changed = new Set(credentialChangedIds);
+      for (const account of this.accounts) {
+        this.notifyStateListener(account, { credentialChanged: changed.has(account.id) });
+      }
+    }
     return credentialChangedIds;
   }
 

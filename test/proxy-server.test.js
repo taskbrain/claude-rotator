@@ -9,6 +9,7 @@ import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 import { AccountManager, familyQuotaExhaustedOnly } from '../src/account-manager.js';
+import { createAlertWatch, normalizeAlertSettings } from '../src/alert-watch.js';
 import { LOCAL_GATEWAY_AUTH_TOKEN } from '../src/config.js';
 import { renderStatus } from '../src/monitor.js';
 import { OAuthTokenRefreshError, parseUsageResponse } from '../src/oauth.js';
@@ -14210,7 +14211,10 @@ describe('session affinity status section and event history', () => {
 
   // 節の形は `{ mode, sessions, capacity, warmTtlMs, sessionsByAccount,
   // warmSessionsByAccount, switchesByReason, evictionsByReason, requests, sidRate,
-  // newAssignmentOrder }` である。
+  // newAssignmentOrder, detoursByAccount, dispersion }` である。
+  // 末尾の2つは、送り先の散らばりを測るために足した仕様の変更である（迂回中のセッションの
+  // 数と、同じセッションの続く要求で送り先が前と変わった割合）。どちらも `on` だけに出し、
+  // ほかの鍵と値は変えていない。
   // 後から足した2つ（warmTtlMs・warmSessionsByAccount）を status 側で直接押さえる——`summary()` が返していても節へ載せ
   // 忘れれば、README が約束した項目が欠ける。
   it('reports the warm window and the warm per-account counts in the status section', async () => {
@@ -14232,6 +14236,7 @@ describe('session affinity status section and event history', () => {
     assert.deepEqual(Object.keys(section), [
       'mode', 'sessions', 'capacity', 'warmTtlMs', 'sessionsByAccount',
       'warmSessionsByAccount', 'switchesByReason', 'evictionsByReason', 'requests', 'sidRate', 'newAssignmentOrder',
+      'detoursByAccount', 'dispersion',
     ], '決まった形どおりの並び');
   });
 
@@ -15232,5 +15237,541 @@ describe('cache observability の reload', () => {
     const after = logLines.length;
     await requestJson(`${proxy.url}/internal/reload`, { method: 'POST' });
     assert.equal(logLines.length, after, 'reload 自体は observability の行を出さない');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// 知らせの見張り（alertWatch）の結線
+//
+// 見張りへ渡すのは、口座の行（資格情報を持たない）と、口座の id・失敗の分類・更新用の
+// 資格情報の期限の数だけである。更新の口の context と refreshed はトークンを持つので渡さない。
+// 見張りの誤り・遅れは、中継の要求を待たせず、結果も変えない。見張りを渡さない構成と、
+// `alerts` の節の無い設定で作った見張りを渡す構成は、status の JSON もログの行も同じである。
+// 送り手は偽物だけを使い、実物の osascript・受け口へは届かない。
+// ---------------------------------------------------------------------------
+describe('alert watch wiring', () => {
+  const TOKEN_MARK = 'TOKENMARK9q';
+  const PATH_MARK = 'PATHMARK4k';
+  const NAME_MARK = 'NAMEMARK2z';
+  // 見張りも偽の送り手もこのパスを開かない（目印が出口に出ないかを見るためだけの字）。
+  const URL_FILE = `/nonexistent/example/${PATH_MARK}/hook-url`;
+  const CLOCK_START_MS = Date.parse('2026-10-05T09:00:00.000Z');
+  const WATCH_METHODS = [
+    'onAccountState', 'noteRefreshFailed', 'noteRefreshSucceeded', 'setDispersionSource',
+    'statusSection', 'reload', 'start', 'stop',
+  ];
+
+  // 見張りの口と同じ形で、呼ばれた引数を記録するだけの偽物。
+  function recordingWatch() {
+    const calls = [];
+    const watch = Object.fromEntries(WATCH_METHODS.map(name => [name, (...args) => {
+      calls.push({ name, args });
+      return name === 'statusSection' ? null : undefined;
+    }]));
+    return { calls, watch };
+  }
+
+  // 送り手の口と同じ形の偽物。
+  function fakeSender() {
+    const calls = [];
+    return {
+      calls,
+      sender: {
+        async notifyMac(args) {
+          calls.push(['notifyMac', args]);
+          return { result: 'exited-0' };
+        },
+        async postWebhook(args) {
+          calls.push(['postWebhook', args]);
+          return { result: 'ok', reason: null };
+        },
+        async checkWebhookFile(urlFile) {
+          calls.push(['checkWebhookFile', urlFile]);
+          return { usable: true, problem: null };
+        },
+        stop() {
+          calls.push(['stop']);
+        },
+      },
+    };
+  }
+
+  // 進めると言ったときだけ進むタイマー。作られたタイマーの数も数える。
+  function manualTimers(clock) {
+    let seq = 0;
+    const tasks = new Map();
+    const created = { timeout: 0, interval: 0 };
+    const add = (fn, ms, repeat) => {
+      seq += 1;
+      tasks.set(seq, { fn, at: clock.ms + ms, ms, repeat });
+      return { id: seq, unref() {} };
+    };
+    const remove = handle => {
+      if (handle) tasks.delete(handle.id);
+    };
+    return {
+      created,
+      timers: {
+        setTimeout: (fn, ms) => {
+          created.timeout += 1;
+          return add(fn, ms, false);
+        },
+        clearTimeout: remove,
+        setInterval: (fn, ms) => {
+          created.interval += 1;
+          return add(fn, ms, true);
+        },
+        clearInterval: remove,
+      },
+      advance(ms) {
+        const end = clock.ms + ms;
+        for (;;) {
+          let next = null;
+          for (const [id, task] of tasks) {
+            if (task.at <= end && (!next || task.at < next.task.at)) next = { id, task };
+          }
+          if (!next) break;
+          clock.ms = next.task.at;
+          if (next.task.repeat) next.task.at += next.task.ms;
+          else tasks.delete(next.id);
+          next.task.fn();
+        }
+        clock.ms = end;
+      },
+    };
+  }
+
+  async function settle() {
+    for (let i = 0; i < 10; i += 1) await new Promise(resolve => setImmediate(resolve));
+  }
+
+  // 値の中の字を全部集める（鍵の名も含む）。関数は中を見ない。
+  function stringsIn(value, seen = new Set()) {
+    if (typeof value === 'string') return [value];
+    if (!value || typeof value !== 'object' || seen.has(value)) return [];
+    seen.add(value);
+    return [...Object.keys(value), ...Object.values(value).flatMap(item => stringsIn(item, seen))];
+  }
+
+  // 時刻・所要時間・資格情報の残り秒数だけは実時間で決まるので、比べる前に伏せる。
+  function maskTiming(text) {
+    return text
+      .replace(/\d{4}-\d{2}-\d{2}T[\d:.]+Z/g, '<time>')
+      .replace(/durationMs=\d+/g, 'durationMs=<n>')
+      .replace(/"durationMs":\d+/g, '"durationMs":<n>')
+      .replace(/remainingSec=\d+/g, 'remainingSec=<n>');
+  }
+
+  async function startAlerts({
+    accounts = ['acct_a', 'acct_b'],
+    watch = null,
+    sessionAffinity = null,
+    tokenRefresher = null,
+    secretFor = id => ({
+      accessToken: `token-${id}-${TOKEN_MARK}`,
+      refreshToken: `refresh-${id}-${TOKEN_MARK}`,
+      expiresAt: Date.now() + 3_600_000,
+    }),
+    alerts = undefined,
+  } = {}) {
+    const logLines = [];
+    const seen = [];
+    const clock = { ms: CLOCK_START_MS };
+    const upstream = await listen(http.createServer((req, res) => {
+      seen.push(req.headers.authorization);
+      req.resume();
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ ok: true }));
+    }));
+    const secretStore = new MemorySecretStore();
+    for (const id of accounts) await secretStore.set(id, secretFor(id));
+    const logger = line => logLines.push(line);
+    const ledgerRows = revision => accounts.map(id => ({
+      id, name: `${id} ${NAME_MARK}`, type: 'oauth', credentialRevision: `${id}-${revision}`,
+    }));
+    const accountManager = new AccountManager({
+      accounts: ledgerRows('rev-1'),
+      logger,
+      now: () => clock.ms,
+      eventHistory: (sessionAffinity?.mode ?? 'off') !== 'off',
+    });
+    const holder = { accounts: ledgerRows('rev-1'), alerts };
+    const alertWatch = typeof watch === 'function'
+      ? watch({ accountManager, logger, clock, holder })
+      : watch;
+    const proxy = await listen(createProxyServer({
+      accountManager,
+      secretStore,
+      logger,
+      ...(tokenRefresher ? { tokenRefresher } : {}),
+      ...(alertWatch ? { alertWatch } : {}),
+      reloadAccounts: async () => holder.accounts,
+      config: {
+        upstream: upstream.url,
+        usagePolling: { enabled: false },
+        ...(sessionAffinity ? { sessionAffinity } : {}),
+        observability: { requestLog: { enabled: false } },
+      },
+    }));
+    // cli.js の runServer と同じく、listen の後に始める。壊れた見張りの偽物（P3）の
+    // start が投げても拒否しても、ここでは試験の準備を止めない。
+    try {
+      alertWatch?.start?.()?.then?.(undefined, () => {});
+    } catch {
+      // P3 の偽物だけが投げる。
+    }
+    cleanupAfterTest(async () => {
+      await close(proxy.server);
+      await close(upstream.server);
+    });
+
+    const ask = ({ sid = null } = {}) => requestJson(`${proxy.url}/v1/messages`, {
+      method: 'POST',
+      body: JSON.stringify({ model: 'sonnet' }),
+      headers: sid ? { 'x-claude-code-session-id': sid } : {},
+    });
+    const status = () => requestJson(`${proxy.url}/internal/status`);
+    const reload = () => requestJson(`${proxy.url}/internal/reload`, { method: 'POST' });
+    return {
+      proxy, accountManager, secretStore, logLines, seen, clock, holder, alertWatch, ask, status, reload, ledgerRows,
+    };
+  }
+
+  // cli.js の runServer と同じ作り方（normalizeAlertSettings を通した節、送り手、ログ、
+  // 設定の読み直し）。送り手とタイマーだけを偽物にする。
+  function realWatch({ sender, timers }) {
+    return ({ accountManager, logger, clock, holder }) => createAlertWatch({
+      accountManager,
+      sender,
+      settings: normalizeAlertSettings(holder.alerts),
+      loadSettings: () => Promise.resolve(holder.alerts),
+      logger,
+      now: () => clock.ms,
+      timers,
+    });
+  }
+
+  it('P1: passes only the account id, the failure class and the expiry number from the refresh hooks', async () => {
+    const cases = [
+      {
+        label: 'failed, expiry in ms',
+        refreshTokenExpiresAt: 2_000_000_000_000,
+        refresher: async () => {
+          throw new Error(`invalid_grant: refresh rejected for ${TOKEN_MARK}`);
+        },
+        expected: ['noteRefreshFailed', ['acct_a', 'invalid_grant', { refreshCredentialExpiresAt: 2_000_000_000_000 }]],
+      },
+      {
+        label: 'failed, no expiry known',
+        refreshTokenExpiresAt: undefined,
+        refresher: async () => {
+          throw new Error(`Token refresh failed (400) ${TOKEN_MARK}`);
+        },
+        expected: ['noteRefreshFailed', ['acct_a', 'http-400', { refreshCredentialExpiresAt: null }]],
+      },
+      {
+        label: 'succeeded, the refreshed expiry wins',
+        refreshTokenExpiresAt: 2_000_000_000_000,
+        refresher: async () => ({
+          accessToken: `fresh-${TOKEN_MARK}`,
+          refreshToken: `refresh-next-${TOKEN_MARK}`,
+          expiresAt: Date.now() + 3_600_000,
+          refreshTokenExpiresAt: 2_100_000_000_000,
+        }),
+        expected: ['noteRefreshSucceeded', ['acct_a', { refreshCredentialExpiresAt: 2_100_000_000_000 }]],
+      },
+      {
+        label: 'succeeded without an expiry: the stored one (seconds) stays and is read in ms',
+        refreshTokenExpiresAt: 2_000_000_000,
+        refresher: async () => ({
+          accessToken: `fresh-${TOKEN_MARK}`,
+          refreshToken: `refresh-next-${TOKEN_MARK}`,
+          expiresAt: Date.now() + 3_600_000,
+        }),
+        expected: ['noteRefreshSucceeded', ['acct_a', { refreshCredentialExpiresAt: 2_000_000_000_000 }]],
+      },
+    ];
+
+    for (const { label, refreshTokenExpiresAt, refresher, expected } of cases) {
+      const { calls, watch } = recordingWatch();
+      const { ask } = await startAlerts({
+        accounts: ['acct_a'],
+        watch,
+        tokenRefresher: refresher,
+        // 期限が近いがまだ使える資格情報：更新を試し、失敗しても古いもので送る。
+        secretFor: id => ({
+          accessToken: `token-${id}-${TOKEN_MARK}`,
+          refreshToken: `refresh-${id}-${TOKEN_MARK}`,
+          expiresAt: Date.now() + 4 * 60 * 1000,
+          ...(refreshTokenExpiresAt === undefined ? {} : { refreshTokenExpiresAt }),
+        }),
+      });
+
+      assert.equal((await ask()).status, 200, label);
+      const refreshCalls = calls.filter(call => call.name.startsWith('noteRefresh'));
+      assert.deepEqual(refreshCalls.map(call => [call.name, call.args]), [expected], label);
+      const passed = stringsIn(calls.map(call => call.args));
+      assert.deepEqual(passed.filter(text => text.includes(TOKEN_MARK)), [], `${label}: no token reaches the watch`);
+    }
+  });
+
+  it('P1: hands the ledger rows to the watch after state changes and flags a changed credential on reload', async () => {
+    const { calls, watch } = recordingWatch();
+    const { accountManager, holder, ledgerRows, reload } = await startAlerts({ watch });
+    const before = calls.length;
+
+    accountManager.markError('acct_b', 'oauth_refresh_failed', null, { cause: 'NATIVE_REFRESH_REAUTH_REQUIRED' });
+    const marked = calls.slice(before).filter(call => call.name === 'onAccountState');
+    assert.equal(marked.length, 1);
+    assert.equal(marked[0].args[0], accountManager.find('acct_b'), 'the ledger row itself');
+    assert.equal(marked[0].args[0].errorReason.cause, 'NATIVE_REFRESH_REAUTH_REQUIRED');
+
+    const beforeReload = calls.length;
+    holder.accounts = ledgerRows('rev-1').map(row => (row.id === 'acct_a' ? { ...row, credentialRevision: 'acct_a-rev-2' } : row));
+    assert.equal((await reload()).status, 200);
+    assert.deepEqual(
+      calls.slice(beforeReload).filter(call => call.name === 'onAccountState').map(call => [call.args[0].id, call.args[1]]),
+      [['acct_a', { credentialChanged: true }], ['acct_b', { credentialChanged: false }]],
+    );
+    assert.equal(calls.filter(call => call.name === 'reload').length, 1, 'the reload reaches the watch once');
+    assert.equal(calls.filter(call => call.name === 'setDispersionSource').length, 1);
+    assert.deepEqual(stringsIn(calls.map(call => call.args)).filter(text => text.includes(TOKEN_MARK)), []);
+  });
+
+  it('P2: adds the alerts section only while the watch is on, and keeps the URL file and the tokens out of the status', async () => {
+    const plain = await startAlerts();
+    const plainStatus = await plain.status();
+    assert.equal(plainStatus.status, 200);
+    assert.equal('alerts' in JSON.parse(plainStatus.bodyText), false, 'no watch, no section');
+
+    const fake = fakeSender();
+    const started = await startAlerts({
+      alerts: { macNotification: true, webhookUrlFile: URL_FILE },
+      watch: context => realWatch({ sender: fake.sender, timers: manualTimers(context.clock).timers })(context),
+    });
+    await settle();
+    const response = await started.status();
+    const body = JSON.parse(response.bodyText);
+    assert.deepEqual(Object.keys(body.alerts), [
+      'macNotification', 'webhook', 'webhookProblem', 'active', 'lastDelivery', 'queued', 'dropped',
+    ]);
+    assert.equal(body.alerts.macNotification, true);
+    assert.equal(body.alerts.webhook, 'usable');
+    assert.deepEqual(Object.keys(body).slice(-1), ['alerts'], 'the section goes last');
+    for (const mark of [PATH_MARK, TOKEN_MARK]) {
+      assert.equal(response.bodyText.includes(mark), false, `${mark} is not in the status`);
+    }
+    const sectionText = JSON.stringify(body.alerts);
+    assert.equal(sectionText.includes(NAME_MARK), false, 'no account name in the section');
+    assert.equal(sectionText.includes('acct_'), false, 'no account id in the section');
+
+    // 設定から節を消して再読込すると、節も消える（見張りの reload は待たずに呼ぶ）。
+    started.holder.alerts = undefined;
+    assert.equal((await started.reload()).status, 200);
+    await settle();
+    assert.equal('alerts' in JSON.parse((await started.status()).bodyText), false);
+  });
+
+  it('wires the real watch end to end: a refusing refresh and a relogin error reach the status and one batched message', async () => {
+    const fake = fakeSender();
+    let manual = null;
+    const { ask, accountManager, holder, ledgerRows, reload, status, logLines, alertWatch } = await startAlerts({
+      alerts: { macNotification: true, webhookUrlFile: URL_FILE },
+      tokenRefresher: async () => {
+        throw new Error(`invalid_grant ${TOKEN_MARK}`);
+      },
+      secretFor: id => ({
+        accessToken: `token-${id}-${TOKEN_MARK}`,
+        refreshToken: `refresh-${id}-${TOKEN_MARK}`,
+        expiresAt: Date.now() + 4 * 60 * 1000,
+      }),
+      watch: context => {
+        manual = manualTimers(context.clock);
+        return realWatch({ sender: fake.sender, timers: manual.timers })(context);
+      },
+    });
+    cleanupAfterTest(() => alertWatch.stop());
+
+    // 古い資格情報で送れている間（要求は通る）でも、更新の口の最初の失敗で鳴らす。
+    assert.equal((await ask()).status, 200);
+    accountManager.markError('acct_b', 'oauth_refresh_failed', null, { cause: 'NATIVE_REFRESH_REAUTH_REQUIRED' });
+    assert.equal(JSON.parse((await status()).bodyText).alerts.active.needsLogin, 2);
+
+    manual.advance(60_000);
+    await settle();
+    const posted = fake.calls.filter(call => call[0] === 'postWebhook');
+    assert.equal(posted.length, 1, 'one message for both accounts');
+    assert.equal(posted[0][1].urlFile, URL_FILE, 'the sender is told where the file is');
+    assert.match(posted[0][1].text, /^claude-rotator: 2 account\(s\) need a new login: acc…, acc…\./);
+    for (const mark of [TOKEN_MARK, NAME_MARK, PATH_MARK, 'acct_']) {
+      assert.equal(posted[0][1].text.includes(mark), false, `${mark} is not in the webhook text`);
+    }
+    // 見張りの行は時刻を1つだけ頭に付ける（server.log のほかの行と同じ形）。
+    const alertLines = logLines.filter(line => line.includes(' alert-'));
+    assert.deepEqual(alertLines.map(line => line.replace(/^\d{4}-\d{2}-\d{2}T[\d:.]+Z /, '')).sort(), [
+      'alert-send channel=mac result=exited-0',
+      'alert-send channel=webhook result=ok',
+    ]);
+    for (const line of alertLines) assert.match(line, /^\d{4}-\d{2}-\d{2}T[\d:.]+Z alert-send /);
+
+    // 再ログインの後の再読込（資格情報が変わった口座）で、その口座は回復に回る。
+    holder.accounts = ledgerRows('rev-1').map(row => (row.id === 'acct_b' ? { ...row, credentialRevision: 'acct_b-rev-2' } : row));
+    assert.equal((await reload()).status, 200);
+    await settle();
+    assert.equal(JSON.parse((await status()).bodyText).alerts.active.needsLogin, 1);
+  });
+
+  it('P3: a watch that throws, rejects or never answers does not hold up or change a relayed request', async () => {
+    const variants = {
+      throws: () => {
+        throw new Error(`watch failure ${TOKEN_MARK}`);
+      },
+      rejects: () => Promise.reject(new Error(`watch failure ${TOKEN_MARK}`)),
+      pending: () => new Promise(() => {}),
+    };
+    const run = async watch => {
+      const started = await startAlerts({
+        watch,
+        tokenRefresher: async () => {
+          throw new Error('invalid_grant');
+        },
+        secretFor: id => ({
+          accessToken: `token-${id}`,
+          refreshToken: `refresh-${id}`,
+          expiresAt: Date.now() + 4 * 60 * 1000,
+        }),
+      });
+      const first = await started.ask();
+      started.accountManager.markError('acct_b', 'oauth_refresh_failed', null, { cause: 'invalid_grant' });
+      const second = await started.ask();
+      const reloaded = await started.reload();
+      const statusResponse = await started.status();
+      return {
+        responses: [first, second].map(response => [response.status, response.bodyText]),
+        reloadStatus: reloaded.status,
+        status: statusResponse,
+        seen: started.seen,
+        lines: started.logLines.map(maskTiming),
+      };
+    };
+
+    const baseline = await run(null);
+    for (const [kind, act] of Object.entries(variants)) {
+      const watch = Object.fromEntries(WATCH_METHODS.map(name => [name, act]));
+      const result = await run(watch);
+      assert.deepEqual(result.responses, baseline.responses, kind);
+      assert.equal(result.reloadStatus, 200, kind);
+      assert.equal(result.status.status, 200, kind);
+      assert.equal('alerts' in JSON.parse(result.status.bodyText), false, `${kind}: no section from a broken watch`);
+      assert.deepEqual(result.seen, baseline.seen, kind);
+      assert.deepEqual(result.lines, baseline.lines, `${kind}: the log lines are the same`);
+    }
+  });
+
+  it('P4: counts the dispersion of on-mode sessions without adding a log line, and reports it with the detours', async () => {
+    const { calls, watch } = recordingWatch();
+    const { ask, accountManager, status, logLines } = await startAlerts({
+      watch,
+      sessionAffinity: { mode: 'on' },
+    });
+    const source = calls.find(call => call.name === 'setDispersionSource').args[0];
+    assert.equal(typeof source, 'function');
+
+    for (let i = 0; i < 3; i += 1) assert.equal((await ask({ sid: 'session-one' })).status, 200);
+    // 再ログインを要しない失敗：結び付けは変えず、迂回先へ送り続ける。
+    accountManager.markError('acct_a', 'authentication_error');
+    for (let i = 0; i < 2; i += 1) assert.equal((await ask({ sid: 'session-one' })).status, 200);
+
+    const section = JSON.parse((await status()).bodyText).sessionAffinity;
+    assert.deepEqual(section.dispersion, { windowMs: 3_600_000, pairs: 4, changes: 1, rate: 0.25 });
+    assert.deepEqual(section.detoursByAccount, { acct_b: 1 });
+    assert.deepEqual(source(), section.dispersion, 'the watch reads the same numbers');
+    assert.deepEqual(Object.keys(section).slice(-3), ['newAssignmentOrder', 'detoursByAccount', 'dispersion']);
+
+    const proxyLines = logLines.filter(line => line.includes(' proxy account='));
+    assert.equal(proxyLines.length, 5);
+    assert.deepEqual(
+      proxyLines.map(line => line.split(' aff=')[1]),
+      ['new fam=other', 'bound fam=other', 'bound fam=other', 'switch fam=other', 'switch fam=other'],
+      'the request lines still end with fam=',
+    );
+    assert.deepEqual(
+      logLines.filter(line => !line.includes(' proxy account=') && !line.includes(' affinity_')),
+      [],
+      'no other kind of line',
+    );
+  });
+
+  it('P4: counts nothing outside the on mode and leaves the observe section as it was', async () => {
+    for (const sessionAffinity of [null, { mode: 'observe' }]) {
+      const { calls, watch } = recordingWatch();
+      const { ask, status } = await startAlerts({ watch, sessionAffinity });
+      const source = calls.find(call => call.name === 'setDispersionSource').args[0];
+
+      for (let i = 0; i < 3; i += 1) assert.equal((await ask({ sid: 'session-one' })).status, 200);
+
+      assert.equal(source(), null, `${sessionAffinity?.mode ?? 'off'}: no dispersion source`);
+      const body = JSON.parse((await status()).bodyText);
+      if (sessionAffinity) {
+        assert.deepEqual(Object.keys(body.sessionAffinity), [
+          'mode', 'sessions', 'capacity', 'warmTtlMs', 'sessionsByAccount',
+          'warmSessionsByAccount', 'switchesByReason', 'evictionsByReason', 'requests', 'sidRate',
+        ]);
+      } else {
+        assert.equal('sessionAffinity' in body, false);
+      }
+    }
+  });
+
+  it('P6: a watch built from a config without the alerts section changes neither the status JSON nor the log lines', async () => {
+    const run = async withWatch => {
+      const fake = fakeSender();
+      let manual = null;
+      const started = await startAlerts({
+        alerts: undefined,
+        tokenRefresher: async () => {
+          throw new Error('invalid_grant');
+        },
+        secretFor: id => ({
+          accessToken: `token-${id}`,
+          refreshToken: `refresh-${id}`,
+          expiresAt: Date.now() + 4 * 60 * 1000,
+        }),
+        watch: withWatch
+          ? context => {
+            manual = manualTimers(context.clock);
+            return realWatch({ sender: fake.sender, timers: manual.timers })(context);
+          }
+          : null,
+      });
+      await started.ask();
+      started.accountManager.markError('acct_b', 'oauth_refresh_failed', null, { cause: 'NATIVE_REFRESH_REAUTH_REQUIRED' });
+      started.holder.accounts = started.ledgerRows('rev-1')
+        .map(row => (row.id === 'acct_a' ? { ...row, credentialRevision: 'acct_a-rev-2' } : row));
+      await started.reload();
+      await started.ask();
+      await settle();
+      // 見張りが動いていれば、30分の段・念押し・見回りが起きるだけの時間を進める（両方の台で同じだけ）。
+      if (manual) manual.advance(7 * 60 * 60_000);
+      else started.clock.ms += 7 * 60 * 60_000;
+      await settle();
+      const response = await started.status();
+      return { started, fake, manual, response };
+    };
+
+    const without = await run(false);
+    const withWatch = await run(true);
+
+    // 同じ台の中で：status の JSON は台帳の出力そのもの（何も足していない）。
+    for (const { started, response } of [without, withWatch]) {
+      assert.equal(response.bodyText, JSON.stringify(started.accountManager.getStatus()));
+    }
+    // 2つの台の間で：所要時間と実時間の時刻のほかは、同じ字。
+    assert.equal(maskTiming(withWatch.response.bodyText), maskTiming(without.response.bodyText));
+    assert.deepEqual(withWatch.started.logLines.map(maskTiming), without.started.logLines.map(maskTiming));
+    assert.equal(withWatch.started.logLines.some(line => line.includes(' alert-')), false);
+    assert.deepEqual(withWatch.manual.created, { timeout: 0, interval: 0 }, 'the watch makes no timer');
+    assert.deepEqual(withWatch.fake.calls, [], 'the sender is never called');
+    assert.equal(withWatch.started.alertWatch.statusSection(), null);
   });
 });

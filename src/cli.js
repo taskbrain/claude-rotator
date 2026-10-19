@@ -9,6 +9,8 @@ import { text as readStdinText } from 'node:stream/consumers';
 import { isDeepStrictEqual, promisify } from 'node:util';
 
 import { AccountManager } from './account-manager.js';
+import { createAlertSender } from './alert-sender.js';
+import { createAlertWatch, normalizeAlertSettings } from './alert-watch.js';
 import {
   createDefaultConfig,
   DEFAULT_PORT,
@@ -394,6 +396,17 @@ async function runServer({ write }) {
     accountManager,
     { onSkipped: message => write(`runtime state restore skipped: ${message}\n`) },
   );
+  // 知らせの見張り。実物の送り手（osascript と受け口への POST）を渡すのはここだけである。
+  // `alerts` の節が無くても見張りは作り、そのときは何もしない（タイマー・ログ・状態の節も無い）。
+  // 再読込（ログインのたび）で節を足せば、その時から効く。
+  const alertWatch = createAlertWatch({
+    accountManager,
+    // 送り手は Promise を返す execFile を前提にしている。
+    sender: createAlertSender({ execFile: execFileAsync, fetchImpl: fetch }),
+    settings: normalizeAlertSettings(config.alerts),
+    loadSettings: () => loadConfig().then(nextConfig => nextConfig?.alerts),
+    logger,
+  });
   const server = createProxyServer({
     accountManager,
     secretStore,
@@ -419,6 +432,7 @@ async function runServer({ write }) {
     // 要求ごとの使用量イベント（日付ごとの usage-events-YYYYMMDD.jsonl）。既定 ~/.config/claude-rotator/usage-events/、
     // CLAUDE_ROTATOR_USAGE_EVENTS_DIR で上書きできる。
     usageEventsDir: usageEventsDir(),
+    alertWatch,
   });
   await new Promise(resolve => server.listen(
     config.proxy?.port || DEFAULT_PORT,
@@ -426,9 +440,12 @@ async function runServer({ write }) {
     resolve,
   ));
   write(`claude-rotator listening on ${proxyBaseUrl(config)}\n`);
+  alertWatch.start();
   try {
     await waitForShutdown(server);
   } finally {
+    // 見張りを先に止める（送り直しの待ちも止まる）。ログを閉じた後に行を書かせない。
+    alertWatch.stop();
     logWriter?.close();
   }
 }
