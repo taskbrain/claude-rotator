@@ -41,6 +41,12 @@ export const DEFAULT_WARM_TTL_MS = 3_600_000;
  * 償却する。1,000 本に1回で、10,000 行の表でも1回あたりの走査は冷えた分だけで済む。
  */
 export const WARM_SWEEP_REQUEST_INTERVAL = 1_000;
+/**
+ * 送り先の散らばりを数える窓（`dispersion()`）。10分ごとの区画を6つ持ち、直近60分を数える。
+ * 区画の数だけのメモリしか使わず、タイマーも作らない。
+ */
+const DISPERSION_SLOT_MS = 600_000;
+const DISPERSION_SLOTS = 6;
 
 /**
  * 設定セクション `sessionAffinity` の既定。
@@ -184,7 +190,8 @@ function clampSetting(value, key) {
  * `gen` は「そのセッションのバインドが変わった回数」を数える単調増加の整数である。
  * 予約で控えた `gen` を確定へ渡すことで、`await` を挟んで遅れて着いた確定が
  * その間に別の要求が作った新しいバインドを上書きすることを防ぐ。
- * 結び付け先が一時的に使えない間の迂回先 `detours` を持つことがあるが、保存しない。
+ * 結び付け先が一時的に使えない間の迂回先 `detours` と、前の要求を実際に送った口座 `lastSent`
+ * （`noteSent`）を持つことがあるが、どちらも保存しない。
  * `detourGen` は迂回先を書いた回数と、結び付けを変えずに消した回数の和で、`gen` と別に数える
  * （結び付けが変わって迂回先が消えるときは `gen` が進む）。
  *
@@ -221,6 +228,8 @@ export class SessionAffinity {
     // 1セッションは1口座につき1回だけ数える（副バインドがあれば2口座に1ずつ載る）。
     this.warmCounts = new Map();
     this.warmSweepCountdown = WARM_SWEEP_REQUEST_INTERVAL;
+    // 送り先の散らばりの区画（区画の番号 → { pairs, changes }）。保存しない。
+    this.dispersionSlots = new Map();
   }
 
   get size() {
@@ -359,6 +368,62 @@ export class SessionAffinity {
     if (!entry?.detours?.[slot]) return;
     delete entry.detours[slot];
     entry.detourGen = detourGenOf(entry) + 1;
+  }
+
+  /**
+   * そのセッションの要求を実際に送った口座を1本ぶん数える（送り先の散らばり）。
+   *
+   * 前の要求の送り先は表の行（`lastSent`）にだけ持つ。前がある要求を「前がある」に、
+   * そのうち口座が前と違う要求を「変わった」に、その時刻の10分の区画で数える。
+   * 表に行が無いセッションは数えない（行を作らない）。保存しない、ログも出さない。
+   * 結び付け先と違う口座へ送ったか（`aff=switch`）ではなく、前の要求と比べる——迂回先へ
+   * 送り続けるセッションは毎回 `switch` でも、送り先は散っていない。
+   *
+   * @param {unknown} key セッション鍵。
+   * @param {string} accountId 実際に送った口座。
+   * @param {{now?:number}} [options]
+   */
+  noteSent(key, accountId, { now = this.now() } = {}) {
+    if (typeof accountId !== 'string' || accountId.length === 0) return;
+    const hash = sidHash(key);
+    const entry = hash ? this.entries.get(hash) : null;
+    if (!entry) return;
+    const previous = entry.lastSent;
+    entry.lastSent = accountId;
+    if (typeof previous !== 'string') return;
+    const slot = Math.floor(now / DISPERSION_SLOT_MS);
+    // 窓の外へ出た区画と、時計が戻ったときの先の区画を捨てる（区画は6つまで）。
+    for (const kept of this.dispersionSlots.keys()) {
+      if (kept <= slot - DISPERSION_SLOTS || kept > slot) this.dispersionSlots.delete(kept);
+    }
+    const counts = this.dispersionSlots.get(slot) ?? { pairs: 0, changes: 0 };
+    counts.pairs += 1;
+    if (previous !== accountId) counts.changes += 1;
+    this.dispersionSlots.set(slot, counts);
+  }
+
+  /**
+   * 直近60分の送り先の散らばり。`rate` は「変わった ÷ 前がある」で、前がある要求が
+   * 無ければ `null`。
+   *
+   * @param {{now?:number}} [options]
+   * @returns {{windowMs:number, pairs:number, changes:number, rate:number|null}}
+   */
+  dispersion({ now = this.now() } = {}) {
+    const slot = Math.floor(now / DISPERSION_SLOT_MS);
+    let pairs = 0;
+    let changes = 0;
+    for (const [kept, counts] of this.dispersionSlots) {
+      if (kept <= slot - DISPERSION_SLOTS || kept > slot) continue;
+      pairs += counts.pairs;
+      changes += counts.changes;
+    }
+    return {
+      windowMs: DISPERSION_SLOT_MS * DISPERSION_SLOTS,
+      pairs,
+      changes,
+      rate: pairs > 0 ? changes / pairs : null,
+    };
   }
 
   /**
@@ -522,14 +587,25 @@ export class SessionAffinity {
    * 数える**——冷えたセッションも表には残っており、status で「何本が表にいるか」と
    * 「何本がまだキャッシュを持っていそうか」は別々に読めたほうがよい。
    *
+   * `detoursByAccount` は、いま迂回中のセッションの数を迂回先の口座ごとに数えた数である
+   * （`get()` の `detour` に出る迂回先だけ。1セッションは1口座につき1回）。迂回先は
+   * 温かい数に入らないので、迂回先が1つの口座に集まっていないかはこの数で見る。
+   *
    * この関数だけは全件走査のままにしてある。要求ごとに呼ぶのは `warmSessionCounts()` の
    * ほうで、status は要求ごとには作られない。
    */
   summary() {
     const sessionsByAccount = {};
+    const detoursByAccount = {};
     for (const entry of this.entries.values()) {
       for (const accountId of entryAccounts(entry)) {
         sessionsByAccount[accountId] = (sessionsByAccount[accountId] ?? 0) + 1;
+      }
+      const detourAccounts = new Set(Object.keys(entry.detours ?? {})
+        .map(slot => detourOf(entry, slot || null))
+        .filter(accountId => accountId !== null));
+      for (const accountId of detourAccounts) {
+        detoursByAccount[accountId] = (detoursByAccount[accountId] ?? 0) + 1;
       }
     }
     return {
@@ -541,6 +617,7 @@ export class SessionAffinity {
       warmSessionsByAccount: Object.fromEntries(this.warmCounts),
       switchesByReason: Object.fromEntries(this.switchCounts),
       evictionsByReason: Object.fromEntries(this.evictCounts),
+      detoursByAccount,
     };
   }
 

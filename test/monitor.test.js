@@ -609,3 +609,153 @@ describe('session affinity section', () => {
     assert.match(output, /Events/);
   });
 });
+
+describe('alerts line', () => {
+  const NOW = Date.parse('2026-10-19T09:00:00.000Z');
+
+  function baseStatus() {
+    return {
+      currentAccount: 'acct_1',
+      currentAccountName: 'a@example.com',
+      switchThreshold: 1,
+      routingAvailability: { fable: [], other: [] },
+      accounts: [],
+      events: [],
+    };
+  }
+
+  function alerts(overrides = {}) {
+    return {
+      macNotification: true,
+      webhook: 'usable',
+      webhookProblem: null,
+      active: { needsLogin: 0, failing: 0, expiringSoon: 0, dispersion: false },
+      lastDelivery: { mac: null, webhook: null },
+      queued: 0,
+      dropped: 0,
+      ...overrides,
+    };
+  }
+
+  function render(status) {
+    return renderStatus(status, { now: NOW, columns: 100 });
+  }
+
+  function alertsLine(output) {
+    return output.split('\n').find(line => line.startsWith('Alerts'));
+  }
+
+  it('draws nothing at all when the status carries no alerts section', () => {
+    const before = render(baseStatus());
+
+    assert.equal(before.includes('Alerts'), false);
+    assert.equal(render({ ...baseStatus(), alerts: null }), before);
+    assert.equal(render({ ...baseStatus(), alerts: [] }), before);
+  });
+
+  it('adds exactly one line and its trailing blank line, right above Events, and nothing else', () => {
+    const before = render(baseStatus());
+
+    const after = render({ ...baseStatus(), alerts: alerts() });
+
+    const lines = after.split('\n');
+    const start = lines.findIndex(line => line.startsWith('Alerts'));
+    assert.ok(start >= 0, '行が描かれていない');
+    assert.equal(lines[start + 1], '');
+    assert.equal(lines[start + 2], 'Events');
+    assert.equal([...lines.slice(0, start), ...lines.slice(start + 2)].join('\n'), before);
+  });
+
+  it('comes after the session affinity section', () => {
+    const output = render({
+      ...baseStatus(),
+      sessionAffinity: { mode: 'on', sessions: 0, requests: { proxied: 0, keyed: 0 } },
+      alerts: alerts(),
+    });
+
+    assert.ok(output.indexOf('Session Affinity') < output.indexOf('Alerts'));
+    assert.ok(output.indexOf('Alerts') < output.indexOf('Events'));
+  });
+
+  it('says a configured, usable channel with nothing active in the current: column', () => {
+    const line = alertsLine(render({ ...baseStatus(), alerts: alerts() }));
+
+    assert.equal(line, `${'Alerts'.padEnd(39)}mac: on  webhook: usable  active: none`);
+  });
+
+  it('shows an unusable webhook file with its class and the counts of what is ringing', () => {
+    const line = alertsLine(render({
+      ...baseStatus(),
+      alerts: alerts({
+        macNotification: false,
+        webhook: 'unusable',
+        webhookProblem: 'mode',
+        active: { needsLogin: 2, failing: 1, expiringSoon: 3, dispersion: true },
+      }),
+    }));
+
+    assert.equal(
+      line,
+      `${'Alerts'.padEnd(39)}mac: off  webhook: unusable (mode)  active: needs login 2, failing 1, expiring soon 3, dispersion`,
+    );
+  });
+
+  it('shows the webhook as off, and unusable without a class before the file has been checked', () => {
+    assert.match(alertsLine(render({ ...baseStatus(), alerts: alerts({ webhook: 'off' }) })), /webhook: off {2}active:/);
+    assert.match(alertsLine(render({ ...baseStatus(), alerts: alerts({ webhook: 'unusable' }) })), /webhook: unusable {2}active:/);
+  });
+
+  it('shows a last webhook delivery that was not ok, with the reason when there is one', () => {
+    const rejected = alertsLine(render({
+      ...baseStatus(),
+      alerts: alerts({
+        lastDelivery: { mac: null, webhook: { at: '2026-10-19T08:59:00.000Z', result: 'rejected-404', reason: 'no_service' } },
+      }),
+    }));
+    const gaveUp = alertsLine(render({
+      ...baseStatus(),
+      alerts: alerts({
+        lastDelivery: { mac: null, webhook: { at: '2026-10-19T08:59:00.000Z', result: 'gave-up-5xx', reason: null } },
+      }),
+    }));
+    const delivered = alertsLine(render({
+      ...baseStatus(),
+      alerts: alerts({
+        lastDelivery: { mac: { at: '2026-10-19T08:59:00.000Z', result: 'failed-exec' }, webhook: { at: '2026-10-19T08:59:00.000Z', result: 'ok', reason: null } },
+      }),
+    }));
+
+    // The receiving side turned the webhook off, yet the state still reads usable.
+    assert.match(rejected, /webhook: usable {2}active: none {2}last webhook: rejected-404 \(no_service\)$/);
+    assert.match(gaveUp, /active: none {2}last webhook: gave-up-5xx$/);
+    assert.equal(delivered.includes('last webhook'), false);
+  });
+
+  it('shows queued and dropped only when they are not zero', () => {
+    const quiet = alertsLine(render({ ...baseStatus(), alerts: alerts() }));
+    const busy = alertsLine(render({ ...baseStatus(), alerts: alerts({ queued: 3, dropped: 2 }) }));
+
+    assert.equal(quiet.includes('queued'), false);
+    assert.equal(quiet.includes('dropped'), false);
+    assert.match(busy, /active: none {2}queued: 3 {2}dropped: 2$/);
+  });
+
+  it('keeps drawing the screen and prints no unexpected string when the section is malformed', () => {
+    const marker = 'https://example.invalid/secret-marker';
+    const output = render({
+      ...baseStatus(),
+      alerts: {
+        macNotification: 'yes',
+        webhook: marker,
+        webhookProblem: marker,
+        active: 'many',
+        lastDelivery: { webhook: { result: marker, reason: marker } },
+        queued: 'lots',
+      },
+    });
+
+    assert.equal(alertsLine(output), `${'Alerts'.padEnd(39)}mac: off  webhook: unknown  active: none`);
+    assert.equal(output.includes('secret-marker'), false);
+    assert.match(output, /Events/);
+  });
+});
