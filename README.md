@@ -14,6 +14,7 @@ npm レジストリでは配布していません（`package.json` は `"private
 
 ## 目次
 
+- [v0.5.0 の主な更新](#v050-の主な更新)
 - [v0.4.1 の主な更新](#v041-の主な更新)
 - [v0.4.0 の主な更新](#v040-の主な更新)
 - [v0.3.0 の主な更新](#v030-の主な更新)
@@ -46,6 +47,11 @@ npm レジストリでは配布していません（`package.json` は `"private
 - [安全設計](#安全設計)
 - [開発](#開発)
 - [English](#english)
+
+## v0.5.0 の主な更新
+
+- **組織の利用拒否を検出して別口座へ切り替え**: `oauth_not_allowed_for_organization` を受けた口座を候補から外し、利用可能な口座へ再送します。利用量取得での検出と、利用回復後の復帰にも対応しました。429の一時制限とは区別します。
+- **`codex-rotator`、通知、切り替え診断を追加**: 前回リリース以降の全変更、Node.js 22以上の要件、使用量イベントの14日保持への変更は [v0.5.0 リリースノート](CHANGELOG.md#v050--2026-10-20) を参照してください。
 
 ## v0.4.1 の主な更新
 
@@ -347,6 +353,10 @@ claude-rotator remove old-account-id --keep-secret
 ```
 
 `--keep-secret` を使うと、Keychain / ローカルファイル側には認証情報が孤児として残ります（[アンインストール](#アンインストール) を参照）。
+
+組織による Claude Code のサブスクリプションアクセス拒否が、Anthropic の明示的なエラーコード `oauth_not_allowed_for_organization` とともに返った場合、rotator はその OAuth アカウントを利用不可にし、利用可能な別アカウントへ同じリクエストを再送します。利用量の定期取得で同じ拒否が判明した場合も切替候補から外します。通常の403やモデル固有の権限エラーは、この処理の対象になりません。
+
+この状態は `status` に `oauth_organization_denied` と表示され、再起動後も保持されます。保存済み認証情報や契約は変更しません。利用量の取得が成功すれば候補に戻ります。意図的に停止したアカウントを候補へ戻したくない場合は、上の `remove <account> --keep-secret` で登録から外してください。
 
 ## モニター
 
@@ -1504,6 +1514,7 @@ This package is not published to the npm registry (`package.json` sets `"private
 
 ### Table of Contents
 
+- [What's New in v0.5.0](#whats-new-in-v050)
 - [What's New in v0.4.1](#whats-new-in-v041)
 - [What's New in v0.4.0](#whats-new-in-v040)
 - [What's New in v0.3.0](#whats-new-in-v030)
@@ -1534,6 +1545,11 @@ This package is not published to the npm registry (`package.json` sets `"private
 - [Troubleshooting](#troubleshooting)
 - [Security Design](#security-design)
 - [Development](#development)
+
+### What's New in v0.5.0
+
+- Explicit `oauth_not_allowed_for_organization` denials now remove the affected OAuth account from routing and retry on an available account. Usage polling detects the same condition; successful usage checks restore eligibility. Temporary 429 responses are handled separately.
+- This release also includes `codex-rotator`, optional alerts, routing diagnostics, daily usage events with 14-day retention, and a Node.js 22 minimum. See the [complete release notes](CHANGELOG.md#v050--2026-10-20).
 
 ### What's New in v0.4.1
 
@@ -1868,6 +1884,10 @@ claude-rotator remove old-account-id --keep-secret
 ```
 
 With `--keep-secret`, the credential is left behind as an orphan in Keychain / the local file store (see [Uninstall](#uninstall)).
+
+When Anthropic explicitly returns `oauth_not_allowed_for_organization` with an OAuth permission error, the affected account is excluded from routing and the request is retried on an available account. Usage polling applies the same exclusion. Other 403 responses and model-specific permission errors do not trigger it.
+
+The account appears as `oauth_organization_denied` in `status`, and the state survives restarts. Stored credentials are retained. A successful usage check restores eligibility. To keep an intentionally disabled account out of the pool, remove its registration with `remove <account> --keep-secret`.
 
 ### Monitor
 

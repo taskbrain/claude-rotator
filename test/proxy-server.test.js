@@ -2,6 +2,7 @@ import { afterEach, describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 import { randomUUID } from 'node:crypto';
 import http from 'node:http';
+import zlib from 'node:zlib';
 import { EventEmitter } from 'node:events';
 import { mkdtemp, readFile, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
@@ -12,7 +13,7 @@ import { AccountManager, familyQuotaExhaustedOnly } from '../src/account-manager
 import { createAlertWatch, normalizeAlertSettings } from '../src/alert-watch.js';
 import { LOCAL_GATEWAY_AUTH_TOKEN } from '../src/config.js';
 import { renderStatus } from '../src/monitor.js';
-import { OAuthTokenRefreshError, parseUsageResponse } from '../src/oauth.js';
+import { fetchUsage, OAuthTokenRefreshError, parseUsageResponse } from '../src/oauth.js';
 import { LinuxFileSecretStore, MemorySecretStore } from '../src/secret-store.js';
 import { sidHash } from '../src/session-affinity.js';
 import { createProxyServer, defaultTokenRefresher } from '../src/proxy-server.js';
@@ -15773,5 +15774,221 @@ describe('alert watch wiring', () => {
     assert.deepEqual(withWatch.manual.created, { timeout: 0, interval: 0 }, 'the watch makes no timer');
     assert.deepEqual(withWatch.fake.calls, [], 'the sender is never called');
     assert.equal(withWatch.started.alertWatch.statusSection(), null);
+  });
+});
+
+describe('OAuth organization access denial', () => {
+  const denial = {
+    type: 'error',
+    error: {
+      type: 'permission_error',
+      message: 'OAuth authentication is currently not allowed for this organization.',
+      details: { error_visibility: 'user_facing', error_code: 'oauth_not_allowed_for_organization' },
+    },
+  };
+
+  async function setup({ mode = 'off', responseBody = denial, encoding = '', encode = body => body, count = 2, accountType = 'oauth', usageFetcher } = {}) {
+    const seen = [];
+    const logs = [];
+    const credentials = Array.from({ length: count }, () => randomUUID());
+    const originalBody = encode(Buffer.from(typeof responseBody === 'string' ? responseBody : JSON.stringify(responseBody)));
+    const upstream = await listen(http.createServer((req, res) => {
+      const index = credentials.findIndex(value => (
+        req.headers.authorization === `Bearer ${value}` || req.headers['x-api-key'] === value
+      ));
+      seen.push(`acct_${index + 1}`);
+      if (index === 0) {
+        res.writeHead(403, {
+          'Content-Type': 'application/json',
+          'Content-Length': originalBody.length,
+          'request-id': 'req_org_denied',
+          ...(encoding ? { 'Content-Encoding': encoding } : {}),
+        });
+        res.end(originalBody);
+      } else {
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ ok: true }));
+      }
+    }));
+    const accounts = credentials.map((_, index) => ({ id: `acct_${index + 1}`, type: accountType }));
+    const accountManager = new AccountManager({ accounts });
+    for (const account of accounts) {
+      accountManager.applyUsage(account.id, { five_hour: { utilization: 0.1, resets_at: futureReset() } });
+    }
+    const secretStore = new MemorySecretStore();
+    for (let index = 0; index < credentials.length; index++) {
+      await secretStore.set(accounts[index].id, {
+        [accountType === 'apikey' ? 'apiKey' : 'accessToken']: credentials[index],
+      });
+    }
+    const proxy = await listen(createProxyServer({
+      accountManager,
+      secretStore,
+      config: {
+        upstream: upstream.url,
+        sessionAffinity: { mode },
+        usagePolling: { enabled: false, concurrency: 1, requestSpacingMs: 0 },
+      },
+      usageFetcher,
+      tokenRefresher: async () => assert.fail('an organization denial must not refresh credentials'),
+      logger: line => logs.push(line),
+    }));
+    cleanupAfterTest(async () => {
+      await close(proxy.server);
+      await close(upstream.server);
+    });
+    const ask = (raw = false) => (raw ? requestRaw : requestJson)(`${proxy.url}/v1/messages`, {
+      method: 'POST',
+      headers: { 'x-claude-code-session-id': 'organization-denial-session' },
+      body: JSON.stringify({ model: 'claude-sonnet-4-5' }),
+    });
+    return { proxy, accountManager, accounts, secretStore, credentials, seen, logs, ask, originalBody };
+  }
+
+  for (const [mode, encoding, encode] of [
+    ['off', '', body => body],
+    ['on', '', body => body],
+    ['on', 'br', zlib.brotliCompressSync],
+    ['on', 'gzip', zlib.gzipSync],
+    ['on', 'gzip, br', body => zlib.brotliCompressSync(zlib.gzipSync(body))],
+  ]) {
+    it(`retries an organization-denied request on a usable account (${mode}, ${encoding || 'identity'})`, async () => {
+      const fixture = await setup({ mode, encoding, encode });
+      const first = await fixture.ask();
+      const second = await fixture.ask();
+
+      assert.equal(first.status, 200);
+      assert.deepEqual(first.body, { ok: true });
+      assert.equal(second.status, 200);
+      assert.deepEqual(fixture.seen, ['acct_1', 'acct_2', 'acct_2']);
+      const failed = fixture.accountManager.getStatus().accounts.find(account => account.id === 'acct_1');
+      assert.equal(failed.status, 'error');
+      assert.equal(failed.unavailableReason.type, 'oauth_organization_denied');
+      assert.equal(failed.unavailableReason.cause, 'OAUTH_ORGANIZATION_ACCESS_DENIED');
+      assert.doesNotMatch(renderStatus(fixture.accountManager.getStatus()), /login expired|needs login/);
+      assert.match(fixture.logs.join('\n'), /status=403 .*outcome=organization-access-retry/);
+      for (const credential of fixture.credentials) assert.ok(!fixture.logs.join('\n').includes(credential));
+      assert.equal((await fixture.secretStore.get('acct_1')).accessToken, fixture.credentials[0]);
+    });
+  }
+
+  for (const [label, responseBody, encoding, encode] of [
+    ['unrelated permission error', { error: { type: 'permission_error', details: { error_code: 'model_access_denied' } } }, ''],
+    ['message without the structured code', { error: { type: 'permission_error', message: denial.error.message } }, ''],
+    ['malformed JSON', '{broken', ''],
+    ['unsupported encoding', denial, 'unknown'],
+    ['corrupt compressed body', denial, 'gzip'],
+    ['oversized denial', { ...denial, padding: 'x'.repeat(128 * 1024) }, ''],
+    ['oversized decompressed denial', { ...denial, padding: 'x'.repeat(128 * 1024) }, 'gzip', zlib.gzipSync],
+    ['unrelated compressed permission error', { error: { type: 'permission_error', details: { error_code: 'model_access_denied' } } }, 'br', zlib.brotliCompressSync],
+    ['too many encoding layers', denial, 'gzip, gzip, gzip, gzip, gzip'],
+  ]) {
+    it(`passes through ${label} without excluding the account`, async () => {
+      const fixture = await setup({ responseBody, encoding, encode });
+      const response = await fixture.ask(true);
+
+      assert.equal(response.status, 403);
+      assert.deepEqual(response.body, fixture.originalBody);
+      assert.equal(response.headers['content-encoding'] || '', encoding);
+      assert.deepEqual(fixture.seen, ['acct_1']);
+      assert.equal(fixture.accountManager.find('acct_1').errorReason, null);
+    });
+  }
+
+  it('does not apply OAuth organization denial handling to API key accounts', async () => {
+    const fixture = await setup({ accountType: 'apikey' });
+    const response = await fixture.ask();
+    assert.equal(response.status, 403);
+    assert.deepEqual(response.body, denial);
+    assert.deepEqual(fixture.seen, ['acct_1']);
+    assert.equal(fixture.accountManager.find('acct_1').errorReason, null);
+  });
+
+  it('keeps the original denial when no alternative exists and does not send later requests to the denied account', async () => {
+    const fixture = await setup({ count: 1 });
+    const first = await fixture.ask();
+    const second = await fixture.ask();
+
+    assert.equal(first.status, 403);
+    assert.deepEqual(first.body, denial);
+    assert.equal(first.headers['request-id'], 'req_org_denied');
+    assert.equal(second.status, 403);
+    assert.equal(second.body.error.details.error_code, 'oauth_not_allowed_for_organization');
+    assert.deepEqual(fixture.seen, ['acct_1']);
+    const restored = new AccountManager({ accounts: fixture.accounts });
+    restored.restoreState(fixture.accountManager.exportState());
+    assert.equal(restored.getActiveAccount(), null);
+    assert.equal(restored.find('acct_1').errorReason.type, 'oauth_organization_denied');
+  });
+
+  it('learns an organization denial first received while a temporarily limited account is used as fallback', async () => {
+    const fixture = await setup({ count: 1 });
+    fixture.accountManager.markRateLimited('acct_1', 120);
+    const first = await fixture.ask();
+
+    assert.equal(first.status, 403);
+    assert.deepEqual(first.body, denial);
+    assert.equal(fixture.accountManager.find('acct_1').errorReason?.type, 'oauth_organization_denied');
+    const second = await fixture.ask();
+    assert.equal(second.status, 403);
+    assert.deepEqual(fixture.seen, ['acct_1']);
+  });
+
+  it('excludes a denial found by usage polling and recovers after a successful usage check', async () => {
+    let rejected = true;
+    const fixture = await setup({
+      usageFetcher: async () => {
+        if (rejected) {
+          return fetchUsage('test-credential', {
+            requestImpl: async () => ({ ok: false, status: 403, text: async () => JSON.stringify(denial) }),
+          });
+        }
+        return { five_hour: { utilization: 0.1, resets_at: futureReset() } };
+      },
+    });
+    const refresh = await requestJson(`${fixture.proxy.url}/internal/refresh-usage`, { method: 'POST' });
+    assert.equal(refresh.body.ok, false);
+    assert.equal(fixture.accountManager.find('acct_1').errorReason?.type, 'oauth_organization_denied');
+    assert.equal(fixture.accountManager.getActiveAccount(), null);
+    assert.deepEqual(fixture.seen, []);
+
+    rejected = false;
+    await requestJson(`${fixture.proxy.url}/internal/refresh-usage`, { method: 'POST' });
+    assert.equal(fixture.accountManager.find('acct_1').errorReason, null);
+    assert.notEqual(fixture.accountManager.getActiveAccount(), null);
+  });
+
+  it('does not persist a usage API rate limit as an organization denial', async () => {
+    const fixture = await setup({
+      usageFetcher: async () => fetchUsage(randomUUID(), {
+        requestImpl: async () => ({
+          ok: false,
+          status: 429,
+          text: async () => JSON.stringify({ error: { type: 'rate_limit_error' } }),
+        }),
+      }),
+    });
+    const refresh = await requestJson(`${fixture.proxy.url}/internal/refresh-usage`, { method: 'POST' });
+    assert.equal(refresh.body.ok, false);
+    assert.equal(fixture.accountManager.find('acct_1').errorReason, null);
+    assert.notEqual(fixture.accountManager.getActiveAccount(), null);
+  });
+
+  it('routes around an organization denial discovered before a message request', async () => {
+    let checks = 0;
+    const fixture = await setup({
+      usageFetcher: async () => {
+        if (++checks === 1) {
+          return fetchUsage('test-credential', {
+            requestImpl: async () => ({ ok: false, status: 403, text: async () => JSON.stringify(denial) }),
+          });
+        }
+        return { five_hour: { utilization: 0.1, resets_at: futureReset() } };
+      },
+    });
+    await requestJson(`${fixture.proxy.url}/internal/refresh-usage`, { method: 'POST' });
+    const response = await fixture.ask();
+    assert.equal(response.status, 200);
+    assert.deepEqual(fixture.seen, ['acct_2']);
   });
 });

@@ -2,6 +2,8 @@ import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 import { EventEmitter } from 'node:events';
 import https from 'node:https';
+import http from 'node:http';
+import zlib from 'node:zlib';
 
 import {
   createSingleFlightTokenRefresher,
@@ -723,6 +725,83 @@ describe('usage response parsing', () => {
 
     assert.equal(receivedSignal, controller.signal);
   });
+
+  it('classifies an explicit OAuth organization denial without exposing its response body', async () => {
+    await assert.rejects(fetchUsage('test-credential', {
+      requestImpl: async () => jsonResponse(403, {
+        type: 'error',
+        error: {
+          type: 'permission_error',
+          message: 'SENTINEL_BODY_do_not_log',
+          details: { error_code: 'oauth_not_allowed_for_organization' },
+        },
+      }),
+    }), error => {
+      assert.equal(error.code, 'OAUTH_ORGANIZATION_ACCESS_DENIED');
+      assert.match(error.message, /Usage fetch failed \(403\)/);
+      assert.doesNotMatch(error.message, /SENTINEL_BODY_do_not_log/);
+      return true;
+    });
+  });
+
+  for (const [encoding, encode] of [['br', zlib.brotliCompressSync], ['gzip', zlib.gzipSync]]) {
+    it(`classifies a compressed OAuth usage denial from the native transport (${encoding})`, async () => {
+      const server = http.createServer((_req, res) => {
+        const body = encode(Buffer.from(JSON.stringify({
+          type: 'error',
+          error: {
+            type: 'permission_error',
+            details: { error_code: 'oauth_not_allowed_for_organization' },
+          },
+        })));
+        res.writeHead(403, { 'Content-Encoding': encoding, 'Content-Type': 'application/json' });
+        res.end(body);
+      });
+      await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
+      try {
+        await assert.rejects(fetchUsage('test-credential', {
+          endpoint: `http://127.0.0.1:${server.address().port}/api/oauth/usage`,
+        }), error => {
+          assert.equal(error.code, 'OAUTH_ORGANIZATION_ACCESS_DENIED');
+          return true;
+        });
+      } finally {
+        await new Promise(resolve => server.close(resolve));
+      }
+    });
+  }
+
+  it('recognizes an already decompressed usage denial returned by fetch', async () => {
+    await assert.rejects(fetchUsage('test-credential', {
+      fetchImpl: async () => new Response(JSON.stringify({
+        error: {
+          type: 'permission_error',
+          details: { error_code: 'oauth_not_allowed_for_organization' },
+        },
+      }), { status: 403, headers: { 'Content-Encoding': 'gzip' } }),
+    }), error => {
+      assert.equal(error.code, 'OAUTH_ORGANIZATION_ACCESS_DENIED');
+      return true;
+    });
+  });
+
+  for (const [status, type, code] of [
+    [403, 'permission_error', 'model_access_denied'],
+    [403, 'permission_error', null],
+    [403, 'api_error', 'oauth_not_allowed_for_organization'],
+    [500, 'permission_error', 'oauth_not_allowed_for_organization'],
+  ]) {
+    it(`does not classify unrelated OAuth usage errors (${status}, ${type}, ${code}) as organization denial`, async () => {
+      await assert.rejects(fetchUsage('test-credential', {
+        requestImpl: async () => jsonResponse(status, {
+          error: { type, message: 'OAuth authentication is currently not allowed for this organization.', details: { error_code: code } },
+        }),
+      }), error => {
+        assert.notEqual(error.code, 'OAUTH_ORGANIZATION_ACCESS_DENIED');
+        return true;
+      });
+    });
+  }
 
   it('retries OAuth usage requests that fail before a connection is established', async () => {
     const originalRequest = https.request;
