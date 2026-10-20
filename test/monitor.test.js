@@ -759,3 +759,77 @@ describe('alerts line', () => {
     assert.match(output, /Events/);
   });
 });
+
+// The `login:` row of an account card: the login expiry the ledger reports.
+describe('login expiry row', () => {
+  const NOW = Date.parse('2026-06-04T09:00:00.000Z');
+
+  // One card only, so the row right above `requests:` belongs to it.
+  function oneAccount(loginExpiry, { omit = false } = {}) {
+    const status = sampleStatus();
+    status.accounts = [status.accounts[1]];
+    if (!omit) status.accounts[0].loginExpiry = loginExpiry;
+    return status;
+  }
+
+  function rowAboveRequests(status) {
+    const lines = renderStatus(status, { now: NOW, columns: 100 }).split('\n');
+    return lines[lines.findIndex(line => line.startsWith('requests:')) - 1];
+  }
+
+  it('a known expiry ahead shows the time left and the time in JST', () => {
+    assert.equal(rowAboveRequests(oneAccount({ state: 'known', at: '2026-06-11T08:30:00.000Z' })),
+      'login: expires in 6d23h -> 06/11 17:30 JST');
+  });
+
+  it('a known expiry in the past shows expired', () => {
+    assert.equal(rowAboveRequests(oneAccount({ state: 'known', at: '2026-06-04T06:00:00.000Z' })),
+      'login: expired -> 06/04 15:00 JST');
+  });
+
+  it('an expiry at this very moment shows expired', () => {
+    assert.equal(rowAboveRequests(oneAccount({ state: 'known', at: '2026-06-04T09:00:00.000Z' })),
+      'login: expired -> 06/04 18:00 JST');
+  });
+
+  it('an expiry not known yet shows unknown', () => {
+    assert.equal(rowAboveRequests(oneAccount({ state: 'unknown', at: null })), 'login: expiry unknown');
+  });
+
+  it('a refresh that reported no expiry shows not reported', () => {
+    assert.equal(rowAboveRequests(oneAccount({ state: 'none', at: null })), 'login: expiry not reported');
+  });
+
+  it('an unreadable time or state shows unknown', () => {
+    for (const loginExpiry of [{ state: 'known', at: 'not-a-date' }, { state: 'weird' }]) {
+      assert.equal(rowAboveRequests(oneAccount(loginExpiry)), 'login: expiry unknown', JSON.stringify(loginExpiry));
+    }
+  });
+
+  it('no row at all when the field is not an object or is absent', () => {
+    const before = renderStatus(oneAccount(null, { omit: true }), { now: NOW, columns: 100 });
+    for (const loginExpiry of ['x', null]) {
+      assert.equal(renderStatus(oneAccount(loginExpiry), { now: NOW, columns: 100 }), before, String(loginExpiry));
+    }
+    assert.equal(before.includes('login:'), false);
+  });
+
+  it('under a minute left shows 1m', () => {
+    assert.equal(rowAboveRequests(oneAccount({ state: 'known', at: '2026-06-04T09:00:30.000Z' })),
+      'login: expires in 1m -> 06/04 18:00 JST');
+  });
+
+  it('the row does not depend on the time zone', () => {
+    const saved = process.env.TZ;
+    try {
+      for (const zone of ['America/Los_Angeles', 'Asia/Tokyo']) {
+        process.env.TZ = zone;
+        assert.equal(rowAboveRequests(oneAccount({ state: 'known', at: '2026-06-11T08:30:00.000Z' })),
+          'login: expires in 6d23h -> 06/11 17:30 JST', zone);
+      }
+    } finally {
+      if (saved === undefined) delete process.env.TZ;
+      else process.env.TZ = saved;
+    }
+  });
+});

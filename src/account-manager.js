@@ -15,6 +15,15 @@ export const DEFAULT_WEEKLY_RESET_PRIORITY_WINDOW_MS = 36 * 60 * 60 * 1000;
 const MAX_DATE_TIMESTAMP_MS = 8_640_000_000_000_000;
 
 /**
+ * Whether a value can be used as a login expiry (ms): a finite number above 0,
+ * no later than the last time a Date can hold. The ledger and the alert watch
+ * both accept exactly these values.
+ */
+export function isLoginExpiryValue(value) {
+  return typeof value === 'number' && Number.isFinite(value) && value > 0 && value <= MAX_DATE_TIMESTAMP_MS;
+}
+
+/**
  * Affinity-only selector constants.
  * `DEFAULT_ASSIGN_STOP_UTILIZATION` stops NEW assignments at 90% - it is not an
  * eviction line: a session already bound to a 90% account stays there until the
@@ -377,6 +386,20 @@ export class AccountManager {
     this.stateListener = typeof listener === 'function' ? listener : null;
   }
 
+  /**
+   * Record the login expiry a credential refresh just reported for an account
+   * (ms, or null when the refresh gave none). `getStatus()` shows it as the
+   * row's `loginExpiry`. A value that is not a usable expiry keeps the one
+   * already known. Unknown ids are ignored. Never throws, and does not call the
+   * state listener.
+   */
+  noteLoginExpiry(accountId, value) {
+    const account = this.accounts.find(item => item.id === accountId);
+    if (!account) return;
+    account.loginExpirySeen = true;
+    if (isLoginExpiryValue(value)) account.loginExpiresAt = value;
+  }
+
   // A listener failure must never change the ledger or reach the caller.
   notifyStateListener(account, details) {
     if (!this.stateListener || !account) return;
@@ -448,6 +471,10 @@ export class AccountManager {
         quotaExhaustionEventKey: credentialIdentityChanged
           ? null
           : existing.quotaExhaustionEventKey,
+        // A changed credential has its own expiry, not known until its first refresh.
+        loginExpiryTracked: tracksLoginExpiry(account),
+        loginExpiresAt: credentialIdentityChanged ? null : existing.loginExpiresAt,
+        loginExpirySeen: credentialIdentityChanged ? false : existing.loginExpirySeen,
       };
     });
     if (this.currentIndex >= this.accounts.length) this.currentIndex = 0;
@@ -517,6 +544,7 @@ export class AccountManager {
             ? new Date(account.rateLimitedUntil).toISOString()
             : null,
           unavailableReason: this.unavailableReason(account),
+          ...(account.loginExpiryTracked ? { loginExpiry: loginExpiryOf(account) } : {}),
         };
       }),
       events: this.events.slice(0, EVENT_HISTORY_LIMIT),
@@ -1291,8 +1319,26 @@ export class AccountManager {
       temporaryUnavailableReason: null,
       errorReason: null,
       quotaExhaustionEventKey: null,
+      loginExpiryTracked: tracksLoginExpiry(account),
+      loginExpiresAt: null,
+      loginExpirySeen: false,
     };
   }
+}
+
+// The login expiry is shown only for accounts the rotator refreshes itself: not
+// for API keys, nor for the accounts that read Claude Code's current login.
+function tracksLoginExpiry(account) {
+  return account.type !== 'apikey'
+    && account.id !== 'current'
+    && account.credentialSource !== 'claude-code-current';
+}
+
+// `known` with the time, `none` when a refresh reported no expiry, `unknown`
+// before the first refresh (after a start or a new login).
+function loginExpiryOf(account) {
+  if (account.loginExpiresAt != null) return { state: 'known', at: new Date(account.loginExpiresAt).toISOString() };
+  return { state: account.loginExpirySeen ? 'none' : 'unknown', at: null };
 }
 
 function keepUnifiedWindowAtomic(parsed, utilizationKey, resetKey) {

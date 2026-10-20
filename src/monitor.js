@@ -114,8 +114,23 @@ function renderAccountCard(account, status, now) {
   for (const limit of account.quota?.weeklyScoped || []) {
     lines.push(renderQuotaRow(`7d ${limit.label || limit.key || 'scoped'}`, limit.utilization, limit.resetAt, now));
   }
+  const login = renderLoginExpiry(account.loginExpiry, now);
+  if (login) lines.push(login);
   lines.push(`requests: ${account.usage?.totalRequests ?? 0}`);
   return lines;
+}
+
+// The `login:` row: the login expiry the ledger reports for the account. When
+// the field is absent (accounts the rotator does not refresh, a status JSON from
+// an older proxy) or is not an object, no row is drawn.
+function renderLoginExpiry(expiry, now) {
+  if (!expiry || typeof expiry !== 'object' || Array.isArray(expiry)) return null;
+  if (expiry.state === 'none') return 'login: expiry not reported';
+  const at = expiry.state === 'known' && typeof expiry.at === 'string' ? Date.parse(expiry.at) : NaN;
+  if (!Number.isFinite(at)) return 'login: expiry unknown';
+  return at - now > 0
+    ? `login: expires in ${formatDuration(at - now)} -> ${formatDate(at)}`
+    : `login: expired -> ${formatDate(at)}`;
 }
 
 function findAccountAvailability(schedule, accountId) {

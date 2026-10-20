@@ -241,6 +241,15 @@ export function createProxyServer({
       return undefined;
     }
   };
+  // 台帳へ期限の数を渡す口（status の口座の行の loginExpiry になる）。見張りへ渡すのと同じ数を渡す。
+  // 台帳が投げても握りつぶし、要求も更新の結果も変えない。
+  const noteLoginExpiry = (context, expiresAt) => {
+    try {
+      accountManager.noteLoginExpiry?.(alertAccountId(context), expiresAt);
+    } catch {
+      // 表示の値が1回古いままになるだけで、要求には響かない。
+    }
+  };
   const refreshLogFields = createRefreshLogFields();
   const coordinatedTokenRefresher = createSingleFlightTokenRefresher(
     refreshTokenWithCredentialSafety,
@@ -254,11 +263,10 @@ export function createProxyServer({
       onSuccess({ context, refreshed, rotated }) {
         logger?.(`${new Date().toISOString()} credential-refresh account=${context?.accountId || 'unknown'} result=success rotated=${rotated} expiresAt=${formatCredentialExpiry(refreshed.expiresAt)}${refreshLogFields.success({ context, refreshed })}`);
         // 更新の結果に期限が無いときは、保管庫に残る元の期限（`{ ...currentSecret, ...refreshed }`）を渡す。
-        callAlertWatch('noteRefreshSucceeded', alertAccountId(context), {
-          refreshCredentialExpiresAt: refreshCredentialExpiry(
-            refreshed?.refreshTokenExpiresAt ?? context?.refreshTokenExpiresAt,
-          ),
-        });
+        // 期限の数はここで1回だけ計算し、台帳と見張りへ同じ数を渡す。
+        const expiresAt = refreshCredentialExpiry(refreshed?.refreshTokenExpiresAt ?? context?.refreshTokenExpiresAt);
+        noteLoginExpiry(context, expiresAt);
+        callAlertWatch('noteRefreshSucceeded', alertAccountId(context), { refreshCredentialExpiresAt: expiresAt });
       },
       onFailure({ context, error, deferred = false }) {
         const retry = error?.retryAfterMs
@@ -270,8 +278,10 @@ export function createProxyServer({
         const result = deferred ? 'deferred' : 'failed';
         logger?.(`${new Date().toISOString()} credential-refresh account=${context?.accountId || 'unknown'} result=${result} errorType=${credentialRefreshErrorType(error)}${retry}${retrySource}${refreshLogFields.failure({ context, error, deferred })}`);
         // 古い資格情報で送り続ける間も要求ごとに呼ばれる。同じ状態の重複は見張りが抑える。
+        const expiresAt = refreshCredentialExpiry(context?.refreshTokenExpiresAt);
+        noteLoginExpiry(context, expiresAt);
         callAlertWatch('noteRefreshFailed', alertAccountId(context), credentialRefreshErrorType(error), {
-          refreshCredentialExpiresAt: refreshCredentialExpiry(context?.refreshTokenExpiresAt),
+          refreshCredentialExpiresAt: expiresAt,
         });
       },
     },

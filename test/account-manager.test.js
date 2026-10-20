@@ -4125,3 +4125,80 @@ describe('setStateListener', () => {
     assert.equal(calls, 0);
   });
 });
+
+// The login expiry the refresh hooks hand to the ledger, shown on each account row
+// of getStatus(). The values are made-up numbers, not anyone's real expiry.
+describe('login expiry on the status rows', () => {
+  const oauthOnly = (extra = {}) => new AccountManager({
+    accounts: [{ id: 'acct', name: 'one', type: 'oauth', ...extra }],
+    now: () => 1_700_000_000_000,
+  });
+  const expiryOf = manager => manager.getStatus().accounts[0].loginExpiry;
+
+  it('is shown only for the accounts the rotator refreshes', () => {
+    const manager = new AccountManager({
+      accounts: [
+        { id: 'acct_oauth', name: 'oauth one', type: 'oauth' },
+        { id: 'acct_key', name: 'key one', type: 'apikey' },
+        { id: 'current', name: 'live one', type: 'oauth' },
+        { id: 'acct_live', name: 'live two', type: 'oauth', credentialSource: 'claude-code-current' },
+      ],
+      now: () => 1_700_000_000_000,
+    });
+    const rows = manager.getStatus().accounts;
+    assert.deepEqual(rows[0].loginExpiry, { state: 'unknown', at: null });
+    for (const row of rows.slice(1)) assert.equal('loginExpiry' in row, false, row.id);
+  });
+
+  it('shows a reported expiry as an ISO time', () => {
+    const manager = oauthOnly();
+    manager.noteLoginExpiry('acct', 2000000000000);
+    assert.deepEqual(expiryOf(manager), { state: 'known', at: '2033-05-18T03:33:20.000Z' });
+  });
+
+  it('says "none" for a refresh without an expiry, and keeps a known expiry over values it cannot use', () => {
+    const manager = oauthOnly();
+    manager.noteLoginExpiry('acct', null);
+    assert.deepEqual(expiryOf(manager), { state: 'none', at: null });
+    manager.noteLoginExpiry('acct', 2000000000000);
+    assert.deepEqual(expiryOf(manager), { state: 'known', at: '2033-05-18T03:33:20.000Z' });
+    for (const value of [null, NaN, 0, -5, Infinity, '2000000000000', 9e15, 8640000000000001]) {
+      manager.noteLoginExpiry('acct', value);
+      assert.deepEqual(expiryOf(manager), { state: 'known', at: '2033-05-18T03:33:20.000Z' }, String(value));
+    }
+  });
+
+  it('forgets the expiry when a reload brings a changed credential, and keeps it otherwise', () => {
+    const changed = oauthOnly({ credentialRevision: 'rev-1' });
+    changed.noteLoginExpiry('acct', 2000000000000);
+    changed.replaceAccounts([{ id: 'acct', name: 'one', type: 'oauth', credentialRevision: 'rev-2' }]);
+    assert.deepEqual(expiryOf(changed), { state: 'unknown', at: null });
+
+    const same = oauthOnly({ credentialRevision: 'rev-1' });
+    same.noteLoginExpiry('acct', 2000000000000);
+    same.replaceAccounts([{ id: 'acct', name: 'one', type: 'oauth', credentialRevision: 'rev-1' }]);
+    assert.deepEqual(expiryOf(same), { state: 'known', at: '2033-05-18T03:33:20.000Z' });
+  });
+
+  it('is not saved in the runtime state', () => {
+    const manager = oauthOnly();
+    manager.noteLoginExpiry('acct', 2000000000000);
+    assert.equal(JSON.stringify(manager.exportState()).includes('loginExpir'), false);
+  });
+
+  it('ignores an id that is not in the ledger and accepts the last time a Date can hold', () => {
+    const manager = oauthOnly();
+    const before = JSON.stringify(manager.getStatus());
+    assert.doesNotThrow(() => manager.noteLoginExpiry('acct_missing', 2000000000000));
+    assert.equal(JSON.stringify(manager.getStatus()), before);
+    manager.noteLoginExpiry('acct', 8640000000000000);
+    assert.deepEqual(expiryOf(manager), { state: 'known', at: '+275760-09-13T00:00:00.000Z' });
+  });
+
+  it('comes last on the row, after the keys the row already had', () => {
+    assert.deepEqual(Object.keys(oauthOnly().getStatus().accounts[0]), [
+      'id', 'name', 'type', 'accountUuid', 'status', 'quota', 'usage', 'rateLimitedUntil', 'unavailableReason',
+      'loginExpiry',
+    ]);
+  });
+});

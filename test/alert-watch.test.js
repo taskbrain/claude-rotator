@@ -93,11 +93,16 @@ function createFakeSender({
   };
 }
 
+// `skew` ({ ms }) moves the watch's clock away from the fake timers (a clock
+// that jumps), and the two expiry-state functions stand in for alert-expiry.json.
 function setup({
   settings = ENABLED,
   accounts = [{ id: 'alpha-example', name: 'alpha MARKER-NAME' }],
   sender = {},
   loadSettings = null,
+  readExpiryState = null,
+  writeExpiryState = null,
+  skew = null,
 } = {}) {
   const clock = createClock();
   const manager = new AccountManager({ accounts, now: clock.now });
@@ -109,8 +114,10 @@ function setup({
     settings,
     loadSettings,
     logger: line => lines.push(line),
-    now: clock.now,
+    now: skew ? () => clock.now() + skew.ms : clock.now,
     timers: clock.timers,
+    readExpiryState,
+    writeExpiryState,
   });
   const row = id => manager.accounts.find(account => account.id === id);
   return { clock, manager, fake, lines, watch, row };
@@ -431,49 +438,798 @@ describe('W3 batching and reminders', () => {
   });
 });
 
-describe('W4 expiry alert', () => {
-  it('fires once 24 hours ahead with the 3-day list, and again for a new expiry', async () => {
-    const { watch, clock, fake } = setup({
-      accounts: [{ id: 'alpha-example', name: 'alpha' }, { id: 'bravo-example', name: 'bravo' }],
-    });
+// ---- login expiry stages: 7 days, 3 days, 1 day before, and expired ----
+//
+// Times are written as START + t. The expected texts are written out in full;
+// nothing below computes them with the code under test.
+
+const SECOND = 1000;
+const DAY = 24 * HOUR;
+const ALPHA = 'alpha-example';
+const BRAVO = 'bravo-example';
+const CHARLIE = 'charlie-example';
+const THREE_ACCOUNTS = [
+  { id: ALPHA, name: 'alpha MARKER-NAME' },
+  { id: BRAVO, name: 'bravo MARKER-NAME' },
+  { id: CHARLIE, name: 'charlie MARKER-NAME' },
+];
+const D7 = 'claude-rotator: login expires within 7 days for 1 account(s): alp…. Run "claude-rotator status" on the Mac.';
+const D3 = 'claude-rotator: login expires within 3 days for 1 account(s): alp…. Run "claude-rotator status" on the Mac.';
+const D1 = 'claude-rotator: login expires within 1 day for 1 account(s): alp…. Run "claude-rotator status" on the Mac.';
+const EX = 'claude-rotator: login expired for 1 account(s): alp…. Run "claude-rotator status" on the Mac.';
+const RL = 'claude-rotator: 1 account(s) need a new login: alp…. Run "claude-rotator status" on the Mac.';
+const WA = 'claude-rotator: working again: alp….';
+
+// Moves the fake clock to START + t and lets the sends finish.
+async function until(clock, t) {
+  clock.advance(START + t - clock.now());
+  await settle();
+}
+
+function succeed(watch, id, value) {
+  watch.noteRefreshSucceeded(id, { refreshCredentialExpiresAt: value });
+}
+
+function messageLines(fake) {
+  return texts(fake).flatMap(text => text.split('\n'));
+}
+
+// A stand-in for alert-expiry.json. `read` returns what a read gives back (a
+// function, so a test can hold or reject it); every write is copied.
+function fakeExpiryStore({ read = () => Promise.resolve(null), write = () => undefined } = {}) {
+  const calls = { read: 0, writes: [] };
+  return {
+    calls,
+    readExpiryState: () => {
+      calls.read += 1;
+      return read();
+    },
+    writeExpiryState: state => {
+      calls.writes.push(structuredClone(state));
+      return write(state);
+    },
+  };
+}
+
+function storeOptions(store) {
+  return { readExpiryState: store.readExpiryState, writeExpiryState: store.writeExpiryState };
+}
+
+function remembered(stage, expiresAt = START + 6 * DAY, id = ALPHA) {
+  return { format: 1, accounts: { [id]: { expiresAt, stage } } };
+}
+
+describe('expiry stages: boundaries and progression', () => {
+  it('sends 7 days, 3 days, 1 day and expired once each, each just after its boundary', async () => {
+    const { watch, clock, fake } = setup();
+    succeed(watch, ALPHA, START + 8 * DAY);
     watch.start();
-    watch.noteRefreshSucceeded('alpha-example', { refreshCredentialExpiresAt: START + 30 * HOUR });
-    watch.noteRefreshSucceeded('bravo-example', { refreshCredentialExpiresAt: START + 60 * HOUR });
-    clock.advance(6 * HOUR - MINUTE);
-    await settle();
+    await until(clock, DAY - 2 * MINUTE);
     assert.equal(fake.calls.postWebhook.length, 0);
-    assert.equal(watch.statusSection().active.expiringSoon, 0);
-
-    clock.advance(MINUTE);
-    assert.equal(watch.statusSection().active.expiringSoon, 1);
-    clock.advance(MINUTE);
-    await settle();
-    assert.deepEqual(texts(fake), [
-      'claude-rotator: login for alp… expires within 24 h. Also within 3 days: bra….',
-    ]);
+    await until(clock, DAY + 2 * MINUTE);
+    assert.deepEqual(texts(fake), [D7]);
+    await until(clock, 5 * DAY - 2 * MINUTE);
+    assert.equal(fake.calls.postWebhook.length, 1);
+    await until(clock, 5 * DAY + 2 * MINUTE);
+    assert.deepEqual(texts(fake), [D7, D3]);
+    await until(clock, 7 * DAY + 2 * MINUTE);
+    assert.deepEqual(texts(fake), [D7, D3, D1]);
+    await until(clock, 8 * DAY + 2 * MINUTE);
+    assert.deepEqual(texts(fake), [D7, D3, D1, EX]);
+    await until(clock, 9 * DAY);
+    assert.equal(fake.calls.postWebhook.length, 4);
     assert.equal(fake.calls.notifyMac[0].body,
-      'claude-rotator: login for alpha-example expires within 24 h. Also within 3 days: bravo-example.');
-
-    clock.advance(12 * HOUR);
-    await settle();
-    assert.equal(fake.calls.postWebhook.length, 1, 'once per expiry value');
-
-    watch.noteRefreshSucceeded('alpha-example', { refreshCredentialExpiresAt: clock.now() + 20 * HOUR });
-    clock.advance(2 * MINUTE);
-    await settle();
-    assert.equal(fake.calls.postWebhook.length, 2);
-    assert.match(texts(fake)[1], /^claude-rotator: login for alp… expires within 20 h\./);
+      'claude-rotator: login expires within 7 days: alpha-example.\nRun: claude-rotator login --id alpha-example');
+    assert.equal(fake.calls.notifyMac[3].body,
+      'claude-rotator: login expired: alpha-example.\nRun: claude-rotator login --id alpha-example');
     watch.stop();
   });
 
-  it('does not fire for an expiry that has already passed', async () => {
+  it('exactly 7 days left at a sweep is inside the 7-day stage', async () => {
+    const { watch, clock, fake } = setup();
+    succeed(watch, ALPHA, START + 7 * DAY + 5 * MINUTE);
+    watch.start();
+    await until(clock, 5 * MINUTE + 30 * SECOND);
+    assert.equal(fake.calls.postWebhook.length, 0);
+    await until(clock, 6 * MINUTE + 30 * SECOND);
+    assert.deepEqual(texts(fake), [D7]);
+    watch.stop();
+  });
+
+  it('one millisecond more than 7 days waits for the next sweep', async () => {
+    const { watch, clock, fake } = setup();
+    succeed(watch, ALPHA, START + 7 * DAY + 5 * MINUTE + 1);
+    watch.start();
+    await until(clock, 6 * MINUTE + 30 * SECOND);
+    assert.equal(fake.calls.postWebhook.length, 0);
+    await until(clock, 7 * MINUTE + 30 * SECOND);
+    assert.deepEqual(texts(fake), [D7]);
+    watch.stop();
+  });
+
+  it('an expiry 3 minutes away sends 1 day, then expired', async () => {
+    const { watch, clock, fake } = setup();
+    succeed(watch, ALPHA, START + 3 * MINUTE);
+    watch.start();
+    await until(clock, 2 * MINUTE);
+    assert.deepEqual(texts(fake), [D1]);
+    await until(clock, 4 * MINUTE + 30 * SECOND);
+    assert.deepEqual(texts(fake), [D1, EX]);
+    watch.stop();
+  });
+
+  it('5 days left sends 7 days at once and 3 days two days later', async () => {
+    const { watch, clock, fake } = setup();
+    succeed(watch, ALPHA, START + 5 * DAY);
+    watch.start();
+    await until(clock, 2 * MINUTE);
+    assert.deepEqual(texts(fake), [D7]);
+    await until(clock, 2 * DAY + 2 * MINUTE);
+    assert.deepEqual(texts(fake), [D7, D3]);
+    watch.stop();
+  });
+
+  it('a stage already passed when the expiry is first seen is not sent', async () => {
+    const { watch, clock, fake } = setup();
+    succeed(watch, ALPHA, START + 2 * DAY);
+    watch.start();
+    await until(clock, 2 * MINUTE);
+    assert.deepEqual(texts(fake), [D3]);
+    await until(clock, DAY + 2 * MINUTE);
+    assert.deepEqual(texts(fake), [D3, D1]);
+    watch.stop();
+  });
+
+  it('12 hours left sends 1 day only, then expired', async () => {
+    const { watch, clock, fake } = setup();
+    succeed(watch, ALPHA, START + 12 * HOUR);
+    watch.start();
+    await until(clock, 2 * MINUTE);
+    assert.deepEqual(texts(fake), [D1]);
+    await until(clock, 12 * HOUR + 2 * MINUTE);
+    assert.deepEqual(texts(fake), [D1, EX]);
+    watch.stop();
+  });
+
+  it('an expiry that has already passed is sent once as expired', async () => {
     const { watch, clock, fake } = setup();
     watch.start();
-    watch.noteRefreshFailed('alpha-example', 'http-500', { refreshCredentialExpiresAt: START - MINUTE });
-    clock.advance(5 * MINUTE);
-    await settle();
+    watch.noteRefreshFailed(ALPHA, 'http-500', { refreshCredentialExpiresAt: START - MINUTE });
+    await until(clock, DAY);
+    const expired = messageLines(fake).filter(line => line.startsWith('claude-rotator: login expired '));
+    assert.equal(expired.length, 1);
+    watch.stop();
+  });
+
+  it('a clock that goes back sends no stage twice', async () => {
+    const skew = { ms: 0 };
+    const { watch, clock, fake } = setup({ skew });
+    succeed(watch, ALPHA, START + 4 * DAY);
+    watch.start();
+    await until(clock, 2 * MINUTE);
+    assert.deepEqual(texts(fake), [D7]);
+    await until(clock, DAY + 2 * MINUTE);
+    assert.deepEqual(texts(fake), [D7, D3]);
+    await until(clock, DAY + 5 * MINUTE);
+    skew.ms = -2 * DAY;
+    await until(clock, 3 * DAY + 5 * MINUTE);
+    assert.deepEqual(texts(fake), [D7, D3]);
+    await until(clock, 5 * DAY + 2 * MINUTE);
+    assert.deepEqual(texts(fake), [D7, D3, D1]);
+    watch.stop();
+  });
+
+  it('a clock that jumps ahead skips the stages it jumped over', async () => {
+    const skew = { ms: 0 };
+    const { watch, clock, fake } = setup({ skew });
+    succeed(watch, ALPHA, START + 4 * DAY);
+    watch.start();
+    await until(clock, 10 * MINUTE);
+    skew.ms = 3.5 * DAY;
+    await until(clock, 13 * MINUTE);
+    assert.deepEqual(texts(fake), [D7, D1]);
+    watch.stop();
+  });
+});
+
+describe('expiry stages: the relogin alert comes first', () => {
+  it('sends no stage while the account needs a new login', async () => {
+    const { watch, clock, fake } = setup();
+    watch.start();
+    watch.noteRefreshFailed(ALPHA, 'invalid_grant', { refreshCredentialExpiresAt: START + 2 * DAY });
+    await until(clock, 2 * MINUTE);
+    assert.deepEqual(texts(fake), [RL]);
+    await until(clock, 1.5 * DAY + 2 * MINUTE);
+    assert.deepEqual(messageLines(fake).filter(line => line.startsWith('claude-rotator: login exp')), []);
+    watch.stop();
+  });
+
+  async function reloginWhileStageWaits() {
+    const context = setup();
+    const { watch, clock, fake } = context;
+    succeed(watch, ALPHA, START + 20 * HOUR);
+    watch.start();
+    await until(clock, 30 * SECOND);
+    watch.noteRefreshFailed(ALPHA, 'invalid_grant', { refreshCredentialExpiresAt: START + 20 * HOUR });
+    await until(clock, 2 * MINUTE);
+    assert.deepEqual(texts(fake), [RL]);
+    return context;
+  }
+
+  it('drops a waiting stage when the relogin alert comes in the same batch', async () => {
+    const { watch } = await reloginWhileStageWaits();
+    watch.stop();
+  });
+
+  it('an expired stage already sent may be followed by the relogin alert', async () => {
+    const { watch, clock, fake } = setup();
+    succeed(watch, ALPHA, START + 3 * MINUTE);
+    watch.start();
+    await until(clock, 10 * MINUTE);
+    watch.noteRefreshFailed(ALPHA, 'NATIVE_REFRESH_REAUTH_REQUIRED', { refreshCredentialExpiresAt: START + 3 * MINUTE });
+    await until(clock, 12 * MINUTE);
+    assert.deepEqual(texts(fake), [D1, EX, RL]);
+    watch.stop();
+  });
+
+  it('sends the dropped stage after the relogin alert ends, before the recovery line', async () => {
+    const { watch, clock, fake } = await reloginWhileStageWaits();
+    await until(clock, 5 * MINUTE + 30 * SECOND);
+    succeed(watch, ALPHA, START + 20 * HOUR);
+    await until(clock, 7 * MINUTE);
+    assert.deepEqual(texts(fake), [RL, `${D1}\n${WA}`]);
+    await until(clock, 20 * HOUR + 2 * MINUTE);
+    assert.deepEqual(texts(fake), [RL, `${D1}\n${WA}`, EX]);
+    watch.stop();
+  });
+
+  it('a new login after the relogin alert counts the new expiry from the start', async () => {
+    const { watch, clock, fake, row } = setup();
+    watch.start();
+    watch.noteRefreshFailed(ALPHA, 'invalid_grant', { refreshCredentialExpiresAt: START + 2 * DAY });
+    await until(clock, 5 * MINUTE);
+    watch.onAccountState(row(ALPHA), { credentialChanged: true });
+    succeed(watch, ALPHA, START + 5 * MINUTE + 28 * DAY);
+    await until(clock, 7 * MINUTE);
+    assert.deepEqual(texts(fake), [RL, WA]);
+    await until(clock, 21 * DAY + 7 * MINUTE);
+    assert.deepEqual(texts(fake), [RL, WA, D7]);
+    watch.stop();
+  });
+});
+
+describe('expiry stages: a new credential and large changes', () => {
+  it('a changed credential starts the stages over for the new expiry', async () => {
+    const { watch, clock, fake, row } = setup();
+    succeed(watch, ALPHA, START + 2 * DAY);
+    watch.start();
+    await until(clock, 10 * MINUTE);
+    watch.onAccountState(row(ALPHA), { credentialChanged: true });
+    succeed(watch, ALPHA, START + 10 * MINUTE + 28 * DAY);
+    await until(clock, 20 * MINUTE);
+    assert.deepEqual(texts(fake), [D3]);
+    await until(clock, 21 * DAY + 12 * MINUTE);
+    assert.deepEqual(texts(fake), [D3, D7]);
+    watch.stop();
+  });
+
+  it('a changed credential drops the stage still waiting for its batch', async () => {
+    const { watch, clock, fake, row } = setup();
+    succeed(watch, ALPHA, START + 20 * HOUR);
+    watch.start();
+    await until(clock, 30 * SECOND);
+    watch.onAccountState(row(ALPHA), { credentialChanged: true });
+    await until(clock, 2 * MINUTE);
+    assert.equal(fake.calls.postWebhook.length, 0);
+    succeed(watch, ALPHA, START + 28 * DAY);
+    await until(clock, 5 * MINUTE);
     assert.equal(fake.calls.postWebhook.length, 0);
     watch.stop();
+  });
+
+  it('an expiry more than a day later counts as a new one even without a changed credential', async () => {
+    const { watch, clock, fake } = setup();
+    succeed(watch, ALPHA, START + 2 * DAY);
+    watch.start();
+    await until(clock, 10 * MINUTE);
+    succeed(watch, ALPHA, START + 2 * DAY + 21 * DAY);
+    await until(clock, 20 * MINUTE);
+    assert.deepEqual(texts(fake), [D3]);
+    await until(clock, 16 * DAY + 2 * MINUTE);
+    assert.deepEqual(texts(fake), [D3, D7]);
+    watch.stop();
+  });
+});
+
+describe('expiry stages: the values and small changes', () => {
+  it('ignores a value that is not a usable expiry', async () => {
+    for (const value of [null, NaN, 0, -5, Infinity, '1767614400000', 9e15]) {
+      const { watch, clock, fake } = setup();
+      succeed(watch, ALPHA, value);
+      watch.start();
+      await until(clock, 2 * MINUTE);
+      assert.equal(fake.calls.postWebhook.length, 0, String(value));
+      assert.equal(watch.statusSection().active.expiringSoon, 0, String(value));
+      watch.stop();
+    }
+  });
+
+  it('a missing value keeps the known expiry', async () => {
+    const { watch, clock, fake } = setup();
+    succeed(watch, ALPHA, START + 6 * DAY);
+    watch.start();
+    await until(clock, 2 * MINUTE);
+    assert.deepEqual(texts(fake), [D7]);
+    await until(clock, 10 * MINUTE);
+    succeed(watch, ALPHA, null);
+    await until(clock, 3 * DAY + 2 * MINUTE);
+    assert.deepEqual(texts(fake), [D7, D3]);
+    watch.stop();
+  });
+
+  it('a change of 30 minutes around a boundary does not send a stage twice', async () => {
+    const { watch, clock, fake } = setup();
+    succeed(watch, ALPHA, START + 3 * DAY + 2 * MINUTE);
+    watch.start();
+    await until(clock, 4 * MINUTE);
+    assert.deepEqual(texts(fake), [D7, D3]);
+    await until(clock, 5 * MINUTE + 10 * SECOND);
+    succeed(watch, ALPHA, START + 3 * DAY + 2 * MINUTE + 30 * MINUTE);
+    await until(clock, 40 * MINUTE);
+    assert.equal(fake.calls.postWebhook.length, 2);
+    watch.stop();
+  });
+
+  it('61 minutes later in the same stage sends nothing new', async () => {
+    const { watch, clock, fake } = setup();
+    succeed(watch, ALPHA, START + 2 * DAY + 12 * HOUR);
+    watch.start();
+    await until(clock, 10 * MINUTE);
+    succeed(watch, ALPHA, START + 2 * DAY + 12 * HOUR + 61 * MINUTE);
+    await until(clock, 20 * MINUTE);
+    assert.deepEqual(texts(fake), [D3]);
+    watch.stop();
+  });
+
+  it('up to a day later lowers the sent stage to the new one and sends it again at its boundary', async () => {
+    const { watch, clock, fake } = setup();
+    succeed(watch, ALPHA, START + 2 * DAY + 21 * HOUR);
+    watch.start();
+    await until(clock, 10 * MINUTE);
+    succeed(watch, ALPHA, START + 2 * DAY + 21 * HOUR + DAY);
+    await until(clock, 20 * MINUTE);
+    assert.deepEqual(texts(fake), [D3]);
+    await until(clock, 21 * HOUR + 2 * MINUTE);
+    assert.deepEqual(texts(fake), [D3, D3]);
+    watch.stop();
+  });
+
+  it('an earlier expiry sends the nearer stage it has reached', async () => {
+    const { watch, clock, fake } = setup();
+    succeed(watch, ALPHA, START + 2 * DAY + 12 * HOUR);
+    watch.start();
+    await until(clock, 10 * MINUTE);
+    succeed(watch, ALPHA, START + 12 * HOUR);
+    await until(clock, 15 * MINUTE);
+    assert.deepEqual(texts(fake), [D3, D1]);
+    watch.stop();
+  });
+
+  it('the same value ten times sends one message', async () => {
+    const { watch, clock, fake } = setup();
+    watch.start();
+    for (let i = 0; i < 10; i += 1) {
+      succeed(watch, ALPHA, START + 6 * DAY);
+      clock.advance(SECOND);
+    }
+    await until(clock, 2 * MINUTE);
+    assert.deepEqual(texts(fake), [D7]);
+    watch.stop();
+  });
+
+  it('a stage whose expiry moved later while it waited is dropped and sent at the new boundary', async () => {
+    const { watch, clock, fake } = setup();
+    succeed(watch, ALPHA, START + 7 * DAY + 5 * MINUTE);
+    watch.start();
+    await until(clock, 5 * MINUTE + 20 * SECOND);
+    succeed(watch, ALPHA, START + 7 * DAY + 5 * MINUTE + 10 * MINUTE);
+    await until(clock, 6 * MINUTE + 30 * SECOND);
+    assert.equal(fake.calls.postWebhook.length, 0);
+    await until(clock, 16 * MINUTE + 30 * SECOND);
+    assert.deepEqual(texts(fake), [D7]);
+    watch.stop();
+  });
+});
+
+describe('expiry stages: the remembered stages', () => {
+  const E = START + 6 * DAY;
+
+  async function started(options = {}, store = fakeExpiryStore()) {
+    const context = setup({ ...options, ...storeOptions(store) });
+    context.watch.start();
+    await settle();
+    return { ...context, store };
+  }
+
+  it('a remembered stage is not sent again, and the next stage is remembered', async () => {
+    const { watch, clock, fake, store } = await started({}, fakeExpiryStore({ read: () => Promise.resolve(remembered('7d')) }));
+    succeed(watch, ALPHA, E);
+    await until(clock, 3 * MINUTE);
+    assert.equal(fake.calls.postWebhook.length, 0);
+    assert.equal(store.calls.writes.length, 0);
+    await until(clock, 3 * DAY + 2 * MINUTE);
+    assert.deepEqual(texts(fake), [D3]);
+    assert.deepEqual(store.calls.writes.at(-1), remembered('3d'));
+    watch.stop();
+  });
+
+  it('a value within 60 minutes of the remembered one is the same expiry, and the file is read once', async () => {
+    const { watch, clock, fake, store } = await started({}, fakeExpiryStore({ read: () => Promise.resolve(remembered('7d')) }));
+    succeed(watch, ALPHA, E + 30 * MINUTE);
+    await until(clock, 3 * MINUTE);
+    assert.equal(fake.calls.postWebhook.length, 0);
+    assert.equal(store.calls.read, 1);
+    await until(clock, 3 * DAY + 32 * MINUTE);
+    assert.deepEqual(texts(fake), [D3]);
+    watch.stop();
+  });
+
+  it('a value more than a day later than the remembered one starts over', async () => {
+    const { watch, clock, fake } = await started({}, fakeExpiryStore({ read: () => Promise.resolve(remembered('3d')) }));
+    succeed(watch, ALPHA, E + 20 * DAY);
+    await until(clock, 3 * MINUTE);
+    assert.equal(fake.calls.postWebhook.length, 0);
+    await until(clock, 19 * DAY + 2 * MINUTE);
+    assert.deepEqual(texts(fake), [D7]);
+    watch.stop();
+  });
+
+  it('an earlier value than the remembered one keeps the remembered stage', async () => {
+    const { watch, clock, fake } = await started({}, fakeExpiryStore({ read: () => Promise.resolve(remembered('7d')) }));
+    succeed(watch, ALPHA, E - 4 * DAY);
+    await until(clock, 3 * MINUTE);
+    assert.deepEqual(texts(fake), [D3]);
+    watch.stop();
+  });
+
+  async function startsFromNothing(read) {
+    const { watch, clock, fake, store, lines } = await started({}, fakeExpiryStore({ read }));
+    succeed(watch, ALPHA, E);
+    await until(clock, 3 * MINUTE);
+    assert.deepEqual(texts(fake), [D7]);
+    assert.deepEqual(store.calls.writes, [remembered('7d')]);
+    for (const line of lines) assert.ok(LOG_LINE_FORMS.some(form => form.test(line)), line);
+    watch.stop();
+    return store;
+  }
+
+  it('nothing remembered sends the stage and writes it once', async () => {
+    await startsFromNothing(() => Promise.resolve(null));
+  });
+
+  it('an unreadable file counts as nothing remembered, with no new log line', async () => {
+    await startsFromNothing(() => Promise.reject(new SyntaxError('Unexpected token in JSON')));
+  });
+
+  it('a file of another format counts as nothing remembered', async () => {
+    await startsFromNothing(() => Promise.resolve({ format: 2, accounts: remembered('7d').accounts }));
+  });
+
+  it('drops only the rows that do not fit', async () => {
+    const { watch, clock, fake } = await started({ accounts: THREE_ACCOUNTS }, fakeExpiryStore({
+      read: () => Promise.resolve({
+        format: 1,
+        accounts: {
+          [ALPHA]: { expiresAt: E, stage: '7d' },
+          [BRAVO]: { expiresAt: E, stage: 'x' },
+          [CHARLIE]: { expiresAt: 'NaN', stage: '7d' },
+        },
+      }),
+    }));
+    for (const id of [ALPHA, BRAVO, CHARLIE]) succeed(watch, id, E);
+    await until(clock, 3 * MINUTE);
+    assert.deepEqual(texts(fake), [
+      'claude-rotator: login expires within 7 days for 2 account(s): bra…, cha…. Run "claude-rotator status" on the Mac.',
+    ]);
+    assert.deepEqual(fake.calls.notifyMac.map(call => call.body), [
+      'claude-rotator: login expires within 7 days: bravo-example, charlie-example.\nRun: claude-rotator login --id bravo-example\nRun: claude-rotator login --id charlie-example',
+    ]);
+    watch.stop();
+  });
+
+  it('a read that does not finish counts as nothing remembered, and its late result is not used', async () => {
+    let finishRead = null;
+    const { watch, clock, fake } = await started({}, fakeExpiryStore({
+      read: () => new Promise(resolve => {
+        finishRead = resolve;
+      }),
+    }));
+    succeed(watch, ALPHA, E);
+    await until(clock, 3 * MINUTE);
+    assert.deepEqual(texts(fake), [D7]);
+    await until(clock, 4 * MINUTE);
+    finishRead(remembered('7d'));
+    await settle();
+    await until(clock, 3 * DAY + 2 * MINUTE);
+    assert.deepEqual(texts(fake), [D7, D3]);
+    watch.stop();
+  });
+
+  it('writes no row for an account that is not in the ledger', async () => {
+    const { watch, clock, fake, store } = await started({}, fakeExpiryStore({
+      read: () => Promise.resolve(remembered('7d', E, 'zulu-example')),
+    }));
+    succeed(watch, ALPHA, E);
+    await until(clock, 3 * MINUTE);
+    assert.deepEqual(texts(fake), [D7]);
+    assert.ok(store.calls.writes.length > 0);
+    assert.equal(JSON.stringify(store.calls.writes).includes('zulu-example'), false);
+    watch.stop();
+  });
+
+  it('a stage that was not handed over before a stop is sent after the restart, once in all', async () => {
+    const store = fakeExpiryStore();
+    const first = await started({}, store);
+    succeed(first.watch, ALPHA, E);
+    await until(first.clock, 90 * SECOND);
+    first.watch.stop();
+    await settle();
+    assert.equal(first.fake.calls.postWebhook.length, 0);
+    assert.equal(store.calls.writes.length, 0);
+
+    const second = createAlertWatch({
+      accountManager: first.manager,
+      sender: first.fake.sender,
+      settings: ENABLED,
+      logger: line => first.lines.push(line),
+      now: first.clock.now,
+      timers: first.clock.timers,
+      ...storeOptions(store),
+    });
+    second.start();
+    await settle();
+    succeed(second, ALPHA, E);
+    await until(first.clock, 90 * SECOND + 3 * MINUTE);
+    assert.deepEqual(texts(first.fake), [D7]);
+    second.stop();
+  });
+
+  it('a write that keeps failing changes nothing else and is tried again after the next stage', async () => {
+    const { watch, clock, fake, store, lines } = await started({}, fakeExpiryStore({
+      write: () => Promise.reject(Object.assign(new Error('EACCES: permission denied'), { code: 'EACCES' })),
+    }));
+    assert.doesNotThrow(() => succeed(watch, ALPHA, E));
+    await until(clock, 3 * MINUTE);
+    assert.deepEqual(texts(fake), [D7]);
+    for (const line of lines) assert.ok(LOG_LINE_FORMS.some(form => form.test(line)), line);
+    await until(clock, 3 * DAY + 2 * MINUTE);
+    assert.deepEqual(texts(fake), [D7, D3]);
+    assert.equal(store.calls.writes.length, 2);
+    watch.stop();
+  });
+
+  it('writes one at a time, and once more with the latest content after a slow write', async () => {
+    let release = null;
+    const { watch, clock, store } = await started({ accounts: THREE_ACCOUNTS }, fakeExpiryStore({
+      write: () => (release ? undefined : new Promise(resolve => {
+        release = resolve;
+      })),
+    }));
+    succeed(watch, ALPHA, E);
+    succeed(watch, BRAVO, START + 7 * DAY + 3 * MINUTE);
+    await until(clock, 3 * MINUTE);
+    assert.deepEqual(store.calls.writes, [remembered('7d')]);
+    await until(clock, 5 * MINUTE);
+    assert.equal(store.calls.writes.length, 1, 'the second write waits for the first');
+    release();
+    await settle();
+    assert.deepEqual(store.calls.writes, [remembered('7d'), {
+      format: 1,
+      accounts: {
+        [ALPHA]: { expiresAt: E, stage: '7d' },
+        [BRAVO]: { expiresAt: START + 7 * DAY + 3 * MINUTE, stage: '7d' },
+      },
+    }]);
+    watch.stop();
+  });
+
+  it('without the alerts section the file is neither read nor written', async () => {
+    const { watch, clock, store } = await started({ settings: {} });
+    succeed(watch, ALPHA, E);
+    clock.advance(10 * MINUTE);
+    await settle();
+    assert.equal(store.calls.read, 0);
+    assert.equal(store.calls.writes.length, 0);
+    assert.equal(clock.size(), 0);
+    watch.stop();
+  });
+
+  it('a reload that turns the section on reads the file once', async () => {
+    const { watch, store } = await started({ settings: {}, loadSettings: () => ENABLED });
+    watch.reload();
+    await settle();
+    watch.reload();
+    await settle();
+    assert.equal(store.calls.read, 1);
+    watch.stop();
+  });
+
+  it('turning the section off and on again keeps what was remembered', async () => {
+    let raw = ENABLED;
+    const { watch, clock, fake, store } = await started({ loadSettings: () => raw });
+    succeed(watch, ALPHA, E);
+    await until(clock, 3 * MINUTE);
+    assert.deepEqual(texts(fake), [D7]);
+    assert.equal(store.calls.writes.length, 1);
+    raw = {};
+    watch.reload();
+    raw = ENABLED;
+    watch.reload();
+    await settle();
+    succeed(watch, ALPHA, E);
+    await until(clock, 10 * MINUTE);
+    assert.deepEqual(texts(fake), [D7]);
+    assert.equal(store.calls.read, 1);
+    watch.stop();
+  });
+
+  it('a changed credential takes its row out of the next write', async () => {
+    const { watch, clock, store, row } = await started({ accounts: THREE_ACCOUNTS });
+    succeed(watch, ALPHA, E);
+    succeed(watch, BRAVO, START + 7 * DAY + 3 * MINUTE);
+    await until(clock, 150 * SECOND);
+    watch.onAccountState(row(ALPHA), { credentialChanged: true });
+    await until(clock, 5 * MINUTE);
+    assert.deepEqual(store.calls.writes, [
+      remembered('7d'),
+      remembered('7d', START + 7 * DAY + 3 * MINUTE, BRAVO),
+    ]);
+    watch.stop();
+  });
+
+  it('writes only after the sender has returned', async () => {
+    const waiting = [];
+    const hold = result => () => new Promise(resolve => waiting.push(() => resolve(result)));
+    const { watch, clock, store } = await started({
+      sender: { mac: hold({ result: 'exited-0' }), webhook: hold({ result: 'ok', reason: null }) },
+    });
+    succeed(watch, ALPHA, E);
+    await until(clock, 3 * MINUTE);
+    assert.equal(store.calls.writes.length, 0);
+    for (const go of waiting.splice(0)) go();
+    await settle();
+    assert.equal(store.calls.writes.length, 1);
+    watch.stop();
+  });
+
+  it('the written content carries no name, path or URL file', async () => {
+    const store = await startsFromNothing(() => Promise.resolve(null));
+    assert.equal(store.calls.writes.length, 1);
+    const written = JSON.stringify(store.calls.writes[0]);
+    for (const marker of ['MARKER-NAME', 'MARKER-PATH', URL_FILE]) assert.equal(written.includes(marker), false, marker);
+  });
+
+  it('a remembered row for an expiry more than a day earlier starts over', async () => {
+    const { watch, clock, fake } = await started({}, fakeExpiryStore({
+      read: () => Promise.resolve(remembered('3d', START + 2 * DAY)),
+    }));
+    succeed(watch, ALPHA, START + 7 * DAY);
+    await until(clock, 3 * MINUTE);
+    assert.deepEqual(texts(fake), [D7]);
+    watch.stop();
+  });
+});
+
+describe('expiry stages: batching', () => {
+  it('two accounts in the same stage share one line', async () => {
+    const { watch, clock, fake } = setup({ accounts: THREE_ACCOUNTS });
+    succeed(watch, ALPHA, START + 6 * DAY);
+    succeed(watch, BRAVO, START + 6 * DAY);
+    watch.start();
+    await until(clock, 2 * MINUTE);
+    assert.deepEqual(texts(fake), [
+      'claude-rotator: login expires within 7 days for 2 account(s): alp…, bra…. Run "claude-rotator status" on the Mac.',
+    ]);
+    assert.deepEqual(fake.calls.notifyMac.map(call => call.body), [
+      'claude-rotator: login expires within 7 days: alpha-example, bravo-example.\nRun: claude-rotator login --id alpha-example\nRun: claude-rotator login --id bravo-example',
+    ]);
+    watch.stop();
+  });
+
+  it('different stages in one message go nearest first', async () => {
+    const { watch, clock, fake } = setup({ accounts: THREE_ACCOUNTS });
+    succeed(watch, ALPHA, START + 12 * HOUR);
+    succeed(watch, BRAVO, START + 5 * DAY);
+    watch.start();
+    await until(clock, 2 * MINUTE);
+    assert.deepEqual(texts(fake), [[
+      'claude-rotator: login expires within 1 day for 1 account(s): alp…. Run "claude-rotator status" on the Mac.',
+      'claude-rotator: login expires within 7 days for 1 account(s): bra…. Run "claude-rotator status" on the Mac.',
+    ].join('\n')]);
+    watch.stop();
+  });
+
+  it('stages more than a batch apart go out as two messages', async () => {
+    const { watch, clock, fake } = setup({ accounts: THREE_ACCOUNTS });
+    succeed(watch, ALPHA, START + 6 * DAY);
+    watch.start();
+    await until(clock, 3 * MINUTE);
+    succeed(watch, BRAVO, START + 6 * DAY);
+    await until(clock, 5 * MINUTE);
+    assert.equal(fake.calls.postWebhook.length, 2);
+    watch.stop();
+  });
+
+  it('a relogin line of another account goes before the stage line', async () => {
+    const { watch, clock, fake } = setup({ accounts: THREE_ACCOUNTS });
+    watch.noteRefreshFailed(BRAVO, 'invalid_grant', { refreshCredentialExpiresAt: START + 20 * DAY });
+    succeed(watch, ALPHA, START + 6 * DAY);
+    watch.start();
+    await until(clock, 2 * MINUTE);
+    assert.deepEqual(texts(fake), [[
+      'claude-rotator: 1 account(s) need a new login: bra…. Run "claude-rotator status" on the Mac.',
+      D7,
+    ].join('\n')]);
+    watch.stop();
+  });
+
+  it('a notice goes after the stage line', async () => {
+    const { watch, clock, fake } = setup();
+    succeed(watch, ALPHA, START + 6 * DAY);
+    watch.start();
+    assert.equal(watch.notice({ kind: 'client-version', key: 'k1', text: 'claude-rotator: test notice.' }), true);
+    await until(clock, 2 * MINUTE);
+    assert.deepEqual(texts(fake), [`${D7}\nclaude-rotator: test notice.`]);
+    watch.stop();
+  });
+});
+
+describe('expiry stages: the status section and time zones', () => {
+  it('expiringSoon still counts the accounts within 24 hours that do not need a new login', () => {
+    const { watch } = setup({ accounts: THREE_ACCOUNTS });
+    succeed(watch, ALPHA, START + 20 * HOUR);
+    succeed(watch, BRAVO, START + 30 * HOUR);
+    watch.noteRefreshFailed(CHARLIE, 'invalid_grant', { refreshCredentialExpiresAt: START + 10 * HOUR });
+    watch.start();
+    assert.equal(watch.statusSection().active.expiringSoon, 1);
+    watch.stop();
+  });
+
+  it('the stages do not depend on the time zone', async () => {
+    const run = async () => {
+      const sentAt = [];
+      let clockOf = null;
+      const context = setup({
+        sender: {
+          webhook: () => {
+            sentAt.push(new Date(clockOf.now()).toISOString());
+            return { result: 'ok', reason: null };
+          },
+        },
+      });
+      clockOf = context.clock;
+      const { watch, clock, fake } = context;
+      succeed(watch, ALPHA, START + 2 * DAY);
+      watch.start();
+      await until(clock, 2 * MINUTE);
+      assert.deepEqual(texts(fake), [D3]);
+      await until(clock, DAY + 2 * MINUTE);
+      assert.deepEqual(texts(fake), [D3, D1]);
+      watch.stop();
+      return { texts: texts(fake), sentAt };
+    };
+    const saved = process.env.TZ;
+    const results = [];
+    try {
+      for (const zone of ['America/Los_Angeles', 'Asia/Tokyo']) {
+        process.env.TZ = zone;
+        results.push(await run());
+      }
+    } finally {
+      if (saved === undefined) delete process.env.TZ;
+      else process.env.TZ = saved;
+    }
+    assert.deepEqual(results[0], results[1]);
   });
 });
 

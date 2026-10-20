@@ -8,7 +8,8 @@
 //                on the old access token.
 //   - failing    any other refresh failure, error status or refresh cooldown that
 //                has lasted 30 minutes without the account coming back.
-//   - expiry     a known refresh-credential expiry within 24 hours.
+//   - expiry     a known login expiry (the refresh credential's): once each at
+//                7 days, 3 days and 1 day before it, and once when it has passed.
 //   - dispersion the share of follow-up requests of a session that went to a
 //                different account than the previous request (last 60 minutes).
 //
@@ -33,10 +34,23 @@
 //   notification stays on this machine and carries the full id with the login
 //   command. The webhook URL is never read here: only the sender reads the file,
 //   and only short classifications come back.
+// - **Each expiry stage is sent once.** Per account the watch keeps the nearest
+//   stage sent and the expiry value it was sent for. A stage already passed
+//   when an expiry is first seen is not sent; values within 60 minutes of each
+//   other are the same expiry, and a value more than a day later is a new one
+//   that is counted again from the start. No stage is sent while the account
+//   needs a new login. A stage waits for its batch, and is checked again just
+//   before the batch goes out: one that no longer applies is dropped, and is
+//   sent later if the expiry reaches it again. The stages that went out are
+//   remembered through `readExpiryState` / `writeExpiryState`
+//   (alert-expiry.json), so a restart does not send them again; a missing,
+//   unreadable or malformed file only means a stage may be sent once more.
+//   Reading or writing it logs nothing.
 // - **Nothing happens without the `alerts` section.** With neither channel
-//   enabled there is no timer, no log line, no status section and no send.
+//   enabled there is no timer, no log line, no status section and no send, and
+//   the remembered stages are neither read nor written.
 import { isAbsolute } from 'node:path';
-import { isCredentialRefreshCooldown, requiresRelogin } from './account-manager.js';
+import { isCredentialRefreshCooldown, isLoginExpiryValue, requiresRelogin } from './account-manager.js';
 
 /** How often the state is swept (the 30-minute stage, reminders, expiry, dispersion). */
 export const ALERT_SWEEP_INTERVAL_MS = 60_000;
@@ -46,10 +60,14 @@ export const ALERT_BATCH_WINDOW_MS = 60_000;
 export const ALERT_FAILING_AFTER_MS = 30 * 60_000;
 /** While an alert lasts, it is repeated once per this interval. */
 export const ALERT_REMINDER_INTERVAL_MS = 6 * 60 * 60_000;
-/** A known refresh-credential expiry within this time is reported once. */
+/** A known login expiry within this time counts as `expiringSoon` in the status section. */
 export const ALERT_EXPIRY_WITHIN_MS = 24 * 60 * 60_000;
-/** Accounts expiring within this time are listed alongside an expiry alert. */
-export const ALERT_EXPIRY_LIST_WITHIN_MS = 72 * 60 * 60_000;
+/** Two expiry values at most this far apart are the same expiry. */
+export const ALERT_EXPIRY_SAME_WITHIN_MS = 60 * 60_000;
+/** Reading the remembered stages gives up after this long, and starts with none. */
+export const ALERT_EXPIRY_STATE_READ_TIMEOUT_MS = 10_000;
+/** At most this many rows are taken from the remembered stages (the first ones, in key order). */
+export const ALERT_MAX_EXPIRY_ENTRIES = 512;
 /** Dispersion is raised at or above this rate... */
 export const ALERT_DISPERSION_RAISE_RATE = 0.02;
 /** ...and cleared below this one. */
@@ -79,6 +97,13 @@ const REASON_PATTERN = /^[a-z_]{1,40}$/;
 const CAUSE_PATTERN = /^[A-Za-z0-9_-]{1,40}$/;
 // Marks "nothing acknowledged yet", so a null error reason can be acknowledged too.
 const NOTHING_ACKNOWLEDGED = Symbol('nothing-acknowledged');
+const DAY_MS = 24 * 60 * 60_000;
+// Expiry stages by rank: 0 none, 1 seven days, 2 three days, 3 one day, 4 expired.
+// STAGE_NAMES are the words kept in alert-expiry.json, STAGE_WORDS the ones in a message.
+const STAGE_NAMES = [null, '7d', '3d', '1d', 'expired'];
+const STAGE_WORDS = [null, '7 days', '3 days', '1 day', null];
+const EXPIRY_STATE_FORMAT = 1;
+const MAX_EXPIRY_ID_LENGTH = 200;
 
 /**
  * Reads the `alerts` section of config.json.
@@ -116,6 +141,12 @@ export function normalizeAlertSettings(raw) {
  * @param {((line: string) => void)|null} options.logger
  * @param {() => number} options.now
  * @param {{setTimeout: Function, clearTimeout: Function, setInterval: Function, clearInterval: Function}} options.timers
+ * @param {(() => Promise<object|null>)|null} options.readExpiryState Reads the
+ *   remembered expiry stages (null when there are none). Called once, when the
+ *   watch first runs with the `alerts` section on. Without it the watch starts
+ *   with nothing remembered.
+ * @param {((state: object) => Promise<void>)|null} options.writeExpiryState
+ *   Writes them, after a message that carried a stage was handed to the sender.
  */
 export function createAlertWatch({
   accountManager = null,
@@ -125,6 +156,8 @@ export function createAlertWatch({
   logger = null,
   now = () => Date.now(),
   timers = defaultTimers(),
+  readExpiryState = null,
+  writeExpiryState = null,
 } = {}) {
   let current = normalizeAlertSettings(settings);
   let webhookState = 'off';
@@ -146,6 +179,16 @@ export function createAlertWatch({
   let delivering = false;
   let dropped = 0;
   const lastDelivery = { mac: null, webhook: null };
+  // The remembered stages: account id -> { expiresAt, stage }. Until the read has
+  // finished (or given up), no stage is judged.
+  const expiryMemory = new Map();
+  let expiryReadStarted = typeof readExpiryState !== 'function';
+  let expiryLoaded = expiryReadStarted;
+  let expiryReadTimer = null;
+  // Rows forgotten (new credential, account gone) while the read was still running.
+  const expiryForgottenWhileReading = new Set();
+  let expiryWriting = false;
+  let expiryWriteAgain = false;
 
   applySettings(current);
 
@@ -155,9 +198,12 @@ export function createAlertWatch({
         if (!active() || typeof account?.id !== 'string') return;
         const st = stateFor(account.id);
         if (credentialChanged) {
-          // A new login: the old expiry no longer applies, and whatever was
-          // wrong with the old credential is over.
+          // A new login: the old expiry and the stages sent for it no longer
+          // apply, and whatever was wrong with the old credential is over.
           st.expiresAt = null;
+          st.expiryAnchor = null;
+          st.expiryStage = 0;
+          forgetExpiry(account.id);
           recoverAccount(st, account);
         }
         evaluateAccount(st, account, now());
@@ -227,6 +273,7 @@ export function createAlertWatch({
         if (started || stopped) return;
         started = true;
         if (!current.enabled) return;
+        readExpiryMemory();
         ensureSweepTimer();
         sweep();
         checkWebhook();
@@ -236,6 +283,8 @@ export function createAlertWatch({
       guard(() => {
         stopped = true;
         clearTimers();
+        if (expiryReadTimer) timers.clearTimeout(expiryReadTimer);
+        expiryReadTimer = null;
         pending = [];
         notices = [];
         queue.length = 0;
@@ -306,6 +355,7 @@ export function createAlertWatch({
     const wasEnabled = current.enabled;
     applySettings(normalizeAlertSettings(raw));
     if (!current.enabled || !started) return;
+    readExpiryMemory();
     ensureSweepTimer();
     if (!wasEnabled) sweep();
     checkWebhook();
@@ -359,16 +409,20 @@ export function createAlertWatch({
         ackCooldown: NOTHING_ACKNOWLEDGED,
         relogin: null,
         failing: null,
+        // The known login expiry, the expiry value the sent stage belongs to,
+        // and the rank of the nearest stage sent for it.
         expiresAt: null,
-        expiryNotifiedFor: null,
+        expiryAnchor: null,
+        expiryStage: 0,
       };
       accounts.set(id, st);
     }
     return st;
   }
 
+  // A value that is not a usable expiry (missing included) keeps the known one.
   function noteExpiry(st, value) {
-    if (typeof value === 'number' && Number.isFinite(value) && value > 0) st.expiresAt = value;
+    if (isLoginExpiryValue(value)) st.expiresAt = value;
   }
 
   // The error reason and cooldown seen at a recovery are acknowledged: they
@@ -415,6 +469,7 @@ export function createAlertWatch({
   function forgetAccount(id) {
     pending = pending.filter(item => item.owner.id !== id);
     accounts.delete(id);
+    forgetExpiry(id);
   }
 
   // ---- alerts, batching and reminders ----
@@ -475,15 +530,48 @@ export function createAlertWatch({
     evaluateReminders(t);
   }
 
+  // Once the remembered stages are read: follow each known expiry, and queue the
+  // stage it has reached when that is nearer than the one already sent. Not
+  // while the account needs a new login. `before` is the rank before the raise,
+  // put back if the stage is dropped before it goes out.
   function evaluateExpiry(t) {
+    if (!expiryLoaded) return;
     for (const st of accounts.values()) {
-      if (st.relogin || st.expiresAt == null || st.expiryNotifiedFor === st.expiresAt) continue;
-      const left = st.expiresAt - t;
-      if (left <= 0 || left > ALERT_EXPIRY_WITHIN_MS) continue;
-      st.expiryNotifiedFor = st.expiresAt;
-      pending.push({ type: 'new', kind: 'expiry', owner: st });
+      if (st.expiresAt == null) continue;
+      followExpiry(st, t);
+      if (st.relogin) continue;
+      const stage = expiryStageOf(st.expiresAt - t);
+      if (stage <= st.expiryStage) continue;
+      pending.push({ type: 'stage', kind: 'expiry', owner: st, stage, before: st.expiryStage });
+      st.expiryStage = stage;
       scheduleFlush();
     }
+  }
+
+  // Compares the known expiry with the one the sent stage belongs to (the
+  // anchor). The first time, the anchor comes from the remembered stages, or is
+  // the known expiry itself with nothing sent.
+  function followExpiry(st, t) {
+    const value = st.expiresAt;
+    if (st.expiryAnchor == null) {
+      const remembered = expiryMemory.get(st.id);
+      if (!remembered) {
+        st.expiryAnchor = value;
+        st.expiryStage = 0;
+        return;
+      }
+      st.expiryAnchor = remembered.expiresAt;
+      st.expiryStage = remembered.stage;
+    }
+    const anchor = st.expiryAnchor;
+    // Within 60 minutes: the same expiry, nothing moves.
+    if (Math.abs(value - anchor) <= ALERT_EXPIRY_SAME_WITHIN_MS) return;
+    st.expiryAnchor = value;
+    // Earlier: the stage sent still holds. Later by up to a day: lowered to the
+    // stage of the new value now, so a stage it falls back into is sent again.
+    // Later by more than a day: a new expiry, counted from the start.
+    if (value < anchor) return;
+    st.expiryStage = value <= anchor + DAY_MS ? Math.min(st.expiryStage, expiryStageOf(value - t)) : 0;
   }
 
   function evaluateDispersion() {
@@ -542,7 +630,10 @@ export function createAlertWatch({
     notices = [];
     if (!active()) return;
     const t = now();
-    const live = items.filter(item => item.owner.id === null || accounts.get(item.owner.id) === item.owner);
+    const live = keepDueStages(
+      items.filter(item => item.owner.id === null || accounts.get(item.owner.id) === item.owner),
+      t,
+    );
     if (live.length === 0 && noticeTexts.length === 0) return;
     for (const item of live) {
       const alert = item.type === 'new' ? item.owner[item.kind] : null;
@@ -552,6 +643,29 @@ export function createAlertWatch({
       }
     }
     enqueueMessage(composeMessage(live, t, noticeTexts));
+  }
+
+  // A stage waited up to a minute for its batch; check it again against the
+  // account as it is now. It stays only if the account is still in the ledger,
+  // does not need a new login, and its known expiry has reached at least that
+  // stage; of two left for one account, the nearer one stays. An account left
+  // with none gets its rank put back to the lowest it had before the dropped
+  // raises (never above the rank it has now), so the stage can be sent later.
+  function keepDueStages(items, t) {
+    const kept = new Map();
+    const droppedBefore = new Map();
+    for (const item of items) {
+      if (item.type !== 'stage') continue;
+      const st = item.owner;
+      const due = findAccount(st.id) && !st.relogin && st.expiresAt != null
+        && expiryStageOf(st.expiresAt - t) >= item.stage;
+      if (!due) droppedBefore.set(st, Math.min(droppedBefore.get(st) ?? Infinity, item.before));
+      else if (!kept.has(st) || kept.get(st).stage < item.stage) kept.set(st, item);
+    }
+    for (const [st, before] of droppedBefore) {
+      if (!kept.has(st)) st.expiryStage = Math.min(st.expiryStage, before);
+    }
+    return items.filter(item => item.type !== 'stage' || kept.get(item.owner) === item);
   }
 
   // ---- message text ----
@@ -585,17 +699,18 @@ export function createAlertWatch({
 
     addRelogin(ids('new', 'relogin'), '');
     addFailing(ids('new', 'failing'), '');
-    const expiring = ids('new', 'expiry');
-    if (expiring.length > 0) {
-      const hours = Math.max(1, Math.ceil(Math.max(...expiring.map(id => (accounts.get(id)?.expiresAt ?? t) - t)) / 3_600_000));
-      const later = [...accounts.values()]
-        .filter(st => !expiring.includes(st.id) && !st.relogin && st.expiresAt != null
-          && st.expiresAt > t && st.expiresAt - t <= ALERT_EXPIRY_LIST_WITHIN_MS)
-        .map(st => st.id);
-      const head = list => `claude-rotator: login for ${list(expiring)} expires within ${hours} h.`;
-      const tail = list => (later.length > 0 ? ` Also within 3 days: ${list(later)}.` : '');
-      slack.push(head(shortLabels) + tail(shortLabels));
-      mac.push(head(fullLabels) + tail(fullLabels));
+    // One line per stage, nearest first. The anchor is kept with each account so
+    // the stage can be remembered once the message has been handed over.
+    const stages = [];
+    for (const stage of [4, 3, 2, 1]) {
+      const owners = items.filter(item => item.type === 'stage' && item.stage === stage).map(item => item.owner);
+      if (owners.length === 0) continue;
+      const list = owners.map(owner => owner.id);
+      const what = stage === 4 ? 'login expired' : `login expires within ${STAGE_WORDS[stage]}`;
+      slack.push(`claude-rotator: ${what} for ${list.length} account(s): ${shortLabels(list)}. Run "claude-rotator status" on the Mac.`);
+      mac.push(`claude-rotator: ${what}: ${fullLabels(list)}.`);
+      for (const id of list) mac.push(`Run: claude-rotator login --id ${id}`);
+      for (const owner of owners) stages.push({ owner, anchor: owner.expiryAnchor, stage });
     }
     if (ids('new', 'dispersion').length > 0) addDispersion('');
     addRelogin(ids('reminder', 'relogin'), 'Still unresolved: ');
@@ -615,7 +730,7 @@ export function createAlertWatch({
       slack.push(line);
       mac.push(line);
     }
-    return { slack: capText(slack.join('\n')), mac: capText(mac.join('\n')) };
+    return { slack: capText(slack.join('\n')), mac: capText(mac.join('\n')), stages };
   }
 
   // ---- delivery ----
@@ -654,6 +769,96 @@ export function createAlertWatch({
         .then(out => guard(() => recordDelivery('webhook', out))));
     }
     await Promise.all(tasks);
+    // Whatever the result, a stage that has been handed over is not sent again.
+    if (message.stages.length > 0) guard(() => rememberStages(message.stages));
+  }
+
+  // ---- the remembered stages (alert-expiry.json) ----
+
+  // Kept per account: the expiry the stage was sent for (the anchor when the
+  // message was put together) and the stage. Not for an account whose state
+  // went away or whose credential changed meanwhile.
+  function rememberStages(stages) {
+    for (const { owner, anchor, stage } of stages) {
+      if (anchor != null && accounts.get(owner.id) === owner && owner.expiryAnchor != null) {
+        expiryMemory.set(owner.id, { expiresAt: anchor, stage });
+      }
+    }
+    writeExpiryMemory();
+  }
+
+  function forgetExpiry(id) {
+    expiryMemory.delete(id);
+    if (!expiryLoaded) expiryForgottenWhileReading.add(id);
+  }
+
+  // Read once, when the watch first runs with the section on. Missing,
+  // unreadable, malformed or not finished within 10 seconds all count as
+  // nothing remembered; a result that comes later is not used.
+  function readExpiryMemory() {
+    if (expiryReadStarted) return;
+    expiryReadStarted = true;
+    let done = false;
+    const finish = raw => {
+      if (done) return;
+      done = true;
+      if (expiryReadTimer) timers.clearTimeout(expiryReadTimer);
+      expiryReadTimer = null;
+      try {
+        for (const [id, row] of parseExpiryState(raw)) {
+          if (!expiryForgottenWhileReading.has(id)) expiryMemory.set(id, row);
+        }
+      } finally {
+        // Judging the stages starts even if the content could not be used.
+        expiryForgottenWhileReading.clear();
+        expiryLoaded = true;
+      }
+    };
+    expiryReadTimer = timers.setTimeout(() => guard(() => finish(null)), ALERT_EXPIRY_STATE_READ_TIMEOUT_MS);
+    expiryReadTimer?.unref?.();
+    let reading;
+    try {
+      reading = Promise.resolve(readExpiryState());
+    } catch {
+      reading = Promise.resolve(null);
+    }
+    reading.then(raw => guard(() => finish(raw)), () => guard(() => finish(null)));
+  }
+
+  // One write at a time. A write asked for meanwhile is done once afterwards,
+  // with the content as it is then. A failure is dropped (the next sent stage
+  // writes again); nothing is written once stopped or while the section is off.
+  function writeExpiryMemory() {
+    if (typeof writeExpiryState !== 'function') return;
+    if (expiryWriting) {
+      expiryWriteAgain = true;
+      return;
+    }
+    expiryWriting = true;
+    (async () => {
+      try {
+        do {
+          expiryWriteAgain = false;
+          if (!active()) break;
+          try {
+            await writeExpiryState(expiryStateSnapshot());
+          } catch {
+            // Dropped on purpose, without a log line.
+          }
+        } while (expiryWriteAgain);
+      } finally {
+        expiryWriting = false;
+      }
+    })();
+  }
+
+  // Only the accounts in the ledger; only ids, expiry times and stage words.
+  function expiryStateSnapshot() {
+    const rows = [];
+    for (const [id, row] of expiryMemory) {
+      if (findAccount(id)) rows.push([id, { expiresAt: row.expiresAt, stage: STAGE_NAMES[row.stage] }]);
+    }
+    return { format: EXPIRY_STATE_FORMAT, accounts: Object.fromEntries(rows) };
   }
 
   // The sender is specified never to throw or reject. If one does anyway, the
@@ -729,6 +934,34 @@ function earliest(a, b) {
   if (a == null) return b ?? null;
   if (b == null) return a;
   return Math.min(a, b);
+}
+
+// The rank of the stage for the time left (ms). Each stage includes its boundary:
+// exactly 7 days left is the 7-day stage, exactly 0 is expired.
+function expiryStageOf(left) {
+  if (left <= 0) return 4;
+  if (left <= DAY_MS) return 3;
+  if (left <= 3 * DAY_MS) return 2;
+  if (left <= 7 * DAY_MS) return 1;
+  return 0;
+}
+
+// The remembered stages as read: `{"format":1,"accounts":{"<id>":{"expiresAt":<ms>,"stage":"7d"}}}`.
+// Another format or shape counts as nothing remembered; a row that does not fit
+// is dropped alone.
+function parseExpiryState(raw) {
+  const rows = new Map();
+  if (!isPlainObject(raw) || raw.format !== EXPIRY_STATE_FORMAT || !isPlainObject(raw.accounts)) return rows;
+  for (const [id, row] of Object.entries(raw.accounts).slice(0, ALERT_MAX_EXPIRY_ENTRIES)) {
+    if (id.length > MAX_EXPIRY_ID_LENGTH || !isPlainObject(row) || !isLoginExpiryValue(row.expiresAt)) continue;
+    const stage = STAGE_NAMES.indexOf(row.stage);
+    if (stage > 0) rows.set(id, { expiresAt: row.expiresAt, stage });
+  }
+  return rows;
+}
+
+function isPlainObject(value) {
+  return value !== null && typeof value === 'object' && !Array.isArray(value);
 }
 
 function unique(values) {
