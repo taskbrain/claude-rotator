@@ -405,6 +405,8 @@ async function runServer({ write }) {
   // 知らせの見張り。実物の送り手（osascript と受け口への POST）を渡すのはここだけである。
   // `alerts` の節が無くても見張りは作り、そのときは何もしない（タイマー・ログ・状態の節も無い）。
   // 再読込（ログインのたび）で節を足せば、その時から効く。
+  // ログインの期限の知らせで送った段は、設定のフォルダの alert-expiry.json に覚える（drift-watch.json と同じ置き方）。
+  const alertExpiryPath = join(dirname(getConfigPath()), 'alert-expiry.json');
   const alertWatch = createAlertWatch({
     accountManager,
     // 送り手は Promise を返す execFile を前提にしている。
@@ -412,6 +414,8 @@ async function runServer({ write }) {
     settings: normalizeAlertSettings(config.alerts),
     loadSettings: () => loadConfig().then(nextConfig => nextConfig?.alerts),
     logger,
+    readExpiryState: () => readJsonFile(alertExpiryPath, null),
+    writeExpiryState: state => writeJsonFile(alertExpiryPath, state),
   });
   // 版・モデル・キャッシュの変化の見張り。起動のときに `alerts` の節が有効なときだけ作る。
   // 知らせは alertWatch の口から出し、状態は設定のフォルダの drift-watch.json に置く。

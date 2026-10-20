@@ -15373,6 +15373,7 @@ describe('alert watch wiring', () => {
       expiresAt: Date.now() + 3_600_000,
     }),
     alerts = undefined,
+    typeFor = () => 'oauth',
   } = {}) {
     const logLines = [];
     const seen = [];
@@ -15387,7 +15388,7 @@ describe('alert watch wiring', () => {
     for (const id of accounts) await secretStore.set(id, secretFor(id));
     const logger = line => logLines.push(line);
     const ledgerRows = revision => accounts.map(id => ({
-      id, name: `${id} ${NAME_MARK}`, type: 'oauth', credentialRevision: `${id}-${revision}`,
+      id, name: `${id} ${NAME_MARK}`, type: typeFor(id), credentialRevision: `${id}-${revision}`,
     }));
     const accountManager = new AccountManager({
       accounts: ledgerRows('rev-1'),
@@ -15773,5 +15774,128 @@ describe('alert watch wiring', () => {
     assert.deepEqual(withWatch.manual.created, { timeout: 0, interval: 0 }, 'the watch makes no timer');
     assert.deepEqual(withWatch.fake.calls, [], 'the sender is never called');
     assert.equal(withWatch.started.alertWatch.statusSection(), null);
+  });
+
+  // 更新の口が計算した期限の数は、台帳（status の loginExpiry）と見張りの両方へ同じものが届く。
+  // 期限の値は作った数（2033 年・2036 年）で、どの口座の期限とも関わりが無い。
+  const nearlyExpiredSecret = refreshTokenExpiresAt => id => ({
+    accessToken: `token-${id}-${TOKEN_MARK}`,
+    refreshToken: `refresh-${id}-${TOKEN_MARK}`,
+    expiresAt: Date.now() + 4 * 60 * 1000,
+    ...(refreshTokenExpiresAt === undefined ? {} : { refreshTokenExpiresAt }),
+  });
+  const refusingRefresher = async () => {
+    throw new Error(`invalid_grant: refresh rejected for ${TOKEN_MARK}`);
+  };
+  const refreshedWith = refreshTokenExpiresAt => async () => ({
+    accessToken: `fresh-${TOKEN_MARK}`,
+    refreshToken: `refresh-next-${TOKEN_MARK}`,
+    expiresAt: Date.now() + 3_600_000,
+    ...(refreshTokenExpiresAt === undefined ? {} : { refreshTokenExpiresAt }),
+  });
+
+  it('the status row and the watch get the same expiry number from the refresh hooks', async () => {
+    const cases = [
+      {
+        label: 'failed, expiry in ms',
+        stored: 2_000_000_000_000,
+        refresher: refusingRefresher,
+        loginExpiry: { state: 'known', at: '2033-05-18T03:33:20.000Z' },
+        watched: 2_000_000_000_000,
+      },
+      {
+        label: 'failed, no expiry known',
+        stored: undefined,
+        refresher: async () => {
+          throw new Error(`Token refresh failed (400) ${TOKEN_MARK}`);
+        },
+        loginExpiry: { state: 'none', at: null },
+        watched: null,
+      },
+      {
+        label: 'succeeded, the refreshed expiry wins',
+        stored: 2_000_000_000_000,
+        refresher: refreshedWith(2_100_000_000_000),
+        loginExpiry: { state: 'known', at: '2036-07-18T13:20:00.000Z' },
+        watched: 2_100_000_000_000,
+      },
+      {
+        label: 'succeeded without an expiry: the stored one (seconds) is read in ms',
+        stored: 2_000_000_000,
+        refresher: refreshedWith(undefined),
+        loginExpiry: { state: 'known', at: '2033-05-18T03:33:20.000Z' },
+        watched: 2_000_000_000_000,
+      },
+    ];
+
+    for (const { label, stored, refresher, loginExpiry, watched } of cases) {
+      const { calls, watch } = recordingWatch();
+      const { ask, status } = await startAlerts({
+        accounts: ['acct_a'],
+        watch,
+        tokenRefresher: refresher,
+        secretFor: nearlyExpiredSecret(stored),
+      });
+
+      assert.equal((await ask()).status, 200, label);
+      assert.deepEqual(JSON.parse((await status()).bodyText).accounts[0].loginExpiry, loginExpiry, label);
+      const refreshCalls = calls.filter(call => call.name.startsWith('noteRefresh'));
+      assert.deepEqual(refreshCalls.map(call => call.args.at(-1).refreshCredentialExpiresAt), [watched], label);
+    }
+  });
+
+  it('a reload with a changed credential forgets that account\'s expiry only', async () => {
+    const { ask, status, accountManager, holder, ledgerRows, reload } = await startAlerts({
+      tokenRefresher: refreshedWith(2_100_000_000_000),
+      secretFor: nearlyExpiredSecret(2_000_000_000_000),
+    });
+    assert.equal((await ask()).status, 200);
+    accountManager.switchTo('acct_b');
+    assert.equal((await ask()).status, 200);
+    const known = { state: 'known', at: '2036-07-18T13:20:00.000Z' };
+    assert.deepEqual(JSON.parse((await status()).bodyText).accounts.map(row => row.loginExpiry), [known, known]);
+
+    holder.accounts = ledgerRows('rev-1').map(row => (row.id === 'acct_a' ? { ...row, credentialRevision: 'acct_a-rev-2' } : row));
+    assert.equal((await reload()).status, 200);
+    assert.deepEqual(JSON.parse((await status()).bodyText).accounts.map(row => row.loginExpiry), [
+      { state: 'unknown', at: null },
+      known,
+    ]);
+  });
+
+  it('the status row shows the expiry without any watch', async () => {
+    const { ask, status } = await startAlerts({
+      accounts: ['acct_a'],
+      tokenRefresher: refusingRefresher,
+      secretFor: nearlyExpiredSecret(2_000_000_000_000),
+    });
+    assert.equal((await ask()).status, 200);
+    assert.deepEqual(JSON.parse((await status()).bodyText).accounts[0].loginExpiry,
+      { state: 'known', at: '2033-05-18T03:33:20.000Z' });
+  });
+
+  it('an API key account has no expiry field, an OAuth account not refreshed yet is unknown', async () => {
+    const { status } = await startAlerts({ typeFor: id => (id === 'acct_a' ? 'apikey' : 'oauth') });
+    const rows = JSON.parse((await status()).bodyText).accounts;
+    assert.equal('loginExpiry' in rows[0], false);
+    assert.deepEqual(rows[1].loginExpiry, { state: 'unknown', at: null });
+  });
+
+  it('a ledger that throws on the expiry changes neither the request nor what the watch gets', async () => {
+    const { calls, watch } = recordingWatch();
+    const { ask, accountManager } = await startAlerts({
+      accounts: ['acct_a'],
+      watch,
+      tokenRefresher: refusingRefresher,
+      secretFor: nearlyExpiredSecret(2_000_000_000_000),
+    });
+    accountManager.noteLoginExpiry = () => {
+      throw new Error('ledger failure');
+    };
+    assert.equal((await ask()).status, 200);
+    assert.deepEqual(
+      calls.filter(call => call.name.startsWith('noteRefresh')).map(call => [call.name, call.args]),
+      [['noteRefreshFailed', ['acct_a', 'invalid_grant', { refreshCredentialExpiresAt: 2_000_000_000_000 }]]],
+    );
   });
 });

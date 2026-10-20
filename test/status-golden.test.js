@@ -132,10 +132,27 @@ const accountsThree = () => ({
   },
 });
 
+// 口座3件に、ログインの期限の欄（先の期限・まだ分からない・過ぎた期限）を足したもの。
+const accountsThreeLoginExpiry = () => {
+  const status = accountsThree();
+  status.accounts[0].loginExpiry = { state: 'known', at: '2026-06-11T08:30:00.000Z' };
+  status.accounts[1].loginExpiry = { state: 'unknown', at: null };
+  status.accounts[2].loginExpiry = { state: 'known', at: '2026-06-04T06:00:00.000Z' };
+  return status;
+};
+
+// その見本の画面に1回ずつ出るはずの行。
+const LOGIN_EXPIRY_ROWS = [
+  'login: expires in 6d23h -> 06/11 17:30 JST',
+  'login: expiry unknown',
+  'login: expired -> 06/04 15:00 JST',
+];
+
 const SAMPLES = Object.freeze({
   'accounts-0': accountsZero,
   'accounts-1-events': accountsOne,
   'accounts-3-events-affinity': accountsThree,
+  'accounts-3-login-expiry': accountsThreeLoginExpiry,
 });
 
 // 描く間だけ、時刻と端末の幅を固定する（終わったら元へ戻す）。
@@ -195,6 +212,9 @@ for (const [name, build] of Object.entries(SAMPLES)) {
     assert.equal(stderr, '');
     const expected = await readGolden(name);
     if (expected !== stdout) t.diagnostic(`golden-record ${name} ${Buffer.from(stdout, 'utf8').toString('base64')}`);
+    if (name === 'accounts-3-login-expiry') {
+      for (const row of LOGIN_EXPIRY_ROWS) assert.equal(stdout.split(row).length - 1, 1, row);
+    }
     assert.notEqual(expected, null, `no recorded sample: test/golden/status/${name}.txt`);
     assert.equal(stdout, expected);
   });

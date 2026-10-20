@@ -390,6 +390,7 @@ Events
 - `5h` / `7d` 行は進捗バー（`█` / `░` を10文字）、使用率、reset までの残り時間と reset 時刻を表示します。使用率のデータが無い場合は ` --%`、reset 情報が無い場合は `no data yet` になります。
 - Usage API がモデル別週次枠（`limits[]`）を返す場合は、`7d Fable` のような追加行がさらに表示されます。
 - `requests:` はそのアカウントで proxy が転送した累計リクエスト数です。
+- `requests:` の上の `login:` の行は、ログインの期限（更新用の資格情報の期限）です。`login: expires in <残り> -> <MM/DD HH:MM> JST` は期限までの時間と期限の時刻、`login: expired -> <MM/DD HH:MM> JST` は期限が過ぎたこと、`login: expiry unknown` はまだ期限が分からないこと、`login: expiry not reported` は資格情報の更新で期限が返らなかったことを表します。`alerts` を設定していてもいなくても表示します。API キーのアカウントと、Claude Code の今のログインを毎回読むアカウント（`current`）には表示しません。期限は server の起動か再ログインの後、最初の資格情報の更新（使っている資格情報の期限の30分前から）で分かるので、それまでは `login: expiry unknown` です。
 - [セッション単位のアカウント固定](#セッション単位のアカウント固定sessionaffinity)（`sessionAffinity`）を有効にしている場合は、アカウントカードの下に `Session Affinity` の行が追加され、`mode`、保持しているセッション数と上限、セッション鍵が付いていたリクエストの割合、アカウント別・切り替え理由別・退避理由別の内訳を表示します（`mode: "off"` では1行も表示しません）。
 - [再ログインなどの知らせ](#再ログインなどの知らせalerts)（`alerts`）を設定している場合は、`Events` の上に `Alerts` の行が1行加わり、macOS の通知の有無（`mac: on` / `off`）、Webhook の状態（`off` / `usable` / `unusable (<分類>)`）、いま続いている知らせの数（`needs login`・`failing`・`expiring soon`・`dispersion`。無ければ `none`）を表示します。最後の Webhook の送信がうまくいかなかった場合は `last webhook:` にその結果を、送り待ち・捨てた知らせがあれば `queued:` / `dropped:` を足します（`alerts` を書いていなければ1行も表示しません）。
 - `Events` には直近の切り替え・リクエスト・エラーが最大8件表示されます。
@@ -659,11 +660,13 @@ Webhook は Slack 互換の Incoming Webhook（`{"text": "..."}` を JSON で PO
 
 - **再ログインが要る** — アカウントの資格情報の更新が、再ログインしないと直らない形で失敗した。
 - **更新の失敗が続く** — 資格情報の更新の失敗や `error` の状態が、正常に戻らないまま30分続いた。
-- **期限が近い** — 分かっている資格情報の期限まで24時間を切った（期限ごとに1回）。3日以内に切れるアカウントも並べます。
+- **ログインの期限** — 分かっているログインの期限（更新用の資格情報の期限）の7日前・3日前・1日前と、期限が切れたときに、1回ずつ知らせます。知らせ始めたときにもう過ぎていた段は出さず、そのとき当たっている段だけを知らせます。再ログインで期限が変わると、新しい期限で数え直します。「再ログインが要る」を知らせている間は出しません（期限が切れた後に更新が断られると、「再ログインが要る」が続きます）。期限は、server の起動か再ログインの後、最初の資格情報の更新で分かります。
 - **送り先の散らばり** — `sessionAffinity` の `mode` が `on` のとき、同じセッションの続きのリクエストが前と別のアカウントへ送られた割合が、直近60分で 2% 以上になった（続きのリクエストが300件未満の間は判定せず、1% 未満で戻ります）。
 - **回復と念押し** — 再ログインが要る・更新の失敗が続く・送り先の散らばりを知らせた後に直れば、回復の知らせを送ります。6時間たっても続いているものは、頭に `Still unresolved:` を付けてまとめて送り直します。
 
 60秒の間に生じた知らせは1通にまとめます。文は英語です。Webhook の本文にはアカウント id の先頭3字だけを、macOS の通知には id の全部と `claude-rotator login --id <id>` を載せます。アカウント名・トークン・セッション ID は載せません。
+
+ログインの期限の知らせは、送った段を設定のフォルダの `alert-expiry.json`（持ち主だけが読み書きできる権限）に覚えるので、server を再起動しても同じ段を知らせ直しません。このファイルに持つのは、アカウントの id と期限の時刻と段だけです。ファイルを消した・読めない・形が違うときは無いものとして扱い、そのとき当たっている段を1回知らせ直すことがあります。そのときも server は止まらず、ログの行も出しません。`alerts` を書いていなければ、このファイルを読みも書きもしません。
 
 設定は常駐 server の再起動か `POST /internal/reload`（`claude-rotator login` の後にも走ります）で読み直します。
 
@@ -1911,6 +1914,7 @@ What each line means:
 - The `5h` / `7d` rows show a progress bar (`█` / `░`, 10 characters), the usage ratio, and time remaining to reset plus the reset time itself. Usage shows as ` --%` when no data is available yet, and the reset field shows `no data yet` when there's no reset information.
 - If the Usage API returns model-scoped weekly limits (`limits[]`), an extra row appears, such as `7d Fable`.
 - `requests:` is the cumulative number of requests the proxy has forwarded for that account.
+- The `login:` row above `requests:` is the login expiry (the expiry of the refresh credential). `login: expires in <time left> -> <MM/DD HH:MM> JST` gives the time left and the expiry time, `login: expired -> <MM/DD HH:MM> JST` means it has passed, `login: expiry unknown` means it is not known yet, and `login: expiry not reported` means a credential refresh returned no expiry. It is shown whether or not `alerts` is configured. It is not shown for API key accounts or for the account that reads Claude Code's current login each time (`current`). The expiry becomes known at the first credential refresh after the server starts or after a new login (from 30 minutes before the credential in use expires), so until then it shows `login: expiry unknown`.
 - When [Per-Session Account Pinning](#per-session-account-pinning-sessionaffinity) (`sessionAffinity`) is enabled, a `Session Affinity` block appears below the account cards showing the `mode`, the number of sessions held and the capacity, the share of forwarded requests that carried a session key, and the per-account, per-switch-reason, and per-eviction-reason breakdowns (nothing is printed while `mode` is `"off"`).
 - When [alerts](#alerts-for-re-login-and-other-problems-alerts) (`alerts`) are configured, one `Alerts` line appears above `Events` showing whether macOS notifications are on (`mac: on` / `off`), the webhook state (`off` / `usable` / `unusable (<class>)`), and the count of alerts that are currently active (`needs login`, `failing`, `expiring soon`, `dispersion`, or `none`). If the last webhook delivery did not succeed, its result is added as `last webhook:`, and `queued:` / `dropped:` are added when alerts are waiting or were dropped (nothing is printed while `alerts` is not written).
 - `Events` shows up to the 8 most recent switches, requests, and errors.
@@ -2167,11 +2171,13 @@ Kinds of alerts:
 
 - **Needs a new login** — refreshing an account's credential failed in a way that only a new login fixes.
 - **Refresh keeps failing** — credential refresh failures or the `error` state have lasted 30 minutes without returning to normal.
-- **Expiring soon** — a known credential expiry is less than 24 hours away (once per expiry). Accounts expiring within 3 days are listed too.
+- **Login expiry** — once each at 7 days, 3 days and 1 day before a known login expiry (the expiry of the refresh credential), and once when it has passed. A stage that had already passed when the alerts start is not sent; only the stage the expiry is in at that time is. When a new login changes the expiry, the stages are counted again for the new one. Nothing is sent while a needs-a-new-login alert is active (after the expiry, refreshing is refused and the needs-a-new-login alert continues). The expiry becomes known at the first credential refresh after the server starts or after a new login.
 - **Requests spreading across accounts** — with `sessionAffinity` `mode` set to `on`, the share of follow-up requests of a session that went to a different account than the previous request reached 2% or more over the last 60 minutes (not judged while there are fewer than 300 follow-up requests; it clears below 1%).
 - **Recovery and reminders** — after a needs-a-new-login, refresh-keeps-failing, or spreading alert, a recovery message is sent once it is fixed. Anything still active after 6 hours is sent again, together, prefixed with `Still unresolved:`.
 
 Alerts that come up within 60 seconds go out as one message. The text is in English. The webhook text carries only the first 3 characters of an account id; the macOS notification carries the whole id and `claude-rotator login --id <id>`. Account names, tokens, and session ids are never included.
+
+The login expiry stages that were sent are remembered in `alert-expiry.json` in the configuration folder (readable and writable by the owner only), so a server restart does not send the same stage again. The file holds only account ids, expiry times, and stages. If it is deleted, unreadable, or malformed, it is treated as absent, and the stage the expiry is in at that time may be sent once more. The server keeps running in that case and writes no log line. Without `alerts`, the file is neither read nor written.
 
 The settings are read again when the resident server restarts or on `POST /internal/reload` (which `claude-rotator login` also triggers).
 
