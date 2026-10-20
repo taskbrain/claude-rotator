@@ -1,6 +1,54 @@
 import { createHash, randomBytes } from 'node:crypto';
 import http from 'node:http';
 import https from 'node:https';
+import { promisify } from 'node:util';
+import zlib from 'node:zlib';
+
+export const OAUTH_ORGANIZATION_ACCESS_DENIED = 'OAUTH_ORGANIZATION_ACCESS_DENIED';
+export const OAUTH_ORGANIZATION_ACCESS_DENIED_MESSAGE =
+  'Claude subscription access is disabled for this organization.';
+const MAX_ORGANIZATION_DENIAL_BODY_BYTES = 64 * 1024;
+const inflate = promisify(zlib.inflate);
+const inflateRaw = promisify(zlib.inflateRaw);
+const ORGANIZATION_DENIAL_DECODERS = new Map([
+  ['gzip', promisify(zlib.gunzip)],
+  ['x-gzip', promisify(zlib.gunzip)],
+  ['br', promisify(zlib.brotliDecompress)],
+  ['deflate', async (body, options) => {
+    try {
+      return await inflate(body, options);
+    } catch (error) {
+      if (error?.code === 'ERR_BUFFER_TOO_LARGE') throw error;
+      return inflateRaw(body, options);
+    }
+  }],
+  ...(typeof zlib.zstdDecompress === 'function'
+    ? [['zstd', promisify(zlib.zstdDecompress)]] : []),
+]);
+
+// Only the provider's explicit organization-wide rejection removes an account
+// from routing. Model permissions and unreadable responses remain untouched.
+export async function isOAuthOrganizationAccessDenied(statusCode, body, contentEncoding = null) {
+  if (statusCode !== 403) return false;
+  try {
+    let decoded = Buffer.from(body || '');
+    if (decoded.length > MAX_ORGANIZATION_DENIAL_BODY_BYTES) return false;
+    const layers = String(contentEncoding || '').split(',')
+      .map(value => value.trim().toLowerCase())
+      .filter(value => value && value !== 'identity');
+    if (layers.length > 4) return false;
+    for (const encoding of layers.reverse()) {
+      const decode = ORGANIZATION_DENIAL_DECODERS.get(encoding);
+      if (!decode) return false;
+      decoded = await decode(decoded, { maxOutputLength: MAX_ORGANIZATION_DENIAL_BODY_BYTES });
+    }
+    const data = JSON.parse(decoded.toString('utf8'));
+    return data?.error?.type === 'permission_error'
+      && data.error.details?.error_code === 'oauth_not_allowed_for_organization';
+  } catch {
+    return false;
+  }
+}
 
 export const OAUTH_CLIENT_ID = '9d1c250a-e61b-44d9-88ed-5944d1962f5e';
 export const OAUTH_AUTHORIZE_URL = 'https://claude.ai/oauth/authorize';
@@ -435,7 +483,17 @@ export async function fetchUsage(accessToken, options = {}) {
   }, options);
 
   if (!response.ok) {
-    throw new Error(`Usage fetch failed (${response.status}): ${await response.text()}`);
+    // The native transport retains wire bytes; fetch implementations already
+    // decompress text(), even when their headers still name the wire encoding.
+    const nativeBody = Buffer.isBuffer(response.rawBody);
+    const body = nativeBody ? response.rawBody : await response.text();
+    const encoding = nativeBody ? responseHeader(response.headers, 'content-encoding') : null;
+    if (await isOAuthOrganizationAccessDenied(response.status, body, encoding)) {
+      throw Object.assign(new Error(`Usage fetch failed (403): ${OAUTH_ORGANIZATION_ACCESS_DENIED_MESSAGE}`), {
+        code: OAUTH_ORGANIZATION_ACCESS_DENIED,
+      });
+    }
+    throw new Error(`Usage fetch failed (${response.status}): ${body}`);
   }
 
   return parseUsageResponse(await response.json());
@@ -826,6 +884,7 @@ function requestHttp(endpoint, {
           ok: res.statusCode >= 200 && res.statusCode < 300,
           status: res.statusCode,
           headers: res.headers,
+          rawBody: buffer,
           async text() {
             return buffer.toString('utf8');
           },

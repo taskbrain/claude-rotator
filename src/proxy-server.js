@@ -21,9 +21,12 @@ import {
   createSingleFlightTokenRefresher,
   fetchProfile,
   fetchUsage,
+  isOAuthOrganizationAccessDenied,
   isOAuthTokenRefreshRateLimit,
   isTokenExpiringSoon,
   OAUTH_BETA_HEADER,
+  OAUTH_ORGANIZATION_ACCESS_DENIED,
+  OAUTH_ORGANIZATION_ACCESS_DENIED_MESSAGE,
   refreshAccessToken,
 } from './oauth.js';
 import { createNativeClaudeRefresher } from './native-claude-refresher.js';
@@ -2756,6 +2759,10 @@ async function refreshAccountUsage({
     const detectedAt = accountManager.now();
     const applyFailure = () => {
       if (!accountManager.accounts.includes(account)) return;
+      if (caught?.code === OAUTH_ORGANIZATION_ACCESS_DENIED) {
+        markOAuthOrganizationDenied(accountManager, account.id, detectedAt);
+        return;
+      }
       const refreshUnavailable = markOAuthRefreshUnavailable(accountManager, account.id, caught);
       if (!refreshUnavailable && isOAuthCredentialError(message, caught)) {
         accountManager.markError(
@@ -2785,6 +2792,15 @@ function isOAuthCredentialError(message, error = null) {
   return error?.code === 'NATIVE_REFRESH_OUTCOME_UNKNOWN'
     || error?.code === 'NATIVE_REFRESH_REAUTH_REQUIRED'
     || /OAuth access token is missing|Token refresh failed|Usage fetch failed \(401\)/.test(String(message || ''));
+}
+
+function markOAuthOrganizationDenied(accountManager, accountId, detectedAt = accountManager.now()) {
+  accountManager.markError(
+    accountId,
+    'oauth_organization_denied',
+    OAUTH_ORGANIZATION_ACCESS_DENIED_MESSAGE,
+    authErrorDetails(OAUTH_ORGANIZATION_ACCESS_DENIED, detectedAt),
+  );
 }
 
 function markOAuthRefreshUnavailable(accountManager, accountId, error) {
@@ -3350,6 +3366,7 @@ async function forwardCurrentUnavailableAccount({
 
   const account = accountManager.getFallbackAccount();
   if (!account) return false;
+  if (accountManager.unavailableReason(account)?.type === 'oauth_organization_denied') return false;
   if (proxyErrorContext) proxyErrorContext.account = account.id;
 
   let secret;
@@ -3902,6 +3919,7 @@ async function forwardOnceInner({
   // 上流 529 は本文を見るまで overloaded_error か判別できない（ヘッダに型情報が無い）。
   // ヘッダ受領の時点では何も書かずにバッファへ倒し、本文が揃ってから応答を決める。
   let upstreamOverloadPending = false;
+  let organizationDenialPending = false;
   let reactiveQuotaRetry = false;
   let reactiveQuotaSource = null;
   let reactiveReplayTargets = null;
@@ -3984,6 +4002,13 @@ async function forwardOnceInner({
         // 学習より前に抜けることを字義どおり満たすため（529 はどちらの条件にも当たらない
         // ので二重の安全になる）。混雑はモデル全体の事象で、口座固有ではない。
         if (holdUpstreamOverload(upstreamRes)) return false;
+
+        // A 403 alone is not account-wide evidence. Buffer OAuth rejections
+        // until the structured error code can be checked, including compression.
+        if (account.type !== 'apikey' && upstreamRes.statusCode === 403) {
+          organizationDenialPending = true;
+          return false;
+        }
 
         if (!passthroughErrors && upstreamRes.statusCode === 429) {
           const unavailableReason = accountManager.unavailableReason(account);
@@ -4092,6 +4117,28 @@ async function forwardOnceInner({
     return { retryNextAccount: false, passthroughResponse: upstreamResponse };
   }
 
+  if (organizationDenialPending) {
+    const denied = await isOAuthOrganizationAccessDenied(
+      upstreamResponse.statusCode,
+      upstreamResponse.body,
+      headerValue(upstreamResponse.headers['content-encoding']),
+    );
+    if (req.aborted || res.destroyed) return { retryNextAccount: false };
+    if (!accountManager.accounts.includes(account)) {
+      finishStaleAccountResponse(res, upstreamResponse, exhaustionMapper);
+      return { retryNextAccount: false, passthroughResponse: upstreamResponse };
+    }
+    if (denied) {
+      markOAuthOrganizationDenied(accountManager, account.id);
+      outcome = passthroughErrors ? 'organization-access-denied' : 'organization-access-retry';
+      // Fallback sends have no usable alternate. Remember the denial while
+      // returning this original response; subsequent requests stay local.
+      if (passthroughErrors) bufferedPassthrough = true;
+    } else {
+      bufferedPassthrough = true;
+    }
+  }
+
   if (outcome === 'reactive-quota-pending') {
     const confirmation = !req.aborted && !res.destroyed
       ? await reactiveQuotaConfirmer.confirm({
@@ -4140,7 +4187,7 @@ async function forwardOnceInner({
   // 再生）と、別口座や更新した資格情報で送り直す経路（quota-retry・auth-refresh-retry）の
   // 否定である。それらの経路は応答をまだ書いていないので、ここでは終えない。
   const streamedToClient = !upstreamOverloadPending && !bufferedPassthrough
-    && !(!passthroughErrors && (outcome === 'quota-retry' || outcome === 'auth-refresh-retry'));
+    && !(!passthroughErrors && ['quota-retry', 'auth-refresh-retry', 'organization-access-retry'].includes(outcome));
   if (streamedToClient && !res.writableEnded) res.end();
 
   // 応答本文の**写し**を読むだけで、クライアントへ流すバイト列には触れない。
@@ -4188,7 +4235,7 @@ async function forwardOnceInner({
     });
   }
 
-  if (!passthroughErrors && outcome === 'quota-retry') {
+  if (!passthroughErrors && (outcome === 'quota-retry' || outcome === 'organization-access-retry')) {
     return {
       retryNextAccount: true,
       passthroughResponse: upstreamResponse,
@@ -5121,6 +5168,19 @@ function sendUnavailableAccounts(res, accountManager = null, exhaustionMapper = 
 } = {}) {
   const current = accountManager?.getCurrentAccount();
   const reason = current ? accountManager.unavailableReason(current) : null;
+  if (accountManager?.accounts.length > 0 && accountManager.accounts.every(
+    account => accountManager.unavailableReason(account)?.type === 'oauth_organization_denied',
+  )) {
+    sendJson(res, 403, {
+      type: 'error',
+      error: {
+        type: 'permission_error',
+        message: OAUTH_ORGANIZATION_ACCESS_DENIED_MESSAGE,
+        details: { error_code: 'oauth_not_allowed_for_organization' },
+      },
+    });
+    return;
+  }
   const body = {
     type: 'error',
     error: { type: 'rate_limit_error', message: 'All configured accounts are unavailable.' },
