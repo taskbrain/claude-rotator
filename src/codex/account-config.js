@@ -28,15 +28,23 @@
 //     codex の絶対パスで shell:false で順に起動する。apps と plugins がどちらも false で、MCP サーバが
 //     0件のときだけ通す。通らなければ codex を起動せず、標準エラーに `guard unverified (<理由>)` の
 //     1行を出す（値は出さない）。
+//   - 型2 の設定のフォルダの点検（上の2つの点検より前。codex を起動しない）: 型2（引数の無い対話）でだけ、
+//     作業フォルダの実パスから、Codex と同じ決め方で求めた根までの各フォルダに `.codex` が在るか（種類を
+//     問わず、有無だけ。中身は読まない）を見る。作業フォルダが git の linked worktree のときは、本体の側の
+//     同じ位置の `.codex` も見る。1つでも在れば `project-config` で止める（信頼済みのフォルダでも止める）。
+//     根を Codex と同じに決められないとき、または決め方がずれうるとき（根の目印を変えうる設定の層が在る・
+//     読めない・形が決まった1行でないなど）は `project-root` で止める。対話の中で作業フォルダを信頼した
+//     後に、プロジェクトの設定が点検を経ずに読まれる道を、起動の前に塞ぐため。
 //
 // 型の照合と引数の組立は純粋な関数で、子プロセスを起動しない。子プロセスを起動するのは起動ごとの
-// 点検だけで、起動の関数は差し替えられる部品として受ける。ファイルは読み書きしない（作業フォルダの
-// 実パスを求めるだけ）。
+// 点検だけで、起動の関数は差し替えられる部品として受ける。ファイルは書かない。読むのは、作業フォルダの
+// 実パスと、型2 の設定のフォルダの点検が見るファイルの有無と、根の決め方に要る小さなファイル（口座の
+// config.toml・システムと管理の層の config・git の worktree の指し先）だけで、どれも 64 KiB までにする。
 // 型1の形は、Codex CLI のジョブを非対話の `codex exec … -` の形で起動するほかのツールの起動の形に合わせてある。
 // その起動の形か型1の形を変えるときは、test/codex/account-config.test.js の回帰の見本と照らし直す。
 import { spawn as spawnChild } from 'node:child_process';
-import { realpathSync } from 'node:fs';
-import { isAbsolute } from 'node:path';
+import { lstatSync, readFileSync, readdirSync, realpathSync, statSync } from 'node:fs';
+import { dirname, isAbsolute, join, relative, sep } from 'node:path';
 
 // --- 第1層 -----------------------------------------------------------------------------------
 
@@ -285,6 +293,8 @@ export const GUARD_UNVERIFIED = Object.freeze({
   exit: 'exit', // 0以外の終了・シグナル・起動や読取の失敗・作業フォルダの実パスが求められない
   timeout: 'timeout', // 期限切れ
   tooLarge: 'too-large', // 標準出力が上限を超えた
+  projectConfig: 'project-config', // 型2：作業フォルダから根まで（linked worktree では本体の側の同じ位置も）に .codex が在る
+  projectRoot: 'project-root', // 型2：根を Codex と同じに決められない、または決め方がずれうる
 });
 
 /** 点検が通らなかった結果の種類（拒否の結果の種類と見分けるため）。 */
@@ -492,12 +502,351 @@ export function resolveLaunchWorkingDirectory({ processCwd = () => process.cwd()
   }
 }
 
+// --- 型2 の設定のフォルダの点検 ----------------------------------------------------------------
+//
+// Codex CLI（確かめた版 rust-v0.160.1）の根の決め方を写す。根は、作業フォルダから `/` へ祖先を1つずつ見て、
+// 根の目印（既定は `.git`）が最初に在った祖先。目印はリンクの先までたどり、ファイルでもフォルダでも数える。
+// ただし `.git` がフォルダで中に `HEAD` が無ければ数えない。どこにも無ければ作業フォルダが根。目印の値は、
+// プロジェクトのもの以外の層（システム・クラウド・口座の config・profile・`-c`・ファイルの管理の層・MDM）を
+// 合わせて決まる。ここでは口座の config の値だけを使い、ほかの層が目印を変えうるときは止める側に倒す。
+// Codex が点検の対象にしない所（クラウドから配る設定の初回、`.codex/` の外で効くものなど）は既知の限り。
+
+/** 型2 の点検が見る、プロジェクトの層の外の置き場（試験では仮のフォルダへ向ける）。 */
+export const PROJECT_LAYER_PATHS = Object.freeze({
+  systemConfig: '/etc/codex/config.toml', // システムの層
+  managedConfig: '/etc/codex/managed_config.toml', // ファイルで置く管理の層（Unix）
+  managedPreferencesDir: '/Library/Managed Preferences', // macOS の管理の設定（MDM）の置き場
+});
+/** MDM の設定のファイルの名（置き場の直下と、その下のユーザーごとのフォルダの中を見る）。 */
+export const MANAGED_PREFERENCES_FILE = 'com.openai.codex.plist';
+/** 口座のフォルダの直下に置かれる、クラウドから配る設定の控え。 */
+export const CLOUD_CONFIG_CACHE_FILE = 'cloud-config-bundle-cache.json';
+/** 根の目印の既定。 */
+export const DEFAULT_PROJECT_ROOT_MARKERS = Object.freeze(['.git']);
+/** 点検で読むファイルの上限（バイト）。超えたら根を決められないものとして止める。 */
+export const PROJECT_CHECK_MAX_FILE_BYTES = 64 * 1024;
+
+const PROJECT_CONFIG_DIR = '.codex';
+const GIT_MARKER = '.git';
+const MARKERS_KEY = 'project_root_markers';
+// 目印の値として受けるのは、最初の表より前の1行に書いた、空でない文字列の配列だけ。
+const MARKERS_LINE = /^[ \t]*project_root_markers[ \t]*=[ \t]*\[([^\]\n]*)\][ \t]*(?:#[^\n]*)?$/;
+const MARKER_ELEMENT = /^[ \t]*(?:"([^"\\\x00-\x1f\x7f]*)"|'([^'\x00-\x1f\x7f]*)')[ \t]*$/;
+const TABLE_HEADER_LINE = /^[ \t]*\[/;
+// 口座の config の profile・profiles の鍵（表の見出し・点で続く鍵・引用符で囲んだ鍵を含む）。
+const PROFILE_KEY_LINE = /^[ \t]*\[{0,2}[ \t]*["']?profiles?["']?[ \t]*[=.\]]/m;
+// 複数行の文字列の区切りと、文字列のエスケープ。字で照らす点検は、これらがあると鍵と値を Codex と同じに
+// 読めないので、根を決められないものとして止める。
+const TOML_UNREADABLE_TEXT = /"""|'''|\\/;
+// 口座の config.toml で、字で照らす点検が通す形。どの行も、空の行・注記の行・表の見出し・その行で閉じる
+// 「鍵 = 値」のどれか。鍵はエスケープの無い名、値はエスケープの無い1行の文字列・真偽・数（日時は含めない）・
+// その行で閉じる配列と inline table だけで、どれも TOML 1.0 の正しい形（TOML 1.1 でも同じ意味）。複数行に
+// 分けた配列や inline table（TOML 1.1）の中の行は一番上の階層の行と見分けられないので、ほかの形が1つでも
+// あれば止める。制御文字（タブと改行を除く）・改行でない CR・BOM も止める。
+const PLAIN_TOML_FORBIDDEN = /[\x00-\x08\x0b\x0c\x0e-\x1f\x7f\ufeff]|\r(?!\n)/;
+const PLAIN_SPACE = /[ \t]*/y;
+const PLAIN_KEY_PART = /[A-Za-z0-9_-]+|"[^"\\]*"|'[^']*'/y;
+const PLAIN_SCALAR = new RegExp([
+  '"[^"\\\\]*"', "'[^']*'", 'true', 'false', '[+-]?(?:inf|nan)',
+  '0x[0-9A-Fa-f](?:_?[0-9A-Fa-f])*', '0o[0-7](?:_?[0-7])*', '0b[01](?:_?[01])*',
+  '[+-]?(?:0|[1-9](?:_?[0-9])*)(?:\\.[0-9](?:_?[0-9])*)?(?:[eE][+-]?[0-9](?:_?[0-9])*)?',
+].join('|'), 'y');
+const PLAIN_MAX_DEPTH = 8;
+const ABSENT_CODES = new Set(['ENOENT', 'ENOTDIR']);
+
+/** 点検に使うファイルの道具（試験では差し替える）。どれも同期の関数。 */
+const NODE_PROJECT_FS = Object.freeze({
+  lstat: lstatSync, stat: statSync, readFile: readFileSync, readdir: readdirSync, realpath: realpathSync.native,
+});
+
+// 根を決められないときに投げる印。点検の関数の外へは出さない。
+class ProjectRootUndetermined extends Error {}
+const undetermined = () => new ProjectRootUndetermined();
+
+// 在れば true、無ければ（ENOENT・ENOTDIR）false。ほかの誤りは、決められないものとして投げる。
+function present(fsImpl, method, path) {
+  try {
+    fsImpl[method](path);
+    return true;
+  } catch (error) {
+    if (ABSENT_CODES.has(error?.code)) return false;
+    throw undetermined();
+  }
+}
+
+// 小さなファイルを読む。無ければ null。ファイルでない・上限を超える・読めないときは投げる。
+function readSmallText(fsImpl, path) {
+  let info;
+  try {
+    info = fsImpl.stat(path);
+  } catch (error) {
+    if (ABSENT_CODES.has(error?.code)) return null;
+    throw undetermined();
+  }
+  if (!info.isFile() || info.size > PROJECT_CHECK_MAX_FILE_BYTES) throw undetermined();
+  const text = fsImpl.readFile(path, 'utf8');
+  if (typeof text !== 'string' || Buffer.byteLength(text) > PROJECT_CHECK_MAX_FILE_BYTES) throw undetermined();
+  return text;
+}
+
+// 行 line の at から re（sticky）に合う字を読み、読み終えた位置を返す。合わなければ -1。
+function eatPlain(re, line, at) {
+  re.lastIndex = at;
+  return re.test(line) ? re.lastIndex : -1;
+}
+
+const skipPlainSpace = (line, at) => eatPlain(PLAIN_SPACE, line, at);
+
+// 点で続く鍵（`a . "b".'c'`）を読み、読み終えた位置を返す。読めなければ -1。
+function eatPlainKey(line, at) {
+  for (let end = eatPlain(PLAIN_KEY_PART, line, at); end !== -1; end = eatPlain(PLAIN_KEY_PART, line, at)) {
+    const next = skipPlainSpace(line, end);
+    if (line[next] !== '.') return end;
+    at = skipPlainSpace(line, next + 1);
+  }
+  return -1;
+}
+
+// 値を1つ読み、読み終えた位置を返す。配列と inline table は、同じ行の中で閉じるものだけ。読めなければ -1。
+function eatPlainValue(line, at, depth) {
+  const open = line[at];
+  if (open !== '[' && open !== '{') return eatPlain(PLAIN_SCALAR, line, at);
+  if (depth >= PLAIN_MAX_DEPTH) return -1;
+  const close = open === '[' ? ']' : '}';
+  at = skipPlainSpace(line, at + 1);
+  if (line[at] === close) return at + 1;
+  for (;;) {
+    if (open === '{') {
+      at = eatPlainKey(line, at);
+      if (at === -1) return -1;
+      at = skipPlainSpace(line, at);
+      if (line[at] !== '=') return -1;
+      at = skipPlainSpace(line, at + 1);
+    }
+    at = eatPlainValue(line, at, depth + 1);
+    if (at === -1) return -1;
+    at = skipPlainSpace(line, at);
+    if (line[at] === close) return at + 1;
+    if (line[at] !== ',') return -1;
+    at = skipPlainSpace(line, at + 1);
+    // 配列は末尾のカンマを受ける（TOML 1.0）。inline table の末尾のカンマは TOML 1.1 だけなので受けない。
+    if (open === '[' && line[at] === close) return at + 1;
+  }
+}
+
+// 1行が、空の行・注記の行・表の見出し・その行で閉じる「鍵 = 値」のどれかか。
+function isPlainTomlLine(line) {
+  let at = skipPlainSpace(line, 0);
+  if (at === line.length || line[at] === '#') return true;
+  if (line[at] === '[') {
+    const close = line[at + 1] === '[' ? ']]' : ']';
+    at = eatPlainKey(line, skipPlainSpace(line, at + close.length));
+    if (at === -1) return false;
+    at = skipPlainSpace(line, at);
+    if (!line.startsWith(close, at)) return false;
+    at += close.length;
+  } else {
+    at = eatPlainKey(line, at);
+    if (at === -1) return false;
+    at = skipPlainSpace(line, at);
+    if (line[at] !== '=') return false;
+    at = eatPlainValue(line, skipPlainSpace(line, at + 1), 0);
+    if (at === -1) return false;
+  }
+  at = skipPlainSpace(line, at);
+  return at === line.length || line[at] === '#';
+}
+
+/**
+ * 口座の config.toml の全文から、根の目印を読む。鍵が無ければ既定（`.git`）、受ける形なら値、ほかは null
+ * （根を決められない）。受ける形は、最初の表より前の1行の `project_root_markers = ["…", …]`（要素は空でない
+ * 1段の名で、`/`・`.`・`..` を含まない文字列）だけ。鍵が2回以上出る・表の中にある・値が配列でない・空の配列・
+ * 複数行の配列・注記の中にだけ在る、と、全文のどこかに複数行の文字列の区切り（`"""`・`'''`）か文字列の
+ * エスケープ（`\`）がある、と、全文のどこかに上の PLAIN_TOML_FORBIDDEN に当たる字か、空の行・注記の行・
+ * 表の見出し・その行で閉じる「鍵 = 値」のほかの行がある（複数行に分けた配列や inline table など）、はどれも null。
+ * @param {string|null} text
+ * @returns {readonly string[]|null}
+ */
+export function readProjectRootMarkers(text) {
+  if (text === null || text === undefined) return DEFAULT_PROJECT_ROOT_MARKERS;
+  if (typeof text !== 'string' || TOML_UNREADABLE_TEXT.test(text) || PLAIN_TOML_FORBIDDEN.test(text)) return null;
+  if (!text.split(/\r?\n/).every(isPlainTomlLine)) return null;
+  const count = text.split(MARKERS_KEY).length - 1;
+  if (count === 0) return DEFAULT_PROJECT_ROOT_MARKERS;
+  if (count > 1) return null;
+  const lines = text.split(/\r?\n/);
+  const at = lines.findIndex(line => line.includes(MARKERS_KEY));
+  const firstTable = lines.findIndex(line => TABLE_HEADER_LINE.test(line));
+  if (firstTable !== -1 && firstTable < at) return null;
+  const match = MARKERS_LINE.exec(lines[at]);
+  if (!match || match[1].trim() === '') return null;
+  const markers = [];
+  for (const part of match[1].split(',')) {
+    const element = MARKER_ELEMENT.exec(part);
+    if (!element) return null;
+    const name = element[1] ?? element[2];
+    if (name === '' || name === '.' || name === '..' || name.includes('/')) return null;
+    markers.push(name);
+  }
+  return Object.freeze(markers);
+}
+
+/**
+ * Codex に渡す引数の並びに、根の目印か profile を変えうる指定があるか（`--profile`・`--profile=…`・`-p` で
+ * 始まる1字の指定、`project_root_markers` を含む語〈`-c`・`--config` の値や `=` で続ける形〉）。
+ * @param {readonly string[]} args
+ * @returns {boolean}
+ */
+export function launchArgsChangeProjectRoot(args) {
+  return args.some(word => typeof word !== 'string' || word.includes(MARKERS_KEY) || word === '--profile'
+    || word.startsWith('--profile=') || (word.startsWith('-p') && !word.startsWith('--')));
+}
+
+// 根の目印が在るか。リンクの先までたどる。`.git` のフォルダは中に HEAD が在るときだけ数える。先までたどれない
+// リンク（切れたリンク）と、ENOENT・ENOTDIR 以外の誤りは、決められないものとして投げる。
+function isRootMarker(fsImpl, path, marker) {
+  let info;
+  try {
+    info = fsImpl.stat(path);
+  } catch (error) {
+    if (!ABSENT_CODES.has(error?.code)) throw undetermined();
+    if (present(fsImpl, 'lstat', path)) throw undetermined();
+    return false;
+  }
+  if (marker === GIT_MARKER && info.isDirectory()) return present(fsImpl, 'stat', join(path, 'HEAD'));
+  return true;
+}
+
+// 作業フォルダから祖先へ、目印が最初に在った祖先。どこにも無ければ作業フォルダ。
+function findProjectRoot(fsImpl, cwd, markers) {
+  for (let dir = cwd; ; dir = dirname(dir)) {
+    if (markers.some(marker => isRootMarker(fsImpl, join(dir, marker), marker))) return dir;
+    if (dirname(dir) === dir) return cwd;
+  }
+}
+
+// 作業フォルダから根までのフォルダ（作業フォルダが先）。
+function foldersUpToRoot(cwd, root) {
+  const folders = [];
+  for (let dir = cwd; ; dir = dirname(dir)) {
+    folders.push(dir);
+    if (dir === root || dirname(dir) === dir) return folders;
+  }
+}
+
+// git の作業ツリーの根（Codex の find_git_checkout_root と同じ）：作業フォルダから祖先へ、`.git` が在る
+// 最初の祖先。`.git` がフォルダで中に HEAD が無ければ飛ばす。無ければ null。
+function findGitCheckoutRoot(fsImpl, cwd) {
+  for (let dir = cwd; ; dir = dirname(dir)) {
+    if (isRootMarker(fsImpl, join(dir, GIT_MARKER), GIT_MARKER)) return dir;
+    if (dirname(dir) === dir) return null;
+  }
+}
+
+// `gitdir:` などの1行のファイルの値。読めない・形が違えば投げる。
+function readPointer(fsImpl, path, prefix = '') {
+  const text = readSmallText(fsImpl, path);
+  if (text === null) throw undetermined();
+  const trimmed = text.trim();
+  if (!trimmed.startsWith(prefix)) throw undetermined();
+  const value = trimmed.slice(prefix.length).trim();
+  if (value === '' || value.includes('\n') || value.includes('\0')) throw undetermined();
+  return value;
+}
+
+const againstFolder = (folder, value) => (isAbsolute(value) ? value : join(folder, value));
+
+/**
+ * linked worktree の本体の根（Codex の resolve_root_git_project_for_trust と同じ求め方で、確かめを足したもの）。
+ * `.git` がフォルダなら null（本体の側は見ない）。求められなければ投げる。
+ */
+function resolveMainCheckoutRoot(fsImpl, checkoutRoot) {
+  const dotGit = join(checkoutRoot, GIT_MARKER);
+  // Codex はリンクの先までたどってフォルダか見て、フォルダなら本体の側を見ない。フォルダでないときは、
+  // リンクでない普通のファイルだけを読む（リンクのファイルは本体の場所を決められないものとして止める）。
+  if (fsImpl.stat(dotGit).isDirectory()) return null;
+  const info = fsImpl.lstat(dotGit);
+  if (!info.isFile() || info.isSymbolicLink()) throw undetermined();
+  const gitDir = againstFolder(checkoutRoot, readPointer(fsImpl, dotGit, 'gitdir:'));
+  const canonicalGitDir = fsImpl.realpath(gitDir);
+  const registeredDotGit = againstFolder(canonicalGitDir, readPointer(fsImpl, join(canonicalGitDir, 'gitdir')));
+  if (fsImpl.realpath(dirname(registeredDotGit)) !== fsImpl.realpath(checkoutRoot)) throw undetermined();
+  const commonDir = fsImpl.realpath(againstFolder(canonicalGitDir, readPointer(fsImpl, join(canonicalGitDir, 'commondir'))));
+  if (commonDir !== dirname(dirname(canonicalGitDir))) throw undetermined();
+  const mainRoot = dirname(dirname(dirname(gitDir)));
+  if (fsImpl.realpath(join(mainRoot, GIT_MARKER)) !== commonDir) throw undetermined();
+  return mainRoot;
+}
+
+// MDM の設定のファイルが、置き場の直下か、その下のユーザーごとのフォルダの中に在るか。
+function managedPreferencesPresent(fsImpl, dir) {
+  if (present(fsImpl, 'lstat', join(dir, MANAGED_PREFERENCES_FILE))) return true;
+  let names;
+  try {
+    names = fsImpl.readdir(dir);
+  } catch (error) {
+    if (ABSENT_CODES.has(error?.code)) return false;
+    throw undetermined();
+  }
+  return names.some(name => present(fsImpl, 'lstat', join(dir, String(name), MANAGED_PREFERENCES_FILE)));
+}
+
+/**
+ * 型2 の設定のフォルダの点検。codex を起動しない。通れば null、止めるなら理由の語（`project-config` か
+ * `project-root`）。例外を投げない（思わない誤りも `project-root` にする）。
+ * `.codex`・クラウドの控え・MDM の設定のファイルは有無だけを見て、中身を読まない。
+ * @param {{
+ *   cwd: string, codexHome: string, launchArgs?: readonly string[],
+ *   fs?: object, paths?: { systemConfig: string, managedConfig: string, managedPreferencesDir: string },
+ * }} options cwd は作業フォルダの実パス、codexHome は選んだ口座のフォルダ（どちらも絶対パス）
+ * @returns {string|null}
+ */
+export function checkProjectFolders({ cwd, codexHome, launchArgs = [], fs: fsImpl = NODE_PROJECT_FS,
+  paths = PROJECT_LAYER_PATHS } = {}) {
+  try {
+    if (!isAbsolute(cwd) || !isAbsolute(codexHome)) return GUARD_UNVERIFIED.projectRoot;
+    if (present(fsImpl, 'lstat', join(cwd, PROJECT_CONFIG_DIR))) return GUARD_UNVERIFIED.projectConfig;
+    if (!Array.isArray(launchArgs) || launchArgsChangeProjectRoot(launchArgs)) return GUARD_UNVERIFIED.projectRoot;
+    const accountConfig = readSmallText(fsImpl, join(codexHome, 'config.toml'));
+    if (accountConfig !== null && PROFILE_KEY_LINE.test(accountConfig)) return GUARD_UNVERIFIED.projectRoot;
+    const markers = readProjectRootMarkers(accountConfig);
+    if (markers === null) return GUARD_UNVERIFIED.projectRoot;
+    if (present(fsImpl, 'lstat', join(codexHome, CLOUD_CONFIG_CACHE_FILE))) return GUARD_UNVERIFIED.projectRoot;
+    for (const layer of [paths.systemConfig, paths.managedConfig]) {
+      const text = readSmallText(fsImpl, layer);
+      if (text !== null && (text.includes(MARKERS_KEY) || TOML_UNREADABLE_TEXT.test(text))) {
+        return GUARD_UNVERIFIED.projectRoot;
+      }
+    }
+    if (managedPreferencesPresent(fsImpl, paths.managedPreferencesDir)) return GUARD_UNVERIFIED.projectRoot;
+    const root = findProjectRoot(fsImpl, cwd, markers);
+    const folders = foldersUpToRoot(cwd, root);
+    if (folders.some(dir => present(fsImpl, 'lstat', join(dir, PROJECT_CONFIG_DIR)))) {
+      return GUARD_UNVERIFIED.projectConfig;
+    }
+    const checkoutRoot = findGitCheckoutRoot(fsImpl, cwd);
+    const mainRoot = checkoutRoot === null ? null : resolveMainCheckoutRoot(fsImpl, checkoutRoot);
+    if (mainRoot !== null) {
+      for (const dir of folders) {
+        const inside = relative(checkoutRoot, dir);
+        if (inside === '..' || inside.startsWith(`..${sep}`) || isAbsolute(inside)) continue;
+        if (present(fsImpl, 'lstat', join(mainRoot, inside, PROJECT_CONFIG_DIR))) return GUARD_UNVERIFIED.projectConfig;
+      }
+    }
+    return null;
+  } catch {
+    return GUARD_UNVERIFIED.projectRoot;
+  }
+}
+
 /**
  * 型の照合・引数の組立・起動ごとの点検をまとめて行い、通れば子の起動の指定を返す。点検の起動と
  * 子の起動には、同じ作業フォルダ（exec 自身の作業フォルダの実パス）と同じ環境を渡す。
  *
  * 型に当たらなければ点検を起動せず { ok: false, kind: 'argument-rejected', reason: 'form', detail }。
  * 作業フォルダの実パスが求められなければ点検を起動せず、点検が通らなかったものとして exit。
+ * 型2 では、点検を起動する前に設定のフォルダの点検（checkProjectFolders）を行い、通らなければ点検を
+ * 起動せずに project-config か project-root。
  * 点検が通らなければ { ok: false, kind: 'guard-unverified', reason }。通れば
  * { ok: true, form, launch: { command, args, options: { shell: false, cwd, env } } }（stdio は呼出し元が
  * 決める）。
@@ -508,10 +857,12 @@ export function resolveLaunchWorkingDirectory({ processCwd = () => process.cwd()
  *   args: readonly string[], caller?: 'exec'|'shim', codexPath: string, codexHome: string, env: object,
  *   spawn?: Function, scheduler?: object, timeoutMs?: number, maxBytes?: number,
  *   processCwd?: () => string, realpath?: (path: string) => string,
- * }} options
+ *   projectFs?: object, projectLayerPaths?: object,
+ * }} options projectFs と projectLayerPaths は、設定のフォルダの点検のファイルの道具とプロジェクトの層の外の
+ *   置き場（試験のため。省けば本物）
  */
 export async function prepareGuardedLaunch({ args, caller, codexPath, codexHome, env, spawn, scheduler,
-  timeoutMs, maxBytes, processCwd, realpath } = {}) {
+  timeoutMs, maxBytes, processCwd, realpath, projectFs, projectLayerPaths } = {}) {
   requireAbsolute(codexPath, 'codexPath');
   requireAbsolute(codexHome, 'codexHome');
   if (env === null || typeof env !== 'object') throw new TypeError('env must be an object');
@@ -519,6 +870,12 @@ export async function prepareGuardedLaunch({ args, caller, codexPath, codexHome,
   if (!built.ok) return Object.freeze({ ...built, kind: ARGUMENT_REJECTED_KIND });
   const cwd = resolveLaunchWorkingDirectory({ processCwd, realpath });
   if (cwd === null) return unverified(GUARD_UNVERIFIED.exit);
+  if (built.form === LAUNCH_FORM.interactive) {
+    const projectReason = checkProjectFolders({
+      cwd, codexHome, launchArgs: built.launchArgs, fs: projectFs, paths: projectLayerPaths,
+    });
+    if (projectReason !== null) return unverified(projectReason);
+  }
   const check = await runGuardCheck({
     codexPath, codexHome, cwd, env, configOverrides: built.configOverrides, spawn, scheduler, timeoutMs, maxBytes,
   });

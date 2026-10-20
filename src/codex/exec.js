@@ -23,6 +23,8 @@
 //      読んだ口座ごとに、判定の語の1行 `usage <ラベル>: <語>` を標準エラーへ出す（守りの点検の前）。
 //   6. 起動ごとの点検（account-config.js の prepareGuardedLaunch。型の照合・第1層・--no-daemon の
 //      付け方・features list と mcp list --json の点検）。通らなければ `guard unverified (<理由>)`。
+//      型2（引数の無い対話）では、その前に codex を起動せずに設定のフォルダの点検を行い、作業フォルダから
+//      根までに `.codex` が在るか、根を Codex と同じに決められなければ、同じ1行で止まる。
 //   7. 起動。stdio は受け継ぎ（exec 自身は標準出力に何も書かない）。子が生きている間だけ、4つの
 //      シグナルの受け口を付けて子へ転送する。子が終了コードで終われば、その値をそのまま返す。
 //      シグナルで終われば、受け口を外してから同じシグナルを自分へ当て直す（当て直しても終わらな
@@ -599,8 +601,10 @@ export function launchAndRelay(launch, { spawn = spawnChild, signals = processSi
  *   now?: () => number, consultDaemon?: Function, request?: Function, readControlToken?: Function,
  *   signals?: { on: Function, off: Function }, raiseSignal?: (signal: string) => void,
  *   processCwd?: () => string, realpath?: (path: string) => string, scheduler?: object,
+ *   projectFs?: object, projectLayerPaths?: object,
  * }} [deps] 差し替えの部品（テストのため）。省いたものは本物を使う。request と readControlToken は、
- *   consultDaemon を省いたときの consultDaemonSelect へ渡す。
+ *   consultDaemon を省いたときの consultDaemonSelect へ渡す。projectFs と projectLayerPaths は、型2 の設定の
+ *   フォルダの点検のファイルの道具と、プロジェクトの層の外の置き場（MDM の設定のファイルの置き場を含む）。
  * @returns {Promise<number>} 終了コード
  */
 export async function runExec(argv = [], io = {}, deps = {}) {
@@ -661,7 +665,8 @@ export async function runExec(argv = [], io = {}, deps = {}) {
   }
 
   const prepared = await prepareGuardedLaunch({ args: parsed.codexArgs, caller: LAUNCH_CALLER.exec, codexPath,
-    codexHome: decision.account.codexHome, env, spawn, scheduler, processCwd, realpath });
+    codexHome: decision.account.codexHome, env, spawn, scheduler, processCwd, realpath,
+    projectFs: deps.projectFs, projectLayerPaths: deps.projectLayerPaths });
   if (!prepared.ok) {
     say(prepared.kind === ARGUMENT_REJECTED_KIND ? formatArgumentRejected(prepared.reason) : formatGuardUnverified(prepared.reason));
     return EXEC_REFUSED_EXIT_CODE;

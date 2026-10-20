@@ -8,8 +8,8 @@
 // 起動の形が変わったときは、その形を読み直してこの見本を合わせる。
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdir, writeFile } from 'node:fs/promises';
-import { join } from 'node:path';
+import { mkdir, rm, writeFile } from 'node:fs/promises';
+import { join, relative } from 'node:path';
 import {
   ACCOUNT_CONFIG_TOML, ALLOWED_CONFIG_OVERRIDES, ALLOWED_SANDBOX_VALUES, ARGUMENT_REJECTED_REASON,
   FIRST_LAYER_ARGS, FORM_REJECTION, LAUNCH_CALLER, LAUNCH_FORM, MODEL_NAME_PATTERN,
@@ -20,13 +20,15 @@ import { readCodexCredentials } from '../../src/codex/credentials.js';
 import { setupCodexIsolation } from './helpers/isolation.js';
 import { EventEmitter } from 'node:events';
 import { chmod, realpath, symlink } from 'node:fs/promises';
-import { readFileSync, realpathSync } from 'node:fs';
-import { isAbsolute } from 'node:path';
+import { lstatSync, readFileSync, readdirSync, realpathSync, statSync } from 'node:fs';
+import { dirname, isAbsolute } from 'node:path';
 import {
-  ARGUMENT_REJECTED_KIND, CODEX_GUARD_CHECK_MAX_STDOUT_BYTES, CODEX_GUARD_CHECK_TIMEOUT_MS,
-  GUARD_CHECK_FEATURES_ARGS, GUARD_CHECK_MCP_ARGS, GUARD_UNVERIFIED, GUARD_UNVERIFIED_KIND, NO_DAEMON_ARG,
-  buildGuardCheckArgs, buildLaunchArgs, formatGuardUnverified, judgeFeaturesList, judgeMcpList,
-  prepareGuardedLaunch, resolveLaunchWorkingDirectory, runGuardCheck,
+  ARGUMENT_REJECTED_KIND, CLOUD_CONFIG_CACHE_FILE, CODEX_GUARD_CHECK_MAX_STDOUT_BYTES, CODEX_GUARD_CHECK_TIMEOUT_MS,
+  DEFAULT_PROJECT_ROOT_MARKERS, GUARD_CHECK_FEATURES_ARGS, GUARD_CHECK_MCP_ARGS, GUARD_UNVERIFIED, GUARD_UNVERIFIED_KIND,
+  MANAGED_PREFERENCES_FILE, NO_DAEMON_ARG, PROJECT_CHECK_MAX_FILE_BYTES, PROJECT_LAYER_PATHS,
+  buildGuardCheckArgs, buildLaunchArgs, checkProjectFolders, formatGuardUnverified, judgeFeaturesList, judgeMcpList,
+  launchArgsChangeProjectRoot, prepareGuardedLaunch, readProjectRootMarkers, resolveLaunchWorkingDirectory,
+  runGuardCheck,
 } from '../../src/codex/account-config.js';
 import { findRealCodex } from '../../src/codex/real-codex.js';
 
@@ -527,6 +529,12 @@ async function guardHarness(t, { features = () => fakeCheckChild({ stdout: [FEAT
   const realWorkDir = await realpath(workDir);
   const linkDir = join(isolation.root, 'zz-work-link');
   await symlink(workDir, linkDir);
+  // 型2 の設定のフォルダの点検の根の検索を、隔離の一時フォルダの中で止める（自前の根の目印）。プロジェクトの
+  // 層の外の置き場も、一時フォルダの中の在らないパスへ向ける。
+  await gitRootMarker(isolation.root);
+  const projectLayerPaths = testLayerPaths(isolation.root);
+  const outside = [];
+  const projectFs = confinedProjectFs(isolation.root, { outside });
   const env = Object.freeze({ ...isolation.env, ZZ_ENV_MARK: 'zz-env' });
   const children = [];
   isolation.registerSpawn(codexPath, (args, options) => {
@@ -535,9 +543,92 @@ async function guardHarness(t, { features = () => fakeCheckChild({ stdout: [FEAT
     return child;
   });
   const run = (args, extra = {}) => prepareGuardedLaunch({
-    args, codexPath, codexHome, env, spawn: isolation.spawn, scheduler, processCwd: () => linkDir, ...extra,
+    args, codexPath, codexHome, env, spawn: isolation.spawn, scheduler, processCwd: () => linkDir,
+    projectFs, projectLayerPaths, ...extra,
   });
-  return { isolation, codexPath, codexHome, env, realWorkDir, linkDir, children, scheduler, run };
+  return { isolation, codexPath, codexHome, env, realWorkDir, linkDir, children, scheduler, run, outside };
+}
+
+// --- 型2 の設定のフォルダの点検の試験の道具 -----------------------------------------------------
+
+/** 自前の根の目印（中に HEAD の在る `.git` のフォルダ）を folder に作る。 */
+async function gitRootMarker(folder) {
+  await mkdir(join(folder, '.git'), { recursive: true, mode: 0o700 });
+  await writeFile(join(folder, '.git', 'HEAD'), 'ref: refs/heads/zz\n', { mode: 0o600 });
+}
+
+/** プロジェクトの層の外の置き場を、一時フォルダの中へ向けたもの（どれも作らなければ在らない）。 */
+function testLayerPaths(root) {
+  return Object.freeze({
+    systemConfig: join(root, 'zz-etc', 'config.toml'),
+    managedConfig: join(root, 'zz-etc', 'managed_config.toml'),
+    managedPreferencesDir: join(root, 'zz-managed-preferences'),
+  });
+}
+
+/**
+ * 点検のファイルの道具。一時フォルダ root の外のパスは、本物の道具へ渡さずに ENOENT とし、outside に残す
+ * （根の検索が一時フォルダの外へ出たかを見るため）。fail[方法](パス) が誤りの code を返せば、その誤りを投げる。
+ * reads には readFile のパスを残す。
+ */
+function confinedProjectFs(root, { fail = {}, outside = [], reads = [] } = {}) {
+  const inside = path => path === root || path.startsWith(`${root}/`);
+  const wrap = (method, impl) => (path, ...rest) => {
+    const key = String(path);
+    if (method === 'readFile') reads.push(key);
+    const code = fail[method]?.(key);
+    if (code) throw Object.assign(new Error(`zz ${method} ${code}`), { code });
+    if (!inside(key)) {
+      outside.push(key);
+      throw Object.assign(new Error('zz outside the test folder'), { code: 'ENOENT' });
+    }
+    return impl(path, ...rest);
+  };
+  return {
+    lstat: wrap('lstat', lstatSync), stat: wrap('stat', statSync), readFile: wrap('readFile', readFileSync),
+    readdir: wrap('readdir', readdirSync), realpath: wrap('realpath', realpathSync.native),
+  };
+}
+
+/**
+ * 型2 の点検だけを確かめる組。一時フォルダの中に、根の目印の在るプロジェクト（project）・口座のフォルダ
+ * （config.toml は login が書く全文）・在らないプロジェクトの層の外の置き場を作る。
+ */
+async function projectHarness(t) {
+  const isolation = await setupCodexIsolation(t);
+  const root = isolation.root;
+  const project = join(root, 'zz-project');
+  await gitRootMarker(project);
+  const codexHome = join(root, 'zz-accounts', 'zz-one');
+  await mkdir(codexHome, { recursive: true, mode: 0o700 });
+  await writeFile(join(codexHome, 'config.toml'), ACCOUNT_CONFIG_TOML, { mode: 0o600 });
+  const paths = testLayerPaths(root);
+  const dir = async (...parts) => {
+    const path = join(...parts);
+    await mkdir(path, { recursive: true, mode: 0o700 });
+    return realpath(path);
+  };
+  const check = (cwd, { fail, args = [...FIRST_LAYER_ARGS, NO_DAEMON_ARG], outside = [], reads = [], ...extra } = {}) =>
+    checkProjectFolders({ cwd, codexHome, launchArgs: args, fs: confinedProjectFs(root, { fail, outside, reads }), paths, ...extra });
+  const setAccountConfig = text => writeFile(join(codexHome, 'config.toml'), text, { mode: 0o600 });
+  return { isolation, root, project, codexHome, paths, dir, check, setAccountConfig };
+}
+
+/** linked worktree の組（本体 main と、外側のフォルダ outer の下の作業ツリー wt）を作り、パスを返す。 */
+async function linkedWorktree(root, name = 'zz-wt') {
+  const main = join(root, `${name}-main`);
+  await gitRootMarker(main);
+  const gitDir = join(main, '.git', 'worktrees', name);
+  await mkdir(gitDir, { recursive: true, mode: 0o700 });
+  const outer = join(root, `${name}-outer`);
+  await gitRootMarker(outer);
+  const wt = join(outer, name);
+  await mkdir(join(wt, 'sub'), { recursive: true, mode: 0o700 });
+  await writeFile(join(wt, '.git'), `gitdir: ${gitDir}\n`, { mode: 0o600 });
+  await writeFile(join(gitDir, 'gitdir'), `${join(wt, '.git')}\n`, { mode: 0o600 });
+  await writeFile(join(gitDir, 'commondir'), '../..\n', { mode: 0o600 });
+  await writeFile(join(gitDir, 'HEAD'), 'ref: refs/heads/zz-wt\n', { mode: 0o600 });
+  return { main: await realpath(main), outer: await realpath(outer), wt: await realpath(wt), gitDir: await realpath(gitDir) };
 }
 
 function assertUnverified(result, reason) {
@@ -830,10 +921,13 @@ for (const [name, { features, mcp, fireAtOnce = false }, reason, started, killed
 }
 
 test('every guard check reason word can be produced', () => {
-  const produced = new Set(GUARD_STOP_CASES.map(entry => entry[2]));
+  // 型1 の点検の止まり方の表と、型2 の設定のフォルダの点検の止まり方の表（下の PROJECT_ROOT_CASES と、
+  // `.codex` が在る道の project-config）を合わせて、理由の語の全部が出せることを確かめる。
+  const produced = new Set([...GUARD_STOP_CASES.map(entry => entry[2]),
+    ...PROJECT_ROOT_CASES.map(() => GUARD_UNVERIFIED.projectRoot), GUARD_UNVERIFIED.projectConfig]);
   assert.deepEqual([...produced].sort(), Object.values(GUARD_UNVERIFIED).sort());
   assert.deepEqual(Object.values(GUARD_UNVERIFIED).sort(),
-    ['exit', 'feature-enabled', 'mcp-present', 'output-format', 'timeout', 'too-large']);
+    ['exit', 'feature-enabled', 'mcp-present', 'output-format', 'project-config', 'project-root', 'timeout', 'too-large']);
 });
 
 test('the guard check reads standard output up to exactly the limit', async t => {
@@ -875,6 +969,325 @@ test('the guard check refuses relative paths and a missing environment before st
     }), TypeError);
   }
   assert.equal(h.isolation.spawnCalls.length, 0);
+});
+
+// === 型2 の設定のフォルダの点検 ====================================================================
+//
+// 根の目印・`.codex`・口座の config・プロジェクトの層の外の置き場は、どれも隔離の一時フォルダの中に作る。
+// 点検のファイルの道具は、一時フォルダの外のパスを本物へ渡さない（confinedProjectFs）。
+
+const P = GUARD_UNVERIFIED;
+
+test('the interactive form stops with project-config before starting any check when the working folder has .codex', async t => {
+  const h = await guardHarness(t);
+  await mkdir(join(h.realWorkDir, '.codex'), { mode: 0o700 });
+  for (const caller of [LAUNCH_CALLER.exec, LAUNCH_CALLER.shim]) {
+    assertUnverified(await h.run([], { caller }), P.projectConfig);
+  }
+  assert.equal(h.isolation.spawnCalls.length, 0, 'no codex is started for the folder check or the two checks');
+  assert.deepEqual(h.outside, [], 'the folder check stays inside the test folder');
+});
+
+test('the exec and version forms do not look for .codex and still run the two checks', async t => {
+  const h = await guardHarness(t);
+  await mkdir(join(h.realWorkDir, '.codex'), { mode: 0o700 });
+  assert.equal((await h.run(REVIEW_ARGS)).ok, true);
+  assert.equal((await h.run(['--version'])).ok, true);
+  assert.equal(h.isolation.spawnCalls.length, 4, 'two checks for each of the two forms, as before');
+});
+
+test('a .codex in any folder from the working folder up to the project root stops the interactive form', async t => {
+  const h = await projectHarness(t);
+  const cwd = await h.dir(h.project, 'a', 'b');
+  const outside = [];
+  assert.equal(h.check(cwd, { outside }), null, 'no .codex anywhere: the folder check passes');
+  assert.deepEqual(outside, [], 'the root search stops at the marker inside the test folder');
+  for (const at of [cwd, join(h.project, 'a'), h.project]) {
+    await mkdir(join(at, '.codex'), { mode: 0o700 });
+    assert.equal(h.check(cwd), P.projectConfig, `.codex at ${relative(h.root, at)}`);
+    await rm(join(at, '.codex'), { recursive: true });
+  }
+});
+
+test('.codex counts by presence only: a file, a link to a folder, or a broken link', async t => {
+  const h = await projectHarness(t);
+  const cwd = await h.dir(h.project, 'a');
+  const target = await h.dir(h.root, 'zz-link-target');
+  const shapes = [
+    ['a file', path => writeFile(path, '')],
+    ['a link to a folder', path => symlink(target, path)],
+    ['a broken link', path => symlink(join(h.root, 'zz-absent'), path)],
+  ];
+  for (const [name, make] of shapes) {
+    await make(join(cwd, '.codex'));
+    const reads = [];
+    assert.equal(h.check(cwd, { reads }), P.projectConfig, name);
+    assert.ok(reads.every(path => !path.includes('.codex')), 'nothing under .codex is read');
+    await rm(join(cwd, '.codex'), { recursive: true, force: true });
+  }
+});
+
+test('a trusted folder and a .codex that only turns on connectors still stop the interactive form', async t => {
+  const h = await projectHarness(t);
+  const cwd = await h.dir(h.project, 'a');
+  await mkdir(join(cwd, '.codex'), { mode: 0o700 });
+  await writeFile(join(cwd, '.codex', 'config.toml'), '[features]\nconnectors = true\n');
+  await h.setAccountConfig(`${ACCOUNT_CONFIG_TOML}\n[projects."${cwd}"]\ntrust_level = "trusted"\n`);
+  const reads = [];
+  assert.equal(h.check(cwd, { reads }), P.projectConfig);
+  assert.ok(reads.every(path => !path.includes('.codex')), 'the contents of .codex are not read');
+});
+
+test('a .codex above the project root is not looked at', async t => {
+  const h = await projectHarness(t);
+  const cwd = await h.dir(h.project, 'a');
+  await mkdir(join(h.root, '.codex'), { mode: 0o700 });
+  assert.equal(h.check(cwd), null);
+});
+
+test('without any root marker only the working folder is looked at', async t => {
+  const h = await projectHarness(t);
+  const free = await h.dir(h.root, 'zz-free');
+  const cwd = await h.dir(free, 'a');
+  await mkdir(join(free, '.codex'), { mode: 0o700 });
+  const outside = [];
+  assert.equal(h.check(cwd, { outside }), null, 'the parent .codex is outside the working folder that is the root');
+  assert.ok(outside.length > 0, 'the search went up past the test folder (answered as absent by the test tool)');
+  await mkdir(join(cwd, '.codex'), { mode: 0o700 });
+  assert.equal(h.check(cwd), P.projectConfig);
+});
+
+test('a .git folder without HEAD is not a root marker, so the search goes on to the next marker', async t => {
+  const h = await projectHarness(t);
+  const cwd = await h.dir(h.project, 'a', 'b');
+  await mkdir(join(h.project, 'a', '.git'), { mode: 0o700 });
+  await mkdir(join(h.project, '.codex'), { mode: 0o700 });
+  assert.equal(h.check(cwd), P.projectConfig, 'the root is the project, so its .codex is looked at');
+  await writeFile(join(h.project, 'a', '.git', 'HEAD'), 'ref: refs/heads/zz\n');
+  assert.equal(h.check(cwd), null, 'with HEAD the inner .git is the root and the project .codex is above it');
+});
+
+test('a root marker that is a link to an existing folder counts', async t => {
+  const h = await projectHarness(t);
+  const inner = await h.dir(h.project, 'a');
+  const cwd = await h.dir(inner, 'b');
+  const gitTarget = await h.dir(h.root, 'zz-git-target');
+  await writeFile(join(gitTarget, 'HEAD'), 'ref: refs/heads/zz\n');
+  await symlink(gitTarget, join(inner, '.git'));
+  await mkdir(join(h.project, '.codex'), { mode: 0o700 });
+  assert.equal(h.check(cwd), null, 'the linked .git makes the inner folder the root');
+});
+
+test('project_root_markers in the account config replaces the default marker', async t => {
+  const h = await projectHarness(t);
+  const top = await h.dir(h.root, 'zz-custom');
+  const inner = await h.dir(top, 'a');
+  const cwd = await h.dir(inner, 'b');
+  await writeFile(join(top, 'zz-marker'), '');
+  await gitRootMarker(inner);
+  await mkdir(join(top, '.codex'), { mode: 0o700 });
+  assert.equal(h.check(cwd), null, 'with the default marker the root is the inner folder');
+  await h.setAccountConfig(`project_root_markers = ["zz-marker"]\n${ACCOUNT_CONFIG_TOML}`);
+  assert.equal(h.check(cwd), P.projectConfig, 'with the configured marker the root is the top folder');
+});
+
+test('the root markers are read only from one plain line before the first table', () => {
+  assert.deepEqual([...readProjectRootMarkers(null)], [...DEFAULT_PROJECT_ROOT_MARKERS]);
+  assert.deepEqual([...readProjectRootMarkers(ACCOUNT_CONFIG_TOML)], ['.git']);
+  assert.deepEqual([...readProjectRootMarkers('project_root_markers = [".git", \'.hg\'] # zz\n[features]\n')], ['.git', '.hg']);
+  for (const text of [
+    'project_root_markers = [".git"]\nproject_root_markers = [".hg"]\n',
+    '[features]\nproject_root_markers = [".git"]\n',
+    'project_root_markers = []\n', 'project_root_markers = ".git"\n', 'project_root_markers = 1\n',
+    'project_root_markers = [\n  ".git",\n]\n', 'project_root_markers = [".git", 1]\n', 'project_root_markers = [".git",]\n',
+    '"project_root_markers" = [".git"]\n', '# project_root_markers = [".git"]\n', 'project_root_markers = ["a/b"]\n',
+    'project_root_markers = [".."]\n', 'project_root_markers = [""]\n', 'project_root_markers = ["a\\"b"]\n',
+    '"project_root_\\u006darkers" = ["zz"]\n', '"pro\\u0066ile" = "zz"\n', 'zz = "a\\\\b"\n',
+    'zz = """\nproject_root_markers = [".git"]\n"""\n', "zz = '''\nproject_root_markers = [\".git\"]\n'''\n",
+    // 複数行に分けた inline table（TOML 1.1）の中の行は、一番上の階層の行と見分けられない。
+    'zz = {\n  project_root_markers = ["zz-marker"]\n}\n', 'zz = [\n  {\n    project_root_markers = ["zz-marker"]\n  },\n]\n',
+    'zz = { zz-a = "}",\nproject_root_markers = ["zz-marker"]\n}\n',
+    // ほかの、決まった単純な形でない行：複数行の配列・日時・inline table の末尾のカンマ・制御文字・BOM。
+    'zz = [\n  1,\n]\n', 'zz = 1979-05-27T07:32:00Z\n', 'zz = { zz-a = 1, }\n', 'zz = 1 # \x01\n', '﻿zz = 1\n',
+  ]) {
+    assert.equal(readProjectRootMarkers(text), null, `undetermined: ${JSON.stringify(text)}`);
+  }
+});
+
+test('the plain lines that login and Codex write keep the root markers readable', async t => {
+  // login が書く全文と、作業フォルダを信頼したときに Codex が書く projects の項（引用した道の付いた表の見出し）。
+  const trusted = `${ACCOUNT_CONFIG_TOML}\n[projects."/zz/a b/c#d"]\ntrust_level = "trusted"\n`;
+  assert.deepEqual([...readProjectRootMarkers(trusted)], ['.git']);
+  assert.deepEqual([...readProjectRootMarkers(trusted.replaceAll('\n', '\r\n'))], ['.git']);
+  assert.deepEqual([...readProjectRootMarkers(`project_root_markers = ["zz-marker"]\n${trusted}`)], ['zz-marker']);
+  // その行で閉じる配列と inline table、数・真偽・文字列は通す。
+  const oneLine = 'zz-a = [1, "}", { zz-b = [true, 0x1F, -1.5e3] }, ]\nzz-c = { "zz d" = \'{\' } # {\n';
+  assert.deepEqual([...readProjectRootMarkers(oneLine)], ['.git']);
+  const h = await projectHarness(t);
+  const cwd = await h.dir(h.project, 'a');
+  await h.setAccountConfig(`${ACCOUNT_CONFIG_TOML}\n[projects."${cwd}"]\ntrust_level = "trusted"\n`);
+  assert.equal(h.check(cwd), null, 'a trusted folder without .codex passes the folder check');
+});
+
+test('launch arguments that can change the project root or the profile are found', () => {
+  assert.equal(launchArgsChangeProjectRoot([...FIRST_LAYER_ARGS, NO_DAEMON_ARG]), false);
+  for (const words of [
+    ['--profile', 'zz'], ['--profile=zz'], ['-p', 'zz'], ['-pzz'],
+    ['-c', 'project_root_markers=["zz"]'], ['--config', 'project_root_markers=[]'],
+    ['-c=project_root_markers=[]'], ['--config=project_root_markers=["zz"]'],
+  ]) {
+    assert.equal(launchArgsChangeProjectRoot(words), true, JSON.stringify(words));
+  }
+});
+
+// [名前, 作る（h, cwd）, 点検に渡す追加の指定（h）]
+const PROJECT_ROOT_CASES = Object.freeze([
+  ['the account config names project_root_markers twice',
+    h => h.setAccountConfig(`project_root_markers = [".git"]\nproject_root_markers = [".hg"]\n${ACCOUNT_CONFIG_TOML}`)],
+  ['the account config has project_root_markers inside a table',
+    h => h.setAccountConfig(`${ACCOUNT_CONFIG_TOML}project_root_markers = [".git"]\n`)],
+  ['the account config has an empty marker list', h => h.setAccountConfig(`project_root_markers = []\n${ACCOUNT_CONFIG_TOML}`)],
+  ['the account config has a marker value that is not a list',
+    h => h.setAccountConfig(`project_root_markers = ".git"\n${ACCOUNT_CONFIG_TOML}`)],
+  ['the account config has a profile key', h => h.setAccountConfig(`profile = "zz"\n${ACCOUNT_CONFIG_TOML}`)],
+  ['the account config has a profiles table', h => h.setAccountConfig(`${ACCOUNT_CONFIG_TOML}\n[profiles.zz]\nmodel = "zz"\n`)],
+  ['the account config has a quoted profiles key', h => h.setAccountConfig(`"profiles".zz.model = "zz"\n${ACCOUNT_CONFIG_TOML}`)],
+  ['the account config writes the project_root_markers key with a string escape',
+    h => h.setAccountConfig(`"project_root_\\u006darkers" = ["zz-marker"]\n${ACCOUNT_CONFIG_TOML}`)],
+  ['the account config writes the profile key with a string escape', h => h.setAccountConfig(`"pro\\u0066ile" = "zz"\n${ACCOUNT_CONFIG_TOML}`)],
+  ['the account config has a project_root_markers line only inside a multi-line string',
+    h => h.setAccountConfig(`zz = """\nproject_root_markers = ["zz-marker"]\n"""\n${ACCOUNT_CONFIG_TOML}`)],
+  ['the account config has a project_root_markers line only inside an inline table split over lines',
+    h => h.setAccountConfig(`zz = {\n  project_root_markers = ["zz-marker"]\n}\n${ACCOUNT_CONFIG_TOML}`)],
+  ['the account config has a project_root_markers line only inside an inline table split over lines in an array',
+    h => h.setAccountConfig(`zz = [\n  {\n    project_root_markers = ["zz-marker"]\n  },\n]\n${ACCOUNT_CONFIG_TOML}`)],
+  ['the account config splits an inline table after a string that holds a closing brace',
+    h => h.setAccountConfig(`zz = { zz-a = "}",\nproject_root_markers = ["zz-marker"]\n}\n${ACCOUNT_CONFIG_TOML}`)],
+  ['the account config has an array split over lines', h => h.setAccountConfig(`zz = [\n  1,\n]\n${ACCOUNT_CONFIG_TOML}`)],
+  ['the account config has a date-time value', h => h.setAccountConfig(`zz = 1979-05-27T07:32:00Z\n${ACCOUNT_CONFIG_TOML}`)],
+  ['the account config is larger than the limit',
+    h => h.setAccountConfig(`${ACCOUNT_CONFIG_TOML}#${'z'.repeat(PROJECT_CHECK_MAX_FILE_BYTES)}\n`)],
+  ['the account config is a folder', async h => {
+    await rm(join(h.codexHome, 'config.toml'));
+    await mkdir(join(h.codexHome, 'config.toml'));
+  }],
+  ['the account config cannot be read', () => {}, h => ({ fail: { stat: path => (path === join(h.codexHome, 'config.toml') ? 'EACCES' : null) } })],
+  ['the cloud config cache is in the account folder', h => writeFile(join(h.codexHome, CLOUD_CONFIG_CACHE_FILE), '')],
+  ['the system config sets project_root_markers', async h => {
+    await mkdir(dirname(h.paths.systemConfig), { recursive: true });
+    await writeFile(h.paths.systemConfig, 'project_root_markers = [".git"]\n');
+  }],
+  ['the managed config sets project_root_markers', async h => {
+    await mkdir(dirname(h.paths.managedConfig), { recursive: true });
+    await writeFile(h.paths.managedConfig, 'project_root_markers = [".git"]\n');
+  }],
+  ...['systemConfig', 'managedConfig'].flatMap(layer => [
+    [`the ${layer} file writes the project_root_markers key with a string escape`, async h => {
+      await mkdir(dirname(h.paths[layer]), { recursive: true });
+      await writeFile(h.paths[layer], '"project_root_\\u006darkers" = ["zz-marker"]\n');
+    }],
+    [`the ${layer} file has a project_root_markers line only inside a multi-line string`, async h => {
+      await mkdir(dirname(h.paths[layer]), { recursive: true });
+      await writeFile(h.paths[layer], "zz = '''\nproject_root_markers = [\"zz-marker\"]\n'''\n");
+    }],
+  ]),
+  ['the system config cannot be read', () => {}, h => ({ fail: { stat: path => (path === h.paths.systemConfig ? 'EACCES' : null) } })],
+  ['the managed preferences file is in the managed preferences folder', async h => {
+    await mkdir(h.paths.managedPreferencesDir, { recursive: true });
+    await writeFile(join(h.paths.managedPreferencesDir, MANAGED_PREFERENCES_FILE), '');
+  }],
+  ['the managed preferences file is in a user folder under it', async h => {
+    await mkdir(join(h.paths.managedPreferencesDir, 'zz-user'), { recursive: true });
+    await writeFile(join(h.paths.managedPreferencesDir, 'zz-user', MANAGED_PREFERENCES_FILE), '');
+  }],
+  ['the managed preferences folder cannot be listed', () => {},
+    h => ({ fail: { readdir: path => (path === h.paths.managedPreferencesDir ? 'EACCES' : null) } })],
+  ['a root marker is a broken link', (h, cwd) => symlink(join(h.root, 'zz-absent'), join(cwd, '.git'))],
+  ['HEAD of a .git folder cannot be looked at', () => {},
+    h => ({ fail: { stat: path => (path === join(h.project, '.git', 'HEAD') ? 'EACCES' : null) } })],
+  ['looking for .codex fails with a permission error', () => {},
+    h => ({ fail: { lstat: path => (path.endsWith('/.codex') ? 'EACCES' : null) } })],
+  ['the launch arguments name a profile', () => {}, () => ({ args: [...FIRST_LAYER_ARGS, NO_DAEMON_ARG, '--profile', 'zz'] })],
+  ['the launch arguments set project_root_markers', () => {},
+    () => ({ args: [...FIRST_LAYER_ARGS, NO_DAEMON_ARG, '-c', 'project_root_markers=["zz"]'] })],
+]);
+
+for (const [name, make, options = () => ({})] of PROJECT_ROOT_CASES) {
+  test(`the interactive folder check stops with project-root when ${name}`, async t => {
+    const h = await projectHarness(t);
+    const cwd = await h.dir(h.project, 'a');
+    assert.equal(h.check(cwd), null, 'the same folder passes before the change');
+    await make(h, cwd);
+    const reads = [];
+    assert.equal(h.check(cwd, { reads, ...options(h) }), P.projectRoot);
+    assert.ok(reads.every(path => !path.endsWith(CLOUD_CONFIG_CACHE_FILE) && !path.endsWith(MANAGED_PREFERENCES_FILE)),
+      'the cloud cache and the managed preferences file are looked at by presence only');
+  });
+}
+
+test('the folder check turns any unexpected error into project-root and never throws', async t => {
+  const h = await projectHarness(t);
+  const cwd = await h.dir(h.project, 'a');
+  assert.equal(checkProjectFolders({ cwd, codexHome: h.codexHome, fs: {}, paths: h.paths }), P.projectRoot);
+  assert.equal(checkProjectFolders({ cwd: 'zz-relative', codexHome: h.codexHome, paths: h.paths }), P.projectRoot);
+  assert.equal(checkProjectFolders({ cwd, codexHome: h.codexHome, launchArgs: 'zz', paths: h.paths }), P.projectRoot);
+  assert.deepEqual(Object.keys(PROJECT_LAYER_PATHS), ['systemConfig', 'managedConfig', 'managedPreferencesDir']);
+});
+
+test('in a linked worktree the .git file folder is the root and the main checkout side is also looked at', async t => {
+  const h = await projectHarness(t);
+  const w = await linkedWorktree(h.root);
+  const cwd = join(w.wt, 'sub');
+  await mkdir(join(w.outer, '.codex'), { mode: 0o700 });
+  const outside = [];
+  assert.equal(h.check(cwd, { outside }), null, 'the outer .codex is above the worktree root; the main side has none');
+  assert.deepEqual(outside, []);
+  for (const at of [join(w.main, 'sub'), w.main]) {
+    await mkdir(join(at, '.codex'), { recursive: true, mode: 0o700 });
+    assert.equal(h.check(cwd), P.projectConfig, `main side .codex at ${relative(h.root, at)}`);
+    await rm(join(at, '.codex'), { recursive: true });
+  }
+  await mkdir(join(w.main, 'sub', 'deeper', '.codex'), { recursive: true });
+  assert.equal(h.check(cwd), null, 'a main side folder below the working folder position is not looked at');
+});
+
+// [名前, 作業ツリーを壊す（w, h）, 点検に渡す追加の指定（w）]
+const WORKTREE_UNDETERMINED_CASES = Object.freeze([
+  ['the .git file cannot be read', () => {}, w => ({ fail: { readFile: path => (path === join(w.wt, '.git') ? 'EACCES' : null) } })],
+  ['the .git file has no gitdir line', w => writeFile(join(w.wt, '.git'), `zz ${w.gitDir}\n`)],
+  ['the gitdir points to a missing folder', w => writeFile(join(w.wt, '.git'), `gitdir: ${join(w.main, '.git', 'worktrees', 'zz-absent')}\n`)],
+  ['the worktree is not registered back to this folder', w => writeFile(join(w.gitDir, 'gitdir'), `${join(w.outer, '.git')}\n`)],
+  ['the commondir file is missing', w => rm(join(w.gitDir, 'commondir'))],
+  ['the commondir points somewhere else', w => writeFile(join(w.gitDir, 'commondir'), '../../..\n')],
+  ['the main checkout found from the gitdir path does not have that common folder', async (w, h) => {
+    const alias = join(h.root, 'zz-alias');
+    await symlink(join(w.main, '.git'), alias);
+    await writeFile(join(w.wt, '.git'), `gitdir: ${join(alias, 'worktrees', 'zz-wt')}\n`);
+  }],
+  ['the .git of the worktree is a link to a file', async w => {
+    await writeFile(join(w.wt, 'zz-dot-git'), `gitdir: ${w.gitDir}\n`);
+    await rm(join(w.wt, '.git'));
+    await symlink(join(w.wt, 'zz-dot-git'), join(w.wt, '.git'));
+  }],
+]);
+
+for (const [name, breakIt, options = () => ({})] of WORKTREE_UNDETERMINED_CASES) {
+  test(`in a linked worktree the folder check stops with project-root when ${name}`, async t => {
+    const h = await projectHarness(t);
+    const w = await linkedWorktree(h.root);
+    const cwd = join(w.wt, 'sub');
+    assert.equal(h.check(cwd), null, 'the worktree passes before the change');
+    await breakIt(w, h);
+    assert.equal(h.check(cwd, options(w)), P.projectRoot);
+  });
+}
+
+test('the interactive form goes on to the two checks when no .codex is found', async t => {
+  const h = await guardHarness(t);
+  const result = await h.run([]);
+  assert.equal(result.ok, true);
+  assert.equal(h.isolation.spawnCalls.length, 2);
+  assert.deepEqual(h.outside, []);
 });
 
 // ---------------------------------------------------------------------------------------------

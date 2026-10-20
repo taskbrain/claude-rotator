@@ -249,6 +249,10 @@ async function fixture(t, {
     await writeFile(join(day, `rollout-2026-01-02T03-04-05-${account.label}.jsonl`), '{"zz":"rollout"}\n', { mode: 0o600 });
   }
 
+  // 型2 の設定のフォルダの点検の根の検索を、作業フォルダ（隔離の一時フォルダの根）で止める自前の根の目印。
+  await mkdir(join(root, '.git'), { recursive: true, mode: 0o700 });
+  await writeFile(join(root, '.git', 'HEAD'), 'ref: refs/heads/zz\n', { mode: 0o600 });
+
   // 偽の ~/.codex（目印の入った偽物。開かれてはならない）。
   const homeCodex = join(home, '.codex');
   await mkdir(homeCodex, { recursive: true, mode: 0o700 });
@@ -311,6 +315,13 @@ async function fixture(t, {
     request: isolation.request,
     now: () => FIXED_NOW_MS,
     processCwd: () => root,
+    // プロジェクトの層の外の置き場（システム・管理の層の config・MDM の設定のファイル）は、一時フォルダの中の
+    // 在らないパスへ向ける。
+    projectLayerPaths: {
+      systemConfig: join(root, 'zz-etc', 'config.toml'),
+      managedConfig: join(root, 'zz-etc', 'managed_config.toml'),
+      managedPreferencesDir: join(root, 'zz-managed-preferences'),
+    },
     signals: { on: (signal, handler) => signals.on(signal, handler), off: (signal, handler) => signals.off(signal, handler) },
     raiseSignal: signal => raised.push(signal),
   };
@@ -636,6 +647,19 @@ test('adds --no-daemon right after the first layer only for the interactive form
   const result = await f.run(['--account', 'alpha'], { fetchImpl: fetch.impl });
   assert.equal(result.code, 0);
   assert.deepEqual(f.launches[0].args, [...FIRST_LAYER_ARGS, NO_DAEMON_ARG]);
+});
+
+test('the interactive form stops with guard unverified (project-config) in a folder with .codex and starts only the version read', async t => {
+  const f = await fixture(t);
+  await mkdir(join(f.root, '.codex'), { mode: 0o700 });
+  const fetch = fakeFetch(() => jsonResponse(usageBody()));
+  const result = await f.run(['--account', 'alpha'], { fetchImpl: fetch.impl });
+  assert.equal(result.code, 1);
+  assert.equal(launchCount(f), 0);
+  assert.deepEqual(result.lines, [formatVerdictLine('alpha', 'ok'), 'guard unverified (project-config)'],
+    'the verdict line is printed before the folder check');
+  assert.deepEqual(f.spawnCalls.map(call => call.kind), ['version'], 'no check and no launch after the version read');
+  assertNoLeaks(result, ['alpha']);
 });
 
 test('does not launch and says guard unverified when the guard check sees apps enabled', async t => {
