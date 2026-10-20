@@ -14,10 +14,10 @@
 
 ### Codex アカウントの切り替え（#68–#71）
 
-- `codex-rotator` コマンドを追加しました。アカウントごとの `CODEX_HOME` を使い、`login`、`accounts`、`status`、`exec`、`daemon` で登録・状態確認・選択・起動を行います。利用量の取得、認証状態の追跡、利用可能な口座の選択を Claude 用プロキシとは別に管理します。
+- `codex-rotator` コマンドを追加しました。アカウントごとの `CODEX_HOME` を使い、`login`、`accounts`、`status`、`exec` で登録・状態確認・選択・起動を行います。利用量の取得、認証状態の追跡、利用可能な口座の選択を Claude 用プロキシとは別に管理します。
 - ローカル daemon と、制御トークンで保護した再読込を追加しました。`status --json` と節を指定した状態出力を用意しました。`claude-rotator status` / `monitor` の Codex 節も子プロセス経由で取得します。
 - 設定と口座フォルダの検証、秘密情報の伏字、設定が古い場合の起動停止を追加しました。`CODEX_API_KEY` / `CODEX_ACCESS_TOKEN` が設定されている場合は `exec` を拒否します。実行する Codex の場所を毎回解決し、その版から User-Agent を組み立てます。
-- 口座フォルダからの起動には、設定・引数・環境変数の制限があります。既存の Codex 環境全体を監視する仕組みではありません。導入・再ログイン・解除の手順と制約は [README の Codex 節](README.md#codex-の口座の切り替えcodex-rotator) を参照してください。
+- 口座フォルダからの起動には、設定・引数・環境変数の制限があります。既存の Codex 環境全体を監視する仕組みではありません。導入・再ログイン・解除の手順と制約は [README の Codex 節](https://github.com/taskbrain/claude-rotator/blob/v0.5.0/README.md#codex-の口座の切り替えcodex-rotator) を参照してください。
 
 ### セッション固定と切り替え（#72、#74–#78）
 
@@ -61,6 +61,6 @@ npm install -g .
 claude-rotator install
 ```
 
-Claude 用の既存設定は引き続き使えます。Codex の登録・daemon 起動や通知の有効化は任意です。使用量イベントの保存先・保持方式と Node.js の要件は、上記の変更点を確認してください。
+Claude 用の既存設定は引き続き使えます。Codex の登録・利用や通知の有効化は任意です。使用量イベントの保存先・保持方式と Node.js の要件は、上記の変更点を確認してください。
 
 過去の版のリリースノートは [GitHub Releases](https://github.com/taskbrain/claude-rotator/releases) を参照してください。
