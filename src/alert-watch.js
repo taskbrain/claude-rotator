@@ -493,7 +493,8 @@ export function createAlertWatch({
     owner[kind] = null;
     pending = pending.filter(item => !(item.owner === owner && item.kind === kind && item.type !== 'recovery'));
     if (alert.phase !== 'sent' || alert.lost || silent) return;
-    pending.push({ type: 'recovery', kind, owner });
+    // The alert goes with it: its first message may still be waiting in the queue.
+    pending.push({ type: 'recovery', kind, owner, alert });
     scheduleFlush();
   }
 
@@ -730,21 +731,39 @@ export function createAlertWatch({
     addRelogin(ids('reminder', 'relogin'), 'Still unresolved: ');
     addFailing(ids('reminder', 'failing'), 'Still unresolved: ');
     if (ids('reminder', 'dispersion').length > 0) addDispersion('Still unresolved: ');
-    const recovered = unique([...ids('recovery', 'relogin'), ...ids('recovery', 'failing')]);
+    // The recovery lines are put together when the message goes out (messageText).
+    const recoveries = kind => items.filter(item => item.type === 'recovery' && item.kind === kind);
+    const recovered = [...recoveries('relogin'), ...recoveries('failing')]
+      .map(item => ({ id: item.owner.id, alert: item.alert }));
+    const routingAlerts = recoveries('dispersion').map(item => item.alert);
+    const routing = routingAlerts.length > 0
+      ? { alerts: routingAlerts, line: `claude-rotator: routing is back to normal (${percent(dispersionOwner.rate)}%).` }
+      : null;
+    return { slack, mac, recovered, routing, notices: noticeTexts, stages };
+  }
+
+  // The text of a queued message, as it goes out. By then every earlier message
+  // about an alert has been delivered or dropped from a full queue, so a recovery
+  // line is kept only for an alert a message reached the sender about. Null when
+  // no line is left.
+  function messageText(message) {
+    const slack = [...message.slack];
+    const mac = [...message.mac];
+    const recovered = unique(message.recovered.filter(entry => entry.alert.delivered).map(entry => entry.id));
     if (recovered.length > 0) {
       slack.push(`claude-rotator: working again: ${shortLabels(recovered)}.`);
       mac.push(`claude-rotator: working again: ${fullLabels(recovered)}.`);
     }
-    if (ids('recovery', 'dispersion').length > 0) {
-      const line = `claude-rotator: routing is back to normal (${percent(dispersionOwner.rate)}%).`;
+    if (message.routing && message.routing.alerts.some(alert => alert.delivered)) {
+      slack.push(message.routing.line);
+      mac.push(message.routing.line);
+    }
+    for (const line of message.notices) {
       slack.push(line);
       mac.push(line);
     }
-    for (const line of noticeTexts) {
-      slack.push(line);
-      mac.push(line);
-    }
-    return { slack: capText(slack.join('\n')), mac: capText(mac.join('\n')), stages };
+    if (slack.length === 0 && mac.length === 0) return null;
+    return { slack: capText(slack.join('\n')), mac: capText(mac.join('\n')) };
   }
 
   // ---- delivery ----
@@ -781,13 +800,16 @@ export function createAlertWatch({
       alert.delivered = true;
       alert.lost = false;
     }
+    // Only recovery lines whose alert nobody was told about: nothing to send.
+    const text = messageText(message);
+    if (!text) return;
     const tasks = [];
     if (current.macNotification) {
-      tasks.push(callSender('notifyMac', { title: MAC_TITLE, body: message.mac })
+      tasks.push(callSender('notifyMac', { title: MAC_TITLE, body: text.mac })
         .then(out => guard(() => recordDelivery('mac', out))));
     }
     if (webhookTarget()) {
-      tasks.push(callSender('postWebhook', { urlFile: current.webhookUrlFile, text: message.slack })
+      tasks.push(callSender('postWebhook', { urlFile: current.webhookUrlFile, text: text.slack })
         .then(out => guard(() => recordDelivery('webhook', out))));
     }
     await Promise.all(tasks);

@@ -1490,7 +1490,7 @@ describe('W8 queue limit', () => {
       }
     };
     const macText = () => fake.calls.notifyMac.map(call => call.body).join('\n');
-    return { watch, drain, macText };
+    return { watch, clock, fake, drain, macText };
   }
 
   it('sends no recovery line for an alert whose first message was dropped from a full queue', async () => {
@@ -1509,6 +1509,106 @@ describe('W8 queue limit', () => {
     await drain();
     assert.equal(watch.statusSection().queued, 0);
     assert.ok(macText().includes('working again: acct05-example'));
+    watch.stop();
+  });
+
+  it('sends no recovery line when the first message is dropped after the alert has cleared', async () => {
+    const { watch, clock, fake, drain, macText } = await fillQueueAndDropOne();
+    // acct02's message is the oldest one waiting. The recovery line goes into a
+    // new message, which overflows the full queue and drops acct02's message.
+    watch.noteRefreshSucceeded('acct02-example');
+    clock.advance(MINUTE + 1000);
+    await settle();
+    assert.equal(watch.statusSection().dropped, 2);
+    await drain();
+    assert.equal(watch.statusSection().queued, 0);
+    assert.ok(macText().includes('Run: claude-rotator login --id acct21-example'), 'the queue was delivered');
+    assert.ok(!macText().includes('Run: claude-rotator login --id acct02-example'), 'the first message was dropped');
+    assert.ok(!macText().includes('working again: acct02-example'));
+    assert.ok(!texts(fake).some(text => text.includes('working again')));
+    // acct00, then acct03 to acct21: a message left with no line is not sent.
+    assert.equal(fake.calls.notifyMac.length, 20);
+    assert.equal(fake.calls.postWebhook.length, 20);
+    watch.stop();
+  });
+
+  it('still sends the recovery line when it was queued behind a first message that was then delivered', async () => {
+    const { watch, clock, drain, macText } = await fillQueueAndDropOne();
+    // acct05's message is still waiting. The recovery line goes into a new
+    // message behind it, and the overflow drops acct02's message instead.
+    watch.noteRefreshSucceeded('acct05-example');
+    clock.advance(MINUTE + 1000);
+    await settle();
+    assert.equal(watch.statusSection().dropped, 2);
+    await drain();
+    assert.equal(watch.statusSection().queued, 0);
+    const text = macText();
+    const first = text.indexOf('Run: claude-rotator login --id acct05-example');
+    const recovery = text.indexOf('working again: acct05-example');
+    assert.ok(first >= 0, 'the first message was delivered');
+    assert.ok(recovery > first, 'the recovery line came after it');
+    watch.stop();
+  });
+
+  it('sends no routing line when the dispersion message is dropped after dispersion has cleared', async () => {
+    const ids = Array.from({ length: 20 }, (_, index) => `acct${String(index).padStart(2, '0')}-example`);
+    let release = null;
+    let first = true;
+    const { watch, clock, fake } = setup({
+      accounts: ids.map(id => ({ id, name: id })),
+      sender: {
+        webhook: () => {
+          if (!first) return { result: 'ok', reason: null };
+          first = false;
+          return new Promise(resolve => {
+            release = () => resolve({ result: 'ok', reason: null });
+          });
+        },
+      },
+    });
+    let snapshot = null;
+    watch.setDispersionSource(() => snapshot);
+    watch.start();
+    // acct00's message hangs on the webhook.
+    watch.noteRefreshFailed('acct00-example', 'NATIVE_REFRESH_REAUTH_REQUIRED');
+    clock.advance(MINUTE + 1000);
+    await settle();
+    // The dispersion message is the oldest one waiting; acct01 to acct19 queue behind it.
+    snapshot = { windowMs: HOUR, pairs: 300, changes: 6, rate: 0.02 };
+    clock.advance(2 * MINUTE);
+    await settle();
+    assert.equal(watch.statusSection().active.dispersion, true);
+    assert.equal(watch.statusSection().queued, 1);
+    snapshot = null;
+    for (const id of ids.slice(1)) {
+      watch.noteRefreshFailed(id, 'NATIVE_REFRESH_REAUTH_REQUIRED');
+      clock.advance(MINUTE + 1000);
+      await settle();
+    }
+    assert.equal(watch.statusSection().queued, ALERT_MAX_QUEUED_MESSAGES);
+    assert.equal(watch.statusSection().dropped, 0);
+    // Dispersion clears. Its recovery line goes into a new message, which
+    // overflows the full queue and drops the dispersion message.
+    snapshot = { windowMs: HOUR, pairs: 1000, changes: 9, rate: 0.009 };
+    clock.advance(2 * MINUTE + 1000);
+    await settle();
+    assert.equal(watch.statusSection().active.dispersion, false);
+    assert.equal(watch.statusSection().dropped, 1);
+    release();
+    for (let i = 0; i < 3; i += 1) {
+      await settle();
+      clock.advance(MINUTE + 1000);
+      await settle();
+    }
+    assert.equal(watch.statusSection().queued, 0);
+    const macText = fake.calls.notifyMac.map(call => call.body).join('\n');
+    assert.ok(macText.includes('Run: claude-rotator login --id acct19-example'), 'the queue was delivered');
+    assert.ok(!macText.includes('of follow-up requests'), 'the dispersion message was dropped');
+    assert.ok(!macText.includes('routing is back to normal'));
+    assert.ok(!texts(fake).some(text => text.includes('routing is back to normal')));
+    // acct00 to acct19: a message left with no line is not sent.
+    assert.equal(fake.calls.notifyMac.length, 20);
+    assert.equal(fake.calls.postWebhook.length, 20);
     watch.stop();
   });
 });
