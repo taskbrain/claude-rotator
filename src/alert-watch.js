@@ -21,8 +21,9 @@
 // - **State, not edges.** Whether an alert is active is decided from the current
 //   state, so repeated `markError` calls and a restart are harmless. A repeat of
 //   the same state sends nothing; a message is sent when an alert starts, every
-//   6 hours while it lasts ("Still unresolved"), and when it ends (only for
-//   alerts that were actually sent).
+//   6 hours while it lasts ("Still unresolved"; for dispersion only in a sweep
+//   that could judge it), and when it ends (only for alerts that were actually
+//   sent, not when every message about one was dropped from a full queue).
 // - **`markAuthenticated` is not a recovery.** While a refresh keeps failing,
 //   usage fetches on the old access token still succeed and clear the error
 //   reason; treating that as "working again" would flap. Recovery is a
@@ -175,6 +176,9 @@ export function createAlertWatch({
   const noticeKeys = new Set();
   const accounts = new Map();
   const dispersionOwner = { id: null, dispersion: null, rate: null, changes: 0, pairs: 0 };
+  // Whether the last sweep could judge dispersion. A reminder is only sent then,
+  // so it never repeats numbers from an earlier window.
+  let dispersionJudged = false;
   const queue = [];
   let delivering = false;
   let dropped = 0;
@@ -476,7 +480,9 @@ export function createAlertWatch({
 
   function raiseAlert(owner, kind) {
     if (owner[kind]) return;
-    owner[kind] = { phase: 'pending', lastNotifiedAt: null };
+    // `delivered`: a message about it reached the sender. `lost`: every message
+    // about it so far was dropped from a full queue before that.
+    owner[kind] = { phase: 'pending', lastNotifiedAt: null, delivered: false, lost: false };
     pending.push({ type: 'new', kind, owner });
     scheduleFlush();
   }
@@ -486,7 +492,7 @@ export function createAlertWatch({
     if (!alert) return;
     owner[kind] = null;
     pending = pending.filter(item => !(item.owner === owner && item.kind === kind && item.type !== 'recovery'));
-    if (alert.phase !== 'sent' || silent) return;
+    if (alert.phase !== 'sent' || alert.lost || silent) return;
     pending.push({ type: 'recovery', kind, owner });
     scheduleFlush();
   }
@@ -575,6 +581,7 @@ export function createAlertWatch({
   }
 
   function evaluateDispersion() {
+    dispersionJudged = false;
     if (!dispersionSource) return;
     let snapshot;
     try {
@@ -587,6 +594,7 @@ export function createAlertWatch({
     const rate = Number(snapshot?.rate);
     if (!Number.isFinite(pairs) || !Number.isFinite(changes) || !Number.isFinite(rate)) return;
     if (pairs < ALERT_DISPERSION_MIN_PAIRS) return;
+    dispersionJudged = true;
     Object.assign(dispersionOwner, { rate, changes, pairs });
     if (!dispersionOwner.dispersion && rate >= ALERT_DISPERSION_RAISE_RATE) raiseAlert(dispersionOwner, 'dispersion');
     else if (dispersionOwner.dispersion && rate < ALERT_DISPERSION_CLEAR_RATE) clearAlert(dispersionOwner, 'dispersion');
@@ -595,6 +603,7 @@ export function createAlertWatch({
   function evaluateReminders(t) {
     const owners = [...accounts.values(), dispersionOwner];
     for (const owner of owners) {
+      if (owner === dispersionOwner && !dispersionJudged) continue;
       for (const kind of ['relogin', 'failing', 'dispersion']) {
         const alert = owner[kind];
         if (alert?.phase !== 'sent' || t - alert.lastNotifiedAt < ALERT_REMINDER_INTERVAL_MS) continue;
@@ -642,7 +651,12 @@ export function createAlertWatch({
         alert.lastNotifiedAt = t;
       }
     }
-    enqueueMessage(composeMessage(live, t, noticeTexts));
+    // The alerts this message tells about, so a drop or a delivery can be noted on them.
+    const alerts = live
+      .filter(item => item.type === 'new' || item.type === 'reminder')
+      .map(item => item.owner[item.kind])
+      .filter(Boolean);
+    enqueueMessage({ ...composeMessage(live, t, noticeTexts), alerts });
   }
 
   // A stage waited up to a minute for its batch; check it again against the
@@ -738,8 +752,12 @@ export function createAlertWatch({
   function enqueueMessage(message) {
     queue.push(message);
     while (queue.length > ALERT_MAX_QUEUED_MESSAGES) {
-      queue.shift();
+      const lost = queue.shift();
       dropped += 1;
+      // An alert nobody was told about gets no recovery line either.
+      for (const alert of lost.alerts) {
+        if (!alert.delivered) alert.lost = true;
+      }
     }
     if (delivering) return;
     delivering = true;
@@ -759,6 +777,10 @@ export function createAlertWatch({
   }
 
   async function deliver(message) {
+    for (const alert of message.alerts) {
+      alert.delivered = true;
+      alert.lost = false;
+    }
     const tasks = [];
     if (current.macNotification) {
       tasks.push(callSender('notifyMac', { title: MAC_TITLE, body: message.mac })
