@@ -14,6 +14,7 @@ npm レジストリでは配布していません（`package.json` は `"private
 
 ## 目次
 
+- [v0.5.1 の主な更新](#v051-の主な更新)
 - [v0.5.0 の主な更新](#v050-の主な更新)
 - [v0.4.1 の主な更新](#v041-の主な更新)
 - [v0.4.0 の主な更新](#v040-の主な更新)
@@ -47,6 +48,12 @@ npm レジストリでは配布していません（`package.json` は `"private
 - [安全設計](#安全設計)
 - [開発](#開発)
 - [English](#english)
+
+## v0.5.1 の主な更新
+
+- **`codex-rotator exec` の引数の無い対話の前に、設定のフォルダを点検**（#89）: exec を実行したフォルダからプロジェクトの根までに `.codex` があるとき、または根を Codex と同じに決められないときは、`codex` を起動せずに止まります。非対話の `exec` と `--version` は変わりません。点検で守れない道は「[口座のフォルダで起動したときの守り](#口座のフォルダで起動したときの守り)」の「守りの対象外」に書いています。
+- **ログインの期限を段階で知らせ、`status` に表示**（#88）: `alerts` の期限の知らせを、7日前・3日前・1日前と期限切れのときの4段に替えました。`status` の各アカウントカードに `login:` の行を足しました。
+- 既知の制限を含む全変更は [v0.5.1 リリースノート](CHANGELOG.md#v051--2026-10-25) を参照してください。
 
 ## v0.5.0 の主な更新
 
@@ -979,6 +986,7 @@ usage: codex-rotator login --label <name> --stop <percent> --resume <percent> [-
 
 - 止まったときは 1（引数の誤りは 2）で終わり、理由の1行と `codex-rotator login: the codex-rotator config was not changed.` を出します。
 - シェルに `CODEX_HOME` を設定しているときは、その値が絶対パスで、`accountsDir`・口座のフォルダと重ならないことが必要です（重なると止まります）。
+- **codex-rotator の設定を書き換える操作は、1つずつ行ってください**（新しい login、login し直し、設定の手での編集）。新しい login は、始めに読んだ時点から設定の中身が変わっていれば、書かずに止まります（書く直前にも読み直します）。ただし、この版には書込みを順に並べる仕組み（ロック）が無く、読み直してから置き換えるまでのごく短い間に別の操作が書いた変更は、置き換えで消えることがあります。そのため、2つの login がほぼ同時に登録を書くと、片方の口座の登録が消えることがあります（その login も成功の行を出します）。終わった後は `codex-rotator accounts` で、登録したラベルが並んでいるかを確かめてください。並んでいなければ、その login で作ったフォルダは「[新規の login が止まったときに残るフォルダ](#新規の-login-が止まったときに残るフォルダ)」と同じに扱い、もう一度 login してください。
 - **登録済みの口座に、資格情報が読めないものがあると、新規の login は止まります**（新しい口座がそれと同じアカウントかを確かめられないため）。そのときは理由の行などの後に、次の2行が出ます（1行目の `<ラベル>` には、読めない口座のラベルが設定の並びの順に入ります）。
 
   ```text
@@ -1531,6 +1539,7 @@ This package is not published to the npm registry (`package.json` sets `"private
 
 ### Table of Contents
 
+- [What's New in v0.5.1](#whats-new-in-v051)
 - [What's New in v0.5.0](#whats-new-in-v050)
 - [What's New in v0.4.1](#whats-new-in-v041)
 - [What's New in v0.4.0](#whats-new-in-v040)
@@ -1562,6 +1571,12 @@ This package is not published to the npm registry (`package.json` sets `"private
 - [Troubleshooting](#troubleshooting)
 - [Security Design](#security-design)
 - [Development](#development)
+
+### What's New in v0.5.1
+
+- **`codex-rotator exec` checks the project folders before an interactive session** (#89): when there is a `.codex` in any folder from the working folder up to the project root, or the root cannot be found the same way Codex finds it, exec stops without launching `codex`. The non-interactive `exec` and `--version` are unchanged. What the check does not cover is listed under "Outside these guards" in [Guards When Codex Runs in an Account Folder](#guards-when-codex-runs-in-an-account-folder).
+- **Login expiry alerts in stages, and the expiry in `status`** (#88): the expiry alert in `alerts` now comes at 7 days, 3 days and 1 day before the login expiry, and once when it has passed. Each account card in `status` has a new `login:` row.
+- See the [v0.5.1 release notes](CHANGELOG.md#v051--2026-10-25) for all changes, including the known limitations.
 
 ### What's New in v0.5.0
 
@@ -2447,6 +2462,7 @@ usage: codex-rotator login --label <name> --stop <percent> --resume <percent> [-
 
 - When it stops, it exits with 1 (2 for a usage error) and prints a reason line and `codex-rotator login: the codex-rotator config was not changed.`
 - If your shell sets `CODEX_HOME`, it must be an absolute path that does not overlap `accountsDir` or any account folder (otherwise login stops).
+- **Change the codex-rotator config one operation at a time** (a new login, logging in again, or editing the config by hand). A new login stops without writing when the config has changed since it read it at the start (it also reads it again right before writing). However, this version has no lock that puts writes in order, so a change written by another operation in the very short time between that last read and the replacement can be lost when the file is replaced. As a result, when two logins write their registrations at almost the same time, one account's registration can be lost (that login still prints its success lines). Afterwards, check with `codex-rotator accounts` that the label you registered is listed. If it is not, treat the folder that login made as in "[Folders Left Behind When a New Login Stops](#folders-left-behind-when-a-new-login-stops)" and log in again.
 - **While a registered account has credentials that cannot be read, a new login stops** (it cannot tell whether the new account is the same account as that one). After the reason line and the other lines, these two lines are printed (`<label>` in the first line is each unreadable account's label, in config order):
 
   ```text
