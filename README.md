@@ -1265,7 +1265,7 @@ usage: codex-rotator exec [--account <label>] -- [codex arguments...]
 
 ### 口座のフォルダで起動したときの守り
 
-口座のフォルダを `CODEX_HOME` にして起動した Codex は、`~/.codex` の設定・指示書（`AGENTS.md`）・MCP サーバ・フック・規則を読みません。そのため、`~/.codex` に置いた遮断（たとえば、コネクタの一部の道具を切る設定）も効きません。codex-rotator は、口座のフォルダで起動するときに次の守りを付けます。
+口座のフォルダを `CODEX_HOME` にして起動した Codex は、ふつうは `~/.codex` の設定・指示書（`AGENTS.md`）・MCP サーバ・フック・規則を読みません。そのため、`~/.codex` に置いた遮断（たとえば、コネクタの一部の道具を切る設定）も効きません。ただし、exec を実行したフォルダによっては、`~/.codex/config.toml` がプロジェクトの設定として読まれます（下の「守りの対象外」の、ホームのフォルダの項）。codex-rotator は、口座のフォルダで起動するときに次の守りを付けます。
 
 - **第1層（起動のたびに付ける指定）**：exec は、`codex` の引数の先頭に、必ず次をこの順で付けます。口座のフォルダの `config.toml` の中身に依りません。
 
@@ -1324,8 +1324,9 @@ usage: codex-rotator exec [--account <label>] -- [codex arguments...]
   - 設定のフォルダの点検が見ないもの：法人・教育・Enterprise の口座でクラウドから配る設定のうち、初回の起動と、控えが消えた後の1回の分／`.codex` の外で効くもの（`AGENTS.md` など）／Codex が起動の中で足す、呼び出し元からの設定の層／macOS の管理の設定の仕組み（CFPreferences）が、上の `com.openai.codex.plist` の置き場のほかから強制する値／Codex CLI の版が変わったときの根の決め方の変化（確かめた版は 0.160.1 です。版を変えたときは、この点検の写しが今も合うかを確かめてください）。
   - 起動の後にセッションの中でつながるコネクタを、codex-rotator は技術的に塞いでいません。守りは、起動の直前の点検が確かめる範囲（`apps` と `plugins` が `false`、MCP サーバが0件）に限ります。実機では、点検を通って起動したセッションで、対話の中で作業フォルダを信頼した後、そのプロジェクトの `.codex/config.toml` に `apps`・`plugins`・`connectors` を `true` にする設定があったとき、`/mcp` の一覧にコネクタ（`codex_apps`）が `connected` と出たのを見ています。
   - ホームのフォルダ（`~/.codex` を含むフォルダ）を、口座のセッションで信頼しないでください。信頼すると、`~/.codex` の設定・フック・規則が、プロジェクトの設定として読まれうるためです。
+  - exec を実行したフォルダがホームのフォルダそのもののとき、または根（既定は `.git` のあるフォルダ）がホームのフォルダかそれより上にあるときは、Codex CLI の設定の探し方では、`~/.codex/config.toml` がプロジェクトの設定として読まれます。ホームのフォルダを信頼していなければ効きませんが、信頼していれば効きます（前の項）。引数の無い対話は、上の設定のフォルダの点検で、開く前に止まりますが、非対話の exec はこの点検をしません。起動ごとの点検が止めるのは MCP サーバと `apps`・`plugins` だけで、ほかの設定（モデルと送り先、承認の方針、`-s` を付けないときのサンドボックス、`notify`、フックなど）は止めません。`codex-rotator exec` は、ホームのフォルダの下にある、`.git` を持つプロジェクトのフォルダで実行してください。ホームのフォルダを信頼した記録が口座のフォルダの `config.toml` にあれば、上の手順で消してください（v0.5.0 ではホームのフォルダから引数の無い対話を開けたので、そのときの記録が残っていることがあります）。
 - **指示書を置く手順**：口座のセッションで使いたい指示書（`AGENTS.md`）は、口座のフォルダに自分で置いてください。codex-rotator は `~/.codex` の中を読まず、写しもしません。
-- **フック**：プロジェクトのフックで守りを掛けているときは、口座のフォルダごとに Codex の `hooks` の機能を有効にし、そのフックを信頼する必要があります（login が作る口座のフォルダの設定は上の3つの設定だけで、`~/.codex` の設定は読まれません）。
+- **フック**：プロジェクトのフックで守りを掛けているときは、口座のフォルダごとに Codex の `hooks` の機能を有効にし、そのフックを信頼する必要があります（login が作る口座のフォルダの設定は上の3つの設定だけで、`~/.codex` の設定は、上の「守りの対象外」に書いたホームのフォルダの場合のほかは読まれません）。
 
 ### 複数の口座を使うリスク
 
@@ -1334,7 +1335,7 @@ usage: codex-rotator exec [--account <label>] -- [codex arguments...]
 - codex-rotator は Codex CLI の**非公式**の補助ツールです。OpenAI とは無関係で、OpenAI が承認・サポートするものではありません。
 - 1台の PC で複数の ChatGPT アカウントを使い分けることが、OpenAI との契約、OpenAI の利用規約、所属組織のポリシーで許されるかは、利用者が確かめ、その責任を負います。
 - 口座のフォルダには、その ChatGPT アカウントの生きた資格情報（`auth.json`）がファイルとして入ります。フォルダは自分だけのもの（`0700`）として作りますが、共有の PC や暗号化されていないディスクでは、保護に注意してください。口座のフォルダを写したり、ほかの人と共有したりしないでください。
-- 口座で起動した Codex には、`~/.codex` に置いた設定・遮断・指示書が効きません（上の「[口座のフォルダで起動したときの守り](#口座のフォルダで起動したときの守り)」）。
+- 口座で起動した Codex には、ふつうは `~/.codex` に置いた設定・遮断・指示書が効きません。ただし、ホームのフォルダで実行したとき、または根がホームのフォルダかそれより上にあるフォルダで実行したときは、ホームのフォルダを信頼していれば、`~/.codex/config.toml` がプロジェクトの設定として効きます（上の「[口座のフォルダで起動したときの守り](#口座のフォルダで起動したときの守り)」）。
 - exec は、口座を選ぶために、口座の資格情報で使用量の読取を送ります（`--account` を付けないときは、選べる口座が見つかるまで、設定の並び順に読みます）。
 - 会話の記録は口座のフォルダごとに分かれて残り、ほかの口座のセッションからは見えません。
 - 2つのゲートは、これらを読んで受け入れたうえで、手で `true` にしてください。`enabled` を `false` に戻せば、exec は `disabled` で止まります。
@@ -2741,7 +2742,7 @@ usage: codex-rotator exec [--account <label>] -- [codex arguments...]
 
 #### Guards When Codex Runs in an Account Folder
 
-Codex launched with an account folder as `CODEX_HOME` does not read the settings, instructions (`AGENTS.md`), MCP servers, hooks or rules in `~/.codex`. So blocks you placed in `~/.codex` (for example, a setting that turns off some tools of a connector) do not apply either. codex-rotator adds the following guards when it launches in an account folder:
+Codex launched with an account folder as `CODEX_HOME` normally does not read the settings, instructions (`AGENTS.md`), MCP servers, hooks or rules in `~/.codex`. So blocks you placed in `~/.codex` (for example, a setting that turns off some tools of a connector) do not apply either. Depending on the folder where `exec` runs, however, `~/.codex/config.toml` is read as project settings (see the home folder item under "Outside these guards" below). codex-rotator adds the following guards when it launches in an account folder:
 
 - **First layer (options added to every launch):** `exec` always puts the following, in this order, in front of the `codex` arguments. It does not depend on the contents of the account folder's `config.toml`.
 
@@ -2800,8 +2801,9 @@ Codex launched with an account folder as `CODEX_HOME` does not read the settings
   - What the project folder check does not see: settings delivered from the cloud for business, education and Enterprise accounts, on the first launch and on the one launch after their cache is gone; things that take effect outside `.codex` (such as `AGENTS.md`); settings layers that Codex adds from its caller while it runs; values that macOS managed preferences (CFPreferences) enforce from places other than the `com.openai.codex.plist` locations above; and changes in how the project root is found when the Codex CLI version changes (the checked version is 0.160.1; when you change versions, check that this copy of the rules still matches).
   - codex-rotator does not technically block connectors that connect inside the session after launch. The guards cover only what the check right before launch confirms (`apps` and `plugins` are `false`, and there are no MCP servers). On a real machine, in a session that had passed the check, after the working folder was trusted inside the session and that project's `.codex/config.toml` had settings that turn `apps`, `plugins` and `connectors` to `true`, `/mcp` listed the connector entry (`codex_apps`) as `connected`.
   - Do not trust your home folder (the folder that contains `~/.codex`) in an account session. If you do, the settings, hooks and rules in `~/.codex` may be read as project settings.
+  - When the folder where `exec` runs is your home folder itself, or its project root (by default, the folder that has `.git`) is your home folder or a folder above it, the way the Codex CLI looks for project settings reads `~/.codex/config.toml` as project settings. It does not take effect while the home folder is untrusted, but it does once the home folder is trusted (see the previous item). The interactive session with no arguments stops before it opens, by the project folder check above, but the non-interactive `exec` does not run that check. The guard check on every launch stops only MCP servers, `apps` and `plugins`; it does not stop other settings (the model and where requests are sent, the approval policy, the sandbox when `-s` is not given, `notify`, hooks and so on). Run `codex-rotator exec` in a project folder under your home folder that has its own `.git`. If the account folder's `config.toml` has a record that you trusted your home folder, delete it as described above (in v0.5.0, an interactive session with no arguments could be opened from the home folder, so such a record may remain from then).
 - **How to provide instructions:** put the instructions (`AGENTS.md`) you want in account sessions into the account folder yourself. codex-rotator does not read inside `~/.codex` and does not copy from it.
-- **Hooks:** if a project relies on hooks as a guard, enable Codex's `hooks` feature in each account folder and trust those hooks (the settings that login creates in the account folder are only the three settings above, and `~/.codex` is not read).
+- **Hooks:** if a project relies on hooks as a guard, enable Codex's `hooks` feature in each account folder and trust those hooks (the settings that login creates in the account folder are only the three settings above, and `~/.codex` is not read except in the home folder case under "Outside these guards" above).
 
 #### The risks of using several accounts
 
@@ -2810,7 +2812,7 @@ Read the following before setting the two gates (`enabled` and `acknowledgedMult
 - codex-rotator is an **unofficial** helper for the Codex CLI. It is not affiliated with, endorsed by, or supported by OpenAI.
 - You are responsible for checking that using several ChatGPT accounts on one machine is allowed by your agreement with OpenAI, the OpenAI terms of use, and your organization's policies.
 - Each account folder holds **live credentials of that ChatGPT account** (`auth.json`) as a file. The folder is created private to you (`0700`), but on shared machines or unencrypted disks, protect it accordingly. Do not copy account folders or share them with anyone.
-- Codex launched with an account does not apply the settings, blocks and instructions you placed in `~/.codex` (see "[Guards When Codex Runs in an Account Folder](#guards-when-codex-runs-in-an-account-folder)").
+- Codex launched with an account normally does not apply the settings, blocks and instructions you placed in `~/.codex`. When it runs in your home folder, or in a folder whose project root is your home folder or a folder above it, and the home folder is trusted, `~/.codex/config.toml` takes effect as project settings (see "[Guards When Codex Runs in an Account Folder](#guards-when-codex-runs-in-an-account-folder)").
 - To select an account, `exec` sends usage reads with the account's credentials (without `--account`, it reads accounts in config order until it finds one it can select).
 - Conversation records stay in each account folder separately and are not visible from sessions of other accounts.
 - Set the two gates to `true` by hand only after reading and accepting the above. Setting `enabled` back to `false` makes `exec` stop with `disabled`.
