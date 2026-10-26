@@ -217,7 +217,7 @@ test('the login child is the real codex by absolute path with the file store, sh
   assert.equal(ctx.iso.refusedSpawns.length, 0);
 });
 
-test('the account folder config.toml holds only the three guard settings before the login child starts, and is read as the file store', async t => {
+test('the account folder config.toml holds only the four guard settings before the login child starts, and is read as the file store', async t => {
   const ctx = await setup(t);
   const result = await ctx.run(ARGS_A);
   assert.equal(result.code, LOGIN_EXIT.ok, result.stderr);
@@ -229,6 +229,7 @@ test('the account folder config.toml holds only the three guard settings before 
   const beforeFirstTable = text.split(/^\s*\[/m)[0];
   assert.match(beforeFirstTable, /^cli_auth_credentials_store = "file"$/m);
   assert.match(text, /^\[features\]\napps = false\nplugins = false$/m);
+  assert.match(text, /^\[feedback\]\nenabled = false$/m);
   const identity = await readCodexCredentials(join(account.codexHome, 'auth.json'));
   assert.equal(identity.credentialsMode, 'file');
 });

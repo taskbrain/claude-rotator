@@ -13,8 +13,8 @@ import { join, relative } from 'node:path';
 import {
   ACCOUNT_CONFIG_TOML, ALLOWED_CONFIG_OVERRIDES, ALLOWED_SANDBOX_VALUES, ARGUMENT_REJECTED_REASON,
   FIRST_LAYER_ARGS, FORM_REJECTION, LAUNCH_CALLER, LAUNCH_FORM, MODEL_NAME_PATTERN,
-  SECOND_LAYER_FEATURES_LINES, SECOND_LAYER_FEATURES_TABLE, SECOND_LAYER_ROOT_LINES,
-  formatArgumentRejected, matchLaunchForm,
+  SECOND_LAYER_FEATURES_LINES, SECOND_LAYER_FEATURES_TABLE, SECOND_LAYER_FEEDBACK_LINES, SECOND_LAYER_FEEDBACK_TABLE,
+  SECOND_LAYER_ROOT_LINES, formatArgumentRejected, matchLaunchForm,
 } from '../../src/codex/account-config.js';
 import { readCodexCredentials } from '../../src/codex/credentials.js';
 import { setupCodexIsolation } from './helpers/isolation.js';
@@ -26,9 +26,9 @@ import {
   ARGUMENT_REJECTED_KIND, CLOUD_CONFIG_CACHE_FILE, CODEX_GUARD_CHECK_MAX_STDOUT_BYTES, CODEX_GUARD_CHECK_TIMEOUT_MS,
   DEFAULT_PROJECT_ROOT_MARKERS, GUARD_CHECK_FEATURES_ARGS, GUARD_CHECK_MCP_ARGS, GUARD_UNVERIFIED, GUARD_UNVERIFIED_KIND,
   MANAGED_PREFERENCES_FILE, NO_DAEMON_ARG, PROJECT_CHECK_MAX_FILE_BYTES, PROJECT_LAYER_PATHS,
-  buildGuardCheckArgs, buildLaunchArgs, checkProjectFolders, formatGuardUnverified, judgeFeaturesList, judgeMcpList,
-  launchArgsChangeProjectRoot, prepareGuardedLaunch, readProjectRootMarkers, resolveLaunchWorkingDirectory,
-  runGuardCheck,
+  buildGuardCheckArgs, buildLaunchArgs, checkFeedbackConfig, checkProjectFolders, formatGuardUnverified,
+  judgeFeaturesList, judgeFeedbackConfig, judgeMcpList, launchArgsChangeProjectRoot, prepareGuardedLaunch,
+  readProjectRootMarkers, resolveLaunchWorkingDirectory, runGuardCheck,
 } from '../../src/codex/account-config.js';
 import { findRealCodex } from '../../src/codex/real-codex.js';
 
@@ -83,28 +83,36 @@ function assertRejected(args, detail, { caller } = {}) {
 
 // --- 第1層・第2層 ----------------------------------------------------------------------------
 
-test('first layer: the three overrides are fixed in this order', () => {
+test('first layer: the four overrides are fixed in this order', () => {
   assert.deepEqual([...FIRST_LAYER_ARGS], [
     '-c', 'cli_auth_credentials_store="file"',
     '-c', 'features.apps=false',
     '-c', 'features.plugins=false',
+    '-c', 'feedback.enabled=false',
   ]);
   assert.ok(Object.isFrozen(FIRST_LAYER_ARGS));
 });
 
-test('second layer: config.toml has only the credentials store before any table and apps/plugins off', () => {
+test('second layer: config.toml has only the credentials store before any table, apps/plugins off and feedback off', () => {
+  assert.equal(ACCOUNT_CONFIG_TOML,
+    'cli_auth_credentials_store = "file"\n\n[features]\napps = false\nplugins = false\n\n[feedback]\nenabled = false\n');
   const lines = ACCOUNT_CONFIG_TOML.split('\n');
   const settings = lines.filter(line => line.trim() !== '' && !line.startsWith('['));
-  assert.deepEqual(settings, ['cli_auth_credentials_store = "file"', 'apps = false', 'plugins = false']);
+  assert.deepEqual(settings, ['cli_auth_credentials_store = "file"', 'apps = false', 'plugins = false', 'enabled = false']);
   assert.deepEqual([...SECOND_LAYER_ROOT_LINES], ['cli_auth_credentials_store = "file"']);
   assert.equal(SECOND_LAYER_FEATURES_TABLE, '[features]');
   assert.deepEqual([...SECOND_LAYER_FEATURES_LINES], ['apps = false', 'plugins = false']);
+  assert.equal(SECOND_LAYER_FEEDBACK_TABLE, '[feedback]');
+  assert.deepEqual([...SECOND_LAYER_FEEDBACK_LINES], ['enabled = false']);
   const tables = lines.filter(line => line.startsWith('['));
-  assert.deepEqual(tables, ['[features]']);
+  assert.deepEqual(tables, ['[features]', '[feedback]']);
   const firstTable = lines.indexOf('[features]');
+  const feedbackTable = lines.indexOf('[feedback]');
   assert.ok(lines.indexOf('cli_auth_credentials_store = "file"') < firstTable, 'store line is before the first table');
-  assert.ok(lines.indexOf('apps = false') > firstTable);
-  assert.ok(lines.indexOf('plugins = false') > firstTable);
+  assert.ok(lines.indexOf('apps = false') > firstTable && lines.indexOf('apps = false') < feedbackTable);
+  assert.ok(lines.indexOf('plugins = false') > firstTable && lines.indexOf('plugins = false') < feedbackTable);
+  assert.equal(lines[feedbackTable - 1], '', 'one blank line before the feedback table');
+  assert.equal(lines[feedbackTable + 1], 'enabled = false');
   assert.doesNotMatch(ACCOUNT_CONFIG_TOML, /approval_policy|sandbox_mode/);
   assert.ok(ACCOUNT_CONFIG_TOML.endsWith('\n'));
 });
@@ -523,7 +531,11 @@ async function guardHarness(t, { features = () => fakeCheckChild({ stdout: [FEAT
   const found = findRealCodex({ env: { ...isolation.env, PATH: binDir } });
   assert.equal(found.reason, null);
   const codexPath = found.path;
+  // 口座のフォルダ（config.toml は login が書く全文。フィードバックの設定の点検が読む）。
   const codexHome = join(isolation.root, 'zz-accounts', 'zz-one');
+  await mkdir(codexHome, { recursive: true, mode: 0o700 });
+  const setAccountConfig = text => writeFile(join(codexHome, 'config.toml'), text, { mode: 0o600 });
+  await setAccountConfig(ACCOUNT_CONFIG_TOML);
   const workDir = join(isolation.root, 'zz-work');
   await mkdir(workDir, { mode: 0o700 });
   const realWorkDir = await realpath(workDir);
@@ -546,7 +558,7 @@ async function guardHarness(t, { features = () => fakeCheckChild({ stdout: [FEAT
     args, codexPath, codexHome, env, spawn: isolation.spawn, scheduler, processCwd: () => linkDir,
     projectFs, projectLayerPaths, ...extra,
   });
-  return { isolation, codexPath, codexHome, env, realWorkDir, linkDir, children, scheduler, run, outside };
+  return { isolation, codexPath, codexHome, env, realWorkDir, linkDir, children, scheduler, run, outside, setAccountConfig };
 }
 
 // --- 型2 の設定のフォルダの点検の試験の道具 -----------------------------------------------------
@@ -923,11 +935,14 @@ for (const [name, { features, mcp, fireAtOnce = false }, reason, started, killed
 test('every guard check reason word can be produced', () => {
   // 型1 の点検の止まり方の表と、型2 の設定のフォルダの点検の止まり方の表（下の PROJECT_ROOT_CASES と、
   // `.codex` が在る道の project-config）を合わせて、理由の語の全部が出せることを確かめる。
+  // フィードバックの設定の点検の止まり方の表（下の FEEDBACK_UNVERIFIED_TEXTS）も合わせる。
   const produced = new Set([...GUARD_STOP_CASES.map(entry => entry[2]),
-    ...PROJECT_ROOT_CASES.map(() => GUARD_UNVERIFIED.projectRoot), GUARD_UNVERIFIED.projectConfig]);
+    ...PROJECT_ROOT_CASES.map(() => GUARD_UNVERIFIED.projectRoot), GUARD_UNVERIFIED.projectConfig,
+    ...FEEDBACK_UNVERIFIED_TEXTS.map(([, text]) => judgeFeedbackConfig(text))]);
   assert.deepEqual([...produced].sort(), Object.values(GUARD_UNVERIFIED).sort());
   assert.deepEqual(Object.values(GUARD_UNVERIFIED).sort(),
-    ['exit', 'feature-enabled', 'mcp-present', 'output-format', 'project-config', 'project-root', 'timeout', 'too-large']);
+    ['exit', 'feature-enabled', 'feedback', 'mcp-present', 'output-format', 'project-config', 'project-root', 'timeout',
+      'too-large']);
 });
 
 test('the guard check reads standard output up to exactly the limit', async t => {
@@ -1290,6 +1305,163 @@ test('the interactive form goes on to the two checks when no .codex is found', a
   assert.deepEqual(h.outside, []);
 });
 
+// === フィードバックの設定の点検 ====================================================================
+//
+// 口座のフォルダの config.toml は、どれも隔離の一時フォルダの中に作る。点検は codex を起動しない。
+
+const F = GUARD_UNVERIFIED.feedback;
+// [feedback] の表の無い全文（フィードバックの設定の点検を足す前の login が書いた全文と同じ）。
+const CONFIG_WITHOUT_FEEDBACK =
+  `${SECOND_LAYER_ROOT_LINES.join('\n')}\n\n${SECOND_LAYER_FEATURES_TABLE}\n${SECOND_LAYER_FEATURES_LINES.join('\n')}\n`;
+// 戻り方で末尾に足す2行。
+const FEEDBACK_TWO_LINES = `${SECOND_LAYER_FEEDBACK_TABLE}\n${SECOND_LAYER_FEEDBACK_LINES.join('\n')}\n`;
+// 作業フォルダを信頼したときに Codex が書き足す projects の項。
+const TRUSTED_PROJECT = '[projects."/zz/a b/c#d"]\ntrust_level = "trusted"\n';
+const inFeedbackTable = body => `${CONFIG_WITHOUT_FEEDBACK}\n[feedback]\n${body}`;
+
+test('the feedback check passes the config.toml that login writes and the shapes Codex and the recovery step make', () => {
+  assert.equal(`${CONFIG_WITHOUT_FEEDBACK}\n${FEEDBACK_TWO_LINES}`, ACCOUNT_CONFIG_TOML);
+  for (const text of [
+    ACCOUNT_CONFIG_TOML,
+    // Codex が後ろに projects の項を書き足した形。
+    `${ACCOUNT_CONFIG_TOML}\n${TRUSTED_PROJECT}`,
+    // projects の項の後ろに2行を足した形と、空行を挟まずに足した形。
+    `${CONFIG_WITHOUT_FEEDBACK}\n${TRUSTED_PROJECT}${FEEDBACK_TWO_LINES}`,
+    `${CONFIG_WITHOUT_FEEDBACK}${FEEDBACK_TWO_LINES}`,
+    ACCOUNT_CONFIG_TOML.replaceAll('\n', '\r\n'),
+    // 等号の前後の空白・字下げ・行末の注記・表の中の注記と空行（型2 の点検の読み手が受ける形）。
+    inFeedbackTable('  enabled\t=\tfalse   # zz\n'),
+    inFeedbackTable('enabled=false\n'),
+    `${CONFIG_WITHOUT_FEEDBACK}\n[ feedback ]  # zz\n# zz\n\nenabled = false\n`,
+    // 字の feedback が、ほかの表の見出しの道や、ほかの表の中の鍵にだけある形（一番上の階層の feedback ではない）。
+    `${ACCOUNT_CONFIG_TOML}\n[projects."/zz/feedback"]\ntrust_level = "trusted"\n`,
+    `${ACCOUNT_CONFIG_TOML}\n[zz]\nfeedback.enabled = true\n`,
+  ]) {
+    assert.equal(judgeFeedbackConfig(text), null, `passes: ${JSON.stringify(text)}`);
+  }
+});
+
+// [名前, 全文]
+const FEEDBACK_UNVERIFIED_TEXTS = Object.freeze([
+  ['there is no config.toml', null],
+  ['the text is not a string', 1],
+  ['the config was written before this check (no feedback table)', CONFIG_WITHOUT_FEEDBACK],
+  ['the config has the feedback table only after a projects entry without the enabled line',
+    `${CONFIG_WITHOUT_FEEDBACK}\n${TRUSTED_PROJECT}[feedback]\n`],
+  ['the config is empty', ''],
+  ['the feedback table appears twice', `${ACCOUNT_CONFIG_TOML}\n${FEEDBACK_TWO_LINES}`],
+  ['the feedback table has no enabled line', inFeedbackTable('')],
+  ['the enabled line is only in the next table', inFeedbackTable('[zz]\nenabled = false\n')],
+  ['the enabled line is only before the first table', `enabled = false\n${inFeedbackTable('')}`],
+  ['enabled appears twice', inFeedbackTable('enabled = false\nenabled = false\n')],
+  ['enabled is true', inFeedbackTable('enabled = true\n')],
+  ['enabled is the string "false"', inFeedbackTable('enabled = "false"\n')],
+  ["enabled is the literal string 'false'", inFeedbackTable("enabled = 'false'\n")],
+  ['enabled is a number', inFeedbackTable('enabled = 0\n')],
+  ['enabled is an array', inFeedbackTable('enabled = [false]\n')],
+  ['enabled is an inline table', inFeedbackTable('enabled = { zz = false }\n')],
+  ['the enabled key is quoted', inFeedbackTable('"enabled" = false\n')],
+  ['the enabled key is dotted', inFeedbackTable('enabled.zz = false\n')],
+  ['the feedback table has another key', inFeedbackTable('enabled = false\nzz = true\n')],
+  ['a dotted feedback.enabled is before the first table', `feedback.enabled = false\n${CONFIG_WITHOUT_FEEDBACK}`],
+  ['a dotted feedback.enabled before the first table comes with the table', `feedback.enabled = true\n${ACCOUNT_CONFIG_TOML}`],
+  ['a quoted dotted feedback key is before the first table', `"feedback".enabled = false\n${CONFIG_WITHOUT_FEEDBACK}`],
+  ['an inline feedback table is before the first table', `feedback = { enabled = false }\n${CONFIG_WITHOUT_FEEDBACK}`],
+  ['a feedback sub-table header is present', `${ACCOUNT_CONFIG_TOML}\n[feedback.zz]\nenabled = true\n`],
+  ['an array of feedback tables is present', `${CONFIG_WITHOUT_FEEDBACK}\n[[feedback]]\nenabled = false\n`],
+  ['the feedback header is quoted', `${CONFIG_WITHOUT_FEEDBACK}\n["feedback"]\nenabled = false\n`],
+  ['the two lines are only inside a multi-line string', `${CONFIG_WITHOUT_FEEDBACK}zz = '''\n[feedback]\nenabled = false\n'''\n`],
+  ['the config has a string escape', `${ACCOUNT_CONFIG_TOML}\n[projects."/zz/a\\"b"]\ntrust_level = "trusted"\n`],
+  ['the config has an array split over lines', `${ACCOUNT_CONFIG_TOML}zz = [\n  1,\n]\n`],
+  ['the config has an inline table split over lines', `zz = {\n  feedback = { enabled = true }\n}\n${ACCOUNT_CONFIG_TOML}`],
+  ['the config has a date-time value', `${ACCOUNT_CONFIG_TOML}zz = 1979-05-27T07:32:00Z\n`],
+  ['the config has a byte order mark', `﻿${ACCOUNT_CONFIG_TOML}`],
+  ['the config has a control character', `${ACCOUNT_CONFIG_TOML}# \x01\n`],
+]);
+
+for (const [name, text] of FEEDBACK_UNVERIFIED_TEXTS) {
+  test(`the feedback check stops with feedback when ${name}`, () => {
+    assert.equal(judgeFeedbackConfig(text), F);
+    assert.equal(formatGuardUnverified(judgeFeedbackConfig(text)), 'guard unverified (feedback)');
+  });
+}
+
+test('the feedback check reads the account config.toml and stops when it is missing, not a file, too large or unreadable', async t => {
+  const h = await projectHarness(t);
+  const configPath = join(h.codexHome, 'config.toml');
+  const confined = fail => confinedProjectFs(h.root, { fail });
+  assert.equal(checkFeedbackConfig({ codexHome: h.codexHome, fs: confined() }), null);
+  assert.equal(checkFeedbackConfig({ codexHome: h.codexHome }), null, 'the real file tools read the same file');
+  for (const fail of [{ stat: path => (path === configPath ? 'EACCES' : null) },
+    { readFile: path => (path === configPath ? 'EIO' : null) }]) {
+    assert.equal(checkFeedbackConfig({ codexHome: h.codexHome, fs: confined(fail) }), F);
+  }
+  assert.equal(checkFeedbackConfig({ codexHome: h.codexHome, fs: {} }), F, 'an unexpected error stops too');
+  assert.equal(checkFeedbackConfig({ codexHome: 'zz-relative' }), F);
+  assert.equal(checkFeedbackConfig(), F);
+  const padding = 'z'.repeat(PROJECT_CHECK_MAX_FILE_BYTES - Buffer.byteLength(ACCOUNT_CONFIG_TOML) - 2);
+  await h.setAccountConfig(`${ACCOUNT_CONFIG_TOML}#${padding}\n`);
+  assert.equal(checkFeedbackConfig({ codexHome: h.codexHome, fs: confined() }), null, 'a file of exactly the limit is read');
+  await h.setAccountConfig(`${ACCOUNT_CONFIG_TOML}#${padding}z\n`);
+  assert.equal(checkFeedbackConfig({ codexHome: h.codexHome, fs: confined() }), F, 'a file over the limit stops');
+  await rm(configPath);
+  assert.equal(checkFeedbackConfig({ codexHome: h.codexHome, fs: confined() }), F, 'a missing file stops');
+  await mkdir(configPath);
+  assert.equal(checkFeedbackConfig({ codexHome: h.codexHome, fs: confined() }), F, 'a folder stops');
+  assert.equal(h.isolation.spawnCalls.length, 0);
+});
+
+// [名前, 利用者の引数, 呼出し元]
+const FEEDBACK_LAUNCH_CASES = Object.freeze([
+  ['the non-interactive exec form', REVIEW_ARGS, LAUNCH_CALLER.exec],
+  ['the image job form through the shim', IMAGE_ARGS, LAUNCH_CALLER.shim],
+  ['the interactive form', [], LAUNCH_CALLER.exec],
+  ['the interactive form through the shim', [], LAUNCH_CALLER.shim],
+  ['the version form', ['--version'], LAUNCH_CALLER.exec],
+]);
+
+test('every launch form stops with feedback before starting any check when the account config.toml lacks the feedback setting', async t => {
+  const h = await guardHarness(t);
+  const accountConfigs = [
+    ['the config written before this check', () => h.setAccountConfig(CONFIG_WITHOUT_FEEDBACK)],
+    ['feedback turned on', () => h.setAccountConfig(inFeedbackTable('enabled = true\n'))],
+    ['no config.toml', () => rm(join(h.codexHome, 'config.toml'), { force: true })],
+  ];
+  for (const [what, make] of accountConfigs) {
+    await make();
+    for (const [name, args, caller] of FEEDBACK_LAUNCH_CASES) {
+      const result = await h.run(args, { caller });
+      assert.equal(result.reason, F, `${what}: ${name}`);
+      assertUnverified(result, F);
+    }
+  }
+  assert.equal(h.isolation.spawnCalls.length, 0, 'no codex is started for the two checks or the launch');
+  assert.deepEqual(h.outside, []);
+});
+
+test('the feedback check runs before the interactive folder check', async t => {
+  const h = await guardHarness(t);
+  await mkdir(join(h.realWorkDir, '.codex'), { mode: 0o700 });
+  await h.setAccountConfig(CONFIG_WITHOUT_FEEDBACK);
+  assertUnverified(await h.run([]), F);
+  await h.setAccountConfig(`${CONFIG_WITHOUT_FEEDBACK}${FEEDBACK_TWO_LINES}`);
+  assertUnverified(await h.run([]), GUARD_UNVERIFIED.projectConfig);
+  assert.equal(h.isolation.spawnCalls.length, 0);
+});
+
+test('with the two lines added after a projects entry every launch form goes on to the two checks as before', async t => {
+  const h = await guardHarness(t);
+  await h.setAccountConfig(`${CONFIG_WITHOUT_FEEDBACK}\n${TRUSTED_PROJECT}${FEEDBACK_TWO_LINES}`);
+  for (const [name, args, caller] of FEEDBACK_LAUNCH_CASES) {
+    const result = await h.run(args, { caller });
+    assert.equal(result.ok, true, name);
+    assert.deepEqual([...result.launch.args.slice(0, FIRST_LAYER_ARGS.length)], [...FIRST_LAYER_ARGS]);
+  }
+  assert.equal(h.isolation.spawnCalls.length, 2 * FEEDBACK_LAUNCH_CASES.length, 'two checks for each launch');
+  assert.ok(h.isolation.spawnCalls.every(call => call.args.includes('feedback.enabled=false')),
+    'the checks carry the first layer with feedback off');
+});
+
 // ---------------------------------------------------------------------------------------------
 // README の守りの節（日英）と実装の突き合わせ
 // ---------------------------------------------------------------------------------------------
@@ -1342,6 +1514,9 @@ test('the README guard sections in Japanese and English carry the guards that th
     // 第1層は1つのコードの囲みに、この順で並ぶ。第2層は login が書く config.toml の全文と同じ。
     assert.ok(fencedBlocks(section, 'text').includes(`${FIRST_LAYER_ARGS.join(' ')}\n`), `${heading}: the first layer`);
     assert.deepEqual(fencedBlocks(section, 'toml'), [ACCOUNT_CONFIG_TOML], `${heading}: the second layer`);
+    // feedback で止まったときの戻り方に、第2層の [feedback] の表の2行がそのまま載る。
+    assert.ok(fencedBlocks(section, 'text').includes(`${SECOND_LAYER_FEEDBACK_TABLE}\n${SECOND_LAYER_FEEDBACK_LINES.join('\n')}\n`),
+      `${heading}: the two lines to add for feedback`);
     // 起動の型（型1の -s の値と通すキー、型3の語）と、型に当たらないときの1行。
     for (const value of ALLOWED_SANDBOX_VALUES) has(`\`${value}\``, 'a sandbox value of the first form');
     for (const { key } of ALLOWED_CONFIG_OVERRIDES) has(`-c ${key}=`, 'a pass-through config key of the first form');

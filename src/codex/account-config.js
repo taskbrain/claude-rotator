@@ -5,8 +5,9 @@
 //     この順で必ず付ける。口座のフォルダの config.toml の中身に依存しない。
 //   - 第2層（口座のフォルダに書く設定）: login が作る config.toml は、最初の表より前の
 //     `cli_auth_credentials_store = "file"` と、[features] の表の `apps = false`・`plugins = false`
-//     の3つの設定だけにする（ACCOUNT_CONFIG_TOML）。exec と shim を通らない起動（利用者が口座のフォルダを
-//     CODEX_HOME にして素の codex を起動する場合）も守るため。
+//     と、[feedback] の表の `enabled = false`（フィードバックの送信を止める）の4つの設定だけにする
+//     （ACCOUNT_CONFIG_TOML）。exec と shim を通らない起動（利用者が口座のフォルダを CODEX_HOME にして
+//     素の codex を起動する場合）も守るため。
 //   - 起動の型: 口座を選んで起動するのは、下の型1〜3に当たる引数の並びだけにする。広く受けてから
 //     危ない形を塞ぐのではなく、使う形だけを語ごとの完全一致で許す（前後の空白・引用符・大文字と
 //     小文字の違いも一致しないものとして扱う）。型に当たらない並びは、exec は拒否して標準エラーに
@@ -22,6 +23,10 @@
 //     型を足す・変えるときは、要る呼出し元と理由を書いて、レビューを通してから変える。
 //   - 起動の引数の組立: 第1層を先頭に付け、型2（引数の無い対話）でだけ、その直後に --no-daemon を
 //     1回付け、その後ろに利用者の引数をそのまま並べる。型1と型3には --no-daemon を付けない。
+//   - フィードバックの設定の点検（下の2つの点検より前。codex を起動しない）: 型1〜3のどれでも、選んだ口座の
+//     フォルダの config.toml に、[feedback] の表の `enabled = false` が決まった形で1つだけあるかを字で照らす。
+//     無い・読めない・ほかの書き方で feedback を定義しているときは `feedback` で止める。第1層の -c は
+//     exec を通る起動にしか付かないので、第2層の値が口座のフォルダに在ることを、起動の前に確かめるため。
 //   - 起動ごとの点検（Codex CLI の更新で遮断が黙って外れないように）: codex を起動する直前に毎回、
 //     選んだ口座のフォルダを CODEX_HOME にし、子と同じ作業フォルダ（exec 自身の作業フォルダの実パス）
 //     で、第1層の後ろに型1の -c の値を同じ順で付けた `features list` と `mcp list --json` を、本物の
@@ -38,8 +43,9 @@
 //
 // 型の照合と引数の組立は純粋な関数で、子プロセスを起動しない。子プロセスを起動するのは起動ごとの
 // 点検だけで、起動の関数は差し替えられる部品として受ける。ファイルは書かない。読むのは、作業フォルダの
-// 実パスと、型2 の設定のフォルダの点検が見るファイルの有無と、根の決め方に要る小さなファイル（口座の
-// config.toml・システムと管理の層の config・git の worktree の指し先）だけで、どれも 64 KiB までにする。
+// 実パスと、フィードバックの設定の点検が読む口座の config.toml と、型2 の設定のフォルダの点検が見るファイルの
+// 有無と、根の決め方に要る小さなファイル（口座の config.toml・システムと管理の層の config・git の worktree の
+// 指し先）だけで、どれも 64 KiB までにする。
 // 型1の形は、Codex CLI のジョブを非対話の `codex exec … -` の形で起動するほかのツールの起動の形に合わせてある。
 // その起動の形か型1の形を変えるときは、test/codex/account-config.test.js の回帰の見本と照らし直す。
 import { spawn as spawnChild } from 'node:child_process';
@@ -48,11 +54,15 @@ import { dirname, isAbsolute, join, relative, sep } from 'node:path';
 
 // --- 第1層 -----------------------------------------------------------------------------------
 
-/** exec が起動する codex の引数の先頭に、この順で必ず付ける指定。 */
+/**
+ * exec が起動する codex の引数の先頭に、この順で必ず付ける指定。feedback.enabled は、信頼済みの作業フォルダの
+ * .codex/config.toml（プロジェクトの層）でも変えられるキーなので、口座の config.toml の値より強い -c でも付ける。
+ */
 export const FIRST_LAYER_ARGS = Object.freeze([
   '-c', 'cli_auth_credentials_store="file"',
   '-c', 'features.apps=false',
   '-c', 'features.plugins=false',
+  '-c', 'feedback.enabled=false',
 ]);
 
 // --- 第2層 -----------------------------------------------------------------------------------
@@ -62,9 +72,12 @@ export const SECOND_LAYER_ROOT_LINES = Object.freeze(['cli_auth_credentials_stor
 /** login が作る config.toml の [features] の表に置く行。 */
 export const SECOND_LAYER_FEATURES_TABLE = '[features]';
 export const SECOND_LAYER_FEATURES_LINES = Object.freeze(['apps = false', 'plugins = false']);
+/** login が作る config.toml の [feedback] の表に置く行（フィードバックの送信を止める）。 */
+export const SECOND_LAYER_FEEDBACK_TABLE = '[feedback]';
+export const SECOND_LAYER_FEEDBACK_LINES = Object.freeze(['enabled = false']);
 
 /**
- * login が口座のフォルダに書く config.toml の全文。設定は上の3つだけで、承認や
+ * login が口座のフォルダに書く config.toml の全文。設定は上の4つだけで、承認や
  * サンドボックスの行（approval_policy・sandbox_mode）は持たない。
  */
 export const ACCOUNT_CONFIG_TOML = [
@@ -72,6 +85,9 @@ export const ACCOUNT_CONFIG_TOML = [
   '',
   SECOND_LAYER_FEATURES_TABLE,
   ...SECOND_LAYER_FEATURES_LINES,
+  '',
+  SECOND_LAYER_FEEDBACK_TABLE,
+  ...SECOND_LAYER_FEEDBACK_LINES,
   '',
 ].join('\n');
 
@@ -295,6 +311,7 @@ export const GUARD_UNVERIFIED = Object.freeze({
   tooLarge: 'too-large', // 標準出力が上限を超えた
   projectConfig: 'project-config', // 型2：作業フォルダから根まで（linked worktree では本体の側の同じ位置も）に .codex が在る
   projectRoot: 'project-root', // 型2：根を Codex と同じに決められない、または決め方がずれうる
+  feedback: 'feedback', // 口座の config.toml に、フィードバックの送信を止める設定が決まった形で無い
 });
 
 /** 点検が通らなかった結果の種類（拒否の結果の種類と見分けるため）。 */
@@ -839,12 +856,114 @@ export function checkProjectFolders({ cwd, codexHome, launchArgs = [], fs: fsImp
   }
 }
 
+// --- フィードバックの設定の点検 ----------------------------------------------------------------
+//
+// 口座の config.toml を、型2 の点検と同じ行の読み手（isPlainTomlLine など）で字で照らす。その読み手が通す
+// 全文では、どの行も一番上の階層の行なので、`[` で始まる行は表の見出し、ほかは見出しの表の「鍵 = 値」と
+// 決められる。迷う書き方（引用符で囲んだ鍵・点で続く鍵・表の中のほかの鍵など）は通さない。
+
+const FEEDBACK_KEY = 'feedback';
+const FEEDBACK_ENABLED_KEY = 'enabled';
+const FEEDBACK_DISABLED_VALUE = /^false[ \t]*(?:#.*)?$/;
+
+// 行 line の at から点で続く鍵を読み、部分ごとの名（引用符を外したもの）と引用符の無い名だったかと、読み終えた
+// 位置を返す。読めなければ null。
+function readPlainKeyParts(line, at) {
+  const parts = [];
+  for (;;) {
+    PLAIN_KEY_PART.lastIndex = at;
+    const match = PLAIN_KEY_PART.exec(line);
+    if (!match) return null;
+    const raw = match[0];
+    const quoted = raw[0] === '"' || raw[0] === "'";
+    parts.push({ name: quoted ? raw.slice(1, -1) : raw, bare: !quoted });
+    const end = at + raw.length;
+    const next = skipPlainSpace(line, end);
+    if (line[next] !== '.') return { parts, end };
+    at = skipPlainSpace(line, next + 1);
+  }
+}
+
+// 鍵が、引用符の無い1つの名 name だけか。
+const isBareKey = (key, name) => key.parts.length === 1 && key.parts[0].bare && key.parts[0].name === name;
+
+/**
+ * 口座の config.toml の全文が、フィードバックの送信を止める設定を持つかを判定する。通れば null、通らなければ
+ * `feedback`。
+ *
+ * 通すのは、引用符の無い `[feedback]` の見出しの行がちょうど1つあり、その表の中（次の見出しの行まで）の
+ * 「鍵 = 値」が、引用符の無い `enabled` と真偽の `false` の1行だけ（等号の前後の空白と行末の注記は受ける）で、
+ * ほかに feedback を定義する書き方が無いときだけ。通さないのは、全文が無い（null）・文字列でない、
+ * readProjectRootMarkers が根を決められないとする書き方（複数行の文字列・エスケープ・決まった単純な形でない行・
+ * 制御文字など）がある、`[feedback]` が無い・2つ以上ある、その表の中に enabled が無い・2つ以上ある・値が false の
+ * 真偽でない・ほかの鍵（引用符で囲んだ `"enabled"`・点で続く鍵を含む）がある、最初の表より前に最初の部分が
+ * feedback の鍵（`feedback.enabled = …`・`feedback = { … }`・引用符で囲んだもの）がある、最初の部分が feedback の
+ * ほかの見出し（`[feedback.…]`・`[[feedback]]`・`["feedback"]`）がある、のどれか。
+ * @param {string|null} text
+ * @returns {string|null}
+ */
+export function judgeFeedbackConfig(text) {
+  const unverifiedFeedback = GUARD_UNVERIFIED.feedback;
+  if (typeof text !== 'string' || TOML_UNREADABLE_TEXT.test(text) || PLAIN_TOML_FORBIDDEN.test(text)) return unverifiedFeedback;
+  const lines = text.split(/\r?\n/);
+  if (!lines.every(isPlainTomlLine)) return unverifiedFeedback;
+  let inFeedback = false;
+  let inOtherTable = false;
+  let headers = 0;
+  let disabled = 0;
+  for (const line of lines) {
+    const at = skipPlainSpace(line, 0);
+    if (at === line.length || line[at] === '#') continue;
+    if (line[at] === '[') {
+      const arrayOfTables = line[at + 1] === '[';
+      const key = readPlainKeyParts(line, skipPlainSpace(line, at + (arrayOfTables ? 2 : 1)));
+      if (key === null) return unverifiedFeedback;
+      inFeedback = key.parts[0].name === FEEDBACK_KEY;
+      inOtherTable = !inFeedback;
+      if (!inFeedback) continue;
+      if (arrayOfTables || !isBareKey(key, FEEDBACK_KEY)) return unverifiedFeedback;
+      headers += 1;
+      continue;
+    }
+    const key = readPlainKeyParts(line, at);
+    if (key === null) return unverifiedFeedback;
+    if (inOtherTable) continue;
+    if (!inFeedback) {
+      if (key.parts[0].name === FEEDBACK_KEY) return unverifiedFeedback;
+      continue;
+    }
+    if (!isBareKey(key, FEEDBACK_ENABLED_KEY)) return unverifiedFeedback;
+    const valueAt = skipPlainSpace(line, skipPlainSpace(line, key.end) + 1);
+    if (!FEEDBACK_DISABLED_VALUE.test(line.slice(valueAt))) return unverifiedFeedback;
+    disabled += 1;
+  }
+  return headers === 1 && disabled === 1 ? null : unverifiedFeedback;
+}
+
+/**
+ * フィードバックの設定の点検。選んだ口座のフォルダの config.toml（64 KiB まで）を読み、judgeFeedbackConfig で
+ * 判定する。codex を起動しない。通れば null、止めるなら `feedback`。例外を投げない（ファイルが無い・普通の
+ * ファイルでない・上限を超える・読めない、と思わない誤りも `feedback` にする）。
+ * @param {{ codexHome: string, fs?: object }} options codexHome は選んだ口座のフォルダ（絶対パス）
+ * @returns {string|null}
+ */
+export function checkFeedbackConfig({ codexHome, fs: fsImpl = NODE_PROJECT_FS } = {}) {
+  try {
+    if (typeof codexHome !== 'string' || !isAbsolute(codexHome)) return GUARD_UNVERIFIED.feedback;
+    return judgeFeedbackConfig(readSmallText(fsImpl, join(codexHome, 'config.toml')));
+  } catch {
+    return GUARD_UNVERIFIED.feedback;
+  }
+}
+
 /**
  * 型の照合・引数の組立・起動ごとの点検をまとめて行い、通れば子の起動の指定を返す。点検の起動と
  * 子の起動には、同じ作業フォルダ（exec 自身の作業フォルダの実パス）と同じ環境を渡す。
  *
  * 型に当たらなければ点検を起動せず { ok: false, kind: 'argument-rejected', reason: 'form', detail }。
  * 作業フォルダの実パスが求められなければ点検を起動せず、点検が通らなかったものとして exit。
+ * 型1〜3のどれでも、続けてフィードバックの設定の点検（checkFeedbackConfig）を行い、通らなければ点検を
+ * 起動せずに feedback。
  * 型2 では、点検を起動する前に設定のフォルダの点検（checkProjectFolders）を行い、通らなければ点検を
  * 起動せずに project-config か project-root。
  * 点検が通らなければ { ok: false, kind: 'guard-unverified', reason }。通れば
@@ -858,8 +977,8 @@ export function checkProjectFolders({ cwd, codexHome, launchArgs = [], fs: fsImp
  *   spawn?: Function, scheduler?: object, timeoutMs?: number, maxBytes?: number,
  *   processCwd?: () => string, realpath?: (path: string) => string,
  *   projectFs?: object, projectLayerPaths?: object,
- * }} options projectFs と projectLayerPaths は、設定のフォルダの点検のファイルの道具とプロジェクトの層の外の
- *   置き場（試験のため。省けば本物）
+ * }} options projectFs と projectLayerPaths は、フィードバックの設定の点検と設定のフォルダの点検のファイルの
+ *   道具と、プロジェクトの層の外の置き場（試験のため。省けば本物）
  */
 export async function prepareGuardedLaunch({ args, caller, codexPath, codexHome, env, spawn, scheduler,
   timeoutMs, maxBytes, processCwd, realpath, projectFs, projectLayerPaths } = {}) {
@@ -870,6 +989,8 @@ export async function prepareGuardedLaunch({ args, caller, codexPath, codexHome,
   if (!built.ok) return Object.freeze({ ...built, kind: ARGUMENT_REJECTED_KIND });
   const cwd = resolveLaunchWorkingDirectory({ processCwd, realpath });
   if (cwd === null) return unverified(GUARD_UNVERIFIED.exit);
+  const feedbackReason = checkFeedbackConfig({ codexHome, fs: projectFs });
+  if (feedbackReason !== null) return unverified(feedbackReason);
   if (built.form === LAUNCH_FORM.interactive) {
     const projectReason = checkProjectFolders({
       cwd, codexHome, launchArgs: built.launchArgs, fs: projectFs, paths: projectLayerPaths,

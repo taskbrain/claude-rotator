@@ -12,7 +12,8 @@ import {
   accountDirPath, createAccountDir, isAccountDirName, newAccountDirName,
 } from '../../src/codex/accounts-dir.js';
 import {
-  ACCOUNT_CONFIG_TOML, SECOND_LAYER_FEATURES_LINES, SECOND_LAYER_FEATURES_TABLE, SECOND_LAYER_ROOT_LINES,
+  ACCOUNT_CONFIG_TOML, SECOND_LAYER_FEATURES_LINES, SECOND_LAYER_FEATURES_TABLE, SECOND_LAYER_FEEDBACK_LINES,
+  SECOND_LAYER_FEEDBACK_TABLE, SECOND_LAYER_ROOT_LINES, judgeFeedbackConfig,
 } from '../../src/codex/account-config.js';
 import { CODEX_ACCOUNT_LABEL } from '../../src/codex/config.js';
 import { readCodexCredentials } from '../../src/codex/credentials.js';
@@ -81,7 +82,7 @@ test('accountDirPath joins the root and the name and refuses other names', () =>
   assert.throws(() => accountDirPath('/zz/accounts', '../x'), assertReason(ACCOUNTS_DIR_REASON.badName));
 });
 
-test('createAccountDir makes the root and the folder 0700 and writes only the three guard settings', async t => {
+test('createAccountDir makes the root and the folder 0700 and writes only the four guard settings', async t => {
   const { accountsDir } = await rootUnder(t);
   const path = await createAccountDir({ accountsDir, name: FIXED_NAME });
   assert.equal(path, join(accountsDir, FIXED_NAME));
@@ -93,16 +94,20 @@ test('createAccountDir makes the root and the folder 0700 and writes only the th
   const text = await readFile(configPath, 'utf8');
   assert.equal(text, ACCOUNT_CONFIG_TOML);
 
-  // 設定は3つだけで、承認とサンドボックスの行を持たない。
+  // 設定は4つだけで、承認とサンドボックスの行を持たない。
   const settingLines = text.split('\n').filter(line => line.trim() !== '' && !line.trim().startsWith('['));
-  assert.deepEqual(settingLines, [...SECOND_LAYER_ROOT_LINES, ...SECOND_LAYER_FEATURES_LINES]);
+  assert.deepEqual(settingLines, [...SECOND_LAYER_ROOT_LINES, ...SECOND_LAYER_FEATURES_LINES, ...SECOND_LAYER_FEEDBACK_LINES]);
   assert.doesNotMatch(text, /approval_policy|sandbox_mode/);
-  // 保存先の行は最初の表より前、機能の2行は [features] の表の中。
+  // 保存先の行は最初の表より前、機能の2行は [features] の表の中、フィードバックの行は [feedback] の表の中。
   const lines = text.split('\n');
-  const firstTable = lines.findIndex(line => line.trim().startsWith('['));
-  assert.equal(lines[firstTable], SECOND_LAYER_FEATURES_TABLE);
+  const tables = lines.map((line, index) => (line.trim().startsWith('[') ? index : -1)).filter(index => index !== -1);
+  assert.deepEqual(tables.map(index => lines[index]), [SECOND_LAYER_FEATURES_TABLE, SECOND_LAYER_FEEDBACK_TABLE]);
+  const [firstTable, feedbackTable] = tables;
   assert.ok(lines.indexOf('cli_auth_credentials_store = "file"') < firstTable);
   assert.deepEqual(lines.slice(firstTable + 1, firstTable + 3), [...SECOND_LAYER_FEATURES_LINES]);
+  assert.deepEqual(lines.slice(feedbackTable + 1, feedbackTable + 2), [...SECOND_LAYER_FEEDBACK_LINES]);
+  // exec の起動の前のフィードバックの設定の点検は、書いた全文を通す。
+  assert.equal(judgeFeedbackConfig(text), null);
 });
 
 test('the credentials reader judges the written config.toml as the file store', async t => {
