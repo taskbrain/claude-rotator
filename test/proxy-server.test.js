@@ -20,6 +20,301 @@ import { createProxyServer, defaultTokenRefresher } from '../src/proxy-server.js
 
 const cleanupCallbacks = [];
 
+it('keeps default-off allocation compatible after an upstream 429 with a past five-hour reset', async () => {
+  const start = Date.parse('2026-01-01T00:00:00Z');
+  const clock = { ms: start };
+  let requests = 0;
+  const upstream = await listen(http.createServer((req, res) => {
+    requests++;
+    const first = requests === 1;
+    res.writeHead(first ? 429 : 200, {
+      'content-type': 'application/json', 'retry-after': '1',
+      'anthropic-ratelimit-unified-5h-utilization': first ? '0' : '0.2',
+      'anthropic-ratelimit-unified-5h-reset': String((first ? start - 1000 : start + 3_600_000) / 1000),
+      'anthropic-ratelimit-unified-7d-fable-utilization': 'invalid-fixture',
+      'anthropic-ratelimit-unified-7d-fable-reset': String((start + 3_600_000) / 1000),
+    });
+    res.end(JSON.stringify(first ? { error: { type: 'rate_limit_error', message: 'fixture rate limit' } } : { ok: true }));
+  }));
+  const accounts = [{ id: 'sample-a', type: 'apikey' }, { id: 'sample-b', type: 'apikey' }];
+  const manager = new AccountManager({ accounts, now: () => clock.ms });
+  const secrets = new MemorySecretStore();
+  for (const [index, account] of accounts.entries()) {
+    await secrets.set(account.id, { apiKey: randomUUID() });
+    manager.updateQuota(account.id, {
+      'anthropic-ratelimit-unified-5h-utilization': String((index + 1) / 10),
+      'anthropic-ratelimit-unified-5h-reset': String((start + 3_600_000) / 1000),
+    });
+  }
+  const proxy = await listen(createProxyServer({
+    accountManager: manager, secretStore: secrets,
+    config: { upstream: upstream.url, usagePolling: { enabled: false } },
+  }));
+  cleanupAfterTest(async () => { await close(proxy.server); await close(upstream.server); });
+  await requestJson(`${proxy.url}/v1/messages`, { method: 'POST', body: JSON.stringify({ model: 'sonnet' }) });
+  assert.ok(requests > 0);
+  clock.ms += 2000;
+  assert.equal(manager.selectForNewAssignment()?.id, 'sample-b');
+  assert.equal(manager.getStatus().events.some(event => event.type === 'quota-header-rejected'), false);
+});
+
+describe('review regressions: weekly recovery and exhaustion', () => {
+  const START = Date.parse('2026-01-01T00:00:00Z');
+  const HOUR = 3_600_000;
+  async function start(policy, { polling = false, restoredState = null, oauth = false, degradeMapping = false } = {}) {
+    const clock = { ms: START + 31 * 60_000 };
+    const seen = [];
+    const logs = [];
+    let usageCalls = 0;
+    const upstream = await listen(http.createServer((req, res) => {
+      seen.push(req.url);
+      res.writeHead(200, {
+        'content-type': 'application/json',
+        'anthropic-ratelimit-unified-7d-utilization': '0.3',
+        'anthropic-ratelimit-unified-7d-reset': String((START + 24 * HOUR) / 1000),
+      });
+      res.end(JSON.stringify({ ok: true }));
+    }));
+    const accounts = ['sample-a', 'sample-b'].map(id => ({ id, type: oauth ? 'oauth' : 'apikey' }));
+    const manager = new AccountManager({
+      accounts, now: () => clock.ms, switchThreshold: 0.97,
+      planQuota: { mode: policy === 'plan' ? 'on' : 'off' },
+      accountUrgency: { mode: policy === 'urgency' ? 'on' : 'off' },
+    });
+    if (restoredState) manager.restoreState(restoredState);
+    const secretStore = new MemorySecretStore();
+    for (const account of accounts) await secretStore.set(account.id, oauth
+      ? { accessToken: randomUUID(), expiresAt: Date.now() + 24 * HOUR }
+      : { apiKey: randomUUID() });
+    const proxy = await listen(createProxyServer({
+      accountManager: manager, secretStore, logger: line => logs.push(line),
+      usageFetcher: async () => { usageCalls++; throw new Error('Usage fetch failed (429)'); },
+      config: {
+        upstream: upstream.url, sessionAffinity: { mode: 'on' },
+        planQuota: { mode: policy === 'plan' ? 'on' : 'off' },
+        accountUrgency: { mode: policy === 'urgency' ? 'on' : 'off' },
+        usagePolling: { enabled: polling, concurrency: 2, requestSpacingMs: 0, intervalMs: HOUR },
+        openaiBridge: { enabled: false, degradeMapping: { enabled: degradeMapping } },
+      },
+    }));
+    cleanupAfterTest(async () => { await close(proxy.server); await close(upstream.server); });
+    const week = used => ({ utilization: used, resets_at: new Date(START + 24 * HOUR).toISOString() });
+    const ask = () => requestJson(`${proxy.url}/v1/messages`, {
+      method: 'POST', body: JSON.stringify({ model: 'sonnet' }),
+    });
+    return { manager, clock, seen, logs, week, ask, proxy, usageCalls: () => usageCalls };
+  }
+
+  for (const policy of ['plan', 'urgency']) {
+    it(`warns when polling is disabled and recovers a stale restored week from response headers (${policy})`, async () => {
+      const original = new AccountManager({ accounts: [{ id: 'sample-a', type: 'apikey' }, { id: 'sample-b', type: 'apikey' }],
+        now: () => START, switchThreshold: 0.97,
+        planQuota: { mode: policy === 'plan' ? 'on' : 'off' },
+        accountUrgency: { mode: policy === 'urgency' ? 'on' : 'off' } });
+      original.applyUsage('sample-a', { seven_day: {
+        utilization: 0.4, resets_at: new Date(START + 24 * HOUR).toISOString(),
+      }, five_hour: null });
+      const h = await start(policy, { restoredState: original.exportState() });
+      assert.ok(h.logs.some(line => line.includes('warning=usage-polling-disabled')));
+      assert.equal((await h.ask()).status, 200);
+      assert.equal(h.seen.length, 1);
+      assert.equal(h.manager.find('sample-a').quota.usageSource, 'header');
+      if (policy === 'urgency') assert.equal(h.manager.getStatus().accountUrgency.accounts[0].weekly.fresh, true);
+      else assert.equal(h.manager.hasFreshWeeklyQuota(h.manager.find('sample-a')), true);
+    });
+
+    it(`recovers through headers even while usage polling keeps returning 429 (${policy})`, async () => {
+      const h = await start(policy, { polling: true, oauth: true });
+      h.manager.applyUsage('sample-a', { seven_day: h.week(0.4), five_hour: null });
+      h.clock.ms += 31 * 60_000;
+      for (let i = 0; i < 2; i++) await requestJson(`${h.proxy.url}/internal/refresh-usage`, { method: 'POST' });
+      assert.ok(h.usageCalls() >= 2);
+      assert.equal((await h.ask()).status, 200);
+      assert.equal(h.manager.find('sample-a').quota.usageSource, 'header');
+    });
+
+    for (const errorType of ['oauth_refresh_failed', 'fixture_error']) {
+      it(`returns quota 429 and reset when another account has stale error state (${policy}, ${errorType})`, async () => {
+        const h = await start(policy);
+        h.manager.markError('sample-a', errorType, 'fixture rejection', { cause: 'invalid_grant' });
+        h.manager.applyUsage('sample-b', { seven_day: h.week(0.99), five_hour: null });
+        h.clock.ms += 31 * 60_000;
+        const response = await h.ask();
+        assert.equal(response.status, 429);
+        assert.equal(response.body.error.type, 'rate_limit_error');
+        assert.equal(response.headers['anthropic-ratelimit-unified-reset'], String((START + 24 * HOUR) / 1000));
+        assert.equal(response.body.error.details.reset_at, new Date(START + 24 * HOUR).toISOString());
+        assert.equal(h.seen.length, 0);
+      });
+    }
+    it(`keeps the terminal exhaustion mapping when a stale login error is present (${policy})`, async () => {
+      const h = await start(policy, { degradeMapping: true });
+      h.manager.markError('sample-a', 'authentication_error', 'fixture rejection');
+      h.manager.applyUsage('sample-b', { seven_day: h.week(0.99), five_hour: null });
+      h.clock.ms += 31 * 60_000;
+      const response = await h.ask();
+      assert.equal(response.status, 529);
+      assert.equal(response.headers['x-claude-rotator-reason'], 'credential_login_required');
+      assert.ok(h.logs.some(line => line.includes('mapPath=d rotatorReason=credential_login_required')));
+      assert.equal(h.seen.length, 0);
+    });
+  }
+});
+
+describe('account urgency turn routing', () => {
+  async function startUrgency(mode, affinityMode = 'on') {
+    const clock = { ms: Date.parse('2026-10-29T07:00:00Z') };
+    const startAt = clock.ms;
+    const seen = [];
+    let release = null;
+    let heldStarted = null;
+    const upstream = await listen(http.createServer(async (req, res) => {
+      const chunks = [];
+      for await (const chunk of req) chunks.push(chunk);
+      const body = JSON.parse(Buffer.concat(chunks));
+      seen.push(req.headers['x-api-key']);
+      if (body.hold) {
+        res.writeHead(200, { 'content-type': 'application/json' });
+        res.write('{');
+        release = () => res.end('"ok":true}');
+        heldStarted?.();
+      } else {
+        res.writeHead(200, { 'content-type': 'application/json' });
+        res.end('{"ok":true}');
+      }
+    }));
+    const secretStore = new MemorySecretStore();
+    for (const id of ['soon', 'later']) await secretStore.set(id, { apiKey: id });
+    const manager = new AccountManager({
+      accounts: ['soon', 'later'].map(id => ({ id, type: 'apikey' })), now: () => clock.ms,
+    });
+    const queued = [];
+    const proxy = await listen(createProxyServer({
+      accountManager: manager, secretStore,
+      alertWatch: { notice: item => { queued.push(item); return true; } },
+      config: { upstream: upstream.url, usagePolling: { enabled: false },
+        accountUrgency: { mode }, sessionAffinity: { mode: affinityMode } },
+    }));
+    cleanupAfterTest(async () => { release?.(); await close(proxy.server); await close(upstream.server); });
+    const usage = (id, weekly, fiveHour = 0.2) => manager.applyUsage(id, {
+      five_hour: { utilization: fiveHour, resets_at: new Date(startAt + 4 * 3_600_000).toISOString() },
+      seven_day: { utilization: weekly, resets_at: new Date(startAt + (id === 'soon' ? 5 : 32) * 3_600_000).toISOString() },
+    });
+    const ask = (content = 'hello', extra = {}) => requestJson(`${proxy.url}/v1/messages`, {
+      method: 'POST', headers: { 'x-claude-code-session-id': 'urgency-session' },
+      body: JSON.stringify({ model: 'sonnet', messages: [{ role: 'user', content }], ...extra }),
+    });
+    usage('later', 0.58, 0.1);
+    const seedRisk = () => {
+      clock.ms += 46 * 60_000;
+      usage('soon', 0.57, 0.7); usage('later', 0.58, 0.1);
+      clock.ms += 15 * 60_000;
+      usage('soon', 0.58, 0.71); usage('later', 0.59, 0.11);
+    };
+    return { manager, clock, seen, queued, ask, seedRisk,
+      started: () => new Promise(resolve => { heldStarted = resolve; }), release: () => release?.() };
+  }
+
+  it('shadow records the same move that on performs, without changing routing or queuing notifications', async () => {
+    const h = await startUrgency('shadow');
+    await h.ask(); h.seedRisk(); await h.ask();
+    assert.deepEqual(h.seen, ['later', 'later']);
+    assert.equal(h.queued.length, 0);
+    const status = h.manager.getStatus().accountUrgency;
+    assert.equal(status.decisions.at(-1).wouldReassign, true);
+    assert.equal(status.reassignments.length, 0);
+    assert.equal(status.notifications[0].delivery, 'shadow-draft');
+  });
+
+  it('on waits through tool continuations and moves at the next user turn without a restart', async () => {
+    const h = await startUrgency('on');
+    await h.ask(); h.seedRisk();
+    await h.ask([{ type: 'tool_result', tool_use_id: 'example', content: 'done' }]);
+    await h.ask(); await h.ask();
+    assert.deepEqual(h.seen, ['later', 'later', 'soon', 'soon']);
+    assert.equal(h.manager.getStatus().accountUrgency.reassignments.length, 1);
+    assert.equal(h.queued.length, 1);
+  });
+
+  it('leaves an in-flight response on its old account and defers another request until release', async () => {
+    const h = await startUrgency('on');
+    await h.ask(); h.seedRisk();
+    const started = h.started();
+    const pending = h.ask([{ type: 'tool_result' }], { hold: true });
+    await started;
+    await h.ask();
+    assert.deepEqual(h.seen, ['later', 'later', 'later']);
+    h.release(); await pending;
+    await h.ask();
+    assert.equal(h.seen.at(-1), 'soon');
+  });
+
+  it('degrades an on request to shadow when sticky affinity is unavailable', async () => {
+    const h = await startUrgency('on', 'off');
+    const status = h.manager.getStatus();
+    assert.equal(status.switchThreshold, 1);
+    assert.equal(status.accountUrgency.mode, 'shadow');
+    assert.equal(status.accountUrgency.activationBlock, 'session-affinity-required');
+  });
+
+  it('on never falls back to an unobserved current account when no new candidate is known', async () => {
+    const h = await startUrgency('on');
+    h.manager.applyUsage('later', { five_hour: null, seven_day: null });
+    const response = await h.ask();
+    assert.equal(response.status, 503);
+    assert.deepEqual(h.seen, []);
+  });
+
+  it('on never uses the grace wait to send a weekly-stopped binding', async () => {
+    const h = await startUrgency('on');
+    await h.ask();
+    h.manager.applyUsage('later', {
+      five_hour: { utilization: 0.2, resets_at: new Date(h.clock.ms + 30_000).toISOString() },
+      seven_day: { utilization: 0.98, resets_at: new Date(h.clock.ms + 5 * 3_600_000).toISOString() },
+    });
+    h.manager.applyUsage('soon', {
+      five_hour: { utilization: 0.2, resets_at: new Date(h.clock.ms + 3_600_000).toISOString() },
+      seven_day: { utilization: 0.5, resets_at: new Date(h.clock.ms + 2 * 3_600_000).toISOString() },
+    });
+    await h.ask();
+    assert.deepEqual(h.seen, ['later', 'soon']);
+  });
+
+  it('routes weekly-only mixed accounts through disappearing and returning five-hour reports', async () => {
+    const h = await startUrgency('on');
+    const hour = 3_600_000;
+    const weekly = used => ({ utilization: used, resets_at: new Date(h.clock.ms + 24 * hour).toISOString() });
+    h.manager.applyUsage('later', { five_hour: null, seven_day: weekly(0.3) });
+    assert.equal((await h.ask()).status, 200);
+    h.manager.applyUsage('later', { five_hour: {
+      utilization: 0.98, resets_at: new Date(h.clock.ms + hour).toISOString(),
+    }, seven_day: weekly(0.31) });
+    h.manager.applyUsage('later', { five_hour: null, seven_day: weekly(0.32) });
+    h.manager.applyUsage('soon', { five_hour: null, seven_day: weekly(0.4) });
+    assert.equal((await h.ask()).status, 200);
+    assert.deepEqual(h.seen, ['later', 'soon']);
+    assert.equal(h.manager.canSendWithUrgency(h.manager.find('later')), false);
+    h.clock.ms += hour;
+    h.manager.applyUsage('later', { five_hour: null, seven_day: weekly(0.33) });
+    h.manager.applyUsage('soon', { five_hour: null, seven_day: weekly(0.97) });
+    assert.equal((await h.ask()).status, 200);
+    assert.deepEqual(h.seen, ['later', 'soon', 'later']);
+  });
+
+  it('applies Fable weekly stops without excluding the same weekly-only account for other models', async () => {
+    const h = await startUrgency('on');
+    const week = used => ({ utilization: used, resets_at: new Date(h.clock.ms + 24 * 3_600_000).toISOString() });
+    h.manager.applyUsage('later', { five_hour: null, seven_day: week(0.3), scoped_weekly: [
+      { key: 'fable', label: 'Fable', ...week(0.97) },
+    ] });
+    h.manager.applyUsage('soon', { five_hour: null, seven_day: week(0.4) });
+    assert.equal((await h.ask()).status, 200);
+    assert.equal((await h.ask('next', { model: 'claude-fable-5' })).status, 200);
+    assert.equal((await h.ask()).status, 200);
+    assert.deepEqual(h.seen, ['later', 'soon', 'later']);
+  });
+});
+
 afterEach(async () => {
   const callbacks = cleanupCallbacks.splice(0).reverse();
   for (const callback of callbacks) await callback();
@@ -13296,6 +13591,7 @@ describe('session affinity rebind grace', () => {
   async function startGrace({
     accounts = ['acct_a', 'acct_b'],
     sessionAffinity = { mode: 'on' },
+    planQuota = null,
     upstream: upstreamHandler = null,
   } = {}) {
     const logLines = [];
@@ -13328,6 +13624,7 @@ describe('session affinity rebind grace', () => {
       config: {
         upstream: upstream.url,
         usagePolling: { enabled: false },
+        ...(planQuota ? { planQuota } : {}),
         ...(sessionAffinity ? { sessionAffinity } : {}),
       },
     });
@@ -13350,6 +13647,23 @@ describe('session affinity rebind grace', () => {
       proxy, upstream, seen, rounds, secretStore, accountManager, logLines, logger, ask, bytesFor,
     };
   }
+
+  it('does not wait for a low five-hour reset while the weekly window is still stopped', async () => {
+    const h = await startGrace({ planQuota: { mode: 'on' }, sessionAffinity: { mode: 'on', rebindGraceMs: 5000 } });
+    for (const [id, value] of [['acct_a', 0.2], ['acct_b', 0.5]]) h.accountManager.applyUsage(id, {
+      five_hour: { utilization: 0.1, resets_at: resetAfter(3_600_000) },
+      seven_day: { utilization: value, resets_at: resetAfter(3_600_000) },
+    });
+    await h.ask({ sid: 'weekly-grace', round: '1' });
+    h.accountManager.applyUsage('acct_a', {
+      five_hour: { utilization: 0.1, resets_at: resetAfter(2000) },
+      seven_day: { utilization: 1, resets_at: resetAfter(3_600_000) },
+    });
+    assert.equal((await h.ask({ sid: 'weekly-grace', round: '2' })).status, 200);
+    assert.deepEqual(h.seen, ['Bearer token-acct_a', 'Bearer token-acct_b']);
+    assert.equal(h.logLines.some(line => line.includes('reason=quota_grace')), false,
+      'a low five-hour window cannot make a stopped weekly window recover');
+  });
 
   it('⑰: waits out a recovery inside the grace and sends once to the same account', async () => {
     let bytesAtUpstream = null;

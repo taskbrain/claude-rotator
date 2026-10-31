@@ -384,6 +384,8 @@ async function runServer({ write }) {
     switchThreshold: config.switchThreshold,
     currentAccountId: config.activeAccount,
     rotationPolicy: config.rotationPolicy,
+    accountUrgency: config.accountUrgency,
+    planQuota: config.planQuota,
     logger,
     // 切替履歴（`events`）を保存・復元し上限50件を適用するかどうか。
     // **復元は下の `restoreRuntimeState` で起きるので、その前に決めておく
@@ -444,6 +446,8 @@ async function runServer({ write }) {
     },
     reloadOpenAiBridge: () => loadConfig().then(nextConfig => nextConfig?.openaiBridge),
     reloadSessionAffinity: () => loadConfig().then(nextConfig => nextConfig?.sessionAffinity),
+    reloadAccountUrgency: () => loadConfig().then(nextConfig => nextConfig?.accountUrgency),
+    reloadPlanQuota: () => loadConfig().then(nextConfig => nextConfig?.planQuota),
     // logMaxBytes だけは reload では効かない（fd は起動時に開くため。README に明記）。
     reloadObservability: () => loadConfig().then(nextConfig => nextConfig?.observability),
     logger,
