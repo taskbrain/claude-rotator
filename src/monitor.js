@@ -35,6 +35,18 @@ export function renderStatus(status, options = {}) {
   // carries the section, which /internal/status omits entirely while the mode is
   // "off" - so the default configuration prints exactly what it prints today.
   lines.push(...renderAffinitySection(status.sessionAffinity));
+  if (status.accountUrgency) {
+    const urgency = status.accountUrgency;
+    const last = urgency.decisions.at(-1);
+    lines.push(`Account urgency: ${urgency.mode}${urgency.activationBlock ? ` (${urgency.activationBlock})` : ''}`);
+    if (last) lines.push(`  actual=${last.actualAccountId || '-'} proposed=${last.proposedAccountId || '-'} reason=${last.reason}`);
+    for (const account of urgency.accounts) {
+      const pace = account.requiredPace == null ? '-' : `${(account.requiredPace * 100).toFixed(2)}pt/h`;
+      const unused = account.predictedUnusedFraction == null ? '-' : `${(account.predictedUnusedFraction * 100).toFixed(1)}pt`;
+      lines.push(`  ${account.accountId}: required=${pace} unused=${unused}${account.exclusionReason ? ` (${account.exclusionReason})` : ''}`);
+    }
+    lines.push('');
+  }
 
   // Alerts line. Drawn only when the status JSON carries the section, which
   // /internal/status omits while no alert channel is configured.
@@ -109,7 +121,11 @@ function renderAccountCard(account, status, now) {
   lines.push(`routes Fable: ${renderAvailability(fable, now)} | Other: ${renderAvailability(other, now)}`);
   const reason = renderUnavailableReason(account.unavailableReason, account.id);
   if (reason) lines.push(`reason: ${reason}`);
-  lines.push(renderQuotaRow('5h', account.quota?.unified5h, account.quota?.unified5hReset, now));
+  const five = status.quotaWindows?.accounts?.find(row => row.accountId === account.id)?.windows?.find(window => window.id === '5h')
+    || status.accountUrgency?.accounts?.find(row => row.accountId === account.id)?.fiveHour;
+  if (five?.applicability === 'unknown') {
+    lines.push(`5h unknown (${five.observationState})${five.retainedConstraint ? ' - previous constraint retained' : ''}`);
+  } else lines.push(renderQuotaRow('5h', account.quota?.unified5h, account.quota?.unified5hReset, now));
   lines.push(renderQuotaRow('7d', account.quota?.unified7d, account.quota?.unified7dReset, now));
   for (const limit of account.quota?.weeklyScoped || []) {
     lines.push(renderQuotaRow(`7d ${limit.label || limit.key || 'scoped'}`, limit.utilization, limit.resetAt, now));

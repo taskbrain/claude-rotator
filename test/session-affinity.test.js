@@ -17,6 +17,25 @@ import {
 const SESSION_ID = 'bae7a638-9f3a-4b7c-8d21-0f4e6c2a11b9';
 const START_MS = 1_757_000_000_000;
 
+it('urgency cooldown starts again when a family binding moves and stays held until every request ends', () => {
+  let now = START_MS;
+  const affinity = new SessionAffinity({ mode: 'on', now: () => now });
+  affinity.note(SESSION_ID, { account: 'home' });
+  now += 2 * 3_600_000;
+  affinity.note(SESSION_ID, { account: 'family', modelFamily: 'fable', reason: 'family_exhausted' });
+  assert.equal(affinity.lastBindingChangeAt(SESSION_ID), now);
+  now += 3_600_000;
+  affinity.note(SESSION_ID, { account: 'next', modelFamily: 'fable', reason: 'weekly_unused' });
+  assert.equal(affinity.lastBindingChangeAt(SESSION_ID), now);
+  const first = affinity.hold(SESSION_ID);
+  const second = affinity.hold(SESSION_ID);
+  assert.equal(affinity.hasInFlight(SESSION_ID), true);
+  first(); first();
+  assert.equal(affinity.hasInFlight(SESSION_ID), true);
+  second();
+  assert.equal(affinity.hasInFlight(SESSION_ID), false);
+});
+
 function collectingLogger() {
   const logger = line => logger.lines.push(line);
   logger.lines = [];

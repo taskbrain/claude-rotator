@@ -3,6 +3,7 @@ import http from 'node:http';
 import https from 'node:https';
 import { promisify } from 'node:util';
 import zlib from 'node:zlib';
+import { projectUsageQuotaShape } from './quota-shape-observer.js';
 
 export const OAUTH_ORGANIZATION_ACCESS_DENIED = 'OAUTH_ORGANIZATION_ACCESS_DENIED';
 export const OAUTH_ORGANIZATION_ACCESS_DENIED_MESSAGE =
@@ -483,6 +484,7 @@ export async function fetchUsage(accessToken, options = {}) {
   }, options);
 
   if (!response.ok) {
+    observeUsageQuota(options.onQuotaObservation, response.status);
     // The native transport retains wire bytes; fetch implementations already
     // decompress text(), even when their headers still name the wire encoding.
     const nativeBody = Buffer.isBuffer(response.rawBody);
@@ -496,7 +498,25 @@ export async function fetchUsage(accessToken, options = {}) {
     throw new Error(`Usage fetch failed (${response.status}): ${body}`);
   }
 
-  return parseUsageResponse(await response.json());
+  let data;
+  try {
+    data = await response.json();
+  } catch (error) {
+    observeUsageQuota(options.onQuotaObservation, response.status);
+    throw error;
+  }
+  observeUsageQuota(options.onQuotaObservation, response.status, data);
+  return parseUsageResponse(data);
+}
+
+function observeUsageQuota(callback, status, data) {
+  if (typeof callback !== 'function') return;
+  try {
+    const result = callback({ status, shape: projectUsageQuotaShape(data) });
+    if (result && typeof result.catch === 'function') result.catch(() => {});
+  } catch {
+    // Observation cannot change usage retrieval or quota decisions.
+  }
 }
 
 export function parseUsageResponse(data) {

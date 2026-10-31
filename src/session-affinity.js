@@ -106,6 +106,7 @@ const REBIND_REASONS = new Set([
   'account_removed',
   'cold_reassign',
   'reauth_required',
+  'weekly_unused',
 ]);
 // 確定で付け替えてよい理由は枠の枯渇の2値だけである。台帳から口座が
 // 消えたことは予約段（`affinity_switch`）と退避段（`affinity_evict`）の事象であって、
@@ -521,6 +522,17 @@ export class SessionAffinity {
     };
   }
 
+  hasInFlight(key) {
+    const hash = sidHash(key);
+    return hash ? held(this.entries.get(hash) || {}) : false;
+  }
+
+  lastBindingChangeAt(key) {
+    const hash = sidHash(key);
+    const entry = hash ? this.entries.get(hash) : null;
+    return entry?.lastReboundAt ?? entry?.boundAt ?? null;
+  }
+
   /**
    * 設定の再正規化（reload）で上限が変わったときに、その場で表へ反映する。
    * `maxSessions` を縮めたときは即 LRU で切り詰める。
@@ -906,6 +918,9 @@ export class SessionAffinity {
   rebind(hash, entry, { account, modelFamily, reason, evidence = null, now, gen }) {
     const from = boundAccount(entry, modelFamily);
     const slot = rebindSlot(entry, modelFamily, reason);
+    // A family move also invalidates its cache. Keep the cooldown conservative
+    // across both slots; restore uses lastSeen through boundAt as before.
+    entry.lastReboundAt = now;
     // 口座の集合が変わるので、先に古い集合ぶんを引いてから書き換える。
     this.removeWarm(entry);
     if (slot === 'family') {

@@ -511,6 +511,20 @@ claude-rotator status
 | `usagePolling.requestSpacingMs` | `1500` | 各リクエスト開始の最小間隔（429対策） |
 | `accounts` | `[]` | 登録済みアカウント。通常は `claude-rotator login` 等の CLI から追加し、直接編集は非推奨です |
 
+### 5時間枠が未報告の場合と週枠による選択
+
+次の設定は互いに独立しており、すべて既定は無効です。
+
+- `quotaObservation.enabled: true`: 通常の上流応答とUsage取得から、許可した枠の名前・有無・null／数値の種別・利用率・reset・HTTP状態を `quota_shape` 行へ記録します。口座は12桁のハッシュです。本文、認証値、メールアドレス、モデル名の文字列値は追加しません。設定は起動時に読みます。
+- `planQuota.mode: "shadow"` または `"on"`: shadowは現行の台帳と割当を維持し、追加の枠情報をstatusへ出します。onは週共通枠と要求モデルの週枠を主軸に新規割当を判断します。5hの欠落やnullは不明とし、0%にも口座エラーにも変換しません。直前の有効な5h制約は元のresetまで保持します。
+- `accountUrgency.mode: "shadow"` または `"on"`: 週resetまでの必要ペースで候補を比べます。onは適用される共通週・モデル別週・観測済み5hの97%関門を守り、5hが不明なだけでは除外しません。未取得・null・不正な週情報は保留します。古いだけでreset前の有効な週観測は、既知の停止条件を守って低順位の回復候補にし、送信応答のヘッダーで更新します。設定済みの厳しい `switchThreshold` も維持します。onには `sessionAffinity.mode: "on"` が必要です。
+
+プラン名から5h制限の有無を決めません。同じ口座で値が消えたり戻ったりしても観測を更新し、制限撤廃を自動で断定しません。固定セッションの積極的な移動は利用者ターンの境界で行い、実行中の要求を保護します。
+
+`GET /internal/status` の追加項目は `quotaWindows.schemaVersion: 1` と `accountUrgency.schemaVersion: 2` です。枠は可変一覧で、比率は0〜1（上流ヘッダーの1超も保持）、時刻はUnixミリ秒です。Monitor等の読み手は `applicability`・`observationState`・`fresh` とnullable値を確認してください。`accountUrgency.byModelFamily` はFableと他モデルの利用可否を分けます。`recoveryOnly: true` は古い観測による回復用の候補であり、観測日時や`fresh`を更新した意味ではありません。既存のトークン量イベントJSONLの形式は変更しません。
+
+記録だけを有効にする場合は `quotaObservation.enabled` だけを設定します。割当方針を切り替える前にshadowと消費側の契約を確認してください。観測を止める場合は同じ設定をfalseにして通常の手順で再起動します。割当の設定は内部reloadでも再読込できます。onでUsageポーリングが無効なら起動時に警告します。shadow中に見たモデル別週枠も、onへの切替時に元の観測日時のまま引き継ぎます。
+
 ### GPT モデルとの相互退避（`openaiBridge.degradeMapping`）
 
 `openaiBridge` は、モデル名が `modelPattern`（既定 `^gpt-|^o[0-9]|^openai/`）に一致するリクエストだけを、ローカルで動く別の Anthropic 互換ブリッジ（例: openai-model-bridge）へ転送する任意の分岐です（`openaiBridge.enabled` の既定は `false`）。`degradeMapping` はその下に置く任意のセクションで、Claude Code 側の `fallbackModel` と組み合わせて次の3つを実現します。

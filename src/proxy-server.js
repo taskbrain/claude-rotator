@@ -1,6 +1,7 @@
 import { createHash } from 'node:crypto';
 import http from 'node:http';
 import https from 'node:https';
+import { isUserTurnBoundary, urgencyMode } from './account-urgency.js';
 
 import {
   commonQuotaEvidence,
@@ -31,7 +32,8 @@ import {
 } from './oauth.js';
 import { createNativeClaudeRefresher } from './native-claude-refresher.js';
 import { createRefreshLogFields } from './refresh-log-fields.js';
-import { isFableScopeIdentity, parseRateLimitHeaders } from './quota.js';
+import { isFableScopeIdentity, parseRateLimitHeaders, scopeMatchesModelFamily } from './quota.js';
+import { createQuotaShapeObserver } from './quota-shape-observer.js';
 import { duplicateRefreshTokenAccountIds } from './secret-store.js';
 // 観測整備（PR #42）が sticky から切り出した純関数。実装は `./session-key.js` の
 // 1箇所にあり、`./session-affinity.js` はそれを再 export しているだけである。
@@ -142,6 +144,8 @@ export function createProxyServer({
   reloadAccounts = null,
   reloadOpenAiBridge = null,
   reloadSessionAffinity = null,
+  reloadAccountUrgency = null,
+  reloadPlanQuota = null,
   reloadObservability = null,
   allowLiveClaudeCodeCredentials = true,
   tokenRefresher = null,
@@ -172,6 +176,9 @@ export function createProxyServer({
 }) {
   assertLoopbackProxyHost(config.proxy?.host || '127.0.0.1');
   const upstream = config.upstream || 'https://api.anthropic.com';
+  const quotaShapeObserver = config.quotaObservation?.enabled === true
+    ? createQuotaShapeObserver({ enabled: true, logger, now: () => accountManager.now() })
+    : null;
   const usageEventWriter = injectedUsageEventWriter
     || (usageEventsDir ? createUsageEventWriter({ dir: usageEventsDir, logger }) : null);
   const upstreamIdleTimeoutMs = config.proxy?.upstreamIdleTimeoutMs
@@ -306,6 +313,7 @@ export function createProxyServer({
     usageFetcher,
     usageRequestOptions,
     usageObservationTracker,
+    quotaShapeObserver,
     allowLiveClaudeCodeCredentials,
     usageRefreshConcurrency: usagePollingConcurrency(config, accountManager.accounts.length),
     usageRefreshRequestSpacingMs: usagePollingRequestSpacingMs(config),
@@ -323,6 +331,7 @@ export function createProxyServer({
     usageFetcher,
     usageRequestOptions,
     usageObservationTracker,
+    quotaShapeObserver,
     allowLiveClaudeCodeCredentials,
     timeoutMs: positiveTimeoutOrDefault(
       reactiveQuotaConfirmTimeoutMs,
@@ -473,6 +482,25 @@ export function createProxyServer({
     });
   }
   sessionAffinitySettings = normalizeSessionAffinity(config.sessionAffinity);
+  function configureUrgency() {
+    const requested = urgencyMode(config.accountUrgency);
+    const blocked = requested === 'on' && sessionAffinitySettings.mode !== 'on';
+    accountManager.configureAccountUrgency({ mode: blocked ? 'shadow' : requested });
+    if (accountManager.urgency) accountManager.urgency.activationBlock = blocked ? 'session-affinity-required' : null;
+    accountManager.setUrgencyNotifier(notice => alertWatch?.notice?.(notice) === true);
+  }
+  configureUrgency();
+  accountManager.configurePlanQuota(config.planQuota);
+  let pollingWarningShown = false;
+  function warnWithoutUsagePolling() {
+    const active = accountManager.planQuotaMode === 'on' || accountManager.urgency?.mode === 'on';
+    const needsWarning = active && !usagePollingEnabled(config);
+    if (needsWarning && !pollingWarningShown) {
+      try { logger?.('quota-policy warning=usage-polling-disabled recovery=last-known-weekly'); } catch {}
+    }
+    pollingWarningShown = needsWarning;
+  }
+  warnWithoutUsagePolling();
   // 台帳へ渡すのは真偽値1つだけ。`mode:"off"` では現行のまま
   // ——`events` は保存も復元もされず、メモリ上限も効かない。
   accountManager.setEventHistoryEnabled(sessionAffinitySettings.mode !== 'off');
@@ -839,6 +867,11 @@ export function createProxyServer({
             logger,
           });
         }
+        if (reloadAccountUrgency) config.accountUrgency = await reloadAccountUrgency();
+        configureUrgency();
+        if (reloadPlanQuota) config.planQuota = await reloadPlanQuota();
+        accountManager.configurePlanQuota(config.planQuota);
+        warnWithoutUsagePolling();
         // キャッシュ観測の再読込。セクションが無い・config.json 自体が無い
         // （reloadObservability が undefined を返す）ときは既定へ戻す。
         // **毎回 normalizeObservability() を通し直すこと。** 起動時の1回きりの
@@ -974,6 +1007,7 @@ export function createProxyServer({
         allowLiveClaudeCodeCredentials,
         logger,
         upstreamIdleTimeoutMs,
+        quotaShapeObserver,
         upstreamConnectTimeoutMs,
         upstreamConnectRetries,
         upstreamConnectRetryDelayMs,
@@ -1294,6 +1328,7 @@ function createUsageRefresher({
   allowLiveClaudeCodeCredentials,
   usageRequestOptions,
   usageObservationTracker,
+  quotaShapeObserver,
   usageRefreshConcurrency,
   usageRefreshRequestSpacingMs,
   beforeRefresh,
@@ -1322,6 +1357,7 @@ function createUsageRefresher({
       allowLiveClaudeCodeCredentials,
       usageRequestOptions,
       usageObservationTracker,
+      quotaShapeObserver,
       usageRefreshConcurrency,
       usageRefreshRequestSpacingMs,
       duplicateRefreshAccountIds,
@@ -1519,6 +1555,7 @@ function createReactiveQuotaConfirmer({
   usageFetcher,
   usageRequestOptions,
   usageObservationTracker,
+  quotaShapeObserver,
   allowLiveClaudeCodeCredentials = true,
   timeoutMs,
   logger,
@@ -1553,6 +1590,9 @@ function createReactiveQuotaConfirmer({
         return Promise.all([
           usageFetcher(accessToken, {
             ...usageRequestOptions,
+            ...(quotaShapeObserver ? {
+              onQuotaObservation: observation => quotaShapeObserver.usage(account.id, observation),
+            } : {}),
             timeoutMs,
             connectTimeoutMs: Math.min(
               Number(usageRequestOptions.connectTimeoutMs) || timeoutMs,
@@ -1661,6 +1701,7 @@ function createReactiveQuotaConfirmer({
             REACTIVE_QUOTA_EXHAUSTION_THRESHOLD,
             modelFamily,
             accountManager.now(),
+            account.extendedQuotaScopes,
           );
         const newerObservation = usageObservationTracker.newerSuccessfulEvidence(
           result.observation,
@@ -1670,6 +1711,7 @@ function createReactiveQuotaConfirmer({
           REACTIVE_QUOTA_EXHAUSTION_THRESHOLD,
           modelFamily,
           accountManager.now(),
+          account.extendedQuotaScopes,
         );
         const authorizationGeneration = directEvidence
           ? result.observation.generation
@@ -1712,6 +1754,7 @@ function createReactiveQuotaConfirmer({
         REACTIVE_QUOTA_EXHAUSTION_THRESHOLD,
         authorization.modelFamily,
         nowMs,
+        authorization.source.extendedQuotaScopes,
       ) && accountQuotaConfirmsModelFamily(
         authorization.source,
         authorization.modelFamily,
@@ -1907,9 +1950,15 @@ function createSessionAffinityRequest({
   //    条件で付け替え先を決めて、この同期区間で `Map.set` まで済ませる。
   const entry = affinity.get(key, { modelFamily });
   const bound = entry ? accountManager.findOrNull(entry.bound) : null;
+  let urgencyPlan = null;
+  const urgencyTarget = accountManager.planUrgencyReassignment({
+    bound, boundAt: affinity.lastBindingChangeAt(key), modelFamily,
+    turnBoundary: isUserTurnBoundary(body), inFlight: affinity.hasInFlight(key), sid: state.sid,
+    onDecision: decision => { urgencyPlan = decision; },
+  });
   // ① の前に1つだけ足した線（冷えた固定の移し替え）。`entry.lastSeen` は **`note()` が
   // 触る前**の値なので、「前回の要求からどれだけ空いたか」をそのまま読める。
-  const coldTarget = coldReassignTarget({
+  const coldTarget = accountManager.urgency?.mode === 'on' ? null : coldReassignTarget({
     entry, bound, accountManager, settings, modelFamily, assign,
   });
   let binding = null;
@@ -1930,13 +1979,18 @@ function createSessionAffinityRequest({
     binding = assign(null);
     sendTo = binding;
     reason = binding ? 'account_removed' : null;
+  } else if (urgencyTarget && accountManager.isAvailable(bound, modelFamily)) {
+    binding = urgencyTarget;
+    sendTo = binding;
+    reason = 'weekly_unused';
+    accountManager.recordUrgencyReassignment(bound.id, binding.id, state.sid);
   } else if (coldTarget) {
     // キャッシュが失効した固定を、混んでいる口座から空いている口座へ移す。
     // 失うものが無いので費用はゼロ。行き先が無ければこの枝は立たず、下の枝へ落ちる。
     binding = coldTarget;
     sendTo = coldTarget;
     reason = 'cold_reassign';
-  } else if (accountManager.isAvailable(bound, modelFamily)) {
+  } else if (accountManager.isAvailable(bound, modelFamily) && accountManager.canSendWithUrgency(bound, modelFamily)) {
     binding = bound;
     sendTo = bound;
     // 結び付け先へ戻ったので、使えなかった間の迂回先は捨てる。
@@ -1973,7 +2027,8 @@ function createSessionAffinityRequest({
     // （無期限の待機を作らないための安全側の既定）。
     // 付け替えるのは使えなかった結び付け先だけである。
     const now = accountManager.now();
-    graceMs = quotaGraceWaitMs(bound, settings.rebindGraceMs, now);
+    graceMs = accountManager.urgency?.mode === 'on' ? 0
+      : quotaGraceWaitMs(bound, settings.rebindGraceMs, now, threshold, modelFamily);
     if (graceMs > 0) {
       binding = bound;
       sendTo = bound;
@@ -2004,6 +2059,7 @@ function createSessionAffinityRequest({
     }
   }
 
+  if (urgencyPlan) accountManager.urgency.record('decisions', { ...urgencyPlan, actualAccountId: sendTo?.id ?? null });
   if (binding) {
     const reserved = affinity.note(key, { account: binding.id, modelFamily, reason, evidence });
     if (reserved) {
@@ -2177,22 +2233,21 @@ function quotaRebindReason(account, threshold, modelFamily, now) {
 }
 
 /**
- * 共通枠の回復見込み。
- *
- * 読むのは口座が**既に持っている** `quota.unified5hReset` / `unified7dReset` のうち
- * `now` より後の直近だけである。**新しいヘッダ解析も本文解析も1つも増やさない**——
- * `parseRateLimitHeaders` / `unifiedQuotaHeaderEvidence` / `retryAfterSeconds` は触らない。
- * 共通枠の 429 を受けると `updateQuota` がヘッダの reset 値をここへ書き込むので、
- * 「429 本文の `resets_at`」が指していた情報は次の要求の選択時にこの値として読める。
- *
- * `retry-after` と短期レート制限の reset（`quota.resetsAt`）は取得元に入れない。
- * どちらも token / request の短期レート制限のもので、共通枠（unified 5h / 7d）の
- * 回復見込みではなく、「バインドは変えない」側（createSessionAffinityRequest の最後の分岐）に属する。
- *
- * @returns {number|null} 回復見込みの時刻（ms）。取得できなければ `null`。
+ * Optional-window routing waits only for the reset of every applicable blocker.
+ * A low-use five-hour window does not predict recovery from an exhausted week.
+ * The legacy selector keeps its existing earliest-reset behavior.
  */
-function commonQuotaRecoveryAt(account, now) {
+function commonQuotaResetAt(account, now, threshold, modelFamily) {
   const quota = account?.quota || {};
+  if (account?.extendedQuotaScopes) {
+    const blockers = [
+      [quota.unified5h, quota.unified5hReset], [quota.unified7d, quota.unified7dReset],
+      ...(quota.weeklyScoped || []).filter(limit => scopeMatchesModelFamily(limit, modelFamily, true))
+        .map(limit => [limit.utilization, limit.resetAt]),
+    ].filter(([utilization]) => Number.isFinite(utilization) && utilization >= threshold);
+    if (!blockers.length || blockers.some(([, reset]) => !Number.isFinite(reset) || reset <= now)) return null;
+    return Math.max(...blockers.map(([, reset]) => reset));
+  }
   let earliest = null;
   for (const resetAt of [quota.unified5hReset, quota.unified7dReset]) {
     if (!Number.isFinite(resetAt) || resetAt <= now) continue;
@@ -2210,9 +2265,9 @@ function commonQuotaRecoveryAt(account, now) {
  *
  * @returns {number} 待つミリ秒。待たないなら 0。
  */
-function quotaGraceWaitMs(account, rebindGraceMs, now) {
+function quotaGraceWaitMs(account, rebindGraceMs, now, threshold, modelFamily) {
   if (!Number.isFinite(rebindGraceMs) || rebindGraceMs <= 0) return 0;
-  const recoveryAt = commonQuotaRecoveryAt(account, now);
+  const recoveryAt = commonQuotaResetAt(account, now, threshold, modelFamily);
   if (recoveryAt === null) return 0;
   const waitMs = recoveryAt - now;
   return waitMs > 0 && waitMs <= rebindGraceMs ? waitMs : 0;
@@ -2424,7 +2479,7 @@ function scopedUsageIdentity(limit) {
   return isFableScopeIdentity(value) ? 'fable' : (value || 'scoped');
 }
 
-function usageEvidenceConfirmsRequest(fields, threshold, modelFamily, nowMs) {
+function usageEvidenceConfirmsRequest(fields, threshold, modelFamily, nowMs, extended = false) {
   for (const [field, evidence] of fields) {
     if (
       (field === 'five_hour' || field === 'seven_day')
@@ -2433,7 +2488,7 @@ function usageEvidenceConfirmsRequest(fields, threshold, modelFamily, nowMs) {
     if (
       isScopedUsageField(field)
       && modelFamily
-      && scopedUsageMatchesModelFamily(evidence, modelFamily)
+      && scopedUsageMatchesModelFamily(evidence, modelFamily, extended)
       && usageBucketConfirmsQuota(evidence, threshold, nowMs)
     ) return true;
   }
@@ -2463,17 +2518,17 @@ function accountQuotaConfirmsModelFamily(account, modelFamily, threshold, nowMs)
   return modelFamily === 'fable'
     && Array.isArray(quota.weeklyScoped)
     && quota.weeklyScoped.some(limit => (
-      scopedUsageMatchesModelFamily(limit, modelFamily)
+      scopedUsageMatchesModelFamily(limit, modelFamily, account.extendedQuotaScopes)
       && usageBucketConfirmsQuota(limit, threshold, nowMs)
     ));
 }
 
-function scopedUsageMatchesModelFamily(limit, modelFamily) {
+function scopedUsageMatchesModelFamily(limit, modelFamily, extended = false) {
   if (modelFamily !== 'fable') return false;
   const key = String(limit?.key || '').trim().toLowerCase();
-  if (key) return isFableScopeIdentity(key);
+  if (key) return isFableScopeIdentity(key, extended);
   const label = String(limit?.label || '').trim().toLowerCase();
-  return isFableScopeIdentity(label);
+  return isFableScopeIdentity(label, extended);
 }
 
 function unifiedQuotaHeaderEvidence(headers, threshold, nowMs) {
@@ -2611,6 +2666,7 @@ async function refreshAllOnce({
   allowLiveClaudeCodeCredentials,
   usageRequestOptions,
   usageObservationTracker,
+  quotaShapeObserver,
   usageRefreshConcurrency,
   usageRefreshRequestSpacingMs,
   duplicateRefreshAccountIds,
@@ -2631,6 +2687,7 @@ async function refreshAllOnce({
       allowLiveClaudeCodeCredentials,
       usageRequestOptions,
       usageObservationTracker,
+      quotaShapeObserver,
       duplicateRefreshAccountIds,
       logger,
     }),
@@ -2682,6 +2739,7 @@ async function refreshAccountUsage({
   allowLiveClaudeCodeCredentials,
   usageRequestOptions,
   usageObservationTracker,
+  quotaShapeObserver,
   duplicateRefreshAccountIds,
   logger,
 }) {
@@ -2724,7 +2782,10 @@ async function refreshAccountUsage({
       usageObservationTracker.fail(observation);
       return { account: account.id, ok: true, stale: true };
     }
-    const usage = await usageFetcher(freshSecret.accessToken, usageRequestOptions);
+    const usage = await usageFetcher(freshSecret.accessToken, quotaShapeObserver ? {
+      ...usageRequestOptions,
+      onQuotaObservation: observation => quotaShapeObserver.usage(account.id, observation),
+    } : usageRequestOptions);
     if (!accountManager.accounts.includes(account)) {
       usageObservationTracker.fail(observation);
       return { account: account.id, ok: true, stale: true };
@@ -2832,6 +2893,7 @@ async function forwardWithRotation({
   allowLiveClaudeCodeCredentials,
   logger,
   upstreamIdleTimeoutMs,
+  quotaShapeObserver,
   upstreamConnectTimeoutMs,
   upstreamConnectRetries,
   upstreamConnectRetryDelayMs,
@@ -2966,6 +3028,7 @@ async function forwardWithRotation({
         allowLiveClaudeCodeCredentials,
         logger,
         upstreamIdleTimeoutMs,
+        quotaShapeObserver,
         upstreamConnectTimeoutMs,
         upstreamConnectRetries,
         upstreamConnectRetryDelayMs,
@@ -2978,7 +3041,7 @@ async function forwardWithRotation({
         usageEvents,
         proxyErrorContext,
       })) return;
-      sendUnavailableAccounts(res, accountManager, mapExhaustion, { req, logger, affinityLog: affinityRequest });
+      sendUnavailableAccounts(res, accountManager, mapExhaustion, { req, logger, affinityLog: affinityRequest, modelFamily });
       return;
     }
     if (proxyErrorContext) proxyErrorContext.account = account.id;
@@ -3006,7 +3069,7 @@ async function forwardWithRotation({
       })
     ) {
       if (lastRetryableResponse) sendLastRetryable();
-      else sendUnavailableAccounts(res, accountManager, mapExhaustion, { req, logger, affinityLog: affinityRequest });
+      else sendUnavailableAccounts(res, accountManager, mapExhaustion, { req, logger, affinityLog: affinityRequest, modelFamily });
       return;
     }
 
@@ -3125,10 +3188,13 @@ async function forwardWithRotation({
     }
     if (attemptedAccountIds.has(account.id)) {
       if (lastRetryableResponse) sendLastRetryable();
-      else sendUnavailableAccounts(res, accountManager, mapExhaustion, { req, logger, affinityLog: affinityRequest });
+      else sendUnavailableAccounts(res, accountManager, mapExhaustion, { req, logger, affinityLog: affinityRequest, modelFamily });
       return;
     }
     attemptedAccountIds.add(account.id);
+    // Selection can precede asynchronous credential work. Recheck the on-mode
+    // gate at the last synchronous point before sending, including old bindings.
+    if (!accountManager.canSendWithUrgency(account, modelFamily)) continue;
     // 反応的 429 の周は `selectAccountForRequest` を経ないので付け替えの理由が
     // 立っていない。429 を返したのが結び付け先で、それが枠の枯渇を示しているときだけ、
     // ここで理由を立ててその周のうちに副バインド／home の付け替えを確定させる。
@@ -3173,6 +3239,7 @@ async function forwardWithRotation({
       allowAuthRefreshRetry: !reactiveQuotaRetryUsed,
       logger,
       upstreamIdleTimeoutMs,
+      quotaShapeObserver,
       upstreamConnectTimeoutMs,
       upstreamConnectRetries,
       upstreamConnectRetryDelayMs,
@@ -3213,6 +3280,7 @@ async function forwardWithRotation({
       }
       if (req.aborted || res.destroyed) return;
       if (!accountManager.accounts.includes(account)) continue;
+      if (!accountManager.canSendWithUrgency(account, modelFamily)) continue;
       const retryResult = await forwardOnce({
         req,
         res,
@@ -3227,6 +3295,7 @@ async function forwardWithRotation({
         allowAuthRefreshRetry: !reactiveQuotaRetryUsed,
         logger,
         upstreamIdleTimeoutMs,
+        quotaShapeObserver,
         upstreamConnectTimeoutMs,
         upstreamConnectRetries,
         upstreamConnectRetryDelayMs,
@@ -3312,6 +3381,7 @@ async function forwardWithRotation({
       allowLiveClaudeCodeCredentials,
       logger,
       upstreamIdleTimeoutMs,
+      quotaShapeObserver,
       upstreamConnectTimeoutMs,
       upstreamConnectRetries,
       upstreamConnectRetryDelayMs,
@@ -3324,7 +3394,7 @@ async function forwardWithRotation({
       usageEvents,
       proxyErrorContext,
     })) return;
-    sendUnavailableAccounts(res, accountManager, mapExhaustion, { req, logger, affinityLog: affinityRequest });
+    sendUnavailableAccounts(res, accountManager, mapExhaustion, { req, logger, affinityLog: affinityRequest, modelFamily });
   }
 }
 
@@ -3341,6 +3411,7 @@ async function forwardCurrentUnavailableAccount({
   allowLiveClaudeCodeCredentials,
   logger,
   upstreamIdleTimeoutMs,
+  quotaShapeObserver,
   upstreamConnectTimeoutMs,
   upstreamConnectRetries,
   upstreamConnectRetryDelayMs,
@@ -3354,6 +3425,9 @@ async function forwardCurrentUnavailableAccount({
   usageEvents = null,
   proxyErrorContext = null,
 }) {
+  // on must never turn an unknown/stale or >=97% candidate into a last-resort
+  // send. The legacy fallback remains byte-for-byte available in off/shadow.
+  if (accountManager.urgency?.mode === 'on' || accountManager.planQuotaMode === 'on') return false;
   if (sendCurrentQuotaUnavailableResponse({
     req,
     res,
@@ -3428,6 +3502,7 @@ async function forwardCurrentUnavailableAccount({
     passthroughErrors: true,
     logger,
     upstreamIdleTimeoutMs,
+    quotaShapeObserver,
     upstreamConnectTimeoutMs,
     upstreamConnectRetries,
     upstreamConnectRetryDelayMs,
@@ -3898,6 +3973,7 @@ async function forwardOnceInner({
   allowAuthRefreshRetry = true,
   logger = null,
   upstreamIdleTimeoutMs,
+  quotaShapeObserver,
   upstreamConnectTimeoutMs,
   upstreamConnectRetries,
   upstreamConnectRetryDelayMs,
@@ -3975,6 +4051,7 @@ async function forwardOnceInner({
       },
       onResponse(upstreamRes) {
         headersAtMs = Date.now();
+        quotaShapeObserver?.headers(account.id, upstreamRes.statusCode, upstreamRes.headers);
         if (usageEventState) {
           usageEventState.statusCode = upstreamRes.statusCode ?? null;
           usageEventState.requestId = headerValue(upstreamRes.headers['request-id'])
@@ -5165,6 +5242,7 @@ function sendUnavailableAccounts(res, accountManager = null, exhaustionMapper = 
   req = null,
   logger = null,
   affinityLog = null,
+  modelFamily = null,
 } = {}) {
   const current = accountManager?.getCurrentAccount();
   const reason = current ? accountManager.unavailableReason(current) : null;
@@ -5185,6 +5263,24 @@ function sendUnavailableAccounts(res, accountManager = null, exhaustionMapper = 
     type: 'error',
     error: { type: 'rate_limit_error', message: 'All configured accounts are unavailable.' },
   };
+  const optionalQuota = accountManager?.urgency?.mode === 'on' || accountManager?.planQuotaMode === 'on';
+  const observationCandidates = optionalQuota
+    ? accountManager.accounts.filter(account => accountManager.isAvailable(account, modelFamily)) : [];
+  if (observationCandidates.some(account => !accountManager.canRecoverWeeklyQuota(account, modelFamily))) {
+    sendJson(res, 503, {
+      type: 'error',
+      error: { type: 'api_error', message: 'Fresh weekly usage observations are not available for a usable account.' },
+    });
+    return;
+  }
+  const quotaCandidates = optionalQuota ? accountManager.accounts
+    .filter(account => account.status !== 'error' && !accountManager.hasCredentialRefreshCooldown(account))
+    .map(account => ({ account, reason: accountManager.unavailableReasonForModelFamily(account, modelFamily) })) : [];
+  const quotaOnly = quotaCandidates.length > 0 && quotaCandidates.every(candidate => isUnifiedQuotaExhaustion(candidate.reason));
+  const quotaTarget = quotaOnly ? quotaCandidates.sort((a, b) =>
+    (finiteQuotaReset(a.reason.resetAt) ?? Number.MAX_SAFE_INTEGER)
+    - (finiteQuotaReset(b.reason.resetAt) ?? Number.MAX_SAFE_INTEGER))[0] : null;
+  const quotaResponse = quotaTarget ? syntheticQuotaExhaustedResponse(quotaTarget.account, quotaTarget.reason) : null;
   // P-d の写像入口。全滅時の終端は、稼働口座
   // ／固定先の個別 state（枯渇・認証失敗・資格情報 cooldown）に依らず必ずここを通す。
   // 資格情報分岐を先に置いていた頃は、同じ全滅台帳でも `getCurrentAccount()` が返す
@@ -5198,7 +5294,7 @@ function sendUnavailableAccounts(res, accountManager = null, exhaustionMapper = 
   // cooldown」なのか「人が再ログインするまで戻らない失効」なのかを名乗れるように、下の
   // 503 分岐と同じ述語（isAuthExpiredReason / isCredentialRefreshCooldown）で分類して
   // から写像器へ渡す。分類は既存のものを写すだけで、新しい語彙は作らない。
-  const mapped = exhaustionMapper?.({
+  const mapped = exhaustionMapper?.(quotaResponse || {
     statusCode: 429,
     headers: { 'Content-Type': 'application/json' },
     body: Buffer.from(JSON.stringify(body)),
@@ -5212,6 +5308,10 @@ function sendUnavailableAccounts(res, accountManager = null, exhaustionMapper = 
       logger, req, accountManager, account: current, mapped, affinityLog,
     });
     sendBufferedResponse(res, mapped);
+    return;
+  }
+  if (quotaResponse) {
+    sendBufferedResponse(res, quotaResponse);
     return;
   }
   if (isCredentialUnavailable(reason)) {
@@ -5237,6 +5337,11 @@ function sendUnavailableAccounts(res, accountManager = null, exhaustionMapper = 
     return;
   }
   sendJson(res, 429, body);
+}
+
+function finiteQuotaReset(value) {
+  const timestamp = Date.parse(value || '');
+  return Number.isFinite(timestamp) ? timestamp : null;
 }
 
 function shortErrorMessage(error) {

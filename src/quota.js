@@ -20,15 +20,112 @@ export function emptyQuota() {
 
 export const USAGE_SOURCES = Object.freeze(['header', 'poll']);
 
+export function planQuotaMode(raw) {
+  return ['off', 'shadow', 'on'].includes(raw?.mode) ? raw.mode : 'off';
+}
+
+export function isValidQuotaWindow(utilization, resetAt, now) {
+  return Number.isFinite(utilization) && utilization >= 0 && Number.isFinite(resetAt) && resetAt > now;
+}
+
+// These observations describe reporting, not a subscription entitlement. An
+// absent window never proves that a server-side restriction has been removed.
+export function observeQuotaWindows(previous, fields, now, source) {
+  const next = { ...previous };
+  if (source === 'poll' && Array.isArray(fields.weeklyScoped)) {
+    const current = new Set(fields.weeklyScoped.map(limit => `7d_${limit.key}`));
+    for (const id of Object.keys(next)) if (id.startsWith('7d_') && !current.has(id)) delete next[id];
+  }
+  const entries = [
+    ['5h', fields.unified5h, fields.unified5hReset, Object.hasOwn(fields, 'unified5h')],
+    ['7d', fields.unified7d, fields.unified7dReset, Object.hasOwn(fields, 'unified7d')],
+    ...(fields.weeklyScoped || []).map(limit => [`7d_${limit.key}`, limit.utilization, limit.resetAt, true]),
+  ];
+  for (const [id, value, resetAt, present] of entries) {
+    const validPair = isValidQuotaWindow(value, resetAt, now);
+    const observationState = !present ? 'missing' : value === null ? 'explicit_null' : validPair ? 'value' : 'invalid';
+    const prior = previous?.[id];
+    const lastKnown = validPair ? {
+      usedFraction: value, resetAt: Number.isFinite(resetAt) ? resetAt : null, observedAt: now,
+    } : prior?.lastKnown ?? null;
+    next[id] = { observationState, observedAt: now, source, lastKnown };
+  }
+  return Object.fromEntries(Object.entries(next).sort(([a, av], [b, bv]) =>
+    Number(b === '5h' || b === '7d') - Number(a === '5h' || a === '7d')
+    || Number(isFableScopeIdentity(b.slice(3), true)) - Number(isFableScopeIdentity(a.slice(3), true))
+    || (bv.lastKnown?.usedFraction ?? -1) - (av.lastKnown?.usedFraction ?? -1)).slice(0, 18));
+}
+
+export function boundWeeklyScopes(scopes) {
+  if (scopes.length <= 16) return scopes;
+  return [...scopes].sort((a, b) =>
+    Number(scopeMatchesModelFamily(b, 'fable', true)) - Number(scopeMatchesModelFamily(a, 'fable', true))
+    || (b.utilization ?? -1) - (a.utilization ?? -1)).slice(0, 16);
+}
+
+export function quotaWindowsView(quota, observations, now) {
+  const limits = [
+    { id: '5h', scope: 'all', usedFraction: quota.unified5h, resetAt: quota.unified5hReset },
+    { id: '7d', scope: 'all', usedFraction: quota.unified7d, resetAt: quota.unified7dReset },
+    ...(quota.weeklyScoped || []).map(limit => ({
+      id: `7d_${limit.key}`, scope: isFableScopeIdentity(limit.key, true) || isFableScopeIdentity(limit.label, true) ? 'fable' : 'unknown',
+      usedFraction: limit.utilization, resetAt: limit.resetAt,
+    })),
+  ];
+  for (const id of Object.keys(observations || {})) {
+    if (!id.startsWith('7d_') || limits.some(limit => limit.id === id)) continue;
+    const last = observations[id]?.lastKnown;
+    limits.push({
+      id, scope: isFableScopeIdentity(id.slice(3), true) ? 'fable' : 'unknown',
+      usedFraction: last?.usedFraction ?? null, resetAt: last?.resetAt ?? null,
+    });
+  }
+  return limits.map(limit => {
+    const observation = observations?.[limit.id];
+    const known = observation?.lastKnown;
+    const value = known?.usedFraction ?? limit.usedFraction;
+    const reset = known?.resetAt ?? limit.resetAt;
+    const expired = reset != null && reset <= now;
+    const state = expired ? 'expired' : observation?.observationState ?? 'missing';
+    const reported = state === 'value' && value != null;
+    return {
+      id: limit.id, scope: limit.scope,
+      applicability: reported ? 'present' : 'unknown', observationState: state,
+      usedFraction: reported ? value : null,
+      resetAt: reported ? reset : null,
+      observedAt: observation?.observedAt ?? null, source: observation?.source ?? null,
+      retainedConstraint: !reported && !expired && value != null,
+      lastKnown: !reported && !expired && known ? { ...known } : null,
+    };
+  });
+}
+
+export function restoreQuotaWindowObservations(value) {
+  const result = {};
+  if (!value || typeof value !== 'object') return result;
+  for (const [id, entry] of Object.entries(value).slice(0, 18)) {
+    if (!/^(?:5h|7d|7d_[a-z0-9_]{1,40})$/.test(id) || !entry || typeof entry !== 'object') continue;
+    if (!['missing', 'explicit_null', 'value', 'invalid'].includes(entry.observationState)) continue;
+    if (!Number.isFinite(entry.observedAt) || !USAGE_SOURCES.includes(entry.source)) continue;
+    const last = entry.lastKnown;
+    const lastKnown = last && Number.isFinite(last.usedFraction) && last.usedFraction >= 0
+      && Number.isFinite(last.observedAt) && (last.resetAt == null || Number.isFinite(last.resetAt))
+      ? { usedFraction: last.usedFraction, resetAt: last.resetAt ?? null, observedAt: last.observedAt } : null;
+    result[id] = { observationState: entry.observationState, observedAt: entry.observedAt, source: entry.source, lastKnown };
+  }
+  return result;
+}
+
 /**
  * @param {object} headers
- * @param {{ onInvalid?: (rejected: { key: string, value: number|string }) => void }} [options]
+ * @param {{ onInvalid?: (rejected: { key: string, value: number|string }) => void, includeScopedWindows?: boolean }} [options]
  *   `onInvalid` is told about every utilization header that was dropped because
  *   it was not a finite number or was negative. `value` is the parsed number when
  *   it is finite, otherwise the raw text cut to 32 characters. Callers without it
  *   behave as before except that such a value no longer reaches the result.
+ *   Scoped window enumeration is opt-in; legacy callers never scan these names.
  */
-export function parseRateLimitHeaders(headers, { onInvalid = null } = {}) {
+export function parseRateLimitHeaders(headers, { onInvalid = null, includeScopedWindows = false } = {}) {
   const get = createHeaderGetter(headers);
   const quota = {};
 
@@ -37,6 +134,21 @@ export function parseRateLimitHeaders(headers, { onInvalid = null } = {}) {
   setEpochSeconds(quota, 'unified5hReset', get('anthropic-ratelimit-unified-5h-reset'));
   setEpochSeconds(quota, 'unified7dReset', get('anthropic-ratelimit-unified-7d-reset'));
   setString(quota, 'unifiedStatus', get('anthropic-ratelimit-unified-status'));
+  if (includeScopedWindows === true) {
+    const names = typeof headers?.keys === 'function' ? [...headers.keys()] : Object.keys(headers || {});
+    const scoped = [];
+    for (const name of names) {
+      const match = /^anthropic-ratelimit-unified-7d[-_]([a-z0-9][a-z0-9_-]{0,39})-utilization$/.exec(name.toLowerCase());
+      if (!match || scoped.length >= 16) continue;
+      const parsed = {};
+      setUtilization(parsed, 'utilization', get(name), () => onInvalid?.({ key: 'weeklyScoped', value: 'invalid' }));
+      if (!('utilization' in parsed)) continue;
+      setEpochSeconds(parsed, 'resetAt', get(name.replace(/-utilization$/i, '-reset')));
+      const key = normalizeScopedKey(match[1]);
+      scoped.push({ key, label: isFableScopeIdentity(key) ? 'Fable' : key, utilization: parsed.utilization, resetAt: parsed.resetAt ?? null });
+    }
+    if (scoped.length) quota.weeklyScoped = scoped;
+  }
 
   setInteger(quota, 'tokensLimit', get('anthropic-ratelimit-tokens-limit'));
   setInteger(quota, 'tokensRemaining', get('anthropic-ratelimit-tokens-remaining'));
@@ -77,6 +189,16 @@ export function normalizeWeeklyScopedUsage(value) {
       };
     })
     .filter(Boolean);
+}
+
+export function normalizeWeeklyScopedObservations(value) {
+  if (!Array.isArray(value)) return [];
+  return value.filter(limit => limit && typeof limit === 'object').map(limit => ({
+    key: normalizeScopedKey(limit.key || limit.label),
+    label: normalizeScopedLabel(limit.label || limit.key),
+    utilization: Number.isFinite(limit.utilization) && limit.utilization >= 0 ? limit.utilization : null,
+    resetAt: parseResetAt(limit.resetAt ?? limit.resets_at),
+  }));
 }
 
 function createHeaderGetter(headers) {
@@ -147,19 +269,12 @@ function normalizeScopedKey(value) {
   return key || 'scoped';
 }
 
-const FABLE_SCOPE_IDENTITIES = new Set([
-  'fable',
-  'fable 5',
-  'fable5',
-  'fable_5',
-  'claude-fable-5',
-  'claude_fable_5',
-]);
-
 /** True when a weeklyScoped entry's key/label denotes the Fable sub-cap. */
-export function isFableScopeIdentity(value) {
+export function isFableScopeIdentity(value, extended = false) {
   if (typeof value !== 'string') return false;
-  return FABLE_SCOPE_IDENTITIES.has(value.trim().toLowerCase());
+  const identity = value.trim().toLowerCase();
+  return ['fable', 'fable 5', 'fable5', 'fable_5', 'claude-fable-5', 'claude_fable_5'].includes(identity)
+    || (extended && /^(?:claude[-_])?fable(?:[ _-]?\d+(?:[._-]\d+)*)?$/.test(identity));
 }
 
 /**
@@ -168,9 +283,9 @@ export function isFableScopeIdentity(value) {
  * never gate Opus/Sonnet/Haiku traffic. Unknown (non-Fable) scoped limits are
  * reported but never gate any request family.
  */
-export function scopeMatchesModelFamily(limit, modelFamily) {
+export function scopeMatchesModelFamily(limit, modelFamily, extended = false) {
   if (!limit) return false;
-  const isFableScope = isFableScopeIdentity(limit.key) || isFableScopeIdentity(limit.label);
+  const isFableScope = isFableScopeIdentity(limit.key, extended) || isFableScopeIdentity(limit.label, extended);
   if (isFableScope) return modelFamily === 'fable';
   return false;
 }
