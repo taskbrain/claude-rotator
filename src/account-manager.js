@@ -115,7 +115,7 @@ export class AccountManager {
     if (this.planQuotaMode === 'on' || this.urgency?.mode === 'on') {
       for (const account of this.accounts) {
         const last = account.windowObservations?.['5h']?.lastKnown;
-        if (last && (last.resetAt == null || last.resetAt > this.now())) {
+        if (isValidQuotaWindow(last?.usedFraction, last?.resetAt, this.now())) {
           account.quota.unified5h = last.usedFraction;
           account.quota.unified5hReset = last.resetAt;
         }
@@ -763,7 +763,8 @@ export class AccountManager {
         };
       }),
       events: this.events.slice(0, EVENT_HISTORY_LIMIT),
-      ...(this.urgency ? { accountUrgency: this.urgency.status(this.urgencyRows(), this.urgencyRows('fable')) } : {}),
+      ...(this.urgency ? { accountUrgency: this.urgency.status(this.urgencyRows(), this.urgencyRows('fable'),
+        new Map(this.accounts.map(account => [account.id, account.windowObservations]))) } : {}),
       ...(this.planQuotaMode !== 'off' ? { quotaWindows: this.quotaWindowsStatus() } : {}),
     };
   }
@@ -1219,6 +1220,8 @@ export class AccountManager {
     if (this.hasCredentialRefreshCooldown(account)) return false;
     if (account.status === 'throttled') return false;
     if (account.status === 'error') return false;
+    // Scoped exhaustion can mask the throttled status. On policies must honor
+    // an upstream short-term hold for every model; off/shadow keep legacy routing.
     if ((this.planQuotaMode === 'on' || this.urgency?.mode === 'on') && account.rateLimitedUntil > this.now()) return false;
     if (account.status === 'exhausted') {
       return !quotaBlocksModelFamily(account.quota, this.switchThreshold, modelFamily, account.extendedQuotaScopes);

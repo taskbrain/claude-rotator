@@ -1,5 +1,5 @@
 import { createHash, randomUUID } from 'node:crypto';
-import { boundWeeklyScopes, scopeMatchesModelFamily } from './quota.js';
+import { boundWeeklyScopes, isValidQuotaWindow, scopeMatchesModelFamily } from './quota.js';
 
 const HOUR = 3_600_000;
 const MAX_AGE = 30 * 60_000;
@@ -241,7 +241,24 @@ export class AccountUrgency {
     }
   }
 
-  status(rows, fableRows = rows) {
+  status(rows, fableRows = rows, savedWindows = new Map()) {
+    // Saved constraints supplement the display only; policy metrics and their
+    // freshness still depend on live observations, never on a status read.
+    const accounts = rows.map(row => {
+      const saved = savedWindows.get(row.accountId)?.['5h'];
+      const known = saved?.lastKnown;
+      if (this.observations.get(row.accountId)?.fiveHour
+        || !['missing', 'explicit_null', 'invalid'].includes(saved?.observationState)
+        || !isValidQuotaWindow(known?.usedFraction, known?.resetAt, this.now())) return row;
+      const display = {
+        observedAt: known.observedAt, source: saved.source, observationState: saved.observationState,
+        retainedConstraint: true, lastKnown: { ...known },
+      };
+      return { ...row,
+        fiveHour: { ...row.fiveHour, ...display, reportedAt: saved.observedAt },
+        windows: row.windows.map(window => window.id === '5h' ? { ...window, ...display } : window),
+      };
+    });
     const familyStatus = accounts => ({
       accounts: accounts.map(({ accountId, eligible, exclusionReason, predictedExhaustsAt, predictedBlockedUntil, recoveryOnly }) => ({
         accountId, eligible, exclusionReason, predictedExhaustsAt, predictedBlockedUntil, recoveryOnly,
@@ -252,7 +269,7 @@ export class AccountUrgency {
       schemaVersion: 2, mode: this.mode, activationBlock: this.activationBlock ?? null,
       instanceId: this.instanceId, sequence: this.sequence,
       generatedAt: this.now(), threshold: URGENCY_THRESHOLD, paceUnit: 'fraction-per-hour', historyLimit: LIMIT,
-      maxObservationAgeMs: MAX_AGE, minHistoryMs: MIN_HISTORY, accounts: rows,
+      maxObservationAgeMs: MAX_AGE, minHistoryMs: MIN_HISTORY, accounts,
       proposedOrder: this.rank(rows).map(row => row.accountId),
       byModelFamily: {
         other: familyStatus(rows),

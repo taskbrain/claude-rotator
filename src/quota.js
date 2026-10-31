@@ -109,8 +109,8 @@ export function restoreQuotaWindowObservations(value) {
     if (!Number.isFinite(entry.observedAt) || !USAGE_SOURCES.includes(entry.source)) continue;
     const last = entry.lastKnown;
     const lastKnown = last && Number.isFinite(last.usedFraction) && last.usedFraction >= 0
-      && Number.isFinite(last.observedAt) && (last.resetAt == null || Number.isFinite(last.resetAt))
-      ? { usedFraction: last.usedFraction, resetAt: last.resetAt ?? null, observedAt: last.observedAt } : null;
+      && Number.isFinite(last.observedAt) && Number.isFinite(last.resetAt)
+      ? { usedFraction: last.usedFraction, resetAt: last.resetAt, observedAt: last.observedAt } : null;
     result[id] = { observationState: entry.observationState, observedAt: entry.observedAt, source: entry.source, lastKnown };
   }
   return result;
