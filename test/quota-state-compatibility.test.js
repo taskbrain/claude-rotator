@@ -34,6 +34,13 @@ describe('default-off bytes against fixed revisions', () => {
   let parent;
   let mismatch = false;
   before(async () => {
+    for (const revision of [baseline, observationBaseline]) {
+      try {
+        execFileSync('git', ['cat-file', '-e', `${revision}^{commit}`], { cwd: root, stdio: ['ignore', 'ignore', 'pipe'] });
+      } catch {
+        assert.fail(`比較基準 ${revision} のGitオブジェクトを確認できません。actions/checkout の fetch-depth: 0 が必要です。`);
+      }
+    }
     directory = await mkdtemp(join(tmpdir(), 'quota-recovery-byte-'));
     async function extract(revision, name) {
       const destination = join(directory, name);
