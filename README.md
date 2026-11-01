@@ -521,7 +521,7 @@ claude-rotator status
 
 プラン名から5h制限の有無を決めません。同じ口座で値が消えたり戻ったりしても観測を更新し、制限撤廃を自動で断定しません。固定セッションの積極的な移動は利用者ターンの境界で行い、実行中の要求を保護します。
 
-`GET /internal/status` の追加項目は `quotaWindows.schemaVersion: 1` と `accountUrgency.schemaVersion: 2` です。枠は可変一覧で、比率は0〜1（上流ヘッダーの1超も保持）、時刻はUnixミリ秒です。Monitor等の読み手は `applicability`・`observationState`・`fresh` とnullable値を確認してください。`accountUrgency.byModelFamily` はFableと他モデルの利用可否を分けます。`recoveryOnly: true` は古いが元reset前の有効な週観測を低順位で使う印です。未観測口座への試し送りは行わず、観測日時や`fresh`も更新しません。既存のトークン量イベントJSONLの形式は変更しません。
+`GET /internal/status` の追加項目は `quotaWindows.schemaVersion: 1` と `accountUrgency.schemaVersion: 2` です。枠は可変一覧で、比率は0〜1（上流ヘッダーの1超も保持）、時刻はUnixミリ秒です。Monitor等の読み手は `applicability`・`observationState`・`fresh` とnullable値を確認してください。`accountUrgency.byModelFamily` はFableと他モデルの利用可否を分けます。`recoveryOnly: true` は古いが元reset前の有効な週観測を低順位で使う印です。候補に選ぶだけでは観測日時や`fresh`を更新しません。未観測口座への回復送信は、後述する予算付きの別経路で扱います。既存のトークン量イベントJSONLの形式は変更しません。
 
 記録だけを有効にする場合は `quotaObservation.enabled` だけを設定します。割当方針を切り替える前にshadowと消費側の契約を確認してください。観測を止める場合は同じ設定をfalseにして通常の手順で再起動します。割当の設定は内部reloadでも再読込できます。onでUsageポーリングが無効なら起動時に警告します。shadow中に見たモデル別週枠も、onへの切替時に元の観測日時のまま引き継ぎます。
 

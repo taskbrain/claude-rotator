@@ -43,6 +43,7 @@ async function fixture({ scenario = 'unobserved', policy = 'plan', mode = 'on', 
   restoredState = null, startAt = START, refreshable = false, credentialExpiry = 'valid', degradeMapping = null } = {}) {
   const clock = { ms: startAt };
   const seen = [];
+  const sendTimes = [];
   const logs = [];
   const events = [];
   const snapshots = [];
@@ -50,9 +51,10 @@ async function fixture({ scenario = 'unobserved', policy = 'plan', mode = 'on', 
   let refreshCalls = 0;
   const state = { status: 200, headers: true, extraHeaders: {}, writer: async () => {}, hold: null,
     onRequest: null, afterHead: null, responseBody: null, rawBody: null, refresh: null,
-    credentialCheck: null, credentialAccepted: [] };
+    credentialCheck: null, credentialAccepted: [], beforeCredentialRead: null };
   const upstream = await listen(http.createServer(async (req, res) => {
     seen.push(req.url);
+    sendTimes.push(clock.ms);
     events.push('upstream');
     req.resume();
     if (state.onRequest) await state.onRequest();
@@ -109,7 +111,11 @@ async function fixture({ scenario = 'unobserved', policy = 'plan', mode = 'on', 
   const get = store.get.bind(store);
   store.get = async key => { events.push('secret'); return get(key); };
   const getOperational = store.getOperational.bind(store);
-  store.getOperational = async key => { events.push('secret'); return getOperational(key); };
+  store.getOperational = async key => {
+    events.push('secret');
+    if (state.beforeCredentialRead) await state.beforeCredentialRead(key);
+    return getOperational(key);
+  };
   const config = {
     upstream: upstream.url, sessionAffinity: { mode: 'on' },
     proxy: { upstreamIdleTimeoutMs: timeoutMs },
@@ -141,7 +147,7 @@ async function fixture({ scenario = 'unobserved', policy = 'plan', mode = 'on', 
   events.length = 0;
   const ask = (body = { model: 'sonnet', messages: [{ role: 'user', content: 'fixture request' }] }, headers = {}) =>
     request(proxy.url + '/v1/messages', { method: 'POST', body, headers });
-  return { manager, clock, state, seen, logs, events, snapshots, ask, proxy, accounts, secrets,
+  return { manager, clock, state, seen, sendTimes, logs, events, snapshots, ask, proxy, accounts, secrets, store,
     usageCalls: () => usageCalls, refreshCalls: () => refreshCalls };
 }
 
@@ -518,6 +524,170 @@ describe('quota recovery HTTP scenarios', () => {
       h.manager.quotaRecoveryIdentity(h.manager.find('sample-a')));
     assert.equal(status.nextAllowedAt, START + 1200 * 1000);
   });
+});
+
+describe('recovery budgets after asynchronous preparation', () => {
+  const MINUTE = 60_000;
+  const DELAY = 5 * MINUTE;
+  function delayPreparation(h, kind) {
+    let delayed = false;
+    const delay = async () => {
+      if (delayed) return;
+      delayed = true;
+      await new Promise(resolve => setImmediate(resolve));
+      h.clock.ms += DELAY;
+    };
+    if (kind === 'persistence') h.state.writer = async snapshot => { if (snapshot.quotaRecovery?.pending) await delay(); };
+    else if (kind === 'credential read') h.state.beforeCredentialRead = async () => {
+      if (h.events.includes('persist-pending')) await delay();
+    };
+    else {
+      const updated = { accessToken: randomUUID(), expiresAt: Date.now() + 24 * HOUR };
+      h.secrets.push(updated.accessToken);
+      h.state.refresh = async () => { await delay(); return updated; };
+    }
+    h.state.headers = false;
+  }
+
+  for (const policy of ['plan', 'urgency']) {
+    for (const kind of ['persistence', 'credential read', 'credential refresh']) {
+      const options = { policy, ...(kind === 'credential refresh' ? { refreshable: true, credentialExpiry: 'expired' } : {}) };
+      it(`keeps actual recovery sends sixty seconds apart after delayed ${kind} (${policy})`, async () => {
+        const h = await fixture({ ...options, count: 2 });
+        delayPreparation(h, kind);
+        assert.equal((await h.ask()).status, 200);
+        await until(() => h.manager.getStatus().quotaRecovery.lastResult === 'no-quota');
+        assert.deepEqual(h.sendTimes, [START + DELAY]);
+        assert.equal((await h.ask()).status, 503);
+        assert.equal(h.seen.length, 1);
+        h.clock.ms = START + DELAY + MINUTE - 1;
+        assert.equal((await h.ask()).status, 503);
+        assert.equal(h.seen.length, 1);
+        h.clock.ms++;
+        assert.equal((await h.ask()).status, 200);
+        assert.deepEqual(h.sendTimes, [START + DELAY, START + DELAY + MINUTE]);
+        assert.equal(h.manager.exportState().quotaRecovery.sequence, 2);
+      });
+
+      it(`keeps actual account sends fifteen minutes apart after delayed ${kind} (${policy})`, async () => {
+        const h = await fixture(options);
+        delayPreparation(h, kind);
+        assert.equal((await h.ask()).status, 200);
+        await until(() => h.manager.getStatus().quotaRecovery.lastResult === 'no-quota');
+        assert.deepEqual(h.sendTimes, [START + DELAY]);
+        h.clock.ms = START + 15 * MINUTE;
+        assert.equal((await h.ask()).status, 503);
+        assert.equal(h.seen.length, 1);
+        h.clock.ms = START + DELAY + 15 * MINUTE - 1;
+        assert.equal((await h.ask()).status, 503);
+        h.clock.ms++;
+        assert.equal((await h.ask()).status, 200);
+        assert.deepEqual(h.sendTimes, [START + DELAY, START + DELAY + 15 * MINUTE]);
+        assert.equal(h.manager.exportState().quotaRecovery.sequence, 2);
+      });
+    }
+
+    it(`keeps delayed actual sends within two per rolling hour (${policy})`, async () => {
+      const h = await fixture({ policy });
+      h.state.headers = false;
+      const delayed = new Set();
+      h.state.writer = async snapshot => {
+        const id = snapshot.quotaRecovery?.pending?.id;
+        if (!id || delayed.has(id)) return;
+        delayed.add(id);
+        await new Promise(resolve => setImmediate(resolve));
+        h.clock.ms += id === 1 ? 20 * MINUTE : id === 2 ? 15 * MINUTE : 0;
+      };
+      assert.equal((await h.ask()).status, 200);
+      await until(() => h.manager.exportState().quotaRecovery.accounts[0]?.lastResult === 'no-quota');
+      h.clock.ms = START + 35 * MINUTE;
+      assert.equal((await h.ask()).status, 200);
+      await until(() => h.manager.exportState().quotaRecovery.pending === null);
+      assert.deepEqual(h.sendTimes, [START + 20 * MINUTE, START + 50 * MINUTE]);
+      h.clock.ms = START + HOUR;
+      assert.equal((await h.ask()).status, 503);
+      assert.equal(h.seen.length, 2);
+      h.clock.ms = START + 80 * MINUTE - 1;
+      assert.equal((await h.ask()).status, 503);
+      h.clock.ms++;
+      assert.equal((await h.ask()).status, 200);
+      assert.deepEqual(h.sendTimes, [START + 20 * MINUTE, START + 50 * MINUTE, START + 80 * MINUTE]);
+      assert.equal(h.manager.exportState().quotaRecovery.sequence, 3);
+    });
+
+    it(`persists the pool wait after a delayed save and a completed recovery send (${policy})`, async () => {
+      const h = await fixture({ policy, count: 2 });
+      h.state.headers = false;
+      const directory = await mkdtemp(join(tmpdir(), 'quota-recovery-send-time-'));
+      const path = join(directory, 'runtime-state.json');
+      const durableWriter = createRuntimeStateWriter(path);
+      let delayed = false;
+      let committed = false;
+      h.state.writer = async snapshot => {
+        if (snapshot.quotaRecovery?.pending && !delayed) {
+          delayed = true;
+          await new Promise(resolve => setImmediate(resolve));
+          h.clock.ms += DELAY;
+        }
+        await durableWriter(snapshot);
+        if (snapshot.quotaRecovery?.pending === null && snapshot.quotaRecovery.accounts[0]?.lastResult === 'no-quota') committed = true;
+      };
+      assert.equal((await h.ask()).status, 200);
+      await until(() => committed);
+      assert.deepEqual(h.sendTimes, [START + DELAY]);
+      const saved = JSON.parse(await readFile(path, 'utf8'));
+      const restarted = await fixture({ policy, count: 2, restoredState: saved, startAt: START + DELAY + MINUTE - 1 });
+      restarted.state.headers = false;
+      assert.equal((await restarted.ask()).status, 503);
+      assert.equal(restarted.seen.length, 0);
+      restarted.clock.ms++;
+      assert.equal((await restarted.ask()).status, 200);
+      assert.deepEqual(restarted.sendTimes, [START + DELAY + MINUTE]);
+      assert.equal(restarted.manager.exportState().quotaRecovery.sequence, 2);
+    });
+  }
+});
+
+describe('recovery entry after an ordinary upstream send', () => {
+  for (const policy of ['plan', 'urgency']) {
+    for (const [name, errorFactory] of [
+      ['relogin refusal', () => Object.assign(new Error('fixture relogin required'), { code: 'NATIVE_REFRESH_REAUTH_REQUIRED' })],
+      ['refresh rate limit', () => new OAuthTokenRefreshError({ status: 429, code: 'rate_limit_error',
+        retryAfterMs: 120_000, retryAfterSource: 'provider' })],
+      ['unknown refresh result', () => Object.assign(new Error('fixture refresh outcome unknown'), { code: 'NATIVE_REFRESH_OUTCOME_UNKNOWN' })],
+    ]) {
+      it(`does not recover through another account after an ordinary 401 and ${name} (${policy})`, async () => {
+        const h = await fixture({ policy, count: 2, refreshable: true });
+        h.manager.applyUsage('sample-a', { seven_day: {
+          utilization: 0.2, resets_at: new Date(START + 24 * HOUR).toISOString(),
+        } });
+        h.state.headers = false;
+        h.state.onRequest = async () => { h.state.status = h.seen.length === 1 ? 401 : 200; };
+        h.state.refresh = async () => { throw errorFactory(); };
+        const response = await h.ask();
+        assert.equal(h.seen.length, 1, 'an ordinary upstream send must close recovery entry for this logical request');
+        assert.equal(response.status, 503);
+        assert.equal(h.refreshCalls(), 1);
+        assert.equal(h.manager.exportState().quotaRecovery.sequence, 0);
+        assert.deepEqual(h.manager.exportState().quotaRecovery.accounts, []);
+        assert.equal((await h.ask()).status, 200, 'a later logical request may recover the still-unknown account');
+        assert.equal(h.seen.length, 2);
+        assert.equal(h.manager.exportState().quotaRecovery.sequence, 1);
+      });
+    }
+
+    it(`still permits recovery when credential resolution failed before any upstream send (${policy})`, async () => {
+      const h = await fixture({ policy, count: 2 });
+      h.manager.applyUsage('sample-a', { seven_day: {
+        utilization: 0.2, resets_at: new Date(START + 24 * HOUR).toISOString(),
+      } });
+      await h.store.delete('sample-a');
+      assert.equal((await h.ask()).status, 200);
+      assert.equal(h.seen.length, 1);
+      assert.equal(h.manager.find('sample-a').errorReason?.type, 'credential_missing');
+      assert.equal(h.manager.exportState().quotaRecovery.sequence, 1);
+    });
+  }
 });
 
 describe('response mapping on quota recovery requests', () => {

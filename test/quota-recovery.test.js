@@ -70,6 +70,77 @@ it('enforces a pool start interval of sixty seconds across different accounts', 
   assert.ok(recovery.reserve(OTHER, IDENTITY));
 });
 
+it('anchors the account interval after delayed preparation and preserves it through restore', () => {
+  const { recovery, clock } = setup();
+  const lease = recovery.reserve(ACCOUNT, IDENTITY);
+  clock.ms += 10 * MINUTE;
+  assert.equal(recovery.settle(lease, { result: 'no-quota' }), true);
+  const saved = recovery.exportState();
+  assert.equal(saved.sequence, 1);
+  assert.equal(saved.accounts[0].starts.length, 1);
+  const restored = setup(BASE + 15 * MINUTE);
+  restored.recovery.restoreState(saved);
+  assert.equal(restored.recovery.inspect(ACCOUNT, IDENTITY).nextAllowedAt, BASE + 25 * MINUTE);
+  assert.equal(restored.recovery.reserve(ACCOUNT, IDENTITY), null);
+  restored.clock.ms = BASE + 25 * MINUTE - 1;
+  assert.equal(restored.recovery.reserve(ACCOUNT, IDENTITY), null);
+  restored.clock.ms++;
+  assert.ok(restored.recovery.reserve(ACCOUNT, IDENTITY));
+});
+
+it('anchors the pool interval after delayed preparation and preserves it through restore', () => {
+  const { recovery, clock } = setup();
+  const lease = recovery.reserve(ACCOUNT, IDENTITY);
+  clock.ms += 5 * MINUTE;
+  assert.equal(recovery.settle(lease, { result: 'no-quota' }), true);
+  const restored = setup(BASE + 6 * MINUTE - 1);
+  restored.recovery.restoreState(recovery.exportState());
+  assert.equal(restored.recovery.inspect(OTHER, IDENTITY).nextAllowedAt, BASE + 6 * MINUTE);
+  assert.equal(restored.recovery.reserve(OTHER, IDENTITY), null);
+  restored.clock.ms++;
+  assert.ok(restored.recovery.reserve(OTHER, IDENTITY));
+});
+
+it('keeps two delayed sends inside the rolling-hour budget after restore', () => {
+  const { recovery, clock } = setup();
+  const first = recovery.reserve(ACCOUNT, IDENTITY);
+  clock.ms = BASE + 20 * MINUTE;
+  assert.equal(recovery.settle(first, { result: 'no-quota' }), true);
+  clock.ms = BASE + 35 * MINUTE;
+  const second = recovery.reserve(ACCOUNT, IDENTITY);
+  assert.ok(second);
+  clock.ms = BASE + 50 * MINUTE;
+  assert.equal(recovery.settle(second, { result: 'no-quota' }), true);
+  const saved = recovery.exportState();
+  assert.equal(saved.sequence, 2);
+  assert.equal(saved.accounts[0].starts.length, 2);
+  const restored = setup(BASE + HOUR);
+  restored.recovery.restoreState(saved);
+  assert.equal(restored.recovery.inspect(ACCOUNT, IDENTITY).nextAllowedAt, BASE + 80 * MINUTE);
+  assert.equal(restored.recovery.reserve(ACCOUNT, IDENTITY), null);
+  restored.clock.ms = BASE + 80 * MINUTE - 1;
+  assert.equal(restored.recovery.reserve(ACCOUNT, IDENTITY), null);
+  restored.clock.ms++;
+  assert.ok(restored.recovery.reserve(ACCOUNT, IDENTITY));
+  assert.equal(restored.recovery.exportState().sequence, 3);
+});
+
+for (const result of ['aborted', 'persistence-failed', 'transport-error']) {
+  it(`does not refund a delayed ${result} reservation`, () => {
+    const { recovery, clock } = setup();
+    const lease = recovery.reserve(ACCOUNT, IDENTITY);
+    clock.ms += 10 * MINUTE;
+    assert.equal(recovery.settle(lease, { result }), true);
+    assert.equal(recovery.exportState().sequence, 1);
+    assert.equal(recovery.exportState().accounts[0].starts.length, 1);
+    assert.equal(recovery.inspect(ACCOUNT, NEW_IDENTITY).nextAllowedAt, BASE + 25 * MINUTE);
+    clock.ms = BASE + 25 * MINUTE - 1;
+    assert.equal(recovery.reserve(ACCOUNT, NEW_IDENTITY), null);
+    clock.ms++;
+    assert.ok(recovery.reserve(ACCOUNT, NEW_IDENTITY));
+  });
+}
+
 it('permits only one pool lease and exposes only known future waiting times', () => {
   const { recovery, clock } = setup();
   const lease = recovery.reserve(ACCOUNT, IDENTITY);

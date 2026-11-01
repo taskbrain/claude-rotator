@@ -2949,6 +2949,7 @@ async function forwardWithRotation(options) {
   // 口座の切り替え・利用不可口座での実送信を含む）。writer が無ければ null で、計測しない。
   const usageEvents = usageEventWriter ? createUsageEventContext(usageEventWriter) : null;
   const attemptedAccountIds = new Set();
+  let upstreamAttempted = false;
   let lastRetryableResponse = null;
   // 再生する応答を作った口座（P-b の replay 行の account= に使う。写像したときだけ読む）。
   let lastRetryableAccountId = null;
@@ -3041,7 +3042,7 @@ async function forwardWithRotation(options) {
         sendLastRetryable();
         return;
       }
-      if (allowQuotaRecovery && accountManager.quotaRecoveryEnabled() && !lastRetryableResponse) {
+      if (allowQuotaRecovery && accountManager.quotaRecoveryEnabled() && !upstreamAttempted && !lastRetryableResponse) {
         const recovery = await forwardQuotaRecovery({
           ...options, modelFamily, requestEffort, usageEvents, affinityRequest, persistQuotaRecovery,
           exhaustionMapper: mapExhaustion, upstreamOverloadMapper,
@@ -3275,6 +3276,8 @@ async function forwardWithRotation(options) {
       accountManager.switchToCandidate(reactiveSelection, 'quota-threshold', '429');
     }
 
+    // A credential retry failure must not reopen recovery after this attempt.
+    upstreamAttempted = true;
     const result = await forwardOnce({
       req,
       res,

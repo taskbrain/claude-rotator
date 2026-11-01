@@ -164,6 +164,10 @@ export class QuotaRecovery {
       // Unreadable outcomes still spend their reservation.
     }
     const account = this.#accounts.get(this.#pending.accountHash);
+    // Keep the spent slot, but use completion as a conservative send-time bound.
+    const completedAt = Math.max(this.#pending.startedAt, current);
+    account.starts[account.starts.length - 1] = completedAt;
+    this.#poolLastStartedAt = completedAt;
     account.lastResult = result;
     if (status === 401 || status === 403 || result === 'authentication' || result === 'forbidden') {
       account.deniedIdentity = this.#pending.identityHash;
