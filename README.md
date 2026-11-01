@@ -525,6 +525,14 @@ claude-rotator status
 
 記録だけを有効にする場合は `quotaObservation.enabled` だけを設定します。割当方針を切り替える前にshadowと消費側の契約を確認してください。観測を止める場合は同じ設定をfalseにして通常の手順で再起動します。割当の設定は内部reloadでも再読込できます。onでUsageポーリングが無効なら起動時に警告します。shadow中に見たモデル別週枠も、onへの切替時に元の観測日時のまま引き継ぎます。
 
+onでは、新鮮な候補も有効な過去観測による候補も無い場合に限り、reset経過・未観測・正常な再ログイン後の口座へ、利用者の要求を1回だけ送って観測を取り直せます。追加の推論要求やUsageポーリングは作りません。既知の97%以上の停止、より厳しい設定、認証拒否、短期制限は守り、不明な使用率を0%にはしません。
+
+試し送りは1 HTTP要求につき最大1口座・1回です。口座ごとに最低15分間隔・過去60分で最大2回、プール全体で最低60秒間隔・同時1件に制限します。429のresetやretry-afterは予算と合わせて最も遅い時刻まで待ち、両方が不明ならその口座を最低60分保留します。同じ要求で別の試し送り口座へ巡回しません。
+
+送信前に予約をruntime-stateへ耐久保存し、保存できなければ試し送りをしません。再起動・通常の認証更新・再ログインで消費回数を戻さず、未完了の予約も消費済みとして扱います。既に消費した予算はoffへ戻した場合も保持しますが、最初からoffなら予約・ログ・保存キーを追加しません。shadowでは新しい試し送りを行いません。
+
+200でも必要な枠が返らなければ不明のままです。通常候補が無く予算を待つ場合は503とRetry-After、既知の全枯渇は従来どおり429とresetを返します。`quotaRecovery.schemaVersion: 1` はprobeReady、inFlight、nextAllowedAt、reason、lastResult、実効ポーリング状態を示し、追加の口座識別子はハッシュです。読み手はこの状態とquotaの数値を区別してください。試し送りは保存済みのoperational credentialだけを使い、live-onlyのcurrent口座から新たに認証情報を取り込む経路は使いません。
+
 ### GPT モデルとの相互退避（`openaiBridge.degradeMapping`）
 
 `openaiBridge` は、モデル名が `modelPattern`（既定 `^gpt-|^o[0-9]|^openai/`）に一致するリクエストだけを、ローカルで動く別の Anthropic 互換ブリッジ（例: openai-model-bridge）へ転送する任意の分岐です（`openaiBridge.enabled` の既定は `false`）。`degradeMapping` はその下に置く任意のセクションで、Claude Code 側の `fallbackModel` と組み合わせて次の3つを実現します。

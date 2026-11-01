@@ -35,6 +35,19 @@ export function renderStatus(status, options = {}) {
   // carries the section, which /internal/status omits entirely while the mode is
   // "off" - so the default configuration prints exactly what it prints today.
   lines.push(...renderAffinitySection(status.sessionAffinity));
+  if (status.quotaRecovery?.schemaVersion === 1) {
+    const recovery = status.quotaRecovery;
+    const state = recovery.inFlight ? 'in-flight' : recovery.probeReady ? 'ready' : 'waiting';
+    const reason = /^[a-z-]{1,40}$/.test(recovery.reason || '') ? recovery.reason : 'unknown';
+    lines.push(`Quota recovery: ${state} (${reason})`);
+    lines.push(`  polling: ${recovery.usagePollingEnabled === true ? 'enabled' : recovery.usagePollingEnabled === false ? 'disabled' : 'unknown'}`);
+    if (Number.isFinite(recovery.nextAllowedAt)) {
+      lines.push(`  next: ${formatDuration(Math.max(0, recovery.nextAllowedAt - now))} -> ${formatDate(recovery.nextAllowedAt)}`);
+    }
+    const result = /^[a-z-]{1,40}$/.test(recovery.lastResult || '') ? recovery.lastResult : null;
+    if (result) lines.push(`  last result: ${result}`);
+    lines.push('');
+  }
   if (status.accountUrgency) {
     const urgency = status.accountUrgency;
     const last = urgency.decisions.at(-1);

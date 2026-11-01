@@ -1,5 +1,13 @@
-import { describe, it } from 'node:test';
+import { before, after, describe, it } from 'node:test';
 import assert from 'node:assert/strict';
+import { execFile, execFileSync } from 'node:child_process';
+import { createHash, randomUUID } from 'node:crypto';
+import { writeFileSync } from 'node:fs';
+import { mkdir, mkdtemp, rm } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { fileURLToPath } from 'node:url';
+import { OFF_MODES, HEADER_CASES } from '../fixtures/quota-recovery-compatibility-worker.js';
 import { AccountManager } from '../src/account-manager.js';
 import { restoreQuotaWindowObservations } from '../src/quota.js';
 
@@ -11,6 +19,102 @@ const make = (policy = 'plan', mode = 'off', at = START, switchThreshold = 1) =>
   switchThreshold,
   planQuota: { mode: policy === 'plan' ? mode : 'off' },
   accountUrgency: { mode: policy === 'urgency' ? mode : 'off' },
+});
+
+describe('default-off bytes against fixed revisions', () => {
+  const root = fileURLToPath(new URL('../', import.meta.url));
+  const worker = join(root, 'fixtures/quota-recovery-compatibility-worker.js');
+  const guard = join(root, 'fixtures/service-command-guard.js');
+  const baseline = 'b3f0db928f1a97833762186ca86f0f36e697e9ff';
+  const observationBaseline = 'ecab7a5356d62dd7ff71d8be0069fc19aa41b9ce';
+  const httpFields = ['selection', 'status', 'state', 'monitor', 'logs', 'initial', 'response', 'internal', 'runtime', 'writes', 'upstream'];
+  let directory;
+  let current;
+  let main;
+  let parent;
+  let mismatch = false;
+  before(async () => {
+    directory = await mkdtemp(join(tmpdir(), 'quota-recovery-byte-'));
+    async function extract(revision, name) {
+      const destination = join(directory, name);
+      await mkdir(destination);
+      const archive = execFileSync('git', ['archive', '--format=tar', revision, 'src', 'package.json'],
+        { cwd: root, maxBuffer: 16 * 1024 * 1024 });
+      execFileSync('tar', ['-xf', '-', '-C', destination], { input: archive });
+      return destination;
+    }
+    const mainRoot = await extract(baseline, 'main-source');
+    const parentRoot = await extract(observationBaseline, 'observation-source');
+    const input = JSON.stringify([randomUUID(), randomUUID()]);
+    function run(sourceRoot, name, scope = 'all') {
+      const storage = join(directory, name);
+      return new Promise((resolveRun, reject) => {
+        const child = execFile(process.execPath, ['--import', guard, worker, sourceRoot, storage, scope], {
+          cwd: sourceRoot, maxBuffer: 16 * 1024 * 1024,
+          env: { PATH: process.env.PATH || '', TMPDIR: directory, TZ: 'UTC', LANG: 'C', LC_ALL: 'C',
+            CLAUDE_ROTATOR_REAL_KEYCHAIN: '0', XDG_CONFIG_HOME: join(storage, 'config'),
+            XDG_DATA_HOME: join(storage, 'data'), CLAUDE_CONFIG_DIR: join(storage, 'claude-fixture'),
+            CLAUDE_ROTATOR_SERVICE_COMMAND_LOG: join(storage, 'service-guard.log') },
+        }, (error, stdout, stderr) => {
+          if (error) reject(new Error(`compatibility worker ${name} failed: ${error.code}; ${stderr}`));
+          else {
+            try { resolveRun(JSON.parse(stdout)); } catch { reject(new Error(`compatibility worker ${name} returned invalid JSON`)); }
+          }
+        });
+        child.stdin.on('error', reject);
+        child.stdin.end(input);
+      });
+    }
+    const runs = await Promise.allSettled([run(root, 'current'), run(mainRoot, 'main'), run(parentRoot, 'parent', 'observation')]);
+    for (const run of runs) assert.equal(run.status, 'fulfilled', run.reason?.message);
+    [current, main, parent] = runs.map(run => run.value);
+  });
+  after(async () => { if (directory && !mismatch) await rm(directory, { recursive: true, force: true }); });
+
+  function equalBytes(actual, expected, label) {
+    const left = Buffer.from(actual, 'base64');
+    const right = Buffer.from(expected, 'base64');
+    const digest = value => createHash('sha256').update(value).digest('hex');
+    if (!left.equals(right)) {
+      mismatch = true;
+      const evidence = join(directory, `mismatch-${digest(Buffer.from(label)).slice(0, 12)}.json`);
+      writeFileSync(evidence, JSON.stringify({ label, current: actual, baseline: expected }, null, 2) + '\n');
+      assert.fail(`${label}: byte mismatch; current=${digest(left)} baseline=${digest(right)} evidence=${evidence}`);
+    }
+  }
+  for (const mode of OFF_MODES) for (const scenario of HEADER_CASES) {
+    const id = `${mode}/${scenario.id}`;
+    it(`keeps selection, status, persistence and monitor bytes equal to main for ${id}`, () => {
+      assert.ok(current.manager[id]);
+      assert.ok(main.manager[id]);
+      for (const field of ['selection', 'status', 'state', 'monitor', 'logs']) {
+        equalBytes(current.manager[id][field], main.manager[id][field], `${id}/${field}`);
+      }
+    });
+    for (const status of [200, 429]) {
+      const httpId = `${id}/${status}`;
+      it(`keeps full HTTP, state and log bytes equal to main for ${httpId}`, () => {
+        assert.ok(current.http[httpId]);
+        assert.ok(main.http[httpId]);
+        for (const field of httpFields) equalBytes(current.http[httpId][field], main.http[httpId][field], `${httpId}/${field}`);
+      });
+    }
+  }
+  for (const mode of OFF_MODES) for (const status of [200, 429]) {
+    const id = `${mode}/invalid-fable/${status}`;
+    it(`keeps observation-only routing equal to main and preserves existing observation log bytes for ${id}`, () => {
+      assert.ok(current.observation[id]);
+      assert.ok(main.observation[id]);
+      assert.ok(parent.observation[id]);
+      for (const field of httpFields) {
+        equalBytes(current.observation[id][field], parent.observation[id][field], `${id}/parent/${field}`);
+        if (field !== 'logs') equalBytes(current.observation[id][field], main.observation[id][field], `${id}/main/${field}`);
+      }
+      const logs = JSON.parse(Buffer.from(current.observation[id].logs, 'base64').toString());
+      assert.equal(logs.filter(line => line.startsWith('{') && JSON.parse(line).event === 'quota_shape').length, 1);
+      assert.equal(logs.some(line => line.startsWith('quota_recovery ')), false);
+    });
+  }
 });
 
 describe('default-off rate-limit compatibility', () => {

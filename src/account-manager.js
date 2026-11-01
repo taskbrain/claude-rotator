@@ -1,4 +1,6 @@
 import { AccountUrgency, urgencyMode, URGENCY_THRESHOLD } from './account-urgency.js';
+import { createHash } from 'node:crypto';
+import { QuotaRecovery } from './quota-recovery.js';
 import {
   emptyQuota,
   normalizeWeeklyScopedUsage,
@@ -105,6 +107,9 @@ export class AccountManager {
     this.currentIndex = configuredIndex >= 0 ? configuredIndex : 0;
     this.configuredSwitchThreshold = this.switchThreshold;
     this.urgency = null;
+    this.quotaRecovery = null;
+    this.quotaRecoveryPersistence = false;
+    this.quotaRecoveryPolling = null;
     this.configureAccountUrgency(accountUrgency);
     this.configurePlanQuota(planQuota);
   }
@@ -112,6 +117,7 @@ export class AccountManager {
   configurePlanQuota(raw) {
     this.planQuotaMode = planQuotaMode(raw);
     for (const account of this.accounts) account.extendedQuotaScopes = this.planQuotaMode === 'on' || this.urgency?.mode === 'on';
+    this.configureQuotaRecovery();
     if (this.planQuotaMode === 'on' || this.urgency?.mode === 'on') {
       for (const account of this.accounts) {
         const last = account.windowObservations?.['5h']?.lastKnown;
@@ -156,6 +162,108 @@ export class AccountManager {
     }
     this.switchThreshold = mode === 'on' ? Math.min(URGENCY_THRESHOLD, this.configuredSwitchThreshold) : this.configuredSwitchThreshold;
     for (const account of this.accounts) account.extendedQuotaScopes = mode === 'on' || this.planQuotaMode === 'on';
+    this.configureQuotaRecovery();
+  }
+
+  quotaRecoveryEnabled() {
+    return this.planQuotaMode === 'on' || this.urgency?.mode === 'on';
+  }
+
+  configureQuotaRecovery() {
+    if (this.quotaRecoveryEnabled() && !this.quotaRecovery) this.quotaRecovery = new QuotaRecovery({ now: this.now });
+  }
+
+  setQuotaRecoveryPersistence(available, pollingEnabled) {
+    this.quotaRecoveryPersistence = available === true;
+    this.quotaRecoveryPolling = pollingEnabled === true;
+  }
+
+  quotaRecoveryKey(account) {
+    return createHash('sha256').update(String(account.id)).digest('hex');
+  }
+
+  quotaRecoveryIdentity(account) {
+    return createHash('sha256').update(JSON.stringify([
+      account.accountUuid, account.credentialRevision, account.type,
+    ])).digest('hex');
+  }
+
+  quotaRecoveryEligible(account, modelFamily = null) {
+    if (!this.quotaRecoveryEnabled() || !account || !this.isAvailable(account, modelFamily)) return false;
+    if (account.id === 'current' || account.credentialSource === 'claude-code-current') return false;
+    const threshold = Math.min(URGENCY_THRESHOLD, this.configuredSwitchThreshold);
+    if (quotaBlocksModelFamily(account.quota, threshold, modelFamily, true)) return false;
+    const now = this.now();
+    for (const [id, observation] of Object.entries(account.windowObservations || {})) {
+      if (id !== '5h' && id !== '7d'
+        && !(id.startsWith('7d_') && scopeMatchesModelFamily({ key: id.slice(3) }, modelFamily, true))) continue;
+      const known = observation?.lastKnown;
+      if (isValidQuotaWindow(known?.usedFraction, known?.resetAt, now)
+        && known.usedFraction >= threshold) return false;
+    }
+    const missing = (id, used, reset) => {
+      if (isValidQuotaWindow(used, reset, now)) return false;
+      const known = account.windowObservations?.[id]?.lastKnown;
+      return !known || (Number.isFinite(known.resetAt) && known.resetAt <= now);
+    };
+    if (missing('7d', account.quota.unified7d, account.quota.unified7dReset)) return true;
+    const scopes = new Map(account.quota.weeklyScoped.map(limit => [limit.key, limit]));
+    for (const [id, observation] of Object.entries(account.windowObservations || {})) {
+      if (id.startsWith('7d_') && !scopes.has(id.slice(3))) scopes.set(id.slice(3), {
+        key: id.slice(3), utilization: null, resetAt: null,
+      });
+    }
+    return [...scopes.values()].filter(limit => scopeMatchesModelFamily(limit, modelFamily, true))
+      .some(limit => missing(`7d_${limit.key}`, limit.utilization, limit.resetAt));
+  }
+
+  quotaRecoveryCandidate(modelFamily = null, allowAccount = () => true) {
+    if (!this.quotaRecoveryEnabled() || !this.quotaRecoveryPersistence
+      || this.selectForNewAssignment({ modelFamily, recordDecision: false })) return null;
+    return this.accounts.find(account => allowAccount(account) && this.quotaRecoveryEligible(account, modelFamily)
+      && this.quotaRecovery.inspect(this.quotaRecoveryKey(account), this.quotaRecoveryIdentity(account)).probeReady) || null;
+  }
+
+  reserveQuotaRecovery(modelFamily = null, allowAccount = () => true) {
+    const account = this.quotaRecoveryCandidate(modelFamily, allowAccount);
+    if (!account) return null;
+    const lease = this.quotaRecovery.reserve(this.quotaRecoveryKey(account), this.quotaRecoveryIdentity(account));
+    return lease ? { account, lease } : null;
+  }
+
+  isCurrentQuotaRecovery(probe) {
+    return this.quotaRecoveryEnabled() && this.accounts.includes(probe?.account)
+      && this.quotaRecoveryIdentity(probe.account) === probe.lease.identityHash
+      && this.quotaRecovery.isCurrent(probe.lease);
+  }
+
+  settleQuotaRecovery(probe, outcome) {
+    return this.quotaRecovery?.settle(probe?.lease, outcome) === true;
+  }
+
+  quotaRecoveryStatus(modelFamily = null) {
+    if (!this.quotaRecoveryEnabled()) return null;
+    const ordinary = this.selectForNewAssignment({ modelFamily, recordDecision: false }) !== null;
+    const accounts = this.accounts.map(account => {
+      const key = this.quotaRecoveryKey(account);
+      const info = this.quotaRecovery.inspect(key, this.quotaRecoveryIdentity(account));
+      const eligible = this.quotaRecoveryEligible(account, modelFamily);
+      return { account: key.slice(0, 12), ...info,
+        probeReady: !ordinary && this.quotaRecoveryPersistence && eligible && info.probeReady,
+        reason: !this.quotaRecoveryPersistence ? 'persistence-unavailable'
+          : ordinary ? 'ordinary-available'
+            : !eligible && info.reason !== 'outcome-unknown' ? 'not-eligible' : info.reason,
+        recorded: info.lastResult !== null || info.inFlight || info.nextAllowedAt !== null, eligible };
+    }).filter(row => row.eligible || row.recorded).map(({ recorded: _recorded, eligible: _eligible, ...row }) => row);
+    const next = accounts.map(row => row.nextAllowedAt).filter(Number.isFinite);
+    return {
+      schemaVersion: 1, usagePollingEnabled: this.quotaRecoveryPolling, modelFamily: modelFamily || 'other',
+      probeReady: accounts.some(row => row.probeReady), inFlight: accounts.some(row => row.inFlight),
+      nextAllowedAt: next.length ? Math.min(...next) : null,
+      reason: !this.quotaRecoveryPersistence ? 'persistence-unavailable' : ordinary ? 'ordinary-available'
+        : accounts.find(row => row.probeReady)?.reason || accounts[0]?.reason || 'no-eligible-account',
+      lastResult: accounts.find(row => row.lastResult !== null)?.lastResult ?? null, accounts,
+    };
   }
 
   setUrgencyNotifier(notifier) {
@@ -168,6 +276,7 @@ export class AccountManager {
       this.refreshQuotaState(account);
       const row = this.urgency.metrics(account.id, account.status === 'error'
       || Boolean(account.rateLimitedUntil && this.now() < account.rateLimitedUntil)
+      || Boolean(this.quotaRecovery?.isHeld(this.quotaRecoveryKey(account)))
       || quotaBlocksModelFamily(account.quota, Math.min(URGENCY_THRESHOLD, this.configuredSwitchThreshold), modelFamily, true),
       modelFamily, account.quota.weeklyScoped);
       const recoveryOnly = ['weekly-unknown-or-stale', 'scoped-weekly-unknown-or-stale'].includes(row.exclusionReason)
@@ -286,7 +395,8 @@ export class AccountManager {
     }
 
     const reason = this.unavailableReason(current);
-    if (current?.status === 'error' || this.hasCredentialRefreshCooldown(current)) {
+    if (current?.status === 'error' || this.hasCredentialRefreshCooldown(current)
+      || (current && this.quotaRecovery?.isHeld(this.quotaRecoveryKey(current)))) {
       const next = this.selectBestAvailableSwitchTarget(modelFamily, { trigger });
       if (next) {
         next.status = 'active';
@@ -319,6 +429,7 @@ export class AccountManager {
   getFallbackAccount() {
     const current = this.getCurrentAccount();
     if (!current) return null;
+    if (this.quotaRecovery?.isHeld(this.quotaRecoveryKey(current))) return null;
     const reason = this.unavailableReason(current);
     if (isUnifiedQuotaExhaustion(reason)) {
       return current;
@@ -352,12 +463,22 @@ export class AccountManager {
     });
   }
 
-  updateQuota(accountId, headers, { atomicUnifiedWindows = false } = {}) {
+  updateQuota(accountId, headers, { atomicUnifiedWindows = false, recoveryStatus = null } = {}) {
     const account = this.find(accountId);
     const parsed = parseRateLimitHeaders(headers, {
       onInvalid: rejected => this.recordQuotaHeaderRejected(account, rejected),
       includeScopedWindows: this.planQuotaMode !== 'off' || this.urgency !== null,
     });
+    if (recoveryStatus !== null && (recoveryStatus < 200 || recoveryStatus >= 300)) {
+      const threshold = Math.min(URGENCY_THRESHOLD, this.configuredSwitchThreshold);
+      for (const [value, reset] of [['unified5h', 'unified5hReset'], ['unified7d', 'unified7dReset']]) {
+        if (!(parsed[value] >= threshold)) { delete parsed[value]; delete parsed[reset]; }
+      }
+      if (parsed.weeklyScoped) {
+        parsed.weeklyScoped = parsed.weeklyScoped.filter(limit => limit.utilization >= threshold);
+        if (!parsed.weeklyScoped.length) delete parsed.weeklyScoped;
+      }
+    }
     const reported = structuredClone(parsed);
     const validateValues = this.planQuotaMode === 'on' || this.urgency?.mode === 'on';
     if (atomicUnifiedWindows || validateValues) {
@@ -374,7 +495,11 @@ export class AccountManager {
     if (this.planQuotaMode !== 'on' && this.urgency?.mode !== 'on') delete applied.weeklyScoped;
     if (applied.weeklyScoped) {
       const byKey = new Map((account.quota.weeklyScoped || []).map(limit => [limit.key, limit]));
-      for (const limit of applied.weeklyScoped) byKey.set(limit.key, limit);
+      for (const limit of applied.weeklyScoped) {
+        const previous = byKey.get(limit.key);
+        if (isValidQuotaWindow(limit.utilization, limit.resetAt, this.now())
+          || !isValidQuotaWindow(previous?.utilization, previous?.resetAt, this.now())) byKey.set(limit.key, limit);
+      }
       account.quota = { ...account.quota, ...applied, weeklyScoped: boundWeeklyScopes([...byKey.values()]) };
     } else account.quota = { ...account.quota, ...applied };
     this.observePlanQuota(account, reported, 'header');
@@ -766,6 +891,7 @@ export class AccountManager {
       ...(this.urgency ? { accountUrgency: this.urgency.status(this.urgencyRows(), this.urgencyRows('fable'),
         new Map(this.accounts.map(account => [account.id, account.windowObservations]))) } : {}),
       ...(this.planQuotaMode !== 'off' ? { quotaWindows: this.quotaWindowsStatus() } : {}),
+      ...(this.quotaRecoveryEnabled() ? { quotaRecovery: this.quotaRecoveryStatus() } : {}),
     };
   }
 
@@ -839,6 +965,9 @@ export class AccountManager {
         temporaryUnavailableReason: clonePlainObject(account.temporaryUnavailableReason),
         errorReason: clonePlainObject(account.errorReason),
       })),
+      ...(this.quotaRecoveryEnabled() || (this.quotaRecovery
+        && (this.quotaRecovery.exportState().sequence > 0 || this.quotaRecovery.exportState().fault !== null))
+        ? { quotaRecovery: this.quotaRecovery.exportState() } : {}),
     };
   }
 
@@ -915,6 +1044,18 @@ export class AccountManager {
 
     if (this.planQuotaMode === 'on' || this.urgency?.mode === 'on') {
       this.configurePlanQuota({ mode: this.planQuotaMode });
+    }
+    if (this.quotaRecovery || state.quotaRecovery) {
+      if (!this.quotaRecovery) this.quotaRecovery = new QuotaRecovery({ now: this.now });
+      this.quotaRecovery.restoreState(state.quotaRecovery);
+      if (this.quotaRecoveryEnabled() && state.quotaRecovery?.pending) {
+        const pending = state.quotaRecovery.pending;
+        const account = this.accounts.find(entry => this.quotaRecoveryKey(entry) === pending.accountHash);
+        const info = account ? this.quotaRecovery.inspect(pending.accountHash, this.quotaRecoveryIdentity(account)) : null;
+        if (account && info.nextAllowedAt > this.now()) {
+          this.markRateLimited(account.id, Math.ceil((info.nextAllowedAt - this.now()) / 1000));
+        }
+      }
     }
     return credentialChangedIds;
   }
@@ -1217,12 +1358,14 @@ export class AccountManager {
   isAvailable(account, modelFamily = null) {
     if (!account) return false;
     this.refreshQuotaState(account);
+    if (this.quotaRecovery?.isHeld(this.quotaRecoveryKey(account))) return false;
     if (this.hasCredentialRefreshCooldown(account)) return false;
     if (account.status === 'throttled') return false;
     if (account.status === 'error') return false;
     // Scoped exhaustion can mask the throttled status. On policies must honor
     // an upstream short-term hold for every model; off/shadow keep legacy routing.
-    if ((this.planQuotaMode === 'on' || this.urgency?.mode === 'on') && account.rateLimitedUntil > this.now()) return false;
+    if ((this.planQuotaMode === 'on' || this.urgency?.mode === 'on' || this.quotaRecovery)
+      && account.rateLimitedUntil > this.now()) return false;
     if (account.status === 'exhausted') {
       return !quotaBlocksModelFamily(account.quota, this.switchThreshold, modelFamily, account.extendedQuotaScopes);
     }
