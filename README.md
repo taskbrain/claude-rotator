@@ -988,7 +988,7 @@ usage: codex-rotator login --label <name> --stop <percent> --resume <percent> [-
 - `--label` は英小文字・数字・`_`・`-` の1〜32文字（先頭は英小文字か数字）です。
 - 流れ（前の手順が通らなければ、次の手順へ進みません）
   1. 引数と設定を確かめます（ラベルが未登録か、新しいフォルダが `~/.codex` やほかの口座のフォルダと重ならないか、本物の `codex` が見つかるか、登録済みの口座の資格情報がどれも読めるか）。通らなければ、フォルダを作らず、ログインも始めずに終わります。
-  2. `accountsDir` の直下に、名前が UUID の新しいフォルダを作り、`config.toml`（下の守りの節の第2層）を置きます。
+  2. `accountsDir` の直下に、名前が UUID の新しいフォルダを作り、`config.toml`（下の守りの節の第2層。資格情報をファイルに保存する指定、コネクタとプラグインの機能を止める `[features]` の表、フィードバックの送信を止める `[feedback]` の表）を置きます。
   3. そのフォルダを `CODEX_HOME` にして `codex -c cli_auth_credentials_store="file" login` を起動します。Codex の画面のとおりにログインしてください。資格情報は、そのフォルダの `auth.json` に書かれます。
   4. 書かれた資格情報が、登録済みのほかの口座と同じアカウントでないことを確かめてから、設定に1件追記します。
 - 成功すると 0 で終わり、次の行を標準エラーに出します（設定を新しく作ったときは、2行の間に上の初回の作成の1行が入ります）。
@@ -1284,10 +1284,10 @@ usage: codex-rotator exec [--account <label>] -- [codex arguments...]
 - **第1層（起動のたびに付ける指定）**：exec は、`codex` の引数の先頭に、必ず次をこの順で付けます。口座のフォルダの `config.toml` の中身に依りません。
 
   ```text
-  -c cli_auth_credentials_store="file" -c features.apps=false -c features.plugins=false
+  -c cli_auth_credentials_store="file" -c features.apps=false -c features.plugins=false -c feedback.enabled=false
   ```
 
-- **第2層（口座のフォルダの設定）**：login が口座のフォルダに作る `config.toml` は、次の3つの設定だけです。exec を通らない起動（口座のフォルダを `CODEX_HOME` にして自分で起動した `codex`）も守るためです。
+- **第2層（口座のフォルダの設定）**：login が口座のフォルダに作る `config.toml` は、次の4つの設定だけです。exec を通らない起動（口座のフォルダを `CODEX_HOME` にして自分で起動した `codex`）も守るためです。
 
   ```toml
   cli_auth_credentials_store = "file"
@@ -1295,15 +1295,22 @@ usage: codex-rotator exec [--account <label>] -- [codex arguments...]
   [features]
   apps = false
   plugins = false
+
+  [feedback]
+  enabled = false
   ```
 
+  v0.5.1 までの login で作った口座のフォルダの `config.toml` には、最後の `[feedback]` の表がありません。その口座は、下の「点検が通らないときの戻り方」の `feedback` のとおりに2行を足すまで、exec では起動できません（`guard unverified (feedback)` で止まります）。
+
 - **コネクタとプラグインの機能を `false` にする理由**：ChatGPT のアカウントに結び付いたコネクタ（メールなどの外部のサービスとの連携）とプラグインは、`~/.codex` に置いた細かい遮断が口座のセッションでは効かないので、口座の側では、コネクタとプラグインの機能（`apps` と `plugins`）を `false` にする指定を付けています（第1層と第2層）。下の「起動ごとの点検」が確かめるのは、`codex features list` の `apps` と `plugins` の値と、`codex mcp list --json` の MCP サーバの件数です。この指定で、セッションの中のコネクタが必ず止まるとは限りません（下の「守りの対象外」）。資格情報をファイルに保存する指定は、資格情報を口座のフォルダの `auth.json` に置き、口座ごとに分けるためです。
+- **フィードバックの送信を止める理由**：Codex のフィードバックの送信（`/feedback` などで、ログや会話の記録を OpenAI へ送る機能）も、`~/.codex` に置いた設定が口座のセッションでは効かないので、口座の側で `feedback.enabled` を `false` にする指定を付けています（第1層と第2層）。`feedback.enabled` は、信頼済みの作業フォルダの設定（`.codex/config.toml`）でも変えられ、その値は口座のフォルダの `config.toml` の値より強く効きます。exec を通る起動では、プロジェクトの設定より強く効く起動の指定（第1層の `-c`）でも付けて、この道を塞ぎます。
 - **起動の型**：exec が口座を選んで起動するのは、次の3つの並びだけです。語ごとの完全一致で照らし、どれにも当たらなければ `argument rejected (form)` の1行で止まります（値は出しません）。
   1. 非対話の `exec`：最初の語が `exec`、最後の語が単独の `-`（文章を標準入力から読む。1回だけ）。その間に置けるのは、`-s`（`read-only` か `workspace-write`）・`--skip-git-repo-check`・`--json`・`-m <モデルの名前>`・`-c model_reasoning_effort=<英小文字>`・`-c features.image_generation=true`・`--image <ファイル>`・`--`（最後の `-` の直前に1回。`--image` があるときは必須）です。順は問いません。`--image` のほかは、それぞれ1回までです。
   2. 引数の無い対話：語が1つも無い並び。
   3. 版の表示：`--version` の1語。
   - そのため、`resume`・`fork`（過去の会話の再開）・`review`・`login`・`-C`・最初の文章を付けた対話などは、exec では使えません。**口座で始めた会話は、exec では再開できません**（会話の記録は、その口座のフォルダに残ります）。
 - **`--no-daemon`**：引数の無い対話（2つ目の型）でだけ、第1層の直後に Codex CLI の `--no-daemon`（共有の常駐を使わない指定）を1回付けます。利用者が付けた `--no-daemon` は、型に合わないので拒否します。
+- **フィードバックの設定の点検**：3つの型のどれでも、口座を選んだ後、口座のセッションを起動する前に毎回（下の「設定のフォルダの点検」と「起動ごとの点検」より前に）、選んだ口座のフォルダの `config.toml` を読みます。この点検そのものは `codex` を起動しません。通るのは、`[feedback]` の見出しの行がちょうど1つあり、その表の中（次の見出しの行まで）の設定が `enabled = false` の1行だけ（等号の前後の空白と行末の注記はかまいません）で、ほかの書き方で `feedback` を定義していないときだけです。通らなければ、`guard unverified (feedback)` の1行で止まり、その後の `codex`（口座のフォルダを `CODEX_HOME` にした Codex のセッションと、下の「起動ごとの点検」の `codex features list`・`codex mcp list --json`）を起動しません。ただし、口座を選ぶための次の2つは、この点検より前に動きます（上の「口座の選び方」）：版の読取（使用量の読取に付ける User-Agent を作るために、`codex --version` を最大1回起動します。`CODEX_HOME` は口座のフォルダに変えません）と、使用量の読取（口座の資格情報で、OpenAI のサーバへ使用量を問い合わせます）。常駐への問い合わせ（上の「常駐と config stale」）も先に動き、常駐が 200 で答えたときは、この2つは動きません。止まるのは、たとえば次のときです：`config.toml` が無い・読めない・64 KiB を超える・普通のファイルでない／`[feedback]` が無い・2つ以上ある／その表に `enabled` が無い・2つ以上ある・値が `false` の真偽でない（`true` や、引用符で囲んだ `"false"` など）・ほかの設定がある／最初の表より前の `feedback.enabled = …` や `feedback = { … }`、`[feedback.…]`・`[[feedback]]`・引用符で囲んだ `["feedback"]` の見出しのように、`[feedback]` の表のほかの書き方で `feedback` を定義している／下の「設定のフォルダの点検」と同じく、複数行の文字列の区切り（`"""` か `'''`）・`\`（バックスラッシュ）・決まった単純な形でない行がある。
 - **引数の無い対話の前の、設定のフォルダの点検**：引数の無い対話（2つ目の型）でだけ、下の「起動ごとの点検」より前に、`codex` を起動せずに次を見ます。止まるときは、`codex` を起動せずに `guard unverified (project-config)` か `guard unverified (project-root)` の1行で止まります。対話の中で作業フォルダを信頼すると、プロジェクトの設定が点検を経ずに読まれるので、その道を開く前に塞ぐためです。
   - exec を実行したフォルダ（実パス）から根までの各フォルダに `.codex` があれば、止まります（`project-config`）。ファイル・フォルダ・リンクのどれでも、有無だけを見て、中身は読みません。そのフォルダを信頼済みにしていても止まります。根は Codex と同じ決め方で求めます（同じに求められると確かめられないときは、下のとおり `project-root` で止まります）：exec を実行したフォルダから上へたどって、根の目印（既定は `.git`。口座のフォルダの `config.toml` に `project_root_markers` があればその値）が最初にあったフォルダです。目印はファイルでもフォルダでも数え、リンクは先までたどります。ただし `.git` がフォルダで中に `HEAD` が無いものは数えません。どこにも目印が無ければ、exec を実行したフォルダが根です。
   - exec を実行したフォルダが git の linked worktree（作業ツリーの根の `.git` がファイル）のときは、本体のチェックアウトの側の同じ位置の各フォルダの `.codex` も見ます（Codex はそこからフックを読むため）。
@@ -1322,16 +1329,24 @@ usage: codex-rotator exec [--account <label>] -- [codex arguments...]
   | `too-large` | 標準出力が上限を超えた |
   | `project-config` | 引数の無い対話で、exec を実行したフォルダから根までに（linked worktree では本体の側の同じ位置にも）`.codex` があった |
   | `project-root` | 引数の無い対話で、根を Codex と同じに決められなかった、または決め方がずれうる設定・控えがあった |
+  | `feedback` | 選んだ口座のフォルダの `config.toml` に、フィードバックの送信を止める設定（`[feedback]` の表の `enabled = false`）が、上の「フィードバックの設定の点検」の形で無かった（読めなかったときを含む） |
 
 - **点検が通らないときの戻り方**
   - `feature-enabled`・`mcp-present`：口座のフォルダの `config.toml` に、機能の有効化や MCP サーバを自分で足していれば外してください。exec を実行したフォルダが信頼済みのプロジェクトで、その設定に MCP サーバがあるときも通りません。そのときは別のフォルダから実行してください。
   - `output-format`・`exit`・`timeout`・`too-large`：Codex CLI を更新した後に出始めたときは、出力の形が変わった見込みがあります。点検が通っていた版の Codex CLI に戻すか、口座を切り替えずに、いつもの `codex` で起動してください。
   - `project-config`：根までに `.codex` の無いフォルダから実行するか、口座を切り替えずに、いつもの `codex` で起動してください。非対話の exec と版の表示は、この点検をしません。
   - `project-root`：上の「設定のフォルダの点検」に挙げた設定・控え・ファイルを確かめてください。外せないときは、口座を切り替えずに、いつもの `codex` で起動してください。
+  - `feedback`：その口座のフォルダの `config.toml` の末尾に、次の2行を足してください（既に `[feedback]` の表があれば、2行は足さずに、その表の `enabled` を `false` にしてください）。ファイルが改行で終わっていなければ、先に改行を入れてから2行を足してください。v0.5.1 までの login で作った口座のフォルダには、この表がありません。2行を足すまで、その口座は exec で起動できません。login し直しは、この2行を足しません。
+
+    ```text
+    [feedback]
+    enabled = false
+    ```
 - **守りの対象外**
   - exec を通らない起動。いつもの `codex`、口座のフォルダを `CODEX_HOME` にして自分で起動した `codex`、口座のセッションの中から起動した `codex`（子は `CODEX_HOME` を受け継ぎます）には、第1層も点検も付きません。後の2つは、その口座のフォルダで、第2層だけで動きます。
   - 信頼済みのプロジェクトの設定は、非対話の exec の口座のセッションでも読まれます（引数の無い対話は、根までに `.codex` があれば、上の設定のフォルダの点検で、開く前に止まります）。点検の `mcp list` は、信頼済みのプロジェクトの MCP サーバへ繋ぎうります。
   - 信頼済みのプロジェクトの設定の `[features]` にある `connectors`（`apps` の別名）は、起動のときに付ける `-c features.apps=false` より強く効きます。exec を通る起動のうち、非対話の exec と版の表示では、起動ごとの点検が `apps` の値を見るので、`connectors = true` があれば `feature-enabled` で止まります。引数の無い対話では、その前の設定のフォルダの点検が、信頼済みのプロジェクトの `.codex` を見つけて `project-config` で止まります。exec を通らない起動では、この道は止まりません。
+  - exec を通らない起動（いつもの `codex` など）には、第1層の `-c feedback.enabled=false` が付きません。口座のフォルダを `CODEX_HOME` にして自分で起動した `codex` と、口座のセッションの中から起動した `codex` では、信頼済みの作業フォルダの設定（`.codex/config.toml`）に `feedback.enabled = true`（`[feedback]` の表の `enabled = true`）があれば、口座のフォルダの `config.toml` の値より強く効き、フィードバックの送信は止まりません。いつもの `codex` は口座のフォルダを使わないので、口座のフォルダの `[feedback]` の表も効きません。また、Codex の説明では、この設定はフィードバックの送信を止めるもので、明示的に手元へ書き出す機能は使えるままです。
   - exec で開いた対話の中で、別のフォルダで続ける命令（`/cd`・`/worktree`・`/resume`・`/fork` など）で信頼済みの別のフォルダへ移ると、そのフォルダの設定（MCP サーバを含む）が、点検を経ずにそのセッションで読まれることがあります。
   - Codex が作業フォルダを信頼するかを尋ねる画面では、最初から信頼する側（`1. Trust and continue`）が選ばれていて、Enter を1回押すだけで信頼になります。まだ信頼していないプロジェクトは信頼せず、終了する側（`2. Quit`）を選んでから Enter を押してください。
   - 対話の中でフォルダを信頼すると、Codex はそのことを、口座のフォルダの `config.toml` に `projects` の項（`[projects."<フォルダのパス>"]` の見出しと、その下の `trust_level = "trusted"` の行）として書きます。それ以後、そのフォルダは、その口座のセッションで信頼済みとして扱われます。元に戻すには、その口座で動いている Codex を終えてから、口座のフォルダの `config.toml` から、その見出しと `trust_level` の行を消してください。
@@ -1340,7 +1355,7 @@ usage: codex-rotator exec [--account <label>] -- [codex arguments...]
   - ホームのフォルダ（`~/.codex` を含むフォルダ）を、口座のセッションで信頼しないでください。信頼すると、`~/.codex` の設定・フック・規則が、プロジェクトの設定として読まれうるためです。
   - exec を実行したフォルダがホームのフォルダそのもののとき、または根（既定は `.git` のあるフォルダ）がホームのフォルダかそれより上にあるときは、Codex CLI の設定の探し方では、`~/.codex/config.toml` がプロジェクトの設定として読まれます。ホームのフォルダを信頼していなければ効きませんが、信頼していれば効きます（前の項）。引数の無い対話は、上の設定のフォルダの点検で、開く前に止まりますが、非対話の exec はこの点検をしません。起動ごとの点検が止めるのは MCP サーバと `apps`・`plugins` だけで、ほかの設定（モデルと送り先、承認の方針、`-s` を付けないときのサンドボックス、`notify`、フックなど）は止めません。`codex-rotator exec` は、ホームのフォルダの下にある、`.git` を持つプロジェクトのフォルダで実行してください。ホームのフォルダを信頼した記録が口座のフォルダの `config.toml` にあれば、上の手順で消してください（v0.5.0 ではホームのフォルダから引数の無い対話を開けたので、そのときの記録が残っていることがあります）。
 - **指示書を置く手順**：口座のセッションで使いたい指示書（`AGENTS.md`）は、口座のフォルダに自分で置いてください。codex-rotator は `~/.codex` の中を読まず、写しもしません。
-- **フック**：プロジェクトのフックで守りを掛けているときは、口座のフォルダごとに Codex の `hooks` の機能を有効にし、そのフックを信頼する必要があります（login が作る口座のフォルダの設定は上の3つの設定だけで、`~/.codex` の設定は、上の「守りの対象外」に書いたホームのフォルダの場合のほかは読まれません）。
+- **フック**：プロジェクトのフックで守りを掛けているときは、口座のフォルダごとに Codex の `hooks` の機能を有効にし、そのフックを信頼する必要があります（login が作る口座のフォルダの設定は上の4つの設定だけで、`~/.codex` の設定は、上の「守りの対象外」に書いたホームのフォルダの場合のほかは読まれません）。
 
 ### 複数の口座を使うリスク
 
@@ -2465,7 +2480,7 @@ usage: codex-rotator login --label <name> --stop <percent> --resume <percent> [-
 - `--label` is 1 to 32 characters of a-z, 0-9, `_` and `-`, starting with a-z or 0-9.
 - The steps (a later step runs only when the earlier one passes):
   1. Check the arguments and the config (the label is not registered yet, the new folder does not overlap `~/.codex` or another account folder, the real `codex` is found, and the credentials of every registered account can be read). If anything fails, no folder is created and no login is started.
-  2. Create a new folder named with a UUID directly under `accountsDir`, and put `config.toml` (the second layer in the guard section below) in it.
+  2. Create a new folder named with a UUID directly under `accountsDir`, and put `config.toml` (the second layer in the guard section below: storing credentials in a file, the `[features]` table that turns off the connector and plugin features, and the `[feedback]` table that turns off feedback uploads) in it.
   3. Launch `codex -c cli_auth_credentials_store="file" login` with that folder as `CODEX_HOME`. Log in as Codex shows you. The credentials are written to `auth.json` in that folder.
   4. Check that the written credentials are not the same account as another registered account, then append one entry to the config.
 - On success it exits with 0 and prints these lines to standard error (when the config was newly created, the first-creation line above comes between the two):
@@ -2761,10 +2776,10 @@ Codex launched with an account folder as `CODEX_HOME` normally does not read the
 - **First layer (options added to every launch):** `exec` always puts the following, in this order, in front of the `codex` arguments. It does not depend on the contents of the account folder's `config.toml`.
 
   ```text
-  -c cli_auth_credentials_store="file" -c features.apps=false -c features.plugins=false
+  -c cli_auth_credentials_store="file" -c features.apps=false -c features.plugins=false -c feedback.enabled=false
   ```
 
-- **Second layer (the account folder's settings):** the `config.toml` that login creates in the account folder has only these three settings. They also guard launches that do not go through `exec` (a `codex` you start yourself with the account folder as `CODEX_HOME`).
+- **Second layer (the account folder's settings):** the `config.toml` that login creates in the account folder has only these four settings. They also guard launches that do not go through `exec` (a `codex` you start yourself with the account folder as `CODEX_HOME`).
 
   ```toml
   cli_auth_credentials_store = "file"
@@ -2772,15 +2787,22 @@ Codex launched with an account folder as `CODEX_HOME` normally does not read the
   [features]
   apps = false
   plugins = false
+
+  [feedback]
+  enabled = false
   ```
 
+  In account folders made by login in v0.5.1 or earlier, `config.toml` does not have the last `[feedback]` table. Such an account cannot be launched through `exec` (it stops with `guard unverified (feedback)`) until you add the two lines as described for `feedback` under "What to do when the check does not pass" below.
+
 - **Why the connector and plugin features are set to `false`:** for connectors tied to the ChatGPT account (links to outside services such as mail) and plugins, fine-grained blocks placed in `~/.codex` do not apply in an account session, so the account side adds settings that set the connector and plugin features (`apps` and `plugins`) to `false` (the first and second layers). The guard check below looks at the values of `apps` and `plugins` in `codex features list` and at the number of MCP servers in `codex mcp list --json`. These settings do not guarantee that connectors stay disconnected inside the session (see "Outside these guards" below). Storing credentials in a file keeps them in the account folder's `auth.json`, separate for each account.
+- **Why feedback uploads are turned off:** for Codex's feedback uploads (sending logs and conversation records to OpenAI, for example with `/feedback`) too, settings placed in `~/.codex` do not apply in an account session, so the account side adds settings that set `feedback.enabled` to `false` (the first and second layers). `feedback.enabled` can also be changed in a trusted working folder's settings (`.codex/config.toml`), and that value takes precedence over the value in the account folder's `config.toml`. For launches through `exec`, the setting is also added as a launch option that takes precedence over project settings (the first layer's `-c`), which closes that path.
 - **Launch forms:** `exec` selects an account and launches only for the following three argument lists. Each word must match exactly; anything else stops with the one line `argument rejected (form)` (no values are printed).
   1. Non-interactive `exec`: the first word is `exec` and the last word is a lone `-` (the prompt is read from standard input; only once). Between them only these may appear: `-s` (`read-only` or `workspace-write`), `--skip-git-repo-check`, `--json`, `-m <model name>`, `-c model_reasoning_effort=<lowercase letters>`, `-c features.image_generation=true`, `--image <file>`, and `--` (once, right before the last `-`; required when `--image` is present). Order does not matter. Each may appear at most once, except `--image`.
   2. Interactive session with no arguments: an empty list.
   3. Version: the single word `--version`.
   - As a result, `resume` and `fork` (continuing a past conversation), `review`, `login`, `-C`, an interactive session with a first prompt, and so on cannot be used through `exec`. **A conversation started with an account cannot be resumed through `exec`** (its record stays in that account folder).
 - **`--no-daemon`:** only for the interactive session with no arguments (the second form), the Codex CLI's `--no-daemon` (do not use the shared daemon) is added once, right after the first layer. A `--no-daemon` you add yourself does not match a form and is refused.
+- **Feedback setting check:** for all three forms, after the account is selected and before every launch of the account session (before the "Project folder check" and the "Guard check on every launch" below), `exec` reads the selected account folder's `config.toml`. This check itself does not start `codex`. It passes only when there is exactly one `[feedback]` header line, the only setting in that table (up to the next header line) is the single line `enabled = false` (spaces around the equals sign and a comment at the end of the line are fine), and `feedback` is not defined in any other way. If it does not pass, `exec` stops with the one line `guard unverified (feedback)` and starts no further `codex` (neither the Codex session with the account folder as `CODEX_HOME` nor the `codex features list` and `codex mcp list --json` of the "Guard check on every launch" below). The two steps that select the account still run before this check, though (see "How the account is selected" above): the version read (to build the User-Agent sent with the usage read, it starts `codex --version` at most once, without changing `CODEX_HOME` to the account folder) and the usage read (it asks OpenAI's server for the usage with each account's credentials). The request to the daemon (see "The Daemon and config stale" above) also runs first, and when the daemon answers 200, these two steps do not run. For example, it stops when: `config.toml` is missing, cannot be read, is larger than 64 KiB or is not a regular file; there is no `[feedback]` or there are two or more; the table has no `enabled`, has two or more, has a value that is not the boolean `false` (such as `true` or the quoted string `"false"`), or has another setting; `feedback` is defined in a way other than the `[feedback]` table, such as `feedback.enabled = …` or `feedback = { … }` before the first table, or a header like `[feedback.…]`, `[[feedback]]` or the quoted `["feedback"]`; or, as in the "Project folder check" below, there is a multi-line string delimiter (`"""` or `'''`), a backslash (`\`), or a line that is not one of the plain shapes.
 - **Project folder check before an interactive session:** only for the interactive session with no arguments (the second form), before the guard check below, `exec` looks at the following without starting `codex`. When it stops, `codex` is not launched and `exec` stops with the one line `guard unverified (project-config)` or `guard unverified (project-root)`. Trusting the working folder inside a session makes Codex load the project settings without the check, so this closes that path before the session opens.
   - If any folder from the folder where `exec` runs (its real path) up to the project root has a `.codex`, it stops (`project-config`). A file, a folder or a link all count; only its presence is checked and its contents are not read. It stops even when that folder is trusted. The root is found the same way Codex finds it (when the check cannot confirm that it finds the root the same way, it stops with `project-root`, as listed below): going up from the folder where `exec` runs, the first folder that has a root marker (`.git` by default, or the value of `project_root_markers` in the account folder's `config.toml`). A marker may be a file or a folder, and links are followed, but a `.git` folder without `HEAD` does not count. When no marker is found, the folder where `exec` runs is the root.
   - When the folder where `exec` runs is a git linked worktree (the `.git` at the root of the working tree is a file), it also looks for `.codex` in the folders at the same places on the main checkout side (Codex reads hooks from there).
@@ -2799,16 +2821,24 @@ Codex launched with an account folder as `CODEX_HOME` normally does not read the
   | `too-large` | Standard output exceeded the limit |
   | `project-config` | In an interactive session, a `.codex` was found from the folder where `exec` runs up to the project root (in a linked worktree, also at the same places on the main checkout side) |
   | `project-root` | In an interactive session, the project root could not be found the same way Codex finds it, or a setting or cache that may change how it is found was present |
+  | `feedback` | The selected account folder's `config.toml` did not have the setting that turns off feedback uploads (`enabled = false` in the `[feedback]` table) in the shape described under "Feedback setting check" above (including when it could not be read) |
 
 - **What to do when the check does not pass:**
   - `feature-enabled`, `mcp-present`: if you added an enabled feature or an MCP server to the account folder's `config.toml` yourself, remove it. The check also fails when the folder where you run `exec` is a trusted project whose settings have MCP servers; run it from another folder.
   - `output-format`, `exit`, `timeout`, `too-large`: if this started after updating the Codex CLI, the output shape may have changed. Go back to a Codex CLI version that passed the check, or launch the usual `codex` without switching accounts.
   - `project-config`: run it from a folder that has no `.codex` up to its project root, or launch the usual `codex` without switching accounts. The non-interactive `exec` and the version form do not run this check.
   - `project-root`: check the settings, caches and files listed under "Project folder check" above. If you cannot remove them, launch the usual `codex` without switching accounts.
+  - `feedback`: add the following two lines to the end of that account folder's `config.toml` (if it already has a `[feedback]` table, do not add the two lines; set `enabled` in that table to `false` instead). If the file does not end with a newline, add one before the two lines. Account folders made by login in v0.5.1 or earlier do not have this table. Until you add the two lines, that account cannot be launched through `exec`. Logging in again with `--relogin` does not add them.
+
+    ```text
+    [feedback]
+    enabled = false
+    ```
 - **Outside these guards:**
   - Launches that do not go through `exec`. The usual `codex`, a `codex` you start yourself with the account folder as `CODEX_HOME`, and a `codex` started from inside an account session (the child inherits `CODEX_HOME`) get neither the first layer nor the check. The last two run in that account folder with only the second layer.
   - The settings of trusted projects are read in account sessions of the non-interactive `exec` too (an interactive session stops before it opens, by the project folder check above, when there is a `.codex` up to the project root). The check's `mcp list` may connect to the MCP servers of a trusted project.
   - `connectors` (another name for `apps`) under `[features]` in a trusted project's settings takes precedence over the `-c features.apps=false` added at launch. Among launches through `exec`, for the non-interactive `exec` and the version form, the guard check on every launch looks at the value of `apps`, so `connectors = true` stops the launch with `feature-enabled`. For the interactive session with no arguments, the project folder check before it finds the trusted project's `.codex` and stops with `project-config`. For a launch that does not go through `exec`, nothing stops this path.
+  - Launches that do not go through `exec` (such as the usual `codex`) do not get the first layer's `-c feedback.enabled=false`. In a `codex` you start yourself with the account folder as `CODEX_HOME` and in a `codex` started from inside an account session, `feedback.enabled = true` (`enabled = true` in the `[feedback]` table) in a trusted working folder's settings (`.codex/config.toml`) takes precedence over the value in the account folder's `config.toml`, and feedback uploads are not turned off. The usual `codex` does not use the account folder, so the account folder's `[feedback]` table does not apply to it either. Also, according to Codex's description, this setting turns off feedback uploads, and explicit local exports remain available.
   - If, in an interactive session started by `exec`, you move to another trusted folder with a command that continues in another folder (such as `/cd`, `/worktree`, `/resume` or `/fork`), that folder's settings, including its MCP servers, may be loaded in that session without the check.
   - On the screen where Codex asks whether to trust the working folder, the trusting choice (`1. Trust and continue`) is selected from the start, and a single Enter trusts the folder. Do not trust a project you have not already trusted: select the quitting choice (`2. Quit`) and then press Enter.
   - When you trust a folder inside a session, Codex records it in the account folder's `config.toml` as a `projects` entry (a `[projects."<folder path>"]` header with a `trust_level = "trusted"` line under it). From then on, that folder is treated as trusted in that account's sessions. To undo it, quit the Codex running with that account, then delete that header and its `trust_level` line from the account folder's `config.toml`.
@@ -2817,7 +2847,7 @@ Codex launched with an account folder as `CODEX_HOME` normally does not read the
   - Do not trust your home folder (the folder that contains `~/.codex`) in an account session. If you do, the settings, hooks and rules in `~/.codex` may be read as project settings.
   - When the folder where `exec` runs is your home folder itself, or its project root (by default, the folder that has `.git`) is your home folder or a folder above it, the way the Codex CLI looks for project settings reads `~/.codex/config.toml` as project settings. It does not take effect while the home folder is untrusted, but it does once the home folder is trusted (see the previous item). The interactive session with no arguments stops before it opens, by the project folder check above, but the non-interactive `exec` does not run that check. The guard check on every launch stops only MCP servers, `apps` and `plugins`; it does not stop other settings (the model and where requests are sent, the approval policy, the sandbox when `-s` is not given, `notify`, hooks and so on). Run `codex-rotator exec` in a project folder under your home folder that has its own `.git`. If the account folder's `config.toml` has a record that you trusted your home folder, delete it as described above (in v0.5.0, an interactive session with no arguments could be opened from the home folder, so such a record may remain from then).
 - **How to provide instructions:** put the instructions (`AGENTS.md`) you want in account sessions into the account folder yourself. codex-rotator does not read inside `~/.codex` and does not copy from it.
-- **Hooks:** if a project relies on hooks as a guard, enable Codex's `hooks` feature in each account folder and trust those hooks (the settings that login creates in the account folder are only the three settings above, and `~/.codex` is not read except in the home folder case under "Outside these guards" above).
+- **Hooks:** if a project relies on hooks as a guard, enable Codex's `hooks` feature in each account folder and trust those hooks (the settings that login creates in the account folder are only the four settings above, and `~/.codex` is not read except in the home folder case under "Outside these guards" above).
 
 #### The risks of using several accounts
 

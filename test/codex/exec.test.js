@@ -662,6 +662,33 @@ test('the interactive form stops with guard unverified (project-config) in a fol
   assertNoLeaks(result, ['alpha']);
 });
 
+test('every launch form stops with guard unverified (feedback) when the account config.toml lacks the feedback setting, and starts only the version read', async t => {
+  const f = await fixture(t);
+  // [feedback] の表の無い全文（フィードバックの設定の点検を足す前の login が書いた全文と同じ）。
+  const withoutFeedback = ACCOUNT_CONFIG_TOML.replace(/\n\[feedback\]\nenabled = false\n$/, '');
+  assert.notEqual(withoutFeedback, ACCOUNT_CONFIG_TOML);
+  await writeFile(join(f.homes.alpha, 'config.toml'), withoutFeedback, { mode: 0o600 });
+  for (const argv of [['--account', 'alpha', '--', 'exec', '--json', '-'], ['--account', 'alpha'],
+    ['--account', 'alpha', '--', '--version'], ['--', 'exec', '--json', '-'], []]) {
+    const before = f.spawnCalls.length;
+    const fetch = fakeFetch(() => jsonResponse(usageBody()));
+    const result = await f.run(argv, { fetchImpl: fetch.impl });
+    assert.equal(result.code, 1, JSON.stringify(argv));
+    assert.deepEqual(result.lines, [formatVerdictLine('alpha', 'ok'), 'guard unverified (feedback)'],
+      'the verdict line is printed before the feedback check');
+    assert.deepEqual(f.spawnCalls.slice(before).map(call => call.kind), ['version'], 'no check and no launch after the version read');
+    assertNoLeaks(result, ['alpha']);
+  }
+  assert.equal(launchCount(f), 0);
+  // 2行を末尾に足すと、今までどおり起動する。
+  await writeFile(join(f.homes.alpha, 'config.toml'), `${withoutFeedback}[feedback]\nenabled = false\n`, { mode: 0o600 });
+  const fetch = fakeFetch(() => jsonResponse(usageBody()));
+  const result = await f.run(['--account', 'alpha', '--', '--version'], { fetchImpl: fetch.impl });
+  assert.equal(result.code, 0);
+  assert.equal(launchCount(f), 1);
+  assert.deepEqual(f.launches[0].args, [...FIRST_LAYER_ARGS, '--version']);
+});
+
 test('does not launch and says guard unverified when the guard check sees apps enabled', async t => {
   const f = await fixture(t, { features: 'apps stable true\nplugins stable false\n' });
   const fetch = fakeFetch(() => jsonResponse(usageBody()));
