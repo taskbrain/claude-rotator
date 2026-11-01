@@ -173,6 +173,36 @@ describe('recovery admission after a clock rollback', () => {
 });
 
 describe('restored recovery outcome holds', () => {
+  for (const [name, planMode, urgencyMode] of [
+    ['off', 'off', 'off'],
+    ['plan shadow', 'shadow', 'off'],
+    ['urgency shadow', 'off', 'shadow'],
+  ]) {
+    it(`preserves recovery snapshot bytes and ordinary selection after pending restore in ${name}`, () => {
+      const first = setup();
+      first.manager.setQuotaRecoveryPersistence(true, false);
+      assert.ok(first.manager.reserveQuotaRecovery());
+      const accounts = [...first.accounts, { id: 'sample-b', type: 'apikey', credentialRevision: 1 }];
+      first.manager.replaceAccounts(accounts);
+      first.manager.applyUsage('sample-b', { seven_day: bucket(0.2, START + 24 * HOUR) });
+      const saved = first.manager.exportState();
+      const restoredAt = START + 5 * 60_000;
+      const restored = new AccountManager({ accounts, now: () => restoredAt,
+        planQuota: { mode: planMode }, accountUrgency: { mode: urgencyMode },
+      });
+      restored.restoreState(saved);
+      const expected = {
+        ...saved.quotaRecovery, lastSeenAt: restoredAt, pending: null,
+        accounts: saved.quotaRecovery.accounts.map(account => ({ ...account, lastResult: 'interrupted', unresolved: true })),
+      };
+      assert.equal(JSON.stringify(restored.exportState().quotaRecovery), JSON.stringify(expected));
+      assert.equal(Object.hasOwn(restored.getStatus(), 'quotaRecovery'), false);
+      assert.equal(restored.reserveQuotaRecovery(), null);
+      assert.equal(restored.selectForNewAssignment()?.id, 'sample-b');
+      assert.equal(JSON.stringify(restored.exportState().quotaRecovery), JSON.stringify(expected));
+    });
+  }
+
   for (const policy of ['plan', 'urgency']) {
     for (const elapsed of [15 * 60_000, HOUR]) {
       for (const fresh of [false, true]) {

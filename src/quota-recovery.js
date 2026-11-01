@@ -41,6 +41,7 @@ export class QuotaRecovery {
   #fault = null;
   #sequence = 0;
   #poolLastStartedAt = null;
+  #restoredPoolNotBefore = null;
   #pending = null;
   #accounts = new Map();
 
@@ -87,6 +88,7 @@ export class QuotaRecovery {
     let reason = 'ready';
     const limits = [
       [this.#poolLastStartedAt === null ? 0 : this.#poolLastStartedAt + MINUTE, 'pool-interval'],
+      [this.#restoredPoolNotBefore ?? 0, 'pool-interval'],
     ];
     if (account) {
       const starts = account.starts.filter(start => start > current - HOUR);
@@ -220,7 +222,11 @@ export class QuotaRecovery {
         account.unresolved = true;
       }
       this.#pending = null;
-      this.#readNow();
+      const restoredAt = this.#readNow();
+      if (restoredAt !== null && [...this.#accounts.values()].some(account => account.unresolved === true)) {
+        // Rebuild this wait after each restore without changing the saved format.
+        this.#restoredPoolNotBefore = restoredAt + MINUTE;
+      }
     } catch {
       this.#fault = 'invalid-state';
     }

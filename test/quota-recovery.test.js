@@ -227,18 +227,24 @@ it('keeps a restored pending account quarantined without reusing its consumed le
   assert.equal(restored.settle(oldLease, { result: 'observed' }), false);
 });
 
-it('quarantines a legacy version-one pending snapshot without blocking another account', () => {
+it('quarantines a legacy pending snapshot and delays other recovery accounts for one minute', () => {
   const snapshot = {
     schemaVersion: 1, sequence: 1, lastSeenAt: BASE, fault: null, poolLastStartedAt: BASE,
     pending: { id: 1, accountHash: ACCOUNT, identityHash: IDENTITY, startedAt: BASE },
     accounts: [{ accountHash: ACCOUNT, starts: [BASE], blockedUntil: null, lastResult: null, deniedIdentity: null }],
   };
-  const { recovery } = setup(BASE + HOUR);
+  const { recovery, clock } = setup(BASE + HOUR);
   recovery.restoreState(snapshot);
   assert.equal(recovery.inspect(ACCOUNT, IDENTITY).inFlight, false);
   assert.equal(recovery.reserve(ACCOUNT, IDENTITY), null);
   assert.equal(recovery.reserve(ACCOUNT, NEW_IDENTITY), null);
+  assert.equal(recovery.inspect(OTHER, IDENTITY).nextAllowedAt, BASE + HOUR + MINUTE);
+  assert.equal(recovery.reserve(OTHER, IDENTITY), null);
+  clock.ms += MINUTE - 1;
+  assert.equal(recovery.reserve(OTHER, IDENTITY), null);
+  clock.ms++;
   assert.ok(recovery.reserve(OTHER, IDENTITY));
+  assert.equal(recovery.reserve(ACCOUNT, NEW_IDENTITY), null);
 });
 
 it('keeps a restored unknown outcome quarantined through a second save and restart', () => {
@@ -254,6 +260,10 @@ it('keeps a restored unknown outcome quarantined through a second save and resta
   assert.equal(third.recovery.reserve(ACCOUNT, NEW_IDENTITY), null);
   assert.equal(third.recovery.exportState().sequence, 1);
   assert.deepEqual(third.recovery.exportState().accounts[0].starts, [BASE]);
+  assert.equal(third.recovery.inspect(OTHER, IDENTITY).nextAllowedAt, BASE + 2 * HOUR + MINUTE);
+  assert.equal(third.recovery.reserve(OTHER, IDENTITY), null);
+  third.clock.ms += MINUTE;
+  assert.ok(third.recovery.reserve(OTHER, IDENTITY));
 });
 
 it('keeps a restored rate-limit deadline and start history', () => {

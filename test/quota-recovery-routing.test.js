@@ -550,6 +550,65 @@ describe('recovery budgets after asynchronous preparation', () => {
   }
 
   for (const policy of ['plan', 'urgency']) {
+    for (const restartAgain of [false, true]) {
+      it(`waits a full pool interval after restoring a delayed send with lost settlement (${policy}, restartAgain=${restartAgain})`, async () => {
+        const first = await fixture({ policy, count: 2 });
+        first.state.headers = false;
+        const directory = await mkdtemp(join(tmpdir(), 'quota-recovery-lost-send-'));
+        const statePath = join(directory, 'runtime-state.json');
+        const writer = createRuntimeStateWriter(statePath);
+        let durable = false;
+        let failedWrites = 0;
+        first.state.writer = async snapshot => {
+          if (!durable && snapshot.quotaRecovery?.pending) {
+            await new Promise(resolve => setImmediate(resolve));
+            first.clock.ms += DELAY;
+            await writer(snapshot);
+            durable = true;
+            return;
+          }
+          if (durable) {
+            failedWrites++;
+            throw new Error('fixture outcome persistence failed');
+          }
+        };
+        assert.equal((await first.ask()).status, 200);
+        await until(() => failedWrites > 0);
+        assert.deepEqual(first.sendTimes, [START + DELAY]);
+        const saved = JSON.parse(await readFile(statePath, 'utf8'));
+        assert.ok(saved.quotaRecovery.pending);
+        assert.equal(saved.quotaRecovery.poolLastStartedAt, START);
+        let restoredAt = START + DELAY;
+        let restarted = await fixture({ policy, count: 2, restoredState: saved, startAt: restoredAt });
+        restarted.state.headers = false;
+        assert.equal((await restarted.ask()).status, 503);
+        assert.equal(restarted.seen.length, 0, 'another unknown account must wait after an uncertain send');
+
+        if (restartAgain) {
+          const normalized = JSON.parse(JSON.stringify(restarted.manager.exportState()));
+          assert.equal(normalized.quotaRecovery.pending, null);
+          assert.equal(normalized.quotaRecovery.accounts[0].unresolved, true);
+          restoredAt++;
+          restarted = await fixture({ policy, count: 2, restoredState: normalized, startAt: restoredAt });
+          restarted.state.headers = false;
+          assert.equal((await restarted.ask()).status, 503);
+          assert.equal(restarted.seen.length, 0);
+        }
+        restarted.clock.ms = restoredAt + MINUTE - 1;
+        assert.equal((await restarted.ask()).status, 503);
+        assert.equal(restarted.seen.length, 0);
+        restarted.clock.ms++;
+        assert.equal((await restarted.ask()).status, 200);
+        assert.deepEqual(restarted.sendTimes, [restoredAt + MINUTE]);
+        assert.ok(restarted.sendTimes[0] - first.sendTimes[0] >= MINUTE);
+        await until(() => restarted.manager.exportState().quotaRecovery.pending === null);
+        const final = restarted.manager.exportState().quotaRecovery;
+        assert.equal(final.sequence, 2);
+        assert.equal(final.accounts.find(account => account.unresolved)?.lastResult, 'interrupted');
+        assert.equal(restarted.manager.quotaRecoveryEligible(restarted.manager.find('sample-a')), false);
+      });
+    }
+
     for (const kind of ['persistence', 'credential read', 'credential refresh']) {
       const options = { policy, ...(kind === 'credential refresh' ? { refreshable: true, credentialExpiry: 'expired' } : {}) };
       it(`keeps actual recovery sends sixty seconds apart after delayed ${kind} (${policy})`, async () => {
