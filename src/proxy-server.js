@@ -379,8 +379,11 @@ export function createProxyServer({
     affinityPersistTimer.unref?.();
   }
   let persistTail = Promise.resolve();
-  function persistState() {
-    if (!stateWriter) return;
+  function persistState({ strict = false } = {}) {
+    if (!stateWriter) {
+      if (strict) return Promise.reject(new Error('Recovery persistence unavailable'));
+      return;
+    }
     const snapshot = accountManager.exportState();
     // 既存の runtime-state.json へ相乗りする。新しいファイルは作らない。
     if (affinityPersistEnabled()) {
@@ -390,9 +393,10 @@ export function createProxyServer({
     }
     const write = persistTail.then(() => stateWriter(snapshot));
     persistTail = write.catch(error => {
-      logger?.(`state persist failed: ${shortErrorMessage(error)}`);
+      logger?.(strict || accountManager.quotaRecoveryEnabled()
+        ? 'quota_recovery result=persistence-failed' : `state persist failed: ${shortErrorMessage(error)}`);
     });
-    return persistTail;
+    return strict ? write : persistTail;
   }
   const checkPersistedRefreshIntents = async () => {
     if (await reconcilePersistedRefreshIntents({ accountManager, secretStore, logger })) {
@@ -491,6 +495,7 @@ export function createProxyServer({
   }
   configureUrgency();
   accountManager.configurePlanQuota(config.planQuota);
+  accountManager.setQuotaRecoveryPersistence(Boolean(stateWriter), usagePollingEnabled(config));
   let pollingWarningShown = false;
   function warnWithoutUsagePolling() {
     const active = accountManager.planQuotaMode === 'on' || accountManager.urgency?.mode === 'on';
@@ -871,6 +876,7 @@ export function createProxyServer({
         configureUrgency();
         if (reloadPlanQuota) config.planQuota = await reloadPlanQuota();
         accountManager.configurePlanQuota(config.planQuota);
+        accountManager.setQuotaRecoveryPersistence(Boolean(stateWriter), usagePollingEnabled(config));
         warnWithoutUsagePolling();
         // キャッシュ観測の再読込。セクションが無い・config.json 自体が無い
         // （reloadObservability が undefined を返す）ときは既定へ戻す。
@@ -1028,6 +1034,7 @@ export function createProxyServer({
         observability: observabilitySettings,
         usageEventWriter,
         proxyErrorContext,
+        persistQuotaRecovery: () => persistState({ strict: true }),
       });
       await persistState();
     } catch (error) {
@@ -1923,6 +1930,35 @@ function createSessionAffinityRequest({
     beginQuotaGrace: () => 0,
   };
   if (!state.pinned) return state;
+
+  state.recoveryAllowed = account => {
+    const current = affinity.get(key, { modelFamily });
+    if (!current || current.bound === account.id) return true;
+    const bound = accountManager.findOrNull(current.bound);
+    const warm = accountManager.now() - current.lastSeen < settings.warmTtlMs;
+    return !affinity.hasInFlight(key) && isUserTurnBoundary(body)
+      && (!warm || !bound || !accountManager.isAvailable(bound, modelFamily));
+  };
+  state.reserveRecovery = account => {
+    if (!state.recoveryAllowed(account)) return false;
+    const current = affinity.get(key, { modelFamily });
+    const bound = current ? accountManager.findOrNull(current.bound) : null;
+    const reason = bound && bound.id !== account.id
+      ? quotaRebindReason(bound, accountManager.switchThreshold, modelFamily, accountManager.now()) || 'cold_reassign'
+      : null;
+    const reserved = affinity.note(key, { account: account.id, modelFamily, reason,
+      ...(reason === 'common_exhausted' ? { evidence: commonQuotaEvidence(bound, accountManager.switchThreshold, accountManager.now()) } : {}) });
+    if (!reserved || reserved.disposition === 'stale') return false;
+    const alreadyHeld = state.gen !== null;
+    state.gen = reserved.gen;
+    state.reservedId = account.id;
+    if (!alreadyHeld) {
+      const release = affinity.hold(key);
+      res.once('close', release);
+      if (res.destroyed || res.writableEnded) release();
+    }
+    return true;
+  };
 
   // 送り先の散らばりの数え。要求の記録（recordProxyRequest）が実際に送った口座で呼ぶ。
   // 鍵のある `on` の要求にだけ置くので、`observe` と鍵の無い要求は数えない。
@@ -2879,7 +2915,8 @@ function markOAuthRefreshUnavailable(accountManager, accountId, error) {
   return true;
 }
 
-async function forwardWithRotation({
+async function forwardWithRotation(options) {
+  const {
   req,
   res,
   body,
@@ -2905,11 +2942,14 @@ async function forwardWithRotation({
   observability = DEFAULT_OBSERVABILITY,
   usageEventWriter = null,
   proxyErrorContext = null,
-}) {
+  persistQuotaRecovery = null,
+  allowQuotaRecovery = true,
+  } = options;
   // 論理要求1件につき1つ。forwardOnce() を呼ぶたびに attempt が1つ進む（401 後の再送・
   // 口座の切り替え・利用不可口座での実送信を含む）。writer が無ければ null で、計測しない。
   const usageEvents = usageEventWriter ? createUsageEventContext(usageEventWriter) : null;
   const attemptedAccountIds = new Set();
+  let upstreamAttempted = false;
   let lastRetryableResponse = null;
   // 再生する応答を作った口座（P-b の replay 行の account= に使う。写像したときだけ読む）。
   let lastRetryableAccountId = null;
@@ -3001,6 +3041,17 @@ async function forwardWithRotation({
       if (reactiveQuotaRetryUsed && lastRetryableResponse) {
         sendLastRetryable();
         return;
+      }
+      if (allowQuotaRecovery && accountManager.quotaRecoveryEnabled() && !upstreamAttempted && !lastRetryableResponse) {
+        const recovery = await forwardQuotaRecovery({
+          ...options, modelFamily, requestEffort, usageEvents, affinityRequest, persistQuotaRecovery,
+          exhaustionMapper: mapExhaustion, upstreamOverloadMapper,
+        });
+        if (recovery === 'normal-ready') {
+          await forwardWithRotation({ ...options, allowQuotaRecovery: false });
+          return;
+        }
+        if (recovery) return;
       }
       if (sendCurrentQuotaUnavailableResponse({
         req,
@@ -3225,6 +3276,8 @@ async function forwardWithRotation({
       accountManager.switchToCandidate(reactiveSelection, 'quota-threshold', '429');
     }
 
+    // A credential retry failure must not reopen recovery after this attempt.
+    upstreamAttempted = true;
     const result = await forwardOnce({
       req,
       res,
@@ -3398,6 +3451,214 @@ async function forwardWithRotation({
   }
 }
 
+function quotaRecoveryDeadline(headers, now, modelFamily, threshold) {
+  const times = [];
+  const retry = headerValue(headers['retry-after']);
+  if (typeof retry === 'string' && /^\d+(?:\.\d+)?$/.test(retry.trim())) times.push(now + Number(retry) * 1000);
+  else if (typeof retry === 'string' && !Number.isFinite(Number(retry))) {
+    const at = Date.parse(retry);
+    if (Number.isFinite(at) && at > now) times.push(at);
+  }
+  const parsed = parseRateLimitHeaders(headers, { includeScopedWindows: true });
+  const windows = [
+    [parsed.unified5h, parsed.unified5hReset],
+    [parsed.unified7d, parsed.unified7dReset],
+    ...(parsed.weeklyScoped || []).filter(limit => scopeMatchesModelFamily(limit, modelFamily, true))
+      .map(limit => [limit.utilization, limit.resetAt]),
+  ];
+  for (const [utilization, resetAt] of windows) {
+    if (usageBucketConfirmsQuota({ utilization, resetAt }, threshold, now)) times.push(resetAt);
+  }
+  const global = finiteHeaderNumber(headers['anthropic-ratelimit-unified-reset']);
+  const resets = global === null ? [] : [global * 1000];
+  const claim = parsed.unifiedStatus === 'rejected'
+    ? headerValue(headers['anthropic-ratelimit-unified-representative-claim'])?.trim().toLowerCase() : null;
+  if (claim === 'five_hour') resets.push(parsed.unified5hReset);
+  else if (claim === 'seven_day') resets.push(parsed.unified7dReset);
+  else if (claim?.startsWith('seven_day_')) {
+    const scope = claim.slice('seven_day_'.length);
+    if (scopeMatchesModelFamily({ key: scope }, modelFamily, true)) {
+      for (const key of new Set([scope, scope.replace(/_/g, '-')])) {
+        for (const separator of ['-', '_']) {
+          const reset = finiteHeaderNumber(headers[`anthropic-ratelimit-unified-7d${separator}${key}-reset`]);
+          if (reset !== null) resets.push(reset * 1000);
+        }
+      }
+    }
+  }
+  for (const at of resets) if (Number.isFinite(at) && at > now) times.push(at);
+  const valid = times.filter(at => Number.isSafeInteger(at) && at >= now && at <= Number.MAX_SAFE_INTEGER - 3_600_000);
+  return valid.length ? Math.max(...valid) : null;
+}
+
+function sendQuotaRecoveryWait(res, accountManager, modelFamily = null) {
+  const status = accountManager.quotaRecoveryStatus(modelFamily);
+  if (!status || status.reason === 'ordinary-available') return false;
+  if (!status.inFlight && status.nextAllowedAt == null && status.reason !== 'persistence-unavailable'
+    && !['invalid-state', 'clock-rollback', 'clock-unavailable', 'outcome-unknown'].includes(status.reason)) return false;
+  if (res.destroyed || res.writableEnded) return true;
+  const seconds = status.nextAllowedAt == null ? 60
+    : Math.max(1, Math.ceil((status.nextAllowedAt - accountManager.now()) / 1000));
+  res.writeHead(503, { 'content-type': 'application/json', 'retry-after': String(seconds) });
+  res.end(JSON.stringify({ type: 'error', error: { type: 'api_error', message: 'Quota observation recovery is waiting for its budget.' } }));
+  return true;
+}
+
+async function forwardQuotaRecovery({
+  req, res, body, upstream, accountManager, secretStore, tokenRefresher, currentCredentialReader, currentProfileFetcher,
+  allowLiveClaudeCodeCredentials, logger, upstreamIdleTimeoutMs, quotaShapeObserver, upstreamConnectTimeoutMs,
+  upstreamConnectRetryDelayMs, modelFamily, requestEffort, observability, usageEvents, affinityRequest,
+  persistQuotaRecovery, exhaustionMapper = null, upstreamOverloadMapper = null,
+}) {
+  if (!accountManager.quotaRecoveryEnabled() || typeof persistQuotaRecovery !== 'function'
+    || req.method !== 'POST' || new URL(req.url, 'http://local.invalid').pathname !== '/v1/messages') return false;
+  const probe = accountManager.reserveQuotaRecovery(modelFamily, account => affinityRequest?.recoveryAllowed?.(account) !== false);
+  if (!probe) return false;
+  let result = 'unknown';
+  let status = null;
+  let notBefore = null;
+  const validIdentity = () => accountManager.isCurrentQuotaRecovery(probe);
+  const holdRateLimit = () => {
+    if ((status !== 429 && result !== 'rate-limit') || !validIdentity()) return;
+    const now = accountManager.quotaRecovery.referenceTime();
+    if (now === null) return;
+    const budget = accountManager.quotaRecovery.inspect(probe.lease.accountHash, probe.lease.identityHash).nextAllowedAt;
+    notBefore = Math.max(notBefore ?? now + 3_600_000, budget ?? 0, probe.account.rateLimitedUntil ?? 0);
+    if ((probe.account.rateLimitedUntil ?? 0) < notBefore) {
+      accountManager.markRateLimited(probe.account.id, Math.max(1, Math.ceil((notBefore - accountManager.now()) / 1000)));
+    }
+  };
+  const persistSettled = async () => {
+    holdRateLimit();
+    accountManager.settleQuotaRecovery(probe, { result, status, notBefore });
+    try { await persistQuotaRecovery(); } catch {
+      // A failed outcome write leaves the durable snapshot unchanged.
+      // Restoring a pending lease quarantines only its account.
+    }
+  };
+  try {
+    if (affinityRequest?.reserveRecovery?.(probe.account) === false) {
+      result = 'aborted'; await persistSettled();
+      sendQuotaRecoveryWait(res, accountManager, modelFamily);
+      return true;
+    }
+    try { await persistQuotaRecovery(); } catch {
+      result = 'persistence-failed'; await persistSettled();
+      if (accountManager.selectForNewAssignment({ modelFamily, recordDecision: false })) return 'normal-ready';
+      if (!sendQuotaRecoveryWait(res, accountManager, modelFamily)) sendJson(res, 503, {
+        type: 'error', error: { type: 'api_error', message: 'Recovery persistence is unavailable.' },
+      });
+      return true;
+    }
+    if (req.aborted || res.destroyed) { result = 'aborted'; return true; }
+    if (!validIdentity()) {
+      result = 'identity-changed'; await persistSettled();
+      if (!sendQuotaRecoveryWait(res, accountManager, modelFamily)) sendJson(res, 503, {
+        type: 'error', error: { type: 'api_error', message: 'Recovery reservation is no longer current.' },
+      });
+      return true;
+    }
+    if (accountManager.selectForNewAssignment({ modelFamily, recordDecision: false })) {
+      result = 'aborted'; await persistSettled();
+      return 'normal-ready';
+    }
+    if (!accountManager.quotaRecoveryEligible(probe.account, modelFamily)) {
+      result = 'aborted'; await persistSettled();
+      return false;
+    }
+    const secret = await resolveSecretForAccount({
+      account: probe.account, secretStore, currentCredentialReader, currentProfileFetcher,
+      allowLiveClaudeCodeCredentials: false, logger: null, lockAcquireTimeoutMs: REQUEST_PATH_SECRET_LOCK_WAIT_MS,
+    });
+    if (req.aborted || res.destroyed) { result = 'aborted'; return true; }
+    if (!validIdentity()) {
+      result = 'identity-changed';
+      sendJson(res, 503, { type: 'error', error: { type: 'api_error', message: 'Recovery identity changed before send.' } });
+      return true;
+    }
+    if (accountManager.selectForNewAssignment({ modelFamily, recordDecision: false })) {
+      result = 'aborted'; await persistSettled();
+      return 'normal-ready';
+    }
+    if (!secret || !accountManager.quotaRecoveryEligible(probe.account, modelFamily)) {
+      result = secret ? 'aborted' : 'authentication';
+      if (!secret) accountManager.markError(probe.account.id, 'credential_missing', 'No stored credential for account');
+      if (!sendQuotaRecoveryWait(res, accountManager, modelFamily)) sendJson(res, 503, {
+        type: 'error', error: { type: 'api_error', message: 'Recovery account is unavailable.' },
+      });
+      return true;
+    }
+    let freshSecret;
+    try {
+      freshSecret = await refreshSecretIfExpiring({
+        account: probe.account, secret, secretStore, tokenRefresher, logger,
+        allowUsableFallback: false,
+      });
+    } catch (caught) {
+      if (req.aborted || res.destroyed) { result = 'aborted'; return true; }
+      if (!validIdentity()) {
+        result = 'identity-changed';
+        sendJson(res, 503, { type: 'error', error: { type: 'api_error', message: 'Recovery identity changed during credential refresh.' } });
+        return true;
+      }
+      result = 'aborted';
+      if (!markOAuthRefreshUnavailable(accountManager, probe.account.id, caught)) {
+        accountManager.markError(probe.account.id, 'oauth_refresh_failed', 'OAuth token refresh failed',
+          authErrorDetails(credentialRefreshErrorType(caught), accountManager.now()));
+      }
+      if (!sendQuotaRecoveryWait(res, accountManager, modelFamily)) sendJson(res, 503, {
+        type: 'error', error: { type: 'api_error', message: 'Recovery credential refresh is unavailable.' },
+      });
+      return true;
+    }
+    if (req.aborted || res.destroyed) { result = 'aborted'; return true; }
+    if (!validIdentity()) {
+      result = 'identity-changed';
+      sendJson(res, 503, { type: 'error', error: { type: 'api_error', message: 'Recovery identity changed during credential refresh.' } });
+      return true;
+    }
+    if (accountManager.selectForNewAssignment({ modelFamily, recordDecision: false })) {
+      result = 'aborted'; await persistSettled();
+      return 'normal-ready';
+    }
+    if (!accountManager.quotaRecoveryEligible(probe.account, modelFamily)) {
+      result = 'aborted';
+      return false;
+    }
+    await forwardOnce({
+      req, res, body, upstream, account: probe.account, secret: freshSecret, accountManager, affinityLog: affinityRequest,
+      passthroughErrors: true, allowReactiveQuotaConfirmation: false, allowQuotaRetry: false, allowAuthRefreshRetry: false,
+      logger: null, upstreamIdleTimeoutMs, quotaShapeObserver, upstreamConnectTimeoutMs,
+      upstreamConnectRetries: 0, upstreamConnectRetryDelayMs, requestEffort, observability, usageEvents,
+      exhaustionMapper, upstreamOverloadMapper,
+      quotaRecoveryProbe: {
+        modelFamily,
+        isCurrent: validIdentity,
+        onResponse: observation => {
+          status = observation.status; notBefore = observation.notBefore;
+          if (status === 401 && validIdentity()) accountManager.markError(probe.account.id, 'authentication_error', 'OAuth token rejected');
+          holdRateLimit();
+        },
+      },
+    });
+    // A mapped response can finish before the upstream body has been read.
+    result = !validIdentity() ? 'identity-changed' : req.aborted || (res.destroyed && !res.writableFinished) ? 'aborted'
+      : status === 429 ? 'rate-limit' : status === 401 ? 'authentication' : status === 403 ? 'forbidden'
+        : status >= 200 && status < 300
+          ? (accountManager.canRecoverWeeklyQuota(probe.account, modelFamily) ? 'observed' : 'no-quota') : 'transport-error';
+    return true;
+  } catch {
+    result = req.aborted || res.destroyed ? 'aborted' : 'transport-error';
+    if (!res.headersSent && !res.destroyed) sendJson(res, 502, {
+      type: 'error', error: { type: 'api_error', message: 'Recovery upstream request failed.' },
+    });
+    return true;
+  } finally {
+    if (accountManager.quotaRecovery?.isCurrent(probe.lease)) await persistSettled();
+    try { logger?.(`quota_recovery account=${probe.lease.accountHash.slice(0, 12)} result=${result} status=${status ?? '-'}`); } catch {}
+  }
+}
+
 async function forwardCurrentUnavailableAccount({
   req,
   res,
@@ -3516,13 +3777,13 @@ async function forwardCurrentUnavailableAccount({
   return true;
 }
 
-async function refreshSecretIfExpiring({ account, secret, secretStore, tokenRefresher, logger }) {
+async function refreshSecretIfExpiring({ account, secret, secretStore, tokenRefresher, logger, allowUsableFallback = true }) {
   if (!canRefreshSecret(account, secret)) return secret;
   if (!isTokenExpiringSoon(secret.expiresAt)) return secret;
   try {
     return await refreshAndStoreSecret({ account, secret, secretStore, tokenRefresher, logger });
   } catch (error) {
-    if (error?.code === 'NATIVE_REFRESH_OUTCOME_UNKNOWN') throw error;
+    if (!allowUsableFallback || error?.code === 'NATIVE_REFRESH_OUTCOME_UNKNOWN') throw error;
     if (!hasUsableAccessToken(secret)) throw error;
     const expiresAt = normalizeCredentialExpiry(secret.expiresAt);
     const remainingSec = expiresAt == null ? 'unknown' : Math.max(0, Math.floor((expiresAt - Date.now()) / 1000));
@@ -3984,6 +4245,7 @@ async function forwardOnceInner({
   observability = DEFAULT_OBSERVABILITY,
   // forwardOnce() が計測するときだけ渡る。null なら何も記録しない。
   usageEventState = null,
+  quotaRecoveryProbe = null,
 }) {
   const target = configuredUpstreamTarget(req.url, upstream);
   const headers = buildUpstreamHeaders(req.headers, account, secret, observability);
@@ -4052,6 +4314,19 @@ async function forwardOnceInner({
       onResponse(upstreamRes) {
         headersAtMs = Date.now();
         quotaShapeObserver?.headers(account.id, upstreamRes.statusCode, upstreamRes.headers);
+        const probeNow = quotaRecoveryProbe ? accountManager.quotaRecovery.referenceTime() : null;
+        const probeObservation = quotaRecoveryProbe ? {
+          status: upstreamRes.statusCode,
+          notBefore: upstreamRes.statusCode === 429 && probeNow !== null
+            ? quotaRecoveryDeadline(upstreamRes.headers, probeNow, quotaRecoveryProbe.modelFamily,
+              Math.min(0.97, accountManager.configuredSwitchThreshold)) : null,
+        } : null;
+        if (quotaRecoveryProbe && !quotaRecoveryProbe.isCurrent()) {
+          quotaRecoveryProbe.onResponse(probeObservation);
+          if (holdUpstreamOverload(upstreamRes)) return false;
+          bufferedPassthrough = true;
+          return false;
+        }
         if (usageEventState) {
           usageEventState.statusCode = upstreamRes.statusCode ?? null;
           usageEventState.requestId = headerValue(upstreamRes.headers['request-id'])
@@ -4072,7 +4347,9 @@ async function forwardOnceInner({
         );
         accountManager.updateQuota(account.id, upstreamRes.headers, {
           atomicUnifiedWindows: upstreamRes.statusCode === 429,
+          ...(quotaRecoveryProbe ? { recoveryStatus: upstreamRes.statusCode } : {}),
         });
+        quotaRecoveryProbe?.onResponse(probeObservation);
 
         // updateQuota の**後**に置く: off の構成と口座台帳の扱いを1分岐も変えないため。
         // 429 分岐（markRateLimited）・401 分岐（markError）の**前**に置く: 口座状態の
@@ -5267,6 +5544,7 @@ function sendUnavailableAccounts(res, accountManager = null, exhaustionMapper = 
   const observationCandidates = optionalQuota
     ? accountManager.accounts.filter(account => accountManager.isAvailable(account, modelFamily)) : [];
   if (observationCandidates.some(account => !accountManager.canRecoverWeeklyQuota(account, modelFamily))) {
+    if (sendQuotaRecoveryWait(res, accountManager, modelFamily)) return;
     sendJson(res, 503, {
       type: 'error',
       error: { type: 'api_error', message: 'Fresh weekly usage observations are not available for a usable account.' },
@@ -5281,6 +5559,7 @@ function sendUnavailableAccounts(res, accountManager = null, exhaustionMapper = 
     (finiteQuotaReset(a.reason.resetAt) ?? Number.MAX_SAFE_INTEGER)
     - (finiteQuotaReset(b.reason.resetAt) ?? Number.MAX_SAFE_INTEGER))[0] : null;
   const quotaResponse = quotaTarget ? syntheticQuotaExhaustedResponse(quotaTarget.account, quotaTarget.reason) : null;
+  if (!quotaResponse && sendQuotaRecoveryWait(res, accountManager, modelFamily)) return;
   // P-d の写像入口。全滅時の終端は、稼働口座
   // ／固定先の個別 state（枯渇・認証失敗・資格情報 cooldown）に依らず必ずここを通す。
   // 資格情報分岐を先に置いていた頃は、同じ全滅台帳でも `getCurrentAccount()` が返す
