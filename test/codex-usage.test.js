@@ -35,7 +35,12 @@ if (process.env.FAKE_FAIL === '1') {
   process.stderr.write('fake failure detail');
   process.exit(7);
 }
-process.stdout.write(fs.readFileSync(process.env.FAKE_RESPONSE, 'utf8'));
+const response = JSON.parse(fs.readFileSync(process.env.FAKE_RESPONSE, 'utf8'));
+if (process.env.FAKE_NOW) {
+  require('node:test').mock.timers.enable({ apis: ['Date'], now: Number(process.env.FAKE_NOW) });
+  response.accounts[0].windows.weekly.observedAt = new Date(Date.now()).toISOString();
+}
+process.stdout.write(JSON.stringify(response));
 `, { mode: 0o755 });
   // The fake has a different basename so the suite's real-command guard stays armed.
   const env = {
@@ -95,6 +100,28 @@ test('least squares uses uneven observation times and all points', async t => {
   assert.equal(window.reachesAt, iso(START + (8 + 1 / 3) * HOUR));
 });
 
+test('omitted now uses the clock after status refreshes the observation', async t => {
+  const h = await harness(t);
+  const points = rows();
+  await h.seed(points.slice(0, 2));
+  await h.set(snapshot(points[2]));
+  h.env.FAKE_NOW = String(START + 2 * HOUR);
+  // Both clocks stay in forecast hours regardless of the real time of day.
+  t.mock.timers.enable({ apis: ['Date'], now: START + HOUR });
+  const collecting = collectUsage({ env: h.env });
+  t.mock.timers.tick(HOUR);
+  await collecting;
+  const report = await h.report();
+  const window = report.accounts[0].windows[0];
+  assert.notEqual(window.reason, 'invalid-observation');
+  assert.equal(window.reason, 'projected');
+  assert.equal(window.status, 'reaches-90');
+  assert.equal(window.sampleCount, 3);
+  assert.equal(window.observedAt, iso(START + 2 * HOUR));
+  assert.equal(report.generatedAt, window.observedAt);
+  assert.deepEqual(await h.calls(), [['status', '--json']]);
+});
+
 for (const [name, values, overrides, expected, reason, count] of [
   ['insufficient points', [10, 20], {}, 'unknown', 'insufficient-points', 2],
   ['latest value is stale', [10, 20, 30], { fresh: false }, 'unknown', 'stale', 0],
@@ -107,6 +134,7 @@ for (const [name, values, overrides, expected, reason, count] of [
   ['window identity missing', [10, 20, 30], { resetAt: null }, 'unknown', 'incomplete-window', 0],
   ['reset has passed', [10, 20, 30], { resetAt: iso(START + HOUR) }, 'unknown', 'expired-window', 0],
   ['observation time missing', [10, 20, 30], { observedAt: null }, 'unknown', 'invalid-observation', 0],
+  ['observation time is in the future', [10, 20, 30], { observedAt: iso(START + 2 * HOUR + 1) }, 'unknown', 'invalid-observation', 0],
   ['threshold already reached', [70, 80, 90], {}, 'reaches-90', 'already-at-90', 3],
 ]) {
   test(name, async t => {
