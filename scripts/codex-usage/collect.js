@@ -156,7 +156,7 @@ async function publishForecast(outputDir, date, snapshot, current, samples, now)
   }
 }
 
-export async function collectUsage({ env = process.env, now = Date.now() } = {}) {
+export async function collectUsage({ env = process.env, now } = {}) {
   const rotator = env.CODEX_USAGE_ROTATOR || join(env.HOME, '.local/bin/codex-rotator');
   let stdout;
   try {
@@ -164,6 +164,7 @@ export async function collectUsage({ env = process.env, now = Date.now() } = {})
   } catch {
     throw new Error('rotator status failed');
   }
+  const at = now ?? Date.now();
   let snapshot, current;
   try {
     snapshot = JSON.parse(stdout);
@@ -185,10 +186,10 @@ export async function collectUsage({ env = process.env, now = Date.now() } = {})
   await mkdir(outputDir, { recursive: true });
   if (additions.length) await appendFile(samplePath, additions.map(row => JSON.stringify(row) + '\n').join(''));
 
-  const jst = new Date(now + 9 * HOUR).toISOString();
+  const jst = new Date(at + 9 * HOUR).toISOString();
   const hour = Number(jst.slice(11, 13));
   if (hour >= 8 && hour < 21) {
-    await publishForecast(outputDir, jst.slice(0, 10), snapshot, current, [...samples, ...additions], now);
+    await publishForecast(outputDir, jst.slice(0, 10), snapshot, current, [...samples, ...additions], at);
   }
 }
 

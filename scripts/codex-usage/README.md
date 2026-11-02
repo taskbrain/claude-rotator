@@ -3,6 +3,7 @@
 Run `node scripts/codex-usage/collect.js` once an hour. It calls
 `$HOME/.local/bin/codex-rotator status --json` exactly once, records each account's
 windows, then publishes the first daily forecast during **08:00–20:59 JST**.
+Unless an explicit time is supplied, the forecast clock is read after the status call completes.
 It uses only Node's standard library, with no AI calls or automatic retries.
 The report is **display only**; do not use it to make routing decisions.
 
