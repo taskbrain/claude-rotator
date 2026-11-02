@@ -30,8 +30,9 @@
 //   - 起動ごとの点検（Codex CLI の更新で遮断が黙って外れないように）: codex を起動する直前に毎回、
 //     選んだ口座のフォルダを CODEX_HOME にし、子と同じ作業フォルダ（exec 自身の作業フォルダの実パス）
 //     で、第1層の後ろに型1の -c の値を同じ順で付けた `features list` と `mcp list --json` を、本物の
-//     codex の絶対パスで shell:false で順に起動する。apps と plugins がどちらも false で、MCP サーバが
-//     0件のときだけ通す。通らなければ codex を起動せず、標準エラーに `guard unverified (<理由>)` の
+//     codex の絶対パスで shell:false で順に起動する。apps と plugins がどちらも false で、ブラウザの操作と
+//     画面の操作に関わる機能が（行が在れば）どれも false で、MCP サーバが0件のときだけ通す。通らなければ
+//     codex を起動せず、標準エラーに `guard unverified (<理由>)` の
 //     1行を出す（値は出さない）。
 //   - 型2 の設定のフォルダの点検（上の2つの点検より前。codex を起動しない）: 型2（引数の無い対話）でだけ、
 //     作業フォルダの実パスから、Codex と同じ決め方で求めた根までの各フォルダに `.codex` が在るか（種類を
@@ -57,12 +58,21 @@ import { dirname, isAbsolute, join, relative, sep } from 'node:path';
 /**
  * exec が起動する codex の引数の先頭に、この順で必ず付ける指定。feedback.enabled は、信頼済みの作業フォルダの
  * .codex/config.toml（プロジェクトの層）でも変えられるキーなので、口座の config.toml の値より強い -c でも付ける。
+ * 末尾の5つは、ブラウザの操作と画面の操作に関わる機能を止める。--disable ではなく -c にしているのは、
+ * Codex CLI が --disable に知らない機能の名前を渡すと起動を断るのに対し、-c の知らない機能のキーは警告を
+ * 残して無視するため（版によってこれらの機能が無くても、起動が止まらない）。先頭の2語（資格情報の置き場の
+ * 指定）は login が切り出して使うので、ほかの指定は後ろに足す。
  */
 export const FIRST_LAYER_ARGS = Object.freeze([
   '-c', 'cli_auth_credentials_store="file"',
   '-c', 'features.apps=false',
   '-c', 'features.plugins=false',
   '-c', 'feedback.enabled=false',
+  '-c', 'features.browser_use=false',
+  '-c', 'features.browser_use_external=false',
+  '-c', 'features.browser_use_full_cdp_access=false',
+  '-c', 'features.computer_use=false',
+  '-c', 'features.in_app_browser=false',
 ]);
 
 // --- 第2層 -----------------------------------------------------------------------------------
@@ -301,11 +311,21 @@ export const GUARD_CHECK_MCP_ARGS = Object.freeze(['mcp', 'list', '--json']);
 /** 点検の出力で、ちょうど1行ずつあって、どちらも最後の欄が false でなければならない機能の名前。 */
 export const GUARD_CHECK_FEATURES = Object.freeze(['apps', 'plugins']);
 
+/**
+ * 点検の出力に行が在るときだけ、ちょうど1行で最後の欄が false でなければならない機能の名前（ブラウザの操作と
+ * 画面の操作に関わる機能）。行が無ければ通す。Codex CLI の版でこれらの機能が無くなっても、起動が全部
+ * 止まらないようにするため。これらはデスクトップのアプリ向けの機能で、CLI でこの種の道具が出る道は
+ * プラグインの MCP サーバであり、それは plugins の点検と MCP サーバが0件の点検で止めている。
+ */
+export const GUARD_CHECK_FEATURES_WHEN_LISTED = Object.freeze([
+  'browser_use', 'browser_use_external', 'browser_use_full_cdp_access', 'computer_use', 'in_app_browser',
+]);
+
 /** 点検が通らなかった理由の語（標準エラーの `guard unverified (<理由>)` に入る）。 */
 export const GUARD_UNVERIFIED = Object.freeze({
-  featureEnabled: 'feature-enabled', // apps か plugins の最後の欄が true
+  featureEnabled: 'feature-enabled', // apps・plugins か、行が在るブラウザと画面の操作の機能の最後の欄が true
   mcpPresent: 'mcp-present', // MCP サーバが1件以上
-  outputFormat: 'output-format', // 行が無い・2行以上・最後の欄が真偽でない・JSON の配列でない
+  outputFormat: 'output-format', // 行が無い（apps・plugins）・2行以上・最後の欄が真偽でない・JSON の配列でない
   exit: 'exit', // 0以外の終了・シグナル・起動や読取の失敗・作業フォルダの実パスが求められない
   timeout: 'timeout', // 期限切れ
   tooLarge: 'too-large', // 標準出力が上限を超えた
@@ -363,10 +383,11 @@ export function buildGuardCheckArgs(configOverrides = [], { includeFirstLayer = 
 /**
  * `features list` の標準出力を判定する。通れば null、通らなければ理由の語。
  *
- * 各行を空白で分け、1つ目の欄が apps の行と plugins の行を探す。どちらもちょうど1行で、最後の欄が
- * true か false でなければ output-format。形が合ったうえで、どちらかの最後の欄が true なら
- * feature-enabled。形の違いを先に見るのは、出力の形が変わったこと（Codex CLI の更新）を
- * 見分けやすくするため。
+ * 各行を空白で分け、1つ目の欄（名前の完全一致）で apps・plugins と GUARD_CHECK_FEATURES_WHEN_LISTED の
+ * 行を探す。apps と plugins はちょうど1行ずつ、GUARD_CHECK_FEATURES_WHEN_LISTED の機能は行が在れば
+ * ちょうど1行で、最後の欄が true か false でなければ output-format（GUARD_CHECK_FEATURES_WHEN_LISTED の
+ * 機能は行が無ければ見ない）。形が合ったうえで、どれかの最後の欄が true なら feature-enabled。
+ * 形の違いを先に見るのは、出力の形が変わったこと（Codex CLI の更新）を見分けやすくするため。
  *
  * @param {string} text
  * @returns {string|null}
@@ -378,8 +399,13 @@ export function judgeFeaturesList(text) {
     .filter(line => line !== '')
     .map(line => line.split(/\s+/));
   const values = [];
-  for (const name of GUARD_CHECK_FEATURES) {
+  const checks = [
+    ...GUARD_CHECK_FEATURES.map(name => ({ name, required: true })),
+    ...GUARD_CHECK_FEATURES_WHEN_LISTED.map(name => ({ name, required: false })),
+  ];
+  for (const { name, required } of checks) {
     const matched = rows.filter(fields => fields[0] === name);
+    if (matched.length === 0 && !required) continue;
     if (matched.length !== 1) return GUARD_UNVERIFIED.outputFormat;
     const last = matched[0][matched[0].length - 1];
     if (matched[0].length < 2 || (last !== TRUE_WORD && last !== FALSE_WORD)) return GUARD_UNVERIFIED.outputFormat;
