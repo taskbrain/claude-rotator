@@ -24,7 +24,7 @@ import { lstatSync, readFileSync, readdirSync, realpathSync, statSync } from 'no
 import { dirname, isAbsolute } from 'node:path';
 import {
   ARGUMENT_REJECTED_KIND, CLOUD_CONFIG_CACHE_FILE, CODEX_GUARD_CHECK_MAX_STDOUT_BYTES, CODEX_GUARD_CHECK_TIMEOUT_MS,
-  DEFAULT_PROJECT_ROOT_MARKERS, GUARD_CHECK_FEATURES_ARGS, GUARD_CHECK_MCP_ARGS, GUARD_UNVERIFIED, GUARD_UNVERIFIED_KIND,
+  DEFAULT_PROJECT_ROOT_MARKERS, GUARD_CHECK_FEATURES_ARGS, GUARD_CHECK_FEATURES_WHEN_LISTED, GUARD_CHECK_MCP_ARGS, GUARD_UNVERIFIED, GUARD_UNVERIFIED_KIND,
   MANAGED_PREFERENCES_FILE, NO_DAEMON_ARG, PROJECT_CHECK_MAX_FILE_BYTES, PROJECT_LAYER_PATHS,
   buildGuardCheckArgs, buildLaunchArgs, checkFeedbackConfig, checkProjectFolders, formatGuardUnverified,
   judgeFeaturesList, judgeFeedbackConfig, judgeMcpList, launchArgsChangeProjectRoot, prepareGuardedLaunch,
@@ -83,14 +83,23 @@ function assertRejected(args, detail, { caller } = {}) {
 
 // --- 第1層・第2層 ----------------------------------------------------------------------------
 
-test('first layer: the four overrides are fixed in this order', () => {
+test('first layer: the nine overrides are fixed in this order', () => {
   assert.deepEqual([...FIRST_LAYER_ARGS], [
     '-c', 'cli_auth_credentials_store="file"',
     '-c', 'features.apps=false',
     '-c', 'features.plugins=false',
     '-c', 'feedback.enabled=false',
+    '-c', 'features.browser_use=false',
+    '-c', 'features.browser_use_external=false',
+    '-c', 'features.browser_use_full_cdp_access=false',
+    '-c', 'features.computer_use=false',
+    '-c', 'features.in_app_browser=false',
   ]);
   assert.ok(Object.isFrozen(FIRST_LAYER_ARGS));
+  // login は先頭の2語を資格情報の置き場の指定として切り出す。
+  assert.deepEqual(FIRST_LAYER_ARGS.slice(0, 2), ['-c', 'cli_auth_credentials_store="file"']);
+  // 機能は -c で止める（--disable は知らない機能の名前で起動を断るため使わない）。
+  assert.ok(!FIRST_LAYER_ARGS.includes('--disable'));
 });
 
 test('second layer: config.toml has only the credentials store before any table, apps/plugins off and feedback off', () => {
@@ -368,6 +377,8 @@ for (const [name, words, embeddedDetail] of REJECTED_OPTIONS) {
 const REJECTED_CONFIG_OVERRIDES = [
   ['enabling apps', 'features.apps=true', R.configKey],
   ['enabling connectors', 'features.connectors=true', R.configKey],
+  ['enabling browser use', 'features.browser_use=true', R.configKey],
+  ['enabling computer use', 'features.computer_use=true', R.configKey],
   ['overriding the credentials store', 'cli_auth_credentials_store=keyring', R.configKey],
   ['trusting a project', 'projects."/zz".trust_level="trusted"', R.configKey],
   ['adding an MCP server', 'mcp_servers.zz.command=true', R.configKey],
@@ -468,8 +479,17 @@ test('matching never starts a child process', async t => {
 
 const MCP_EMPTY_STDOUT = '[]\n';
 const MCP_ONE_STDOUT = `${JSON.stringify([{ name: 'zz-server', enabled: true, transport: { type: 'stdio', command: 'zz-cmd' } }])}\n`;
-const featuresStdout = ({ apps = 'false', plugins = 'false' } = {}) =>
-  `zz_other_feature   stable   true\napps   stable   ${apps}\nplugins   stable   ${plugins}\n`;
+const featuresStdout = ({
+  apps = 'false', plugins = 'false', browser_use = 'false', browser_use_external = 'false',
+  browser_use_full_cdp_access = 'false', computer_use = 'false', in_app_browser = 'false',
+} = {}) =>
+  `zz_other_feature   stable   true\napps   stable   ${apps}\nplugins   stable   ${plugins}\n`
+  + `browser_use   stable   ${browser_use}\nbrowser_use_external   under development   ${browser_use_external}\n`
+  + `browser_use_full_cdp_access   under development   ${browser_use_full_cdp_access}\n`
+  + `computer_use   stable   ${computer_use}\nin_app_browser   stable   ${in_app_browser}\n`;
+const WHEN_LISTED_FEATURES = [
+  'browser_use', 'browser_use_external', 'browser_use_full_cdp_access', 'computer_use', 'in_app_browser',
+];
 const FEATURES_OK_STDOUT = featuresStdout();
 const OUTPUT_MARKER = 'ZZ-OUTPUT-MARKER';
 const FAKE_CODEX_BODY = '#!/bin/sh\n# zz-fake codex for tests (never executed)\n';
@@ -764,6 +784,57 @@ test('features list reports output-format for a missing, repeated, or non-boolea
   assert.equal(judgeFeaturesList('apps stable true\n'), GUARD_UNVERIFIED.outputFormat);
 });
 
+test('features list checks the browser and computer use features only when their rows are listed', () => {
+  assert.deepEqual([...GUARD_CHECK_FEATURES_WHEN_LISTED], WHEN_LISTED_FEATURES);
+  assert.ok(Object.isFrozen(GUARD_CHECK_FEATURES_WHEN_LISTED));
+  // 5つの行が無くても、apps と plugins が false なら通す。
+  assert.equal(judgeFeaturesList('apps stable false\nplugins stable false\n'), null);
+  // 1つずつだけ欠けていても通す。
+  for (const name of WHEN_LISTED_FEATURES) {
+    const text = FEATURES_OK_STDOUT.split('\n').filter(line => line.split(/\s+/)[0] !== name).join('\n');
+    assert.ok(!text.split('\n').some(line => line.split(/\s+/)[0] === name), `row ${name} removed`);
+    assert.equal(judgeFeaturesList(text), null, `missing ${name}`);
+  }
+  // 5つの行が在っても、apps か plugins の行が無ければ今どおり止める。
+  const withoutApps = FEATURES_OK_STDOUT.split('\n').filter(line => !line.startsWith('apps ')).join('\n');
+  const withoutPlugins = FEATURES_OK_STDOUT.split('\n').filter(line => !line.startsWith('plugins ')).join('\n');
+  assert.equal(judgeFeaturesList(withoutApps), GUARD_UNVERIFIED.outputFormat);
+  assert.equal(judgeFeaturesList(withoutPlugins), GUARD_UNVERIFIED.outputFormat);
+});
+
+test('features list reports feature-enabled for each browser and computer use feature that is true', () => {
+  for (const name of WHEN_LISTED_FEATURES) {
+    assert.equal(judgeFeaturesList(featuresStdout({ [name]: 'true' })), GUARD_UNVERIFIED.featureEnabled, name);
+    // 行がこの1つだけでも見る。
+    assert.equal(judgeFeaturesList(`apps x false\nplugins x false\n${name} x true\n`), GUARD_UNVERIFIED.featureEnabled, name);
+  }
+  // 名前は完全一致で見る（browser_use と browser_use_external を取り違えない）。
+  assert.equal(judgeFeaturesList('apps x false\nplugins x false\nbrowser_use_external x true\nbrowser_use x false\n'),
+    GUARD_UNVERIFIED.featureEnabled);
+  assert.equal(judgeFeaturesList('apps x false\nplugins x false\nbrowser_use x true\nbrowser_use_external x false\n'),
+    GUARD_UNVERIFIED.featureEnabled);
+  assert.equal(judgeFeaturesList('apps x false\nplugins x false\nbrowser_use x false\nbrowser_use_external x false\n'), null);
+  // browser_use の行が browser_use_external の1行だけのとき、browser_use の2行目と数えない。
+  assert.equal(judgeFeaturesList('apps x false\nplugins x false\nbrowser_use_external x false\n'), null);
+  // 名前が似ているだけの行は見ない。
+  assert.equal(judgeFeaturesList('apps x false\nplugins x false\nbrowser_use_zz x true\nzz_computer_use x true\n'), null);
+});
+
+test('features list reports output-format for a repeated or non-boolean browser or computer use row', () => {
+  for (const name of WHEN_LISTED_FEATURES) {
+    for (const text of [
+      `${FEATURES_OK_STDOUT}${name} stable false\n`,
+      `${FEATURES_OK_STDOUT}${name} stable true\n`,
+      featuresStdout({ [name]: 'False' }), featuresStdout({ [name]: 'yes' }),
+      `apps x false\nplugins x false\n${name}\n`,
+    ]) {
+      assert.equal(judgeFeaturesList(text), GUARD_UNVERIFIED.outputFormat, `format of ${JSON.stringify(text)}`);
+    }
+  }
+  // 形の違いは、有効の検出より先に見る。
+  assert.equal(judgeFeaturesList(featuresStdout({ apps: 'true', computer_use: 'yes' })), GUARD_UNVERIFIED.outputFormat);
+});
+
 test('mcp list passes only an empty JSON array', () => {
   assert.equal(judgeMcpList(MCP_EMPTY_STDOUT), null);
   assert.equal(judgeMcpList('[]'), null);
@@ -886,6 +957,8 @@ const GUARD_STOP_CASES = [
   ['apps is true', { features: () => fakeCheckChild({ stdout: [featuresStdout({ apps: 'true' })] }) },
     GUARD_UNVERIFIED.featureEnabled, 1],
   ['plugins is true', { features: () => fakeCheckChild({ stdout: [featuresStdout({ plugins: 'true' })] }) },
+    GUARD_UNVERIFIED.featureEnabled, 1],
+  ['computer use is true', { features: () => fakeCheckChild({ stdout: [featuresStdout({ computer_use: 'true' })] }) },
     GUARD_UNVERIFIED.featureEnabled, 1],
   ['an MCP server is configured', { mcp: () => fakeCheckChild({ stdout: [MCP_ONE_STDOUT] }) },
     GUARD_UNVERIFIED.mcpPresent, 2],
