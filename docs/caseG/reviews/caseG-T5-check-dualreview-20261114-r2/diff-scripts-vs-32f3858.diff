@@ -1,0 +1,231 @@
+diff --git a/experiments/caseG-expiry/README.md b/experiments/caseG-expiry/README.md
+index 883d9f0..5d1ecaf 100644
+--- a/experiments/caseG-expiry/README.md
++++ b/experiments/caseG-expiry/README.md
+@@ -42,7 +42,11 @@ The raw credential string is held in memory until the read returns; the parser k
+ Read-only checks: Keychain attributes (no `-g`/`-w`), processes that open the account folder(s) (`lsof`,
+ `pgrep`, process names only; no environment), protected PIDs, 3789x/3799x listeners, the sha256 of the
+ rotator config (content not printed), and counts from the prototype proxy log (lines not printed). The T5
+-script also lists launchd job names containing "claude" and counts crontab lines (lines not printed).
++script also lists launchd job names containing "claude" and counts crontab lines (lines not printed), lists
++every Claude Code process (named `claude`, or launched as `.../claude/versions/<version>`, whose process name is
++the version) with PID, start time, cwd and launch path, and prints the newest mtime under the k and j folders
++(time and relative path only). A session that selects its account only through `CLAUDE_CONFIG_DIR` in its
++environment cannot be tied to a folder by these checks; compare the process list before and after instead.
+ 
+ A failed lookup is never read as "none" or "0": a Keychain search that fails with anything other than
+ "not found" (exit 44), a failed `lsof`/`pgrep`/`launchctl`/`crontab`, an `lsof` that reports paths it
+diff --git a/experiments/caseG-expiry/caseG-T5-check.sh b/experiments/caseG-expiry/caseG-T5-check.sh
+index c5450a6..3b80ca2 100755
+--- a/experiments/caseG-expiry/caseG-T5-check.sh
++++ b/experiments/caseG-expiry/caseG-T5-check.sh
+@@ -1,6 +1,7 @@
+ #!/bin/bash
+ # 案G 試験T5 確認（読むだけ）。表示用 k と差し替え先 j の口座フォルダについて、Keychain の属性・
+-# 開いているプロセス・自動で起こす仕組み・本番の無事・ポート・試作プロキシの記録の件数を出す。
++# 開いているプロセス・Claude Code の全プロセスの一覧・フォルダの最終更新・自動で起こす仕組み・本番の無事・
++# ポート・試作プロキシの記録の件数を出す。
+ # 値は出さない。何も書かない。crontab の行そのものは出さない（件数とフォルダの有無だけ）。
+ # 使い方: caseG-T5-check.sh <k のフォルダ> <j のフォルダ> [試作プロキシの記録 requests.jsonl] [acct]
+ set -u
+@@ -20,6 +21,9 @@ caseg_keychain_item "$SJ" "$A"
+ caseg_search_list
+ caseg_folder_openers "$K" "表示用 k のフォルダ（試験タブだけのはず）"
+ caseg_folder_openers "$J" "差し替え先 j のフォルダ（0件のはず）"
++caseg_claude_inventory
++caseg_folder_newest "$K" "表示用 k のフォルダ"
++caseg_folder_newest "$J" "差し替え先 j のフォルダ（区間中に変わらないはず）"
+ echo "## 自動で起こす仕組み（名前だけ）"
+ echo "- launchctl list の claude を含む名前:"
+ if lc=$(launchctl list 2>/dev/null); then
+diff --git a/experiments/caseG-expiry/caseG-check-lib.sh b/experiments/caseG-expiry/caseG-check-lib.sh
+index 236f550..4c44159 100644
+--- a/experiments/caseG-expiry/caseG-check-lib.sh
++++ b/experiments/caseG-expiry/caseG-check-lib.sh
+@@ -2,7 +2,7 @@
+ # caseG T4/T5 確認スクリプトの共通部分（読むだけ）。
+ # Keychain は属性（svce・acct・mdat・keychain）だけを見る。-g / -w / dump-keychain は使わない。
+ # claude もプロキシも起動しない。タブに入力しない。37891 に接続しない。プロセスを止めない。
+-# ファイルを書かない（標準出力に出すだけ。lsof・crontab の標準エラーを受ける一時ファイルは、読んだらすぐ消す）。
++# ファイルを書かない（標準出力に出すだけ。lsof・crontab・find の標準エラーを受ける一時ファイルは、読んだらすぐ消す）。
+ # 値（トークン・認証 JSON）は出さない。取得に失敗したものは「0件」と読まず、未確認として終了コード 3 で終わる。
+ #
+ # 試験用の差し込み口（実行のときは設定しない）:
+@@ -49,6 +49,73 @@ caseg_pgrep() {
+   return 1
+ }
+ 
++# Claude Code に当たるプロセスの PID を CASEG_CLAUDE_PIDS に入れる（空白区切り。0件もありうる）。
++# 名前が claude のもの（~/.local/bin/claude などで起動）に加え、~/.local/share/claude/versions/<版> を
++# フルパスで起動したものも拾う（その場合プロセス名は版番号になり、pgrep -x claude には出ない）。
++# ps -axo の comm は macOS では起動したパス。環境変数は読まない。戻り値: 0=取得できた、1=失敗。
++caseg_claude_pids() {
++  local out
++  CASEG_CLAUDE_PIDS=""
++  out=$(ps -axo pid=,comm= 2>/dev/null) || return 1
++  [ -n "$out" ] || return 1
++  CASEG_CLAUDE_PIDS=$(printf '%s\n' "$out" | awk '{
++      pid = $1; c = $0; sub(/^ *[0-9]+ +/, "", c); n = c; sub(/.*\//, "", n)
++      if (pid ~ /^[0-9]+$/ && (n == "claude" || c ~ /\/claude\/versions\/[^\/]+$/)) print pid
++    }' | sort -n | tr '\n' ' ')
++  return 0
++}
++
++caseg_lstart_jst() {
++  local s e
++  s=$(ps -o lstart= -p "$1" 2>/dev/null) || return 1
++  [ -n "$s" ] || return 1
++  e=$(date -j -f "%a %b %d %T %Y" "$s" +%s 2>/dev/null) && TZ=Asia/Tokyo date -r "$e" "+%m/%d %H:%M:%S JST" \
++    || printf '%s' "$s"
++}
++
++# Claude Code の全プロセスの一覧（PID・開始時刻・作業フォルダ・起動したパス）。試験の前後で比べるためのもの。
++# 口座フォルダを環境変数（CLAUDE_CONFIG_DIR）で渡したセッションは、この一覧でもどの口座かは分からない。
++# 既知の PID 以外が増えていないかを人が見る。
++caseg_claude_inventory() {
++  local pid start cwd comm rc n=0 mark
++  [ -n "$CASEG_ANCESTORS" ] || CASEG_ANCESTORS=$(caseg_ancestors)
++  echo "## Claude Code の全プロセス（PID・開始時刻・作業フォルダ・起動したパス。環境変数は読まない。前後で比べる）"
++  if ! caseg_claude_pids; then caseg_fail "Claude Code のプロセス一覧（ps -axo）の取得に失敗"; return; fi
++  for pid in $CASEG_CLAUDE_PIDS; do
++    mark=""
++    case " $CASEG_ANCESTORS " in *" $pid "*) mark=" （この確認を起こした祖先）" ;; esac
++    if ! start=$(caseg_lstart_jst "$pid"); then echo "  $pid 照会の間に終了（ps -p で見えない）"; continue; fi
++    comm=$(ps -o comm= -p "$pid" 2>/dev/null)
++    caseg_lsof -a -p "$pid" -d cwd -Fn; rc=$?
++    cwd=$(printf '%s\n' "$CASEG_LSOF_OUT" | sed -n 's/^n//p' | head -n 1)
++    if [ "$rc" -ne 0 ] || [ -z "$cwd" ]; then
++      if ps -p "$pid" >/dev/null 2>&1; then
++        caseg_fail "PID $pid の作業フォルダの取得に失敗または不完全"; cwd="（取得できない）"
++      else
++        echo "  $pid 照会の間に終了"; continue
++      fi
++    fi
++    echo "  $pid 開始=$start cwd=$cwd 起動=$comm$mark"
++    n=$((n + 1))
++  done
++  echo "件数=$n"
++}
++
++# 口座フォルダの下（フォルダ自身を含む）で最後に更新されたもの。時刻と相対パスとファイル数だけ。中身は読まない。
++# find・stat が失敗した、または標準エラーに何か出た（見られない経路がある）ときは未確認。
++caseg_folder_newest() {
++  local dir="$1" label="$2" out err errf rc files newest rel
++  echo "## $label の下で最後に更新されたもの（時刻と相対パスだけ。中身は読まない）"
++  errf=$(mktemp "${TMPDIR:-/tmp}/caseg-find.XXXXXX") || { caseg_fail "一時ファイルを作れない"; return; }
++  out=$(find "$dir" -exec stat -f '%m %N' {} + 2>"$errf"); rc=$?
++  err=$(cat "$errf"); rm -f "$errf"
++  if [ "$rc" -ne 0 ] || [ -n "$err" ]; then caseg_fail "find $dir の取得に失敗または不完全"; return; fi
++  files=$(printf '%s\n' "$out" | grep -c .)
++  newest=$(printf '%s\n' "$out" | grep . | sort -n | tail -n 1)
++  rel=${newest#* }; rel=${rel#"$dir"}; rel=${rel#/}; [ -n "$rel" ] || rel="（フォルダ自身）"
++  echo "項目=$files（フォルダ自身を含む） 最終更新=$(TZ=Asia/Tokyo date -r "${newest%% *}" '+%m/%d %H:%M:%S') JST $rel"
++}
++
+ caseg_abs_dir() {
+   case "$1" in
+     /*) ;;
+@@ -156,9 +223,9 @@ caseg_folder_openers() {
+   else
+     caseg_fail "pgrep -f の取得に失敗"
+   fi
+-  echo "- claude の各プロセスの作業フォルダ（このフォルダの下だけを出す）:"
+-  if pids=$(caseg_pgrep -x claude); then
+-    for pid in $pids; do
++  echo "- claude の各プロセスの作業フォルダ（このフォルダの下だけを出す。名前が claude のものと …/claude/versions/<版> で起動したもの）:"
++  if caseg_claude_pids; then
++    for pid in $CASEG_CLAUDE_PIDS; do
+       caseg_lsof -a -p "$pid" -d cwd -Fn; rc=$?
+       if [ "$rc" -eq 0 ]; then
+         printf '%s\n' "$CASEG_LSOF_OUT" | sed -n 's/^n//p' | while read -r cwd; do
+@@ -169,7 +236,7 @@ caseg_folder_openers() {
+       fi
+     done
+   else
+-    caseg_fail "pgrep -x claude の取得に失敗"
++    caseg_fail "Claude Code のプロセス一覧（ps -axo）の取得に失敗"
+   fi
+   echo "（何も出なければ0件）"
+ }
+diff --git a/experiments/caseG-expiry/test/check-scripts.test.js b/experiments/caseG-expiry/test/check-scripts.test.js
+index f89e8a1..399a2da 100644
+--- a/experiments/caseG-expiry/test/check-scripts.test.js
++++ b/experiments/caseG-expiry/test/check-scripts.test.js
+@@ -53,7 +53,8 @@ case "$*" in
+   *"+D ${k}"*) if [ -n "\${FAKE_LSOF_PARTIAL:-}" ]; then
+       printf 'COMMAND PID\nclaude 4242\n'; echo "lsof: WARNING: can't stat() directory ${k}/private: Permission denied" >&2; exit 0
+     fi;;
+-  *"+D ${j}"*) if [ -n "\${FAKE_LSOF_DENIED:-}" ]; then
++  *"+D ${j}"*) [ -n "\${FAKE_LSOF_NOMATCH:-}" ] && exit 1
++    if [ -n "\${FAKE_LSOF_DENIED:-}" ]; then
+       echo "lsof: WARNING: can't stat() directory ${j}/private: Permission denied" >&2; exit 1
+     fi;;
+ esac
+@@ -71,6 +72,7 @@ esac
+ exit 0`,
+     pgrep: `${record}
+ [ -n "\${FAKE_PGREP_FAIL:-}" ] && exit 3
++[ -n "\${FAKE_PGREP_NONE:-}" ] && exit 1
+ # FAKE_PGREP_SELF: answer -f the way the real pgrep would for the check script itself: its own PID and the
+ # $(...) subshells between it and pgrep, which carry the same arguments.
+ if [ -n "\${FAKE_PGREP_SELF:-}" ] && [ "$1" = "-f" ]; then
+@@ -79,6 +81,11 @@ fi
+ case "$*" in *"${j}"*) exit 1;; esac
+ echo 4242`,
+     ps: `${record}
++case "$*" in
++  *"-axo pid=,comm="*) [ -n "\${FAKE_PS_LIST_FAIL:-}" ] && exit 1
++    printf '  4242 /Users/tester/.local/bin/claude\\n  4343 /Users/tester/.local/share/claude/versions/2.1.325\\n  5555 /Applications/Other.app/Contents/MacOS/Other\\n  6666 /usr/bin/claudette\\n'; exit 0;;
++  *lstart=*) echo "Sat Nov 14 13:30:00 2026"; exit 0;;
++esac
+ [ -n "\${FAKE_PGREP_SELF:-}" ] && case "$*" in *comm=*|*ppid=*) exec /bin/ps "$@";; esac
+ case "$*" in *"-p 99999"*) exit 1;; esac
+ [ -n "\${FAKE_LSOF_PARENT:-}" ] && case "$*" in *comm=*|*ppid=*) exec /bin/ps "$@";; esac
+@@ -197,7 +204,46 @@ test('lsof failures are unverified, not zero openers', async () => {
+ test('pgrep failures are unverified, not zero processes', async () => {
+   const r = run(T4, [k], { FAKE_PGREP_FAIL: '1' });
+   assertUnverified(r, /!! 未確認: pgrep -f の取得に失敗/);
+-  assert.match(r.stdout, /!! 未確認: pgrep -x claude の取得に失敗/);
++});
++
++test('a failed Claude Code process list is unverified, not zero processes', async () => {
++  const r = run(T5, [k, j], { FAKE_PS_LIST_FAIL: '1' });
++  assertUnverified(r, /!! 未確認: Claude Code のプロセス一覧（ps -axo）の取得に失敗/);
++  assert.ok(!/^件数=\d+$/m.test(r.stdout), 'no process count is printed');
++});
++
++test('T5 inventory lists claude and versions/<ver> processes with start time and cwd', async () => {
++  const r = run(T5, [k, j, log]);
++  assert.equal(r.status, 0, r.stdout + r.stderr);
++  const inv = r.stdout.split('## Claude Code の全プロセス')[1].split('## ')[0];
++  assert.match(inv, new RegExp(`4242 開始=11/14 13:30:00 JST cwd=${k}/work 起動=claude`));
++  assert.match(inv, new RegExp(`4343 開始=11/14 13:30:00 JST cwd=${k}/work`));
++  assert.ok(!inv.includes('5555') && !inv.includes('6666'), 'other programs are not listed');
++  assert.match(inv, /^件数=2$/m);
++  const cwdSection = r.stdout.split('- claude の各プロセスの作業フォルダ')[1].split('（何も出なければ0件）')[0];
++  assert.match(cwdSection, /4343 cwd=/, 'a versions/<ver> launch is checked for its cwd too');
++});
++
++test('real "no match" from lsof (exit 1, no output) and pgrep (exit 1) are zero, not unverified', async () => {
++  const r = run(T5, [k, j, log], { FAKE_LSOF_NOMATCH: '1', FAKE_PGREP_NONE: '1' });
++  assert.equal(r.status, 0, r.stdout + r.stderr);
++  assert.ok(!r.stdout.includes('!! 未確認'));
++  const jSection = r.stdout.split('差し替え先 j のフォルダ（0件のはず） を開いているプロセス')[1].split('## ')[0];
++  const lsofPart = jSection.split('- lsof +D:\n')[1].split('- 命令の引数にフォルダを含むプロセス')[0];
++  assert.equal(lsofPart.trim(), '');
++  const pgrepPart = jSection.split('（PID とコマンド名）:\n')[1].split('- claude の各プロセスの作業フォルダ')[0];
++  assert.equal(pgrepPart.trim(), '');
++});
++
++test('T5 prints the newest change under each folder without reading contents', async () => {
++  await mkdir(join(j, 'sub'), { recursive: true });
++  await writeFile(join(j, 'sub', 'state.json'), SECRET);
++  const r = run(T5, [k, j]);
++  assert.equal(r.status, 0, r.stdout + r.stderr);
++  assert.ok(!r.stdout.includes(SECRET));
++  const jPart = r.stdout.split('## 差し替え先 j のフォルダ（区間中に変わらないはず） の下で最後に更新されたもの')[1].split('## ')[0];
++  assert.match(jPart, /項目=\d+（フォルダ自身を含む） 最終更新=\d\d\/\d\d \d\d:\d\d:\d\d JST (sub|sub\/state\.json)/);
++  await rm(join(j, 'sub'), { recursive: true, force: true });
+ });
+ 
+ test('launchctl and crontab failures are unverified; "no crontab" is zero lines', async () => {

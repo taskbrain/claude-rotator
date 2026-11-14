@@ -1,0 +1,23 @@
+### T1-1 確認 2026-11-03 21:28:11 JST
+## レーンの Keychain 項目（acct と mdat だけ。-a なし・値は読まない）
+88a534ad: 項目なし（ログイン前の期待値。ログイン後は acct=<user> が1件のはず）
+## 試験フォルダ（名前とサイズだけ。中身は読まない）
+$HOME/caseG-T1-run1:
+drwx------@   5 <user>  staff   160 Nov  3 21:26 .
+drwxr-xr-x+ 230 <user>  staff  7360 Nov  3 21:27 ..
+drwx------@   2 <user>  staff    64 Nov  3 21:26 lane
+drwx------@   2 <user>  staff    64 Nov  3 21:26 tmp
+drwx------@   2 <user>  staff    64 Nov  3 21:26 work
+
+$HOME/caseG-T1-run1/lane:
+drwx------@ 2 <user>  staff   64 Nov  3 21:26 .
+drwx------@ 5 <user>  staff  160 Nov  3 21:26 ..
+lane/.claude.json なし（ログイン前の期待値）
+## 触れてはいけないプロセス（期待：どれも残っている）
+本番Rotator 73215 02-12:20:28 S    $HOME/.nvm/versions/node/v22.23.4/bin/node
+試験2タブ 33261 03-07:47:11 S+   $HOME/.local/bin/claude
+試験3-15番タブ 13945 18:16:39 S+   $HOME/.local/share/claude/versions/2.1.316
+## 本番ポート（期待：37891 が本番Rotatorのまま LISTEN）
+node      73215 <user>   13u  IPv4 0xaeb2376438a2006a      0t0  TCP 127.0.0.1:37891 (LISTEN)
+## バイナリ（期待：versions/2.1.317。コピーや書き換えがないこと）
+$HOME/.local/share/claude/versions/2.1.317
