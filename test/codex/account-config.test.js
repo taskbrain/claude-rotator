@@ -10,9 +10,10 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { mkdir, rm, writeFile } from 'node:fs/promises';
 import { join, relative } from 'node:path';
+import { homedir } from 'node:os';
 import {
   ACCOUNT_CONFIG_TOML, ALLOWED_CONFIG_OVERRIDES, ALLOWED_SANDBOX_VALUES, ARGUMENT_REJECTED_REASON,
-  FIRST_LAYER_ARGS, FORM_REJECTION, LAUNCH_CALLER, LAUNCH_FORM, MODEL_NAME_PATTERN,
+  FIRST_LAYER_ARGS, FORM_REJECTION, LAUNCH_CALLER, LAUNCH_FORM, MODEL_NAME_PATTERN, READ_SCOPE_ALIAS_ROOTS, READ_SCOPE_DENIED_HOME_FOLDERS,
   SECOND_LAYER_FEATURES_LINES, SECOND_LAYER_FEATURES_TABLE, SECOND_LAYER_FEEDBACK_LINES, SECOND_LAYER_FEEDBACK_TABLE,
   SECOND_LAYER_ROOT_LINES, formatArgumentRejected, matchLaunchForm,
 } from '../../src/codex/account-config.js';
@@ -20,7 +21,7 @@ import { readCodexCredentials } from '../../src/codex/credentials.js';
 import { setupCodexIsolation } from './helpers/isolation.js';
 import { EventEmitter } from 'node:events';
 import { chmod, realpath, symlink } from 'node:fs/promises';
-import { lstatSync, readFileSync, readdirSync, realpathSync, statSync } from 'node:fs';
+import { existsSync, lstatSync, readFileSync, readdirSync, realpathSync, statSync } from 'node:fs';
 import { dirname, isAbsolute } from 'node:path';
 import {
   ARGUMENT_REJECTED_KIND, CLOUD_CONFIG_CACHE_FILE, CODEX_GUARD_CHECK_MAX_STDOUT_BYTES, CODEX_GUARD_CHECK_TIMEOUT_MS,
@@ -405,6 +406,272 @@ test('rejects -c values that only resemble an allowed key', () => {
   assertRejected(['exec', '-c', ' model_reasoning_effort=high', '-'], R.configKey);
 });
 
+// --- --ephemeral と読む範囲を縛る組 ------------------------------------------------------------
+//
+// 名指しのフォルダの確かめはファイルの種類と実パスを見るので、隔離の一時フォルダ（HOME もその中）に
+// フォルダを作って試す。隔離の中では os.homedir() が隔離の HOME を返す。
+
+const SCOPE_ID = '3fa9c1d2';
+const scopeProfile = (id = SCOPE_ID) => `default_permissions="cjob-ro-${id}"`;
+const scopeFilesystem = (roots, { id = SCOPE_ID, head = '":root"="deny", ":minimal"="read", ":tmpdir"="deny", ":slash_tmp"="deny", ',
+  access = 'read' } = {}) =>
+  `permissions.cjob-ro-${id}.filesystem={${head}${roots.map(root => `"${root}"="${access}", `).join('')}":workspace_roots"={"."="read"}}`;
+
+// 読む範囲を縛るジョブで、そのツールが並べる引数の形（-s は無い）。
+function scopedJobArgs(roots, { profile = scopeProfile(), filesystem = scopeFilesystem(roots), extra = [] } = {}) {
+  return ['exec', '--skip-git-repo-check', '--json', '-m', MODEL, '-c', 'model_reasoning_effort=high',
+    '-c', profile, '-c', filesystem, ...extra, '-'];
+}
+
+async function scopeFolders(t) {
+  const isolation = await setupCodexIsolation(t);
+  const home = isolation.env.HOME;
+  assert.equal(homedir(), home, 'the isolation points the home folder at its own temporary folder');
+  const read = join(isolation.root, 'zz-read', 'map');
+  const second = join(isolation.root, 'zz-read', 'notes');
+  await mkdir(read, { recursive: true, mode: 0o700 });
+  await mkdir(second, { recursive: true, mode: 0o700 });
+  return { isolation, root: isolation.root, home, read, second };
+}
+
+test('accepts the read scope job form (no -s, one named folder)', async t => {
+  const { isolation, read } = await scopeFolders(t);
+  const args = scopedJobArgs([read]);
+  assert.deepEqual(args, ['exec', '--skip-git-repo-check', '--json', '-m', MODEL, '-c', 'model_reasoning_effort=high',
+    '-c', 'default_permissions="cjob-ro-3fa9c1d2"',
+    '-c', `permissions.cjob-ro-3fa9c1d2.filesystem={":root"="deny", ":minimal"="read", ":tmpdir"="deny", ":slash_tmp"="deny", "${read}"="read", ":workspace_roots"={"."="read"}}`,
+    '-']);
+  assertAccepted(args, { configOverrides: ['model_reasoning_effort=high', args[8], args[10]] });
+  assertAccepted(args, { caller: LAUNCH_CALLER.shim });
+  assertAccepted(scopedJobArgs([read], { extra: ['--ephemeral'] }));
+  assert.equal(isolation.spawnCalls.length, 0);
+  assert.equal(isolation.refusedChildProcesses.length, 0);
+});
+
+test('a sample read scope value has the allowed shape and is refused only because the sample folder does not exist', async t => {
+  await scopeFolders(t);
+  const example = scopeFilesystem(['/Users/example/wiki/map']);
+  assert.equal(example, 'permissions.cjob-ro-3fa9c1d2.filesystem={":root"="deny", ":minimal"="read", ":tmpdir"="deny", '
+    + '":slash_tmp"="deny", "/Users/example/wiki/map"="read", ":workspace_roots"={"."="read"}}');
+  assert.ok(ALLOWED_CONFIG_OVERRIDES[3].pattern.test(example));
+  assert.ok(ALLOWED_CONFIG_OVERRIDES[2].pattern.test('default_permissions="cjob-ro-3fa9c1d2"'));
+  assertRejected(scopedJobArgs(['/Users/example/wiki/map']), R.readRootMissing);
+});
+
+test('accepts several named folders, including one under the home folder', async t => {
+  const { home, read, second } = await scopeFolders(t);
+  const underHome = join(home, 'zz-wiki', 'map');
+  await mkdir(underHome, { recursive: true, mode: 0o700 });
+  assertAccepted(scopedJobArgs([read, second, underHome]));
+  assertAccepted(['exec', '-c', scopeFilesystem([read]), '--ephemeral', '-c', scopeProfile(), '-']);
+});
+
+test('accepts --ephemeral alone in the review job form with -s read-only', () => {
+  const args = intoReview(['--ephemeral']);
+  assert.deepEqual(args, ['exec', '-s', 'read-only', '--skip-git-repo-check', '-c', 'model_reasoning_effort=high', '--json',
+    '--ephemeral', '-']);
+  assertAccepted(args, { configOverrides: ['model_reasoning_effort=high'] });
+  assertAccepted(['exec', '--ephemeral', '-']);
+});
+
+test('rejects --ephemeral twice and the read scope pair given twice', async t => {
+  const { read } = await scopeFolders(t);
+  assertRejected(intoReview(['--ephemeral', '--ephemeral']), R.duplicate);
+  assertRejected(scopedJobArgs([read], { extra: ['-c', scopeProfile()] }), R.duplicate);
+  assertRejected(scopedJobArgs([read], { extra: ['-c', scopeFilesystem([read])] }), R.duplicate);
+  // 名の違う2つ目も、同じキーの2回目として断る。
+  assertRejected(scopedJobArgs([read], { extra: ['-c', scopeFilesystem([read], { id: '00000000' })] }), R.duplicate);
+  assertRejected(scopedJobArgs([read, read]), R.duplicate);
+});
+
+test('rejects only one half of the read scope pair, different ids, and the pair with -s', async t => {
+  const { read } = await scopeFolders(t);
+  assertRejected(['exec', '-c', scopeProfile(), '-'], R.readScopeUnpaired);
+  assertRejected(['exec', '-c', scopeFilesystem([read]), '-'], R.readScopeUnpaired);
+  assertRejected(intoReview(['-c', scopeProfile()]), R.readScopeUnpaired);
+  assertRejected(scopedJobArgs([read], { profile: scopeProfile('0123abcd') }), R.readScopeMismatch);
+  for (const sandbox of ALLOWED_SANDBOX_VALUES) {
+    assertRejected(scopedJobArgs([read], { extra: ['-s', sandbox] }), R.readScopeWithSandbox);
+  }
+  assertRejected(intoReview(['-c', scopeProfile(), '-c', scopeFilesystem([read])]), R.readScopeWithSandbox);
+});
+
+test('rejects read scope values outside the allowed shape', async t => {
+  const { read } = await scopeFolders(t);
+  // [名前, -c の値, 細目]
+  const cases = [
+    ['write access', scopeFilesystem([read], { access: 'write' }), R.valueShape],
+    ['another key in the table', scopeFilesystem([read], {
+      head: '":root"="deny", ":minimal"="read", ":tmpdir"="read", ":slash_tmp"="deny", ' }), R.valueShape],
+    ['an extra key in the table', scopeFilesystem([read], {
+      head: '":root"="deny", ":minimal"="read", ":tmpdir"="deny", ":slash_tmp"="deny", ":home"="read", ' }), R.valueShape],
+    ['no named folder', scopeFilesystem([]), R.valueShape],
+    ['a delete character in a folder', scopeFilesystem([`${read}\x7f`]), R.valueShape],
+    ['a newline in a folder', scopeFilesystem([`${read}\nzz`]), R.valueShape],
+    ['a quote in a folder', scopeFilesystem([`${read}"zz`]), R.valueShape],
+    ['a backslash in a folder', scopeFilesystem([`${read}\\zz`]), R.valueShape],
+    ['an uppercase id in the filesystem key', scopeFilesystem([read], { id: '3FA9C1D2' }), R.configKey],
+    ['a short id in the filesystem key', scopeFilesystem([read], { id: '3fa9c1d' }), R.configKey],
+    ['another permissions key', `permissions.cjob-ro-${SCOPE_ID}.network={"enabled"=true}`, R.configKey],
+    ['another profile name', `permissions.zz.filesystem={":root"="read"}`, R.configKey],
+    ['a built-in profile', 'default_permissions=":danger-full-access"', R.valueShape],
+    ['an uppercase id in the profile', scopeProfile('3FA9C1D2'), R.valueShape],
+    ['a trailing space', `${scopeFilesystem([read])} `, R.valueShape],
+  ];
+  for (const [name, value, detail] of cases) {
+    const result = matchLaunchForm(['exec', '-c', value, '-c', scopeProfile(), '-']);
+    assert.equal(result.ok, false, name);
+    assert.equal(result.detail, detail, name);
+  }
+});
+
+test('rejects named folders that are not plain absolute paths', async t => {
+  const { read } = await scopeFolders(t);
+  for (const root of [`${read}/..`, `${read}/../notes`, `${read}/.`, `${read}//zz`, `${read}/`, '/', `/${read}`]) {
+    assertRejected(scopedJobArgs([root]), R.readRootShape);
+  }
+  // `/` で始まらないものは、表の形に合わない。
+  for (const root of ['zz-read/map', './zz', '~/zz', '']) assertRejected(scopedJobArgs([root]), R.valueShape);
+});
+
+test('rejects the home folder, the folders above it, and the credential and setting folders under it', async t => {
+  const { root, home, read } = await scopeFolders(t);
+  for (const name of READ_SCOPE_DENIED_HOME_FOLDERS) await mkdir(join(home, name, 'zz'), { recursive: true, mode: 0o700 });
+  for (const denied of [home, root, dirname(root), join(home, '.ssh'), join(home, '.ssh', 'zz'), join(home, '.config', 'zz'),
+    join(home, '.claude'), join(home, '.codex', 'zz'), join(home, '.codex-accounts'), join(home, '.codex-accounts-retired', 'zz'),
+    join(home, '.aws'), join(home, '.aws', 'zz'), join(home, '.gnupg'), join(home, '.gnupg', 'zz'), join(home, '.docker'),
+    join(home, '.docker', 'zz'), join(home, 'Library'), join(home, 'Library', 'Keychains'), join(home, 'Library', 'Keychains', 'zz')]) {
+    assertRejected(scopedJobArgs([denied]), R.readRootDenied);
+    // 1つ目が通っても、2つ目で断る。
+    assertRejected(scopedJobArgs([read, denied]), R.readRootDenied);
+  }
+  // Library の下でも、Keychains に重ならないフォルダは通す。
+  const libraryOther = join(home, 'Library', 'zz-other');
+  await mkdir(libraryOther, { recursive: true, mode: 0o700 });
+  assertAccepted(scopedJobArgs([libraryOther]));
+  // 拒む置き場は、在らなくても字で拒む（ファイルの道具に触れる前に断る）。
+  await rm(join(home, '.ssh'), { recursive: true });
+  assertRejected(scopedJobArgs([join(home, '.ssh', 'zz')]), R.readRootDenied);
+});
+
+test('rejects a named folder that overlaps the real place of a linked setting folder', async t => {
+  const { root, home } = await scopeFolders(t);
+  const dotfiles = join(root, 'zz-dotfiles');
+  await mkdir(join(dotfiles, 'config', 'zz'), { recursive: true, mode: 0o700 });
+  await mkdir(home, { recursive: true });
+  await symlink(join(dotfiles, 'config'), join(home, '.config'));
+  assertRejected(scopedJobArgs([join(dotfiles, 'config', 'zz')]), R.readRootDenied);
+  assertRejected(scopedJobArgs([dotfiles]), R.readRootDenied);
+});
+
+// macOS では /System/Volumes/Data の下（ファームリンク）・/.nofollow と /.resolve の下（解き方の印）・/.vol の
+// 下（番号での指し方）のパスがホームなどを別の字で指し、その実パスは別名の字のまま返る。根は字で拒むので、
+// この道が無い OS（Linux など）でも同じに断る（ファイルの道具に触れる前に断る）。
+test('rejects a named folder that overlaps a macOS alias root, whether or not it exists', async t => {
+  const { home, read } = await scopeFolders(t);
+  assert.deepEqual([...READ_SCOPE_ALIAS_ROOTS], ['/System/Volumes', '/.nofollow', '/.resolve', '/.vol']);
+  for (const denied of [`/System/Volumes/Data${home}/.ssh`, `/System/Volumes/Data${home}/zz-wiki`,
+    '/System/Volumes/Data/Users/example/wiki/map', '/System/Volumes/Data', '/System/Volumes', '/System',
+    `/.nofollow${home}/.ssh`, '/.nofollow/Users/example/wiki', '/.nofollow', `/.resolve/1${home}/zz-wiki`, '/.resolve',
+    '/.vol/1/2', '/.vol']) {
+    assertRejected(scopedJobArgs([denied]), R.readRootDenied);
+    assertRejected(scopedJobArgs([read, denied]), R.readRootDenied);
+  }
+  // 字の似たほかの置き場は、この決まりでは断らない（在らないので、在るかの確かめで断る）。
+  assertRejected(scopedJobArgs(['/System/VolumesZZ/zz']), R.readRootMissing);
+  assertRejected(scopedJobArgs(['/.nofollowZZ/zz']), R.readRootMissing);
+});
+
+// 実体（装置と i-node）の照合。リンクでない別名の道を試験の中で作るのは難しいので、ファイルの道具を差し替え、
+// `/zz-alias<パス>` を `<パス>` と同じ実体として返す（stat はその先の実物を見て、realpath は字のまま返す）。
+const ALIAS_PREFIX = '/zz-alias';
+function aliasFs({ failOn = null } = {}) {
+  const target = path => (path === ALIAS_PREFIX ? '/' : path.startsWith(`${ALIAS_PREFIX}/`) ? path.slice(ALIAS_PREFIX.length) : path);
+  return Object.freeze({
+    stat(path, options) {
+      if (path === failOn) throw Object.assign(new Error('zz stat failure'), { code: 'EACCES' });
+      return statSync(target(path), options);
+    },
+    realpath: path => (target(path) === path ? realpathSync.native(path) : path),
+  });
+}
+
+test('rejects a named folder whose identity is a denied place or under it, the home folder, or above them', async t => {
+  const { root, home, read } = await scopeFolders(t);
+  for (const name of ['.ssh', join('Library', 'Keychains')]) await mkdir(join(home, name, 'zz'), { recursive: true, mode: 0o700 });
+  await mkdir(join(home, 'zz-wiki'), { recursive: true, mode: 0o700 });
+  const readScopeFs = aliasFs();
+  const match = roots => matchLaunchForm(scopedJobArgs(roots), { readScopeFs });
+  for (const denied of [`${ALIAS_PREFIX}${home}/.ssh`, `${ALIAS_PREFIX}${home}/.ssh/zz`, `${ALIAS_PREFIX}${home}/Library`,
+    `${ALIAS_PREFIX}${home}/Library/Keychains/zz`, `${ALIAS_PREFIX}${home}`, `${ALIAS_PREFIX}${root}`, ALIAS_PREFIX]) {
+    assert.equal(match([denied]).detail, R.readRootDenied, denied);
+    assert.equal(match([read, denied]).detail, R.readRootDenied, denied);
+  }
+  // 別名でも、ホームの下のほかのフォルダと、拒む所に重ならないフォルダは通す。
+  assert.equal(match([`${ALIAS_PREFIX}${home}/zz-wiki`]).ok, true);
+  assert.equal(match([`${ALIAS_PREFIX}${read}`, read]).ok, true);
+});
+
+test('rejects a named folder that overlaps the identity of the account root, and refuses when an identity cannot be read', async t => {
+  const { root, read } = await scopeFolders(t);
+  const accountsDir = join(root, 'zz-place', 'accounts');
+  await mkdir(join(accountsDir, 'zz-one'), { recursive: true, mode: 0o700 });
+  for (const denied of [`${ALIAS_PREFIX}${accountsDir}/zz-one`, `${ALIAS_PREFIX}${dirname(accountsDir)}`]) {
+    assert.equal(matchLaunchForm(scopedJobArgs([denied]), { accountsDir, readScopeFs: aliasFs() }).detail, R.readRootDenied);
+  }
+  // 名指しのフォルダの祖先の実体が求められなければ通さない。
+  assert.equal(matchLaunchForm(scopedJobArgs([read]), { readScopeFs: aliasFs({ failOn: dirname(read) }) }).detail,
+    R.readRootDenied);
+  // 拒む所の実体が、在らない以外の誤りで求められなければ通さない。
+  assert.equal(matchLaunchForm(scopedJobArgs([read]), { accountsDir, readScopeFs: aliasFs({ failOn: accountsDir }) }).detail,
+    R.readRootDenied);
+  assert.equal(matchLaunchForm(scopedJobArgs([read]), { accountsDir, readScopeFs: aliasFs() }).ok, true);
+  assert.throws(() => matchLaunchForm(scopedJobArgs([read]), { readScopeFs: { stat: statSync } }), TypeError);
+});
+
+// 本物の /.nofollow は macOS にだけ在る。在るときだけ、その下の別名で拒む置き場を名指しして断ることを見る。
+test('rejects a real /.nofollow alias of a denied place when the system has it', { skip: !existsSync('/.nofollow') }, async t => {
+  const { home } = await scopeFolders(t);
+  await mkdir(join(home, '.ssh'), { recursive: true, mode: 0o700 });
+  assertRejected(scopedJobArgs([`/.nofollow${home}/.ssh`]), R.readRootDenied);
+  assertRejected(scopedJobArgs([`/.nofollow${home}`]), R.readRootDenied);
+});
+
+test('rejects a named folder that overlaps the root of the account folders when it is given', async t => {
+  const { root, read } = await scopeFolders(t);
+  const place = join(root, 'zz-place');
+  const accountsDir = join(place, 'accounts');
+  await mkdir(join(accountsDir, 'zz-one'), { recursive: true, mode: 0o700 });
+  for (const denied of [place, accountsDir, join(accountsDir, 'zz-one')]) {
+    assert.equal(matchLaunchForm(scopedJobArgs([denied]), { accountsDir }).detail, R.readRootDenied);
+  }
+  assert.equal(matchLaunchForm(scopedJobArgs([place])).ok, true, 'without the root, the folder itself is allowed');
+  assert.equal(matchLaunchForm(scopedJobArgs([read]), { accountsDir }).ok, true);
+  assert.throws(() => matchLaunchForm(scopedJobArgs([read]), { accountsDir: 'zz-relative' }), TypeError);
+});
+
+test('rejects a named folder that is missing, is not a folder, or is not its own real path', async t => {
+  const { root, read } = await scopeFolders(t);
+  assertRejected(scopedJobArgs([join(root, 'zz-absent')]), R.readRootMissing);
+  const file = join(root, 'zz-read', 'zz-file');
+  await writeFile(file, 'zz\n', { flag: 'wx' });
+  assertRejected(scopedJobArgs([file]), R.readRootMissing);
+  const link = join(root, 'zz-read', 'zz-link');
+  await symlink(read, link);
+  assertRejected(scopedJobArgs([link]), R.readRootNotPhysical);
+  const throughLink = join(root, 'zz-read-link');
+  await symlink(join(root, 'zz-read'), throughLink);
+  assertRejected(scopedJobArgs([join(throughLink, 'map')]), R.readRootNotPhysical);
+});
+
+test('read scope rejections carry no named folder', async t => {
+  const { root } = await scopeFolders(t);
+  const marker = join(root, 'zz-secret-marker-ZZ-PATH-MARKER');
+  const result = matchLaunchForm(scopedJobArgs([marker]));
+  assert.equal(result.ok, false);
+  assert.ok(!JSON.stringify(result).includes('ZZ-PATH-MARKER'));
+});
+
 // --- 拒否する形: 語の完全一致 ----------------------------------------------------------------
 
 test('matches each word exactly, including whitespace, quotes, and case', () => {
@@ -443,9 +710,14 @@ test('rejects input that is not a list of words', () => {
 
 // --- 表と拒否の行 ----------------------------------------------------------------------------
 
-test('the pass-through key table has exactly the two keys a tool that launches Codex CLI jobs passes', () => {
-  assert.deepEqual(ALLOWED_CONFIG_OVERRIDES.map(entry => entry.key), ['model_reasoning_effort', 'features.image_generation']);
+test('the pass-through key table has exactly the four keys a tool that launches Codex CLI jobs passes', () => {
+  assert.deepEqual(ALLOWED_CONFIG_OVERRIDES.map(entry => entry.key), [
+    'model_reasoning_effort', 'features.image_generation', 'default_permissions', 'permissions.cjob-ro-<id>.filesystem',
+  ]);
   assert.deepEqual([...ALLOWED_SANDBOX_VALUES], ['read-only', 'workspace-write']);
+  assert.deepEqual([...READ_SCOPE_DENIED_HOME_FOLDERS],
+    ['.ssh', '.config', '.claude', '.codex', '.codex-accounts', '.codex-accounts-retired',
+      '.aws', '.gnupg', '.docker', 'Library/Keychains']);
 });
 
 test('the rejection line carries only the kind word and never the rejected values', () => {
@@ -748,6 +1020,19 @@ test('guard check arguments without the first layer keep only the job -c values'
   assert.deepEqual([...built.mcpList], ['-c', 'model_reasoning_effort=low', 'mcp', 'list', '--json']);
 });
 
+test('guard check arguments carry the read scope pair in the same order as the job', () => {
+  const filesystem = scopeFilesystem(['/Users/example/wiki/map']);
+  const built = buildGuardCheckArgs(['model_reasoning_effort=high', scopeProfile(), filesystem]);
+  assert.deepEqual([...built.featuresList], [...FIRST_LAYER_ARGS,
+    '-c', 'model_reasoning_effort=high', '-c', 'default_permissions="cjob-ro-3fa9c1d2"', '-c', filesystem, 'features', 'list']);
+  assert.deepEqual([...built.mcpList.slice(0, -3)], [...built.featuresList.slice(0, -2)]);
+  const reversed = buildGuardCheckArgs([filesystem, scopeProfile()], { includeFirstLayer: false });
+  assert.deepEqual([...reversed.featuresList], ['-c', filesystem, '-c', 'default_permissions="cjob-ro-3fa9c1d2"', 'features', 'list']);
+  for (const value of [scopeFilesystem(['/Users/example/wiki/map'], { access: 'write' }), scopeProfile('3FA9C1D2')]) {
+    assert.throws(() => buildGuardCheckArgs([value]), TypeError);
+  }
+});
+
 test('guard check arguments refuse -c values outside the pass-through table', () => {
   for (const value of ['features.apps=true', 'model=zz', 'model_reasoning_effort= high', 1]) {
     assert.throws(() => buildGuardCheckArgs([value]), TypeError);
@@ -885,6 +1170,123 @@ test('a clean guard check starts features list then mcp list, then returns the l
   assert.ok(h.children.every(child => child.kills.length === 0));
   assert.equal(h.isolation.refusedChildProcesses.length, 0);
   assert.equal(h.isolation.refusedSpawns.length, 0);
+});
+
+test('a read scope job passes the guard check with its -c values after the first layer, in the same order', async t => {
+  const h = await guardHarness(t);
+  const read = join(h.isolation.root, 'zz-read', 'map');
+  await mkdir(read, { recursive: true, mode: 0o700 });
+  const args = scopedJobArgs([read], { extra: ['--ephemeral'] });
+  const result = await h.run(args);
+  assert.equal(result.ok, true, JSON.stringify(result));
+  const expected = buildGuardCheckArgs(['model_reasoning_effort=high', scopeProfile(), scopeFilesystem([read])]);
+  assert.deepEqual(h.isolation.spawnCalls.map(call => call.args), [[...expected.featuresList], [...expected.mcpList]]);
+  assert.deepEqual(expected.featuresList.slice(0, FIRST_LAYER_ARGS.length), [...FIRST_LAYER_ARGS]);
+  assert.deepEqual([...result.launch.args], [...FIRST_LAYER_ARGS, ...args]);
+  assert.ok(!result.launch.args.includes('-s'));
+});
+
+test('a read scope job naming the root of the account folders is refused before any check starts', async t => {
+  const h = await guardHarness(t);
+  for (const denied of [dirname(h.codexHome), h.codexHome]) {
+    const result = await h.run(scopedJobArgs([denied]));
+    assert.equal(result.ok, false);
+    assert.equal(result.kind, ARGUMENT_REJECTED_KIND);
+    assert.equal(result.detail, R.readRootDenied);
+  }
+  assert.equal(h.isolation.spawnCalls.length, 0);
+});
+
+// 読む範囲を縛る組の表は作業フォルダも読ませるので、作業フォルダ（exec 自身の作業フォルダの実パス）も
+// 名指しのフォルダと同じ置き場の決まりで照らす。
+test('a read scope job refuses a working directory at the home folder, above it, in a setting folder, or at the account root', async t => {
+  const h = await guardHarness(t);
+  const home = h.isolation.env.HOME;
+  assert.equal(homedir(), home);
+  const read = join(h.isolation.root, 'zz-read', 'map');
+  await mkdir(read, { recursive: true, mode: 0o700 });
+  await mkdir(join(home, '.ssh', 'zz'), { recursive: true, mode: 0o700 });
+  for (const workDir of [home, h.isolation.root, join(home, '.ssh', 'zz'), dirname(h.codexHome), h.codexHome]) {
+    const result = await h.run(scopedJobArgs([read]), { processCwd: () => workDir });
+    assert.equal(result.ok, false, workDir);
+    assert.equal(result.kind, ARGUMENT_REJECTED_KIND);
+    assert.equal(result.reason, ARGUMENT_REJECTED_REASON);
+    assert.equal(result.detail, R.readScopeWorkspaceDenied);
+    assert.ok(!JSON.stringify(result).includes(workDir), 'the result has no working directory');
+  }
+  assert.equal(h.isolation.spawnCalls.length, 0, 'no check starts');
+});
+
+test('a read scope job refuses a working directory reached through a link into a setting folder', async t => {
+  const h = await guardHarness(t);
+  const read = join(h.isolation.root, 'zz-read', 'map');
+  await mkdir(read, { recursive: true, mode: 0o700 });
+  await mkdir(join(h.isolation.env.HOME, '.claude', 'zz'), { recursive: true, mode: 0o700 });
+  const link = join(h.isolation.root, 'zz-claude-link');
+  await symlink(join(h.isolation.env.HOME, '.claude', 'zz'), link);
+  const result = await h.run(scopedJobArgs([read]), { processCwd: () => link });
+  assert.equal(result.detail, R.readScopeWorkspaceDenied);
+  assert.equal(h.isolation.spawnCalls.length, 0);
+});
+
+test('a read scope job accepts an ordinary working directory under the home folder', async t => {
+  const h = await guardHarness(t);
+  const read = join(h.isolation.root, 'zz-read', 'map');
+  await mkdir(read, { recursive: true, mode: 0o700 });
+  const workDir = join(h.isolation.env.HOME, 'zz-project');
+  await mkdir(workDir, { recursive: true, mode: 0o700 });
+  const result = await h.run(scopedJobArgs([read]), { processCwd: () => workDir });
+  assert.equal(result.ok, true, JSON.stringify(result));
+  assert.equal(result.launch.options.cwd, workDir);
+  assert.equal(h.isolation.spawnCalls.length, 2);
+});
+
+test('without the read scope pair the working directory is not checked against the denied places', async t => {
+  const h = await guardHarness(t);
+  const home = h.isolation.env.HOME;
+  const result = await h.run(REVIEW_ARGS, { processCwd: () => home });
+  assert.equal(result.ok, true, JSON.stringify(result));
+  assert.equal(result.launch.options.cwd, home);
+});
+
+// 作業フォルダの実パスが macOS の別名の道の根の下なら断る。実パスの求め方を差し替えて、この道が無い
+// OS でも同じに確かめる（macOS の realpath は /System/Volumes/Data/… や /.nofollow/… の字をそのまま返す）。
+test('a read scope job refuses a working directory under a macOS alias root', async t => {
+  const h = await guardHarness(t);
+  const home = h.isolation.env.HOME;
+  const read = join(h.isolation.root, 'zz-read', 'map');
+  await mkdir(read, { recursive: true, mode: 0o700 });
+  for (const workDir of [`/System/Volumes/Data${home}/.ssh`, `/System/Volumes/Data${home}/zz-project`,
+    '/System/Volumes/Data/Users/example/project', '/System', `/.nofollow${home}/zz-project`, '/.vol/1/2']) {
+    const result = await h.run(scopedJobArgs([read]), { processCwd: () => workDir, realpath: path => path });
+    assert.equal(result.ok, false, workDir);
+    assert.equal(result.kind, ARGUMENT_REJECTED_KIND);
+    assert.equal(result.detail, R.readScopeWorkspaceDenied);
+    assert.ok(!JSON.stringify(result).includes(workDir), 'the result has no working directory');
+  }
+  assert.equal(h.isolation.spawnCalls.length, 0, 'no check starts');
+});
+
+// 作業フォルダも実体で照らす（別名の道を差し替えのファイルの道具で作る。上の aliasFs と同じ）。
+test('a read scope job refuses a working directory whose identity overlaps a denied place or the home folder', async t => {
+  const h = await guardHarness(t);
+  const home = h.isolation.env.HOME;
+  const read = join(h.isolation.root, 'zz-read', 'map');
+  await mkdir(read, { recursive: true, mode: 0o700 });
+  await mkdir(join(home, '.aws', 'zz'), { recursive: true, mode: 0o700 });
+  await mkdir(join(home, 'zz-project'), { recursive: true, mode: 0o700 });
+  const readScopeFs = aliasFs();
+  for (const workDir of [`${ALIAS_PREFIX}${home}/.aws/zz`, `${ALIAS_PREFIX}${home}`, `${ALIAS_PREFIX}${h.codexHome}`,
+    `${ALIAS_PREFIX}${dirname(dirname(h.codexHome))}`]) {
+    const result = await h.run(scopedJobArgs([read]), { processCwd: () => workDir, realpath: path => path, readScopeFs });
+    assert.equal(result.detail, R.readScopeWorkspaceDenied, workDir);
+  }
+  const failing = await h.run(scopedJobArgs([read]), {
+    processCwd: () => join(home, 'zz-project'), readScopeFs: aliasFs({ failOn: join(home, 'zz-project') }) });
+  assert.equal(failing.detail, R.readScopeWorkspaceDenied, 'an identity that cannot be read refuses');
+  assert.equal(h.isolation.spawnCalls.length, 0, 'no check starts');
+  const ordinary = await h.run(scopedJobArgs([read]), { processCwd: () => join(home, 'zz-project'), readScopeFs });
+  assert.equal(ordinary.ok, true, JSON.stringify(ordinary));
 });
 
 test('the guard check working directory is the real path of the exec working directory', async t => {

@@ -14,10 +14,18 @@
 //     `argument rejected (form)` の1行を出し（値は出さない）、shim は口座を選ばずに素通しにする。
 //       型1 非対話の exec（exec と shim）: 最初の語が `exec`、最後の語が単独の `-`（文章を標準入力
 //           から読む）で、`-` は1回だけ。その間に置けるのは、-s と値（read-only・workspace-write）、
-//           --skip-git-repo-check、--json、-m と値（モデルの名前の形）、-c と値（通すキーの表）、
+//           --skip-git-repo-check、--json、--ephemeral、-m と値（モデルの名前の形）、-c と値（通すキーの表）、
 //           --image と値（`-` で始まらない空でない語）、`--`（最後の `-` の直前に1回。--image が
 //           あるときは必須）。順は問わず各1回まで。ただし -c は表のキーごとに1回まで、--image は
-//           繰り返してよい。
+//           繰り返してよい。表のうち読む範囲を縛る2つ（default_permissions と
+//           permissions.cjob-ro-<16進8桁>.filesystem）は、同じ8桁の組でだけ通し、-s とは一緒に置けない。
+//           filesystem の表で読ませる各フォルダは、在るフォルダの物理パスで、ホームそのものとその上で
+//           なく、資格情報や設定の置き場（ホームの下の .ssh・.config・.claude・.codex・.codex-accounts・
+//           .codex-accounts-retired・.aws・.gnupg・.docker・Library/Keychains）と口座のフォルダの根と
+//           macOS の別名の道の根（/System/Volumes・/.nofollow・/.resolve・/.vol）のどれとも重ならない
+//           （それ自身・その下・その上でない）ものだけにする（ホームの下のほかのフォルダは通す）。重なりは
+//           字と、実体（装置と i-node。祖先も含む）の両方で照らす。表は作業フォルダも読ませるので、
+//           この組があるときは、作業フォルダの実パスも同じ置き場の決まりで照らす（prepareGuardedLaunch）。
 //       型2 引数の無い対話（exec と shim）: 語が1つも無い並び。
 //       型3 版の表示（exec だけ）: `--version` の1語。shim は口座を選ばずに素通しにする。
 //     型を足す・変えるときは、要る呼出し元と理由を書いて、レビューを通してから変える。
@@ -42,8 +50,10 @@
 //     読めない・形が決まった1行でないなど）は `project-root` で止める。対話の中で作業フォルダを信頼した
 //     後に、プロジェクトの設定が点検を経ずに読まれる道を、起動の前に塞ぐため。
 //
-// 型の照合と引数の組立は純粋な関数で、子プロセスを起動しない。子プロセスを起動するのは起動ごとの
-// 点検だけで、起動の関数は差し替えられる部品として受ける。ファイルは書かない。読むのは、作業フォルダの
+// 型の照合と引数の組立は子プロセスを起動しない。子プロセスを起動するのは起動ごとの
+// 点検だけで、起動の関数は差し替えられる部品として受ける。ファイルは書かない。型の照合がファイルの道具に
+// 触れるのは、読む範囲を縛る組があるときに、読ませるフォルダ・作業フォルダ・縛る側のフォルダとそれらの祖先の
+// 種類・実体（装置と i-node）・実パスを求めるところだけで、中身は読まない。読むのは、作業フォルダの
 // 実パスと、フィードバックの設定の点検が読む口座の config.toml と、型2 の設定のフォルダの点検が見るファイルの
 // 有無と、根の決め方に要る小さなファイル（口座の config.toml・システムと管理の層の config・git の worktree の
 // 指し先）だけで、どれも 64 KiB までにする。
@@ -51,7 +61,8 @@
 // その起動の形か型1の形を変えるときは、test/codex/account-config.test.js の回帰の見本と照らし直す。
 import { spawn as spawnChild } from 'node:child_process';
 import { lstatSync, readFileSync, readdirSync, realpathSync, statSync } from 'node:fs';
-import { dirname, isAbsolute, join, relative, sep } from 'node:path';
+import { homedir } from 'node:os';
+import { dirname, isAbsolute, join, relative, resolve, sep } from 'node:path';
 
 // --- 第1層 -----------------------------------------------------------------------------------
 
@@ -120,14 +131,68 @@ const FORM_CALLERS = Object.freeze({
 });
 
 /**
- * 通すキーの表（型1の -c の値）。値の語の全体が pattern に合うときだけ通す。-c と値は別の語。
+ * 読む範囲を縛る組の filesystem の表の形。名指しのフォルダ（1つ以上）だけを読ませ、残りの根・一時の
+ * 置き場を拒み、Codex が動くのに要る最小限と作業フォルダだけを読ませる。2つ目の捕まえる組は、名指しの
+ * フォルダの並び（`"<フォルダ>"="read", ` の繰り返し）。
+ */
+const READ_SCOPE_FILESYSTEM_PATTERN = new RegExp(
+  '^permissions\\.cjob-ro-([0-9a-f]{8})\\.filesystem='
+  + '\\{":root"="deny", ":minimal"="read", ":tmpdir"="deny", ":slash_tmp"="deny", '
+  + '((?:"\\/[^"\\\\\\x00-\\x1f\\x7f]*"="read", )+)'
+  + '":workspace_roots"=\\{"\\."="read"\\}\\}$',
+);
+/** filesystem の表の名指しのフォルダの並びから、フォルダを1つずつ取り出す形。 */
+const READ_SCOPE_ROOT_ENTRY = /"(\/[^"\\\x00-\x1f\x7f]*)"="read", /g;
+
+/**
+ * 通すキーの表（型1の -c の値）。値の語が keyPattern に合えばその項目と照らし、語の全体が pattern に
+ * 合うときだけ通す。key は項目ごとに固定の名で、1回までの確かめと README の照らし合わせに使う。
+ * -c と値は別の語。
  *   - model_reasoning_effort: Codex CLI のジョブを非対話の `codex exec … -` の形で起動するほかのツールが、全部のジョブで渡す。
  *   - features.image_generation: 同じツールが画像のジョブで渡す（true だけ）。
+ *   - default_permissions と permissions.cjob-ro-<16進8桁>.filesystem: 同じツールが、Codex に読ませる範囲を
+ *     名指しのフォルダと作業フォルダだけに縛るジョブで、組で渡す（名は `cjob-ro-` と小文字の16進8桁で、ジョブごとに変わる。
+ *     組込みの名を指せない）。組・8桁の一致・-s を置かないこと・名指しのフォルダの確かめは、照合の側で行う。
  */
+const READ_SCOPE_PROFILE_KEY = 'default_permissions';
+const READ_SCOPE_FILESYSTEM_KEY = 'permissions.cjob-ro-<id>.filesystem';
 export const ALLOWED_CONFIG_OVERRIDES = Object.freeze([
-  Object.freeze({ key: 'model_reasoning_effort', pattern: /^model_reasoning_effort=[a-z]+$/ }),
-  Object.freeze({ key: 'features.image_generation', pattern: /^features\.image_generation=true$/ }),
+  Object.freeze({
+    key: 'model_reasoning_effort', keyPattern: /^model_reasoning_effort=/, pattern: /^model_reasoning_effort=[a-z]+$/,
+  }),
+  Object.freeze({
+    key: 'features.image_generation', keyPattern: /^features\.image_generation=/, pattern: /^features\.image_generation=true$/,
+  }),
+  Object.freeze({
+    key: READ_SCOPE_PROFILE_KEY, keyPattern: /^default_permissions=/, pattern: /^default_permissions="cjob-ro-([0-9a-f]{8})"$/,
+  }),
+  Object.freeze({
+    key: READ_SCOPE_FILESYSTEM_KEY,
+    keyPattern: /^permissions\.cjob-ro-[0-9a-f]{8}\.filesystem=/,
+    pattern: READ_SCOPE_FILESYSTEM_PATTERN,
+  }),
 ]);
+
+/**
+ * 読む範囲を縛る組で、名指しのフォルダと作業フォルダが重なってはならないホームの下のフォルダ（それ自身・
+ * その下・その上）。資格情報・設定・Codex の口座の置き場。ホームそのものとその上は別に拒み、ホームの下の
+ * ほかのフォルダは通す。
+ */
+export const READ_SCOPE_DENIED_HOME_FOLDERS = Object.freeze([
+  '.ssh', '.config', '.claude', '.codex', '.codex-accounts', '.codex-accounts-retired',
+  '.aws', '.gnupg', '.docker', join('Library', 'Keychains'),
+]);
+
+/**
+ * 読む範囲を縛る組で、名指しのフォルダと作業フォルダが重なってはならない（それ自身・その下・その上）、
+ * macOS の別名の道の根。この下のパス（`/System/Volumes/Data/Users/…` のファームリンク、`/.nofollow/Users/…`・
+ * `/.resolve/<印>/Users/…` の解き方の印、`/.vol/<装置>/<番号>` の番号での指し方）は、ホームなどを別の字で
+ * 指し、実パスを求めても別名の字のまま返るので、字のままでも実パスでもホームや置き場と照らし合わせられない。
+ * その下の別名は実体（装置と i-node）の照合でも断るが、根そのもの（`/.nofollow` など）は `/` と違う実体を
+ * 持つので、実体の照合では断れない（根を名指しすると、その下の全部の別名を読ませることになる）。そこで、
+ * この根は字で、それ自身・その下・その上を拒む。字で拒むので、この道の無い OS でも同じに動く。
+ */
+export const READ_SCOPE_ALIAS_ROOTS = Object.freeze(['/System/Volumes', '/.nofollow', '/.resolve', '/.vol']);
 
 /** 型1の -s に許す値。 */
 export const ALLOWED_SANDBOX_VALUES = Object.freeze(['read-only', 'workspace-write']);
@@ -140,7 +205,7 @@ const EXEC_WORD = 'exec';
 const VERSION_WORD = '--version';
 
 // 型1の、値を取らない指定と値を取る指定。値の検査は語の全体に対して行う。
-const EXEC_FLAGS = new Set(['--skip-git-repo-check', '--json']);
+const EXEC_FLAGS = new Set(['--skip-git-repo-check', '--json', '--ephemeral']);
 const EXEC_VALUE_OPTIONS = Object.freeze({
   '-s': value => ALLOWED_SANDBOX_VALUES.includes(value),
   '-m': value => MODEL_NAME_PATTERN.test(value),
@@ -169,6 +234,14 @@ export const FORM_REJECTION = Object.freeze({
   duplicate: 'duplicate', // 1回までの指定が2回以上
   separatorPosition: 'separator-position', // `--` が最後の `-` の直前にない
   missingSeparator: 'missing-separator', // --image があるのに `--` が無い
+  readScopeUnpaired: 'read-scope-unpaired', // 読む範囲を縛る組の片方だけがある
+  readScopeMismatch: 'read-scope-mismatch', // 読む範囲を縛る組の2つの8桁が違う
+  readScopeWithSandbox: 'read-scope-with-sandbox', // 読む範囲を縛る組と -s が一緒にある
+  readRootShape: 'read-root-shape', // 名指しのフォルダが、`/` で始まらない・`/` そのもの・空や `.`・`..` の区切りや末尾の `/` を含む
+  readRootDenied: 'read-root-denied', // 名指しのフォルダが、ホームかその上、または資格情報・設定・口座の置き場か別名の道の根に重なる（字か実体で。実体が求められないときも）
+  readRootMissing: 'read-root-missing', // 名指しのフォルダが無い・フォルダでない
+  readRootNotPhysical: 'read-root-not-physical', // 名指しのフォルダの実パスが元の字と違う（リンクを含むなど）
+  readScopeWorkspaceDenied: 'read-scope-workspace-denied', // 読む範囲を縛る組があり、作業フォルダが、readRootDenied と同じ決まりに当たる
 });
 
 /**
@@ -190,16 +263,181 @@ function accept(form, configOverrides = []) {
 
 // -c の値の語を通すキーの表と照らす。通すなら表の項目、通さないなら拒否の細目。
 function matchConfigOverride(value) {
-  const entry = ALLOWED_CONFIG_OVERRIDES.find(item => value.startsWith(`${item.key}=`));
+  const entry = ALLOWED_CONFIG_OVERRIDES.find(item => item.keyPattern.test(value));
   if (!entry) return { detail: FORM_REJECTION.configKey };
-  if (!entry.pattern.test(value)) return { detail: FORM_REJECTION.valueShape };
-  return { entry };
+  const match = entry.pattern.exec(value);
+  if (!match) return { detail: FORM_REJECTION.valueShape };
+  return { entry, match };
+}
+
+// parent が child 自身かその上なら true（どちらも正規化した絶対パス）。
+function containsPath(parent, child) {
+  return child === parent || child.startsWith(parent.endsWith(sep) ? parent : `${parent}${sep}`);
+}
+
+// path の実パス。求められなければ null。
+function realpathOrNull(fsImpl, path) {
+  try {
+    return fsImpl.realpath(path);
+  } catch {
+    return null;
+  }
+}
+
+// path の実体（装置と i-node の組）を字にしたもの。大きな i-node でも桁を落とさないよう bigint で求める。
+// 求められなければ例外。
+function identityOf(fsImpl, path) {
+  const stats = fsImpl.stat(path, { bigint: true });
+  return `${stats.dev}:${stats.ino}`;
+}
+
+// path とその祖先（`/` まで）を、近い順に並べたもの（字の上の祖先）。
+function pathAndAncestors(path) {
+  const list = [path];
+  for (let current = path; dirname(current) !== current; current = dirname(current)) list.push(dirname(current));
+  return list;
+}
+
+// 拒む所の実体の組。ホームとその祖先（homeOrAbove）、置き場（folder）、置き場の祖先（folderAbove）。在らない
+// 所（ENOENT・ENOTDIR）は飛ばす。ほかの誤りで求められなければ null（照らす側は全部を断る）。
+function deniedIdentities(fsImpl, homes, folders) {
+  const identities = { homeOrAbove: new Set(), folder: new Set(), folderAbove: new Set() };
+  const chainOf = path => {
+    try {
+      return pathAndAncestors(path).map(item => identityOf(fsImpl, item));
+    } catch (error) {
+      if (error?.code === 'ENOENT' || error?.code === 'ENOTDIR') return [];
+      throw error;
+    }
+  };
+  try {
+    for (const home of homes) for (const id of chainOf(home)) identities.homeOrAbove.add(id);
+    for (const folder of folders) {
+      const [own, ...above] = chainOf(folder);
+      if (own === undefined) continue;
+      identities.folder.add(own);
+      for (const id of above) identities.folderAbove.add(id);
+    }
+  } catch {
+    return null;
+  }
+  return identities;
+}
+
+// 名指しのフォルダが重なってはならない所（ホームと、それ自身・その下・その上を拒む置き場）。どれも字の
+// ままのパスと、求められれば実パスの両方を持つ（ホームや置き場がリンクでも、物理パスの名指しで避けられない
+// ように）。あわせて、それらの実体の組も持つ（別名の字で同じフォルダを指す道を、字に頼らずに断るため）。
+function readScopeDeniedPlaces(fsImpl, accountsDir) {
+  const lexicalHome = resolve(homedir());
+  const homes = [...new Set([lexicalHome, realpathOrNull(fsImpl, lexicalHome)].filter(Boolean))];
+  const folders = homes.flatMap(home => READ_SCOPE_DENIED_HOME_FOLDERS.map(name => join(home, name)));
+  if (accountsDir !== undefined) folders.push(resolve(accountsDir));
+  folders.push(...READ_SCOPE_ALIAS_ROOTS);
+  const withReal = [...new Set(folders.flatMap(folder => [folder, realpathOrNull(fsImpl, folder)].filter(Boolean)))];
+  return { homes, folders: withReal, identities: deniedIdentities(fsImpl, homes, withReal) };
+}
+
+// path（正規化した絶対パス）がホームそのものかその上、または拒む置き場のそれ自身・その下・その上なら true。
+// ホームの下のほかのフォルダは通す。字で照らす。
+function overlapsDeniedPlace(path, denied) {
+  if (denied.homes.some(home => containsPath(path, home))) return true;
+  return denied.folders.some(folder => containsPath(folder, path) || containsPath(path, folder));
+}
+
+// overlapsDeniedPlace と同じ決まりを実体で照らす。path の実体がホームかその祖先の実体なら「ホームかその上」、
+// path かその祖先の実体が置き場の実体なら「置き場かその下」、path の実体が置き場の祖先の実体なら「置き場の上」
+// として true。ホームの下のほかのフォルダは通す。拒む所か path の実体が求められなければ true（通さない）。
+function overlapsDeniedIdentity(path, fsImpl, denied) {
+  const ids = denied.identities;
+  if (ids === null) return true;
+  let chain;
+  try {
+    chain = pathAndAncestors(path).map(item => identityOf(fsImpl, item));
+  } catch {
+    return true;
+  }
+  const [own] = chain;
+  return ids.homeOrAbove.has(own) || ids.folderAbove.has(own) || chain.some(id => ids.folder.has(id));
+}
+
+// 名指しのフォルダ1つを照らす。通すなら null、通さないなら拒否の細目。字の形と置き場の重なりを先に見て、
+// 名指しのフォルダにファイルの道具で触れるのはその後にする。
+function readRootRejection(root, fsImpl, denied) {
+  if (!root.startsWith(sep) || root === sep || root.endsWith(sep)) return FORM_REJECTION.readRootShape;
+  if (root.slice(1).split(sep).some(part => part === '' || part === '.' || part === '..')) {
+    return FORM_REJECTION.readRootShape;
+  }
+  if (overlapsDeniedPlace(root, denied)) return FORM_REJECTION.readRootDenied;
+  try {
+    if (!fsImpl.stat(root).isDirectory()) return FORM_REJECTION.readRootMissing;
+  } catch {
+    return FORM_REJECTION.readRootMissing;
+  }
+  if (realpathOrNull(fsImpl, root) !== root) return FORM_REJECTION.readRootNotPhysical;
+  if (overlapsDeniedIdentity(root, fsImpl, denied)) return FORM_REJECTION.readRootDenied;
+  return null;
+}
+
+// 読む範囲を縛る組（default_permissions と permissions.<名>.filesystem）を照らす。組が無ければ null。
+function readScopeRejection(readScope, sandboxGiven, { accountsDir, fs: fsImpl }) {
+  const profile = readScope.get(READ_SCOPE_PROFILE_KEY);
+  const filesystem = readScope.get(READ_SCOPE_FILESYSTEM_KEY);
+  if (!profile && !filesystem) return null;
+  if (!profile || !filesystem) return FORM_REJECTION.readScopeUnpaired;
+  if (profile[1] !== filesystem[1]) return FORM_REJECTION.readScopeMismatch;
+  if (sandboxGiven) return FORM_REJECTION.readScopeWithSandbox;
+  const roots = [...filesystem[2].matchAll(READ_SCOPE_ROOT_ENTRY)].map(entry => entry[1]);
+  if (new Set(roots).size !== roots.length) return FORM_REJECTION.duplicate;
+  const denied = readScopeDeniedPlaces(fsImpl, accountsDir);
+  for (const root of roots) {
+    const detail = readRootRejection(root, fsImpl, denied);
+    if (detail) return detail;
+  }
+  return null;
+}
+
+// 名指しのフォルダの確かめに使うファイルの道具（種類・実体・実パスだけ。中身は読まない）。実パスは OS の
+// 求め方にする（大文字と小文字を区別しないファイルシステムでも、字の違う名指しを物理パスでないとして拒むため）。
+const READ_SCOPE_FS = Object.freeze({ stat: statSync, realpath: realpathSync.native });
+
+// 差し替えのファイルの道具（試験のため）。省けば本物。
+function readScopeFsOrDefault(readScopeFs) {
+  if (readScopeFs === undefined) return READ_SCOPE_FS;
+  if (typeof readScopeFs?.stat !== 'function' || typeof readScopeFs?.realpath !== 'function') {
+    throw new TypeError('readScopeFs must have stat and realpath');
+  }
+  return readScopeFs;
+}
+
+/**
+ * 読む範囲を縛る組があるときの、作業フォルダの確かめ。filesystem の表は `":workspace_roots"={"."="read"}` を
+ * 必ず含むので、Codex を起動する作業フォルダも読める範囲に入る。そこで作業フォルダの実パスも、名指しの
+ * フォルダと同じ決まり（ホームそのものとその上、資格情報・設定・口座の置き場と別名の道の根のそれ自身・その下・
+ * その上を、字と実体の両方で）で照らす。組が無ければ照らさない。通すなら null、通さないなら拒否の細目（値は
+ * 含まない）。
+ *
+ * @param {readonly string[]} configOverrides matchLaunchForm の結果の configOverrides
+ * @param {string} cwd 作業フォルダの実パス（絶対パス）
+ * @param {{ accountsDir?: string, fs: { stat: Function, realpath: Function } }} options accountsDir は口座の
+ *   フォルダの根（絶対パス）
+ * @returns {string|null}
+ */
+function readScopeWorkspaceRejection(configOverrides, cwd, { accountsDir, fs: fsImpl }) {
+  const profileEntry = ALLOWED_CONFIG_OVERRIDES.find(entry => entry.key === READ_SCOPE_PROFILE_KEY);
+  if (!configOverrides.some(value => profileEntry.keyPattern.test(value))) return null;
+  const denied = readScopeDeniedPlaces(fsImpl, accountsDir);
+  const path = resolve(cwd);
+  if (overlapsDeniedPlace(path, denied) || overlapsDeniedIdentity(path, fsImpl, denied)) {
+    return FORM_REJECTION.readScopeWorkspaceDenied;
+  }
+  return null;
 }
 
 // 型1の最初の `exec` と最後の `-` の間の語を照らす。
-function matchExecMiddle(middle) {
+function matchExecMiddle(middle, readScopeOptions) {
   const seen = new Set();
   const configOverrides = [];
+  const readScope = new Map();
   let imageCount = 0;
   for (let i = 0; i < middle.length; i += 1) {
     const word = middle[i];
@@ -219,11 +457,12 @@ function matchExecMiddle(middle) {
       const value = middle[i + 1];
       i += 1;
       if (word === '-c') {
-        const { entry, detail } = matchConfigOverride(value);
+        const { entry, match, detail } = matchConfigOverride(value);
         if (!entry) return { rejected: detail };
         const seenKey = `-c ${entry.key}`;
         if (seen.has(seenKey)) return { rejected: FORM_REJECTION.duplicate };
         seen.add(seenKey);
+        if (entry.key === READ_SCOPE_PROFILE_KEY || entry.key === READ_SCOPE_FILESYSTEM_KEY) readScope.set(entry.key, match);
         configOverrides.push(value);
         continue;
       }
@@ -239,6 +478,8 @@ function matchExecMiddle(middle) {
     return { rejected: FORM_REJECTION.unknownWord };
   }
   if (imageCount > 0 && !seen.has(SEPARATOR)) return { rejected: FORM_REJECTION.missingSeparator };
+  const readScopeDetail = readScopeRejection(readScope, seen.has('-s'), readScopeOptions);
+  if (readScopeDetail) return { rejected: readScopeDetail };
   return { configOverrides };
 }
 
@@ -250,11 +491,20 @@ function matchExecMiddle(middle) {
  * もの（型2・型3では空）。当たらなければ { ok: false, reason: 'form', detail }。detail は
  * FORM_REJECTION の語で、値を含まない。
  *
+ * accountsDir は口座のフォルダの根（絶対パス）。渡されれば、読む範囲を縛る組の名指しのフォルダが、
+ * これ自身・その下・その上に当たるときも拒む（ホームの下の既定の置き場は渡さなくても拒む）。
+ * readScopeFs は名指しのフォルダの確かめに使うファイルの道具（stat と realpath。試験のため。省けば本物）。
+ *
  * @param {readonly string[]} args
- * @param {{ caller?: 'exec'|'shim' }} [options]
+ * @param {{ caller?: 'exec'|'shim', accountsDir?: string,
+ *   readScopeFs?: { stat: Function, realpath: Function } }} [options]
  */
-export function matchLaunchForm(args, { caller = LAUNCH_CALLER.exec } = {}) {
+export function matchLaunchForm(args, { caller = LAUNCH_CALLER.exec, accountsDir, readScopeFs } = {}) {
   if (!Object.values(LAUNCH_CALLER).includes(caller)) throw new TypeError('unknown launch caller');
+  if (accountsDir !== undefined && (typeof accountsDir !== 'string' || !isAbsolute(accountsDir))) {
+    throw new TypeError('accountsDir must be an absolute path');
+  }
+  const fsImpl = readScopeFsOrDefault(readScopeFs);
   if (!Array.isArray(args) || !args.every(word => typeof word === 'string')) return reject(FORM_REJECTION.notWords);
   const words = [...args];
   const forCaller = (form, configOverrides) =>
@@ -267,7 +517,7 @@ export function matchLaunchForm(args, { caller = LAUNCH_CALLER.exec } = {}) {
   const markers = words.filter(word => word === STDIN_MARKER).length;
   if (markers !== 1 || words[words.length - 1] !== STDIN_MARKER) return reject(FORM_REJECTION.stdinMarker);
 
-  const result = matchExecMiddle(words.slice(1, -1));
+  const result = matchExecMiddle(words.slice(1, -1), { accountsDir, fs: fsImpl });
   if (result.rejected) return reject(result.rejected);
   return forCaller(LAUNCH_FORM.exec, result.configOverrides);
 }
@@ -285,7 +535,7 @@ export const NO_DAEMON_ARG = '--no-daemon';
  * （{ ok: false, reason: 'form', detail }）をそのまま返す。
  *
  * @param {readonly string[]} args
- * @param {{ caller?: 'exec'|'shim' }} [options]
+ * @param {{ caller?: 'exec'|'shim', accountsDir?: string, readScopeFs?: object }} [options] matchLaunchForm と同じ
  */
 export function buildLaunchArgs(args, options) {
   const match = matchLaunchForm(args, options);
@@ -358,7 +608,8 @@ const KILL_SIGNAL = 'SIGKILL';
  *
  * includeFirstLayer を false にすると第1層を付けない（口座のフォルダの config.toml だけで遮断が
  * 効いているかを見る点検のため）。configOverrides の値は通すキーの表に合うものだけを受け、
- * 合わなければ TypeError を投げる。
+ * 合わなければ TypeError を投げる。ここで見るのは値の形だけで、読む範囲を縛る組の組・8桁の一致・
+ * 名指しのフォルダの確かめは matchLaunchForm が済ませている前提にする。
  *
  * @param {readonly string[]} [configOverrides] matchLaunchForm の結果の configOverrides
  * @param {{ includeFirstLayer?: boolean }} [options]
@@ -987,7 +1238,10 @@ export function checkFeedbackConfig({ codexHome, fs: fsImpl = NODE_PROJECT_FS } 
  * 子の起動には、同じ作業フォルダ（exec 自身の作業フォルダの実パス）と同じ環境を渡す。
  *
  * 型に当たらなければ点検を起動せず { ok: false, kind: 'argument-rejected', reason: 'form', detail }。
+ * 型の照合には、選んだ口座のフォルダの親（口座のフォルダの根）を accountsDir として渡す。
  * 作業フォルダの実パスが求められなければ点検を起動せず、点検が通らなかったものとして exit。
+ * 読む範囲を縛る組があり、作業フォルダの実パスが拒む置き場に当たれば（readScopeWorkspaceRejection）、
+ * 点検を起動せず { ok: false, kind: 'argument-rejected', reason: 'form', detail: 'read-scope-workspace-denied' }。
  * 型1〜3のどれでも、続けてフィードバックの設定の点検（checkFeedbackConfig）を行い、通らなければ点検を
  * 起動せずに feedback。
  * 型2 では、点検を起動する前に設定のフォルダの点検（checkProjectFolders）を行い、通らなければ点検を
@@ -1002,19 +1256,24 @@ export function checkFeedbackConfig({ codexHome, fs: fsImpl = NODE_PROJECT_FS } 
  *   args: readonly string[], caller?: 'exec'|'shim', codexPath: string, codexHome: string, env: object,
  *   spawn?: Function, scheduler?: object, timeoutMs?: number, maxBytes?: number,
  *   processCwd?: () => string, realpath?: (path: string) => string,
- *   projectFs?: object, projectLayerPaths?: object,
+ *   projectFs?: object, projectLayerPaths?: object, readScopeFs?: object,
  * }} options projectFs と projectLayerPaths は、フィードバックの設定の点検と設定のフォルダの点検のファイルの
- *   道具と、プロジェクトの層の外の置き場（試験のため。省けば本物）
+ *   道具と、プロジェクトの層の外の置き場。readScopeFs は読む範囲を縛る組の確かめのファイルの道具（どれも
+ *   試験のため。省けば本物）
  */
 export async function prepareGuardedLaunch({ args, caller, codexPath, codexHome, env, spawn, scheduler,
-  timeoutMs, maxBytes, processCwd, realpath, projectFs, projectLayerPaths } = {}) {
+  timeoutMs, maxBytes, processCwd, realpath, projectFs, projectLayerPaths, readScopeFs } = {}) {
   requireAbsolute(codexPath, 'codexPath');
   requireAbsolute(codexHome, 'codexHome');
   if (env === null || typeof env !== 'object') throw new TypeError('env must be an object');
-  const built = buildLaunchArgs(args, caller ? { caller } : undefined);
+  const accountsDir = dirname(codexHome);
+  const built = buildLaunchArgs(args, { caller, accountsDir, readScopeFs });
   if (!built.ok) return Object.freeze({ ...built, kind: ARGUMENT_REJECTED_KIND });
   const cwd = resolveLaunchWorkingDirectory({ processCwd, realpath });
   if (cwd === null) return unverified(GUARD_UNVERIFIED.exit);
+  const workspaceDetail = readScopeWorkspaceRejection(built.configOverrides, cwd,
+    { accountsDir, fs: readScopeFsOrDefault(readScopeFs) });
+  if (workspaceDetail !== null) return Object.freeze({ ...reject(workspaceDetail), kind: ARGUMENT_REJECTED_KIND });
   const feedbackReason = checkFeedbackConfig({ codexHome, fs: projectFs });
   if (feedbackReason !== null) return unverified(feedbackReason);
   if (built.form === LAUNCH_FORM.interactive) {
