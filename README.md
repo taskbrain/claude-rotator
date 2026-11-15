@@ -518,6 +518,7 @@ claude-rotator status
 - `quotaObservation.enabled: true`: 通常の上流応答とUsage取得から、許可した枠の名前・有無・null／数値の種別・利用率・reset・HTTP状態を `quota_shape` 行へ記録します。口座は12桁のハッシュです。本文、認証値、メールアドレス、モデル名の文字列値は追加しません。設定は起動時に読みます。
 - `planQuota.mode: "shadow"` または `"on"`: shadowは現行の台帳と割当を維持し、追加の枠情報をstatusへ出します。onは週共通枠と要求モデルの週枠を主軸に新規割当を判断します。5hの欠落やnullは不明とし、0%にも口座エラーにも変換しません。直前の有効な5h制約は元のresetまで保持します。
 - `accountUrgency.mode: "shadow"` または `"on"`: 週resetまでの必要ペースで候補を比べます。onは適用される共通週・モデル別週・観測済み5hの97%関門を守り、5hが不明なだけでは除外しません。未取得・null・不正な週情報は保留します。古いだけでreset前の有効な週観測は、既知の停止条件を守って `recoveryOnly` として通常の候補より低い順位で使い、送信応答のヘッダーで更新します。設定済みの厳しい `switchThreshold` も維持します。onには `sessionAffinity.mode: "on"` が必要です。
+- `fableQuotaCompat.mode: "on"`: 新しい Claude Code が Fable の週枠に使う枠の名（ヘッダー `anthropic-ratelimit-unified-7d_oi-*`、Usage API の `seven_day_overage_included`）も Fable の週枠として読み、その枠が上限に達した口座を Fable の要求から外します。`claude-fable-5-<数字>`（例 `claude-fable-5-2`）の429も、`claude-fable-5` と同じく Usage API で確かめ直します。`planQuota`・`accountUrgency` とは独立して効きます（ヘッダーの枠を口座の台帳へ入れるのは、従来どおりそのどちらかが on のときだけです）。`"off"`・`"on"` 以外の値は off として扱い、ログに1行出します。内部 reload でも再読込し、off に戻すと on の間に読み込んだ枠も off のときと同じに扱います。
 
 プラン名から5h制限の有無を決めません。同じ口座で値が消えたり戻ったりしても観測を更新し、制限撤廃を自動で断定しません。固定セッションの積極的な移動は利用者ターンの境界で行い、実行中の要求を保護します。
 
@@ -2100,6 +2101,7 @@ What the main keys mean:
 | `switchThreshold` | `1` (= 100%) | The usage ratio at which an account is considered unavailable |
 | `rotationPolicy.mode` | `use-expiring-weekly` | The switching algorithm's mode |
 | `rotationPolicy.weeklyResetPriorityWindowMs` | `129600000` (36 hours) | Grace period for prioritizing consumption of an account whose 7-day window is about to reset within this time |
+| `fableQuotaCompat.mode` | `off` | When `"on"`, the Fable weekly limit is also read under the scope names newer Claude Code builds use (header `anthropic-ratelimit-unified-7d_oi-*`, Usage API `seven_day_overage_included`), so an account whose Fable limit is used up is skipped for Fable requests, and a 429 for `claude-fable-5-<number>` (e.g. `claude-fable-5-2`) is confirmed against the Usage API like `claude-fable-5`. Works independently of `planQuota` / `accountUrgency` (header windows still enter the account ledger only while one of them is on). Any other value counts as off and logs one line. Re-read on internal reload; after switching back to off, windows read while it was on are treated as off would treat them |
 | `usagePolling.enabled` | `true` | Whether to poll the Usage API in the background |
 | `usagePolling.intervalMs` | `900000` (15 min) | Interval between polls |
 | `usagePolling.concurrency` | `1` | Number of accounts fetched concurrently |

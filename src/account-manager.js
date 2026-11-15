@@ -3,6 +3,7 @@ import { createHash } from 'node:crypto';
 import { QuotaRecovery } from './quota-recovery.js';
 import {
   emptyQuota,
+  fableQuotaCompatMode,
   normalizeWeeklyScopedUsage,
   normalizeWeeklyScopedObservations,
   parseRateLimitHeaders,
@@ -81,6 +82,7 @@ export class AccountManager {
     rotationPolicy = null,
     accountUrgency = null,
     planQuota = null,
+    fableQuotaCompat = null,
     logger = null,
     // Keep `events` as a bounded, persisted history.
     // The ledger is told nothing about session affinity - not the instance, not
@@ -112,6 +114,17 @@ export class AccountManager {
     this.quotaRecoveryPolling = null;
     this.configureAccountUrgency(accountUrgency);
     this.configurePlanQuota(planQuota);
+    this.configureFableQuotaCompat(fableQuotaCompat);
+  }
+
+  // `fableQuotaCompat` for this ledger only, copied onto every account like
+  // `extendedQuotaScopes` so helpers that receive an account can read it. Only
+  // the reading changes; stored windows are left as they are. Returns the mode.
+  configureFableQuotaCompat(raw) {
+    const mode = fableQuotaCompatMode(raw);
+    this.fableQuotaCompat = mode === 'on';
+    for (const account of this.accounts) account.fableQuotaCompat = this.fableQuotaCompat;
+    return mode;
   }
 
   configurePlanQuota(raw) {
@@ -147,7 +160,8 @@ export class AccountManager {
     return {
       schemaVersion: 1, mode: this.planQuotaMode, generatedAt: this.now(),
       accounts: this.accounts.map(account => ({
-        accountId: account.id, windows: quotaWindowsView(account.quota, account.windowObservations, this.now()),
+        accountId: account.id,
+        windows: quotaWindowsView(account.quota, account.windowObservations, this.now(), account.fableQuotaCompat),
       })),
     };
   }
@@ -192,11 +206,12 @@ export class AccountManager {
     if (!this.quotaRecoveryEnabled() || !account || !this.isAvailable(account, modelFamily)) return false;
     if (account.id === 'current' || account.credentialSource === 'claude-code-current') return false;
     const threshold = Math.min(URGENCY_THRESHOLD, this.configuredSwitchThreshold);
-    if (quotaBlocksModelFamily(account.quota, threshold, modelFamily, true)) return false;
+    if (quotaBlocksModelFamily(account.quota, threshold, modelFamily, true, account.fableQuotaCompat)) return false;
     const now = this.now();
     for (const [id, observation] of Object.entries(account.windowObservations || {})) {
       if (id !== '5h' && id !== '7d'
-        && !(id.startsWith('7d_') && scopeMatchesModelFamily({ key: id.slice(3) }, modelFamily, true))) continue;
+        && !(id.startsWith('7d_')
+          && scopeMatchesModelFamily({ key: id.slice(3) }, modelFamily, true, account.fableQuotaCompat))) continue;
       const known = observation?.lastKnown;
       if (isValidQuotaWindow(known?.usedFraction, known?.resetAt, now)
         && known.usedFraction >= threshold) return false;
@@ -213,7 +228,7 @@ export class AccountManager {
         key: id.slice(3), utilization: null, resetAt: null,
       });
     }
-    return [...scopes.values()].filter(limit => scopeMatchesModelFamily(limit, modelFamily, true))
+    return [...scopes.values()].filter(limit => scopeMatchesModelFamily(limit, modelFamily, true, account.fableQuotaCompat))
       .some(limit => missing(`7d_${limit.key}`, limit.utilization, limit.resetAt));
   }
 
@@ -277,8 +292,9 @@ export class AccountManager {
       const row = this.urgency.metrics(account.id, account.status === 'error'
       || Boolean(account.rateLimitedUntil && this.now() < account.rateLimitedUntil)
       || Boolean(this.quotaRecovery?.isHeld(this.quotaRecoveryKey(account)))
-      || quotaBlocksModelFamily(account.quota, Math.min(URGENCY_THRESHOLD, this.configuredSwitchThreshold), modelFamily, true),
-      modelFamily, account.quota.weeklyScoped);
+      || quotaBlocksModelFamily(account.quota, Math.min(URGENCY_THRESHOLD, this.configuredSwitchThreshold), modelFamily, true,
+        account.fableQuotaCompat),
+      modelFamily, account.quota.weeklyScoped, account.fableQuotaCompat);
       const recoveryOnly = ['weekly-unknown-or-stale', 'scoped-weekly-unknown-or-stale'].includes(row.exclusionReason)
         && this.canRecoverWeeklyQuota(account, modelFamily, Math.min(URGENCY_THRESHOLD, this.configuredSwitchThreshold));
       return { ...row, recoveryOnly, ...(recoveryOnly ? { eligible: true, exclusionReason: null, unusedRisk: false } : {}) };
@@ -301,13 +317,13 @@ export class AccountManager {
         && !['explicit_null', 'invalid'].includes(observation.observationState);
     };
     return fresh('7d', account.quota.unified7d, account.quota.unified7dReset)
-      && (account.quota.weeklyScoped || []).filter(limit => scopeMatchesModelFamily(limit, modelFamily, true))
+      && (account.quota.weeklyScoped || []).filter(limit => scopeMatchesModelFamily(limit, modelFamily, true, account.fableQuotaCompat))
         .every(limit => fresh(`7d_${limit.key}`, limit.utilization, limit.resetAt));
   }
 
   canRecoverWeeklyQuota(account, modelFamily = null, threshold = this.switchThreshold) {
     if (!account || !this.isAvailable(account, modelFamily)
-      || quotaBlocksModelFamily(account.quota, threshold, modelFamily, true)) return false;
+      || quotaBlocksModelFamily(account.quota, threshold, modelFamily, true, account.fableQuotaCompat)) return false;
     const now = this.now();
     const usable = (id, utilization, resetAt) => {
       const observation = account.windowObservations?.[id];
@@ -322,7 +338,7 @@ export class AccountManager {
       scopes.set(id.slice(3), { key: id.slice(3), utilization: observation.lastKnown?.usedFraction,
         resetAt: observation.lastKnown?.resetAt });
     }
-    return [...scopes.values()].filter(limit => scopeMatchesModelFamily(limit, modelFamily, true))
+    return [...scopes.values()].filter(limit => scopeMatchesModelFamily(limit, modelFamily, true, account.fableQuotaCompat))
       .every(limit => usable(`7d_${limit.key}`, limit.utilization, limit.resetAt));
   }
 
@@ -814,6 +830,7 @@ export class AccountManager {
         loginExpirySeen: credentialIdentityChanged ? false : existing.loginExpirySeen,
         windowObservations: credentialIdentityChanged ? {} : existing.windowObservations,
         extendedQuotaScopes: this.planQuotaMode === 'on' || this.urgency?.mode === 'on',
+        fableQuotaCompat: this.fableQuotaCompat === true,
       };
     });
     this.urgency?.prune(this.accounts.map(account => account.id).filter(id => !credentialChangedIds.includes(id)));
@@ -1309,7 +1326,8 @@ export class AccountManager {
     if (!this.isAvailable(account, modelFamily)) return null;
     const quota = account.quota || {};
     const utilizations = (this.planQuotaMode === 'on'
-      ? [quota.unified7d, ...(quota.weeklyScoped || []).filter(limit => scopeMatchesModelFamily(limit, modelFamily, true)).map(limit => limit.utilization)]
+      ? [quota.unified7d, ...(quota.weeklyScoped || [])
+        .filter(limit => scopeMatchesModelFamily(limit, modelFamily, true, account.fableQuotaCompat)).map(limit => limit.utilization)]
       : [quota.unified5h, quota.unified7d])
       .filter(value => typeof value === 'number' && Number.isFinite(value));
     if (utilizations.length === 0) return null;
@@ -1367,7 +1385,8 @@ export class AccountManager {
     if ((this.planQuotaMode === 'on' || this.urgency?.mode === 'on' || this.quotaRecovery)
       && account.rateLimitedUntil > this.now()) return false;
     if (account.status === 'exhausted') {
-      return !quotaBlocksModelFamily(account.quota, this.switchThreshold, modelFamily, account.extendedQuotaScopes);
+      return !quotaBlocksModelFamily(account.quota, this.switchThreshold, modelFamily, account.extendedQuotaScopes,
+        account.fableQuotaCompat);
     }
     return true;
   }
@@ -1462,7 +1481,8 @@ export class AccountManager {
     if (account.status === 'error') {
       return account.errorReason || { type: 'account_error' };
     }
-    const quotaReason = quotaUnavailableReasonForModelFamily(account.quota, this.switchThreshold, modelFamily, account.extendedQuotaScopes);
+    const quotaReason = quotaUnavailableReasonForModelFamily(account.quota, this.switchThreshold, modelFamily,
+      account.extendedQuotaScopes, account.fableQuotaCompat);
     if (quotaReason) return quotaReason;
     if (account.rateLimitedUntil && this.now() < account.rateLimitedUntil) {
       return {
@@ -1604,7 +1624,8 @@ export class AccountManager {
       .map(({ account, index }) => {
         const quota = account.quota;
         const weekly = [quota.unified7d,
-          ...(quota.weeklyScoped || []).filter(limit => scopeMatchesModelFamily(limit, modelFamily, true)).map(limit => limit.utilization)]
+          ...(quota.weeklyScoped || []).filter(limit => scopeMatchesModelFamily(limit, modelFamily, true, account.fableQuotaCompat))
+            .map(limit => limit.utilization)]
           .filter(value => Number.isFinite(value));
         return { ...this.newAssignmentCandidate(account, index, modelFamily, now, sessionCounts),
           weeklyHeadroom: weekly.length ? Math.min(...weekly.map(value => 1 - value)) : null };
@@ -1641,7 +1662,8 @@ export class AccountManager {
    */
   assignmentHeadroomFor(account, modelFamily = null) {
     if (!account) return { min: null, complete: false };
-    return assignmentHeadroom(account.quota || {}, modelFamily, this.now(), this.planQuotaMode === 'on', account.extendedQuotaScopes);
+    return assignmentHeadroom(account.quota || {}, modelFamily, this.now(), this.planQuotaMode === 'on', account.extendedQuotaScopes,
+      account.fableQuotaCompat);
   }
 
   /**
@@ -1711,7 +1733,8 @@ export class AccountManager {
     return {
       account,
       index,
-      headroom: assignmentHeadroom(quota, modelFamily, now, this.planQuotaMode === 'on', account.extendedQuotaScopes),
+      headroom: assignmentHeadroom(quota, modelFamily, now, this.planQuotaMode === 'on', account.extendedQuotaScopes,
+        account.fableQuotaCompat),
       // K1: how much of the 5h window this account has actually
       // burned, not how much is left on its tightest window. `headroom.min` can be
       // dominated by the WEEKLY window, so an account that has barely touched its
@@ -1755,6 +1778,7 @@ export class AccountManager {
       quota: emptyQuota(),
       windowObservations: {},
       extendedQuotaScopes: this.planQuotaMode === 'on' || this.urgency?.mode === 'on',
+      fableQuotaCompat: this.fableQuotaCompat === true,
       usage: emptyAccountUsage(),
       rateLimitedUntil: null,
       temporaryUnavailableReason: null,
@@ -1900,7 +1924,7 @@ export function quotaUnavailableReason(quota, threshold) {
  * common-quota reason (token/request rate limit) to a non-matching-family
  * request instead of a scoped claim that does not apply to it (m2).
  */
-export function quotaUnavailableReasonForModelFamily(quota, threshold, modelFamily, extended = false) {
+export function quotaUnavailableReasonForModelFamily(quota, threshold, modelFamily, extended = false, fableCompat = false) {
   if (quota.unified5h != null && quota.unified5h >= threshold) {
     return {
       type: 'quota_exhausted',
@@ -1920,7 +1944,7 @@ export function quotaUnavailableReasonForModelFamily(quota, threshold, modelFami
   if (Array.isArray(quota.weeklyScoped)) {
     for (const limit of quota.weeklyScoped) {
       if (!limit || typeof limit.utilization !== 'number' || limit.utilization < threshold) continue;
-      if (!scopeMatchesModelFamily(limit, modelFamily, extended)) continue;
+      if (!scopeMatchesModelFamily(limit, modelFamily, extended, fableCompat)) continue;
       return {
         type: 'quota_exhausted',
         window: `7d ${limit.label || limit.key || 'scoped'}`,
@@ -2016,13 +2040,13 @@ export function requiresRelogin(account) {
  * `scopeMatchesModelFamily`: a Fable-scoped entry at/over threshold gates only
  * Fable requests; an unrecognized scope is reported but never gates any request.
  */
-function quotaBlocksModelFamily(quota, threshold, modelFamily, extended = false) {
+function quotaBlocksModelFamily(quota, threshold, modelFamily, extended = false, fableCompat = false) {
   if (!quota) return true;
   if (commonQuotaExhausted(quota, threshold)) return true;
   if (Array.isArray(quota.weeklyScoped)) {
     for (const limit of quota.weeklyScoped) {
       if (!limit || typeof limit.utilization !== 'number' || limit.utilization < threshold) continue;
-      if (scopeMatchesModelFamily(limit, modelFamily, extended)) return true;
+      if (scopeMatchesModelFamily(limit, modelFamily, extended, fableCompat)) return true;
     }
   }
   return false;
@@ -2151,7 +2175,7 @@ export function familyQuotaExhaustedOnly(account, threshold, modelFamily, now = 
   if (account.status === 'error' || account.status === 'throttled') return false;
   if (account.rateLimitedUntil != null && now < account.rateLimitedUntil) return false;
   if (commonQuotaExhausted(account.quota, threshold)) return false;
-  return quotaBlocksModelFamily(account.quota, threshold, modelFamily, account.extendedQuotaScopes);
+  return quotaBlocksModelFamily(account.quota, threshold, modelFamily, account.extendedQuotaScopes, account.fableQuotaCompat);
 }
 
 function futureAvailabilityForModelFamily(account, threshold, modelFamily, now) {
@@ -2184,7 +2208,7 @@ function futureAvailabilityForModelFamily(account, threshold, modelFamily, now) 
   if (Array.isArray(quota.weeklyScoped)) {
     for (const limit of quota.weeklyScoped) {
       if (!limit || typeof limit.utilization !== 'number' || limit.utilization < threshold) continue;
-      if (!scopeMatchesModelFamily(limit, modelFamily, account.extendedQuotaScopes)) continue;
+      if (!scopeMatchesModelFamily(limit, modelFamily, account.extendedQuotaScopes, account.fableQuotaCompat)) continue;
       blockers.push(availabilityResetTimestamp(limit.resetAt));
     }
   }
@@ -2235,7 +2259,7 @@ function compareRoutingAvailabilityCandidates(left, right) {
  * leave it: a 5h or 7d window counts as not read, and a scoped weekly limit is
  * dropped. Nothing is written back.
  */
-function assignmentHeadroom(quota, modelFamily, now, optionalFiveHour = false, extended = false) {
+function assignmentHeadroom(quota, modelFamily, now, optionalFiveHour = false, extended = false, fableCompat = false) {
   const five = quota?.unified5hReset && now >= quota.unified5hReset ? null : finiteNumberOrNull(quota?.unified5h);
   const utilizations = [
     ...(optionalFiveHour && five == null ? [] : [five]),
@@ -2243,7 +2267,7 @@ function assignmentHeadroom(quota, modelFamily, now, optionalFiveHour = false, e
   ];
   if (modelFamily === 'fable' && Array.isArray(quota?.weeklyScoped)) {
     for (const limit of quota.weeklyScoped) {
-      if (!scopeMatchesModelFamily(limit, modelFamily, extended)) continue;
+      if (!scopeMatchesModelFamily(limit, modelFamily, extended, fableCompat)) continue;
       if (limit.resetAt && now >= limit.resetAt) continue;
       utilizations.push(finiteNumberOrNull(limit.utilization));
     }

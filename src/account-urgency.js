@@ -121,7 +121,7 @@ export class AccountUrgency {
     };
   }
 
-  metrics(id, unavailable = false, modelFamily = null, expectedScopes = []) {
+  metrics(id, unavailable = false, modelFamily = null, expectedScopes = [], fableCompat = false) {
     const state = this.observations.get(id);
     const weekly = this.window(state?.weekly, 168 * HOUR);
     const lastFive = this.window(state?.fiveHour, 5 * HOUR);
@@ -149,14 +149,14 @@ export class AccountUrgency {
       const retained = limit.reportingValid === false && Number.isFinite(limit.usedFraction) && limit.resetAt > this.now();
       return {
         key: limit.key, label: limit.label,
-        scope: scopeMatchesModelFamily(limit, 'fable', true) ? 'fable' : 'unknown', ...window,
+        scope: scopeMatchesModelFamily(limit, 'fable', true, fableCompat) ? 'fable' : 'unknown', ...window,
         usedFraction: retained ? null : window.usedFraction, resetAt: retained ? null : window.resetAt,
         retainedConstraint: retained, lastKnown: retained ? {
           usedFraction: limit.usedFraction, resetAt: limit.resetAt, observedAt: limit.observedAt,
         } : null,
       };
     });
-    const applicableScoped = scopedWeekly.filter(limit => scopeMatchesModelFamily(limit, modelFamily, true));
+    const applicableScoped = scopedWeekly.filter(limit => scopeMatchesModelFamily(limit, modelFamily, true, fableCompat));
     const hoursLeft = weekly.fresh ? (weekly.resetAt - this.now()) / HOUR : null;
     const requiredPace = hoursLeft != null ? Math.max(0, URGENCY_THRESHOLD - weekly.usedFraction) / hoursLeft : null;
     const predictedUnusedFraction = weekly.observedPace != null

@@ -24,6 +24,23 @@ export function planQuotaMode(raw) {
   return ['off', 'shadow', 'on'].includes(raw?.mode) ? raw.mode : 'off';
 }
 
+// `fableQuotaCompat` setting. Newer Claude Code builds report the Fable weekly
+// limit under the scope name `oi` (header `anthropic-ratelimit-unified-7d_oi-*`)
+// and `overage_included` (Usage API `seven_day_overage_included`). With the
+// setting on, those names count as the Fable limit wherever a scope name is
+// matched, whatever planQuota / accountUrgency say. The setting belongs to one
+// account ledger, so the matchers take it as an argument (off when omitted).
+// Stored windows keep the upstream names and nothing derived from the setting:
+// turning it off reads them exactly as if it had never been on. Bounded
+// retention (`boundWeeklyScopes`, `observeQuotaWindows`) ignores the setting
+// for the same reason; with more than 16 scoped windows a compat-named one may
+// be dropped before the canonical Fable ones.
+const FABLE_QUOTA_COMPAT_SCOPE_NAMES = new Set(['oi', 'overage_included']);
+
+export function fableQuotaCompatMode(raw) {
+  return ['off', 'on'].includes(raw?.mode) ? raw.mode : 'off';
+}
+
 export function isValidQuotaWindow(utilization, resetAt, now) {
   return Number.isFinite(utilization) && utilization >= 0 && Number.isFinite(resetAt) && resetAt > now;
 }
@@ -63,12 +80,13 @@ export function boundWeeklyScopes(scopes) {
     || (b.utilization ?? -1) - (a.utilization ?? -1)).slice(0, 16);
 }
 
-export function quotaWindowsView(quota, observations, now) {
+export function quotaWindowsView(quota, observations, now, fableCompat = false) {
   const limits = [
     { id: '5h', scope: 'all', usedFraction: quota.unified5h, resetAt: quota.unified5hReset },
     { id: '7d', scope: 'all', usedFraction: quota.unified7d, resetAt: quota.unified7dReset },
     ...(quota.weeklyScoped || []).map(limit => ({
-      id: `7d_${limit.key}`, scope: isFableScopeIdentity(limit.key, true) || isFableScopeIdentity(limit.label, true) ? 'fable' : 'unknown',
+      id: `7d_${limit.key}`,
+      scope: isFableScopeIdentity(limit.key, true, fableCompat) || isFableScopeIdentity(limit.label, true, fableCompat) ? 'fable' : 'unknown',
       usedFraction: limit.utilization, resetAt: limit.resetAt,
     })),
   ];
@@ -76,7 +94,7 @@ export function quotaWindowsView(quota, observations, now) {
     if (!id.startsWith('7d_') || limits.some(limit => limit.id === id)) continue;
     const last = observations[id]?.lastKnown;
     limits.push({
-      id, scope: isFableScopeIdentity(id.slice(3), true) ? 'fable' : 'unknown',
+      id, scope: isFableScopeIdentity(id.slice(3), true, fableCompat) ? 'fable' : 'unknown',
       usedFraction: last?.usedFraction ?? null, resetAt: last?.resetAt ?? null,
     });
   }
@@ -145,6 +163,7 @@ export function parseRateLimitHeaders(headers, { onInvalid = null, includeScoped
       if (!('utilization' in parsed)) continue;
       setEpochSeconds(parsed, 'resetAt', get(name.replace(/-utilization$/i, '-reset')));
       const key = normalizeScopedKey(match[1]);
+      // The label never depends on `fableQuotaCompat`: this window is stored.
       scoped.push({ key, label: isFableScopeIdentity(key) ? 'Fable' : key, utilization: parsed.utilization, resetAt: parsed.resetAt ?? null });
     }
     if (scoped.length) quota.weeklyScoped = scoped;
@@ -269,12 +288,16 @@ function normalizeScopedKey(value) {
   return key || 'scoped';
 }
 
-/** True when a weeklyScoped entry's key/label denotes the Fable sub-cap. */
-export function isFableScopeIdentity(value, extended = false) {
+/**
+ * True when a weeklyScoped entry's key/label denotes the Fable sub-cap.
+ * `fableCompat` is the ledger's `fableQuotaCompat` reading (see above).
+ */
+export function isFableScopeIdentity(value, extended = false, fableCompat = false) {
   if (typeof value !== 'string') return false;
   const identity = value.trim().toLowerCase();
   return ['fable', 'fable 5', 'fable5', 'fable_5', 'claude-fable-5', 'claude_fable_5'].includes(identity)
-    || (extended && /^(?:claude[-_])?fable(?:[ _-]?\d+(?:[._-]\d+)*)?$/.test(identity));
+    || (extended && /^(?:claude[-_])?fable(?:[ _-]?\d+(?:[._-]\d+)*)?$/.test(identity))
+    || (fableCompat === true && FABLE_QUOTA_COMPAT_SCOPE_NAMES.has(identity.replace(/[^a-z0-9]+/g, '_')));
 }
 
 /**
@@ -283,9 +306,10 @@ export function isFableScopeIdentity(value, extended = false) {
  * never gate Opus/Sonnet/Haiku traffic. Unknown (non-Fable) scoped limits are
  * reported but never gate any request family.
  */
-export function scopeMatchesModelFamily(limit, modelFamily, extended = false) {
+export function scopeMatchesModelFamily(limit, modelFamily, extended = false, fableCompat = false) {
   if (!limit) return false;
-  const isFableScope = isFableScopeIdentity(limit.key, extended) || isFableScopeIdentity(limit.label, extended);
+  const isFableScope = isFableScopeIdentity(limit.key, extended, fableCompat)
+    || isFableScopeIdentity(limit.label, extended, fableCompat);
   if (isFableScope) return modelFamily === 'fable';
   return false;
 }

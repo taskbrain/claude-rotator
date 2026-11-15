@@ -448,6 +448,7 @@ async function runServer({ write }) {
     reloadSessionAffinity: () => loadConfig().then(nextConfig => nextConfig?.sessionAffinity),
     reloadAccountUrgency: () => loadConfig().then(nextConfig => nextConfig?.accountUrgency),
     reloadPlanQuota: () => loadConfig().then(nextConfig => nextConfig?.planQuota),
+    reloadFableQuotaCompat: () => loadConfig().then(nextConfig => nextConfig?.fableQuotaCompat),
     // logMaxBytes だけは reload では効かない（fd は起動時に開くため。README に明記）。
     reloadObservability: () => loadConfig().then(nextConfig => nextConfig?.observability),
     logger,

@@ -112,6 +112,21 @@ describe('quota shape observation', () => {
     assert.equal(lines[0].includes('secret'), false);
   });
 
+  it('records the 7d_oi header window and the seven_day_overage_included Usage bucket by fixed name', async () => {
+    const { createQuotaShapeObserver, projectUsageQuotaShape } = await observerModule();
+    const lines = [];
+    const observer = createQuotaShapeObserver({ enabled: true, logger: line => lines.push(line), now: () => sampleTime });
+    observer.headers('fixture-account', 429, {
+      'anthropic-ratelimit-unified-7d_oi-utilization': '1',
+      'anthropic-ratelimit-unified-7d_oi-reset': '1793491200',
+    });
+    const header = JSON.parse(lines[0]).shape;
+    assert.deepEqual(header['anthropic-ratelimit-unified-7d_oi-utilization'], { type: 'number', value: 1 });
+    assert.deepEqual(header['anthropic-ratelimit-unified-7d_oi-reset'], { type: 'number', value: 1793491200 });
+    const usage = projectUsageQuotaShape({ seven_day_overage_included: { utilization: 42 } });
+    assert.deepEqual(usage.seven_day_overage_included.utilization, { type: 'number', value: 42 });
+  });
+
   it('deduplicates per account and source until the interval while reporting changes immediately', async () => {
     const { createQuotaShapeObserver, projectUsageQuotaShape } = await observerModule();
     let now = sampleTime;

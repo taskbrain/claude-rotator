@@ -146,6 +146,7 @@ export function createProxyServer({
   reloadSessionAffinity = null,
   reloadAccountUrgency = null,
   reloadPlanQuota = null,
+  reloadFableQuotaCompat = null,
   reloadObservability = null,
   allowLiveClaudeCodeCredentials = true,
   tokenRefresher = null,
@@ -495,6 +496,24 @@ export function createProxyServer({
   }
   configureUrgency();
   accountManager.configurePlanQuota(config.planQuota);
+  // `fableQuotaCompat` (off unless the section says exactly "on"). It is kept on
+  // this server's account ledger, so another server in the same process is not
+  // affected. A section with any other mode is read as off and logged once; an
+  // absent section or an explicit "off" logs nothing, so the default
+  // configuration's log is unchanged. The line is written again only when it
+  // changes across reloads.
+  let fableQuotaCompatNotice = null;
+  function applyFableQuotaCompat() {
+    const raw = config.fableQuotaCompat;
+    const mode = accountManager.configureFableQuotaCompat(raw);
+    const notice = mode === 'on' ? 'fable-quota-compat mode=on'
+      : raw != null && raw.mode !== 'off' ? 'fable-quota-compat warning=invalid-mode mode=off' : null;
+    if (notice && notice !== fableQuotaCompatNotice) {
+      try { logger?.(notice); } catch {}
+    }
+    fableQuotaCompatNotice = notice;
+  }
+  applyFableQuotaCompat();
   accountManager.setQuotaRecoveryPersistence(Boolean(stateWriter), usagePollingEnabled(config));
   let pollingWarningShown = false;
   function warnWithoutUsagePolling() {
@@ -876,6 +895,8 @@ export function createProxyServer({
         configureUrgency();
         if (reloadPlanQuota) config.planQuota = await reloadPlanQuota();
         accountManager.configurePlanQuota(config.planQuota);
+        if (reloadFableQuotaCompat) config.fableQuotaCompat = await reloadFableQuotaCompat();
+        applyFableQuotaCompat();
         accountManager.setQuotaRecoveryPersistence(Boolean(stateWriter), usagePollingEnabled(config));
         warnWithoutUsagePolling();
         // キャッシュ観測の再読込。セクションが無い・config.json 自体が無い
@@ -1685,7 +1706,7 @@ function createReactiveQuotaConfirmer({
       clientRequest = null,
       clientResponse = null,
     }) {
-      const modelFamily = requestModelFamily(requestBody);
+      const modelFamily = requestModelFamily(requestBody, accountManager.fableQuotaCompat);
       let clientAborted = false;
       let entry = null;
       try {
@@ -1709,6 +1730,7 @@ function createReactiveQuotaConfirmer({
             modelFamily,
             accountManager.now(),
             account.extendedQuotaScopes,
+            account.fableQuotaCompat,
           );
         const newerObservation = usageObservationTracker.newerSuccessfulEvidence(
           result.observation,
@@ -1719,6 +1741,7 @@ function createReactiveQuotaConfirmer({
           modelFamily,
           accountManager.now(),
           account.extendedQuotaScopes,
+          account.fableQuotaCompat,
         );
         const authorizationGeneration = directEvidence
           ? result.observation.generation
@@ -1762,6 +1785,7 @@ function createReactiveQuotaConfirmer({
         authorization.modelFamily,
         nowMs,
         authorization.source.extendedQuotaScopes,
+        authorization.source.fableQuotaCompat,
       ) && accountQuotaConfirmsModelFamily(
         authorization.source,
         authorization.modelFamily,
@@ -1850,13 +1874,22 @@ function positiveTimeoutOrDefault(value, fallback) {
     : fallback;
 }
 
-function requestModelFamily(body) {
+// `fableCompat` is the ledger's `fableQuotaCompat` reading.
+function requestModelFamily(body, fableCompat = false) {
   try {
     const model = JSON.parse(body.toString('utf8'))?.model;
-    return isCanonicalFableModelId(model) ? 'fable' : null;
+    return isCanonicalFableModelId(model) || (fableCompat === true && isFableQuotaCompatModelId(model)) ? 'fable' : null;
   } catch {
     return null;
   }
+}
+
+// With `fableQuotaCompat` on, later Fable 5 point releases (`claude-fable-5-2`,
+// ...) also enter reactive Usage confirmation. Still an exact match: one or two
+// digits without a leading zero, no trim, no case folding, and no date or build
+// suffix (an eight-digit date such as `claude-fable-5-20260818` stays out).
+function isFableQuotaCompatModelId(value) {
+  return typeof value === 'string' && /^claude-fable-5-[1-9][0-9]?$/.test(value);
 }
 
 // Exact canonical id match only (no trim/lowercase/regex). Used to gate
@@ -2278,7 +2311,7 @@ function commonQuotaResetAt(account, now, threshold, modelFamily) {
   if (account?.extendedQuotaScopes) {
     const blockers = [
       [quota.unified5h, quota.unified5hReset], [quota.unified7d, quota.unified7dReset],
-      ...(quota.weeklyScoped || []).filter(limit => scopeMatchesModelFamily(limit, modelFamily, true))
+      ...(quota.weeklyScoped || []).filter(limit => scopeMatchesModelFamily(limit, modelFamily, true, account.fableQuotaCompat))
         .map(limit => [limit.utilization, limit.resetAt]),
     ].filter(([utilization]) => Number.isFinite(utilization) && utilization >= threshold);
     if (!blockers.length || blockers.some(([, reset]) => !Number.isFinite(reset) || reset <= now)) return null;
@@ -2515,7 +2548,7 @@ function scopedUsageIdentity(limit) {
   return isFableScopeIdentity(value) ? 'fable' : (value || 'scoped');
 }
 
-function usageEvidenceConfirmsRequest(fields, threshold, modelFamily, nowMs, extended = false) {
+function usageEvidenceConfirmsRequest(fields, threshold, modelFamily, nowMs, extended = false, fableCompat = false) {
   for (const [field, evidence] of fields) {
     if (
       (field === 'five_hour' || field === 'seven_day')
@@ -2524,7 +2557,7 @@ function usageEvidenceConfirmsRequest(fields, threshold, modelFamily, nowMs, ext
     if (
       isScopedUsageField(field)
       && modelFamily
-      && scopedUsageMatchesModelFamily(evidence, modelFamily, extended)
+      && scopedUsageMatchesModelFamily(evidence, modelFamily, extended, fableCompat)
       && usageBucketConfirmsQuota(evidence, threshold, nowMs)
     ) return true;
   }
@@ -2554,17 +2587,17 @@ function accountQuotaConfirmsModelFamily(account, modelFamily, threshold, nowMs)
   return modelFamily === 'fable'
     && Array.isArray(quota.weeklyScoped)
     && quota.weeklyScoped.some(limit => (
-      scopedUsageMatchesModelFamily(limit, modelFamily, account.extendedQuotaScopes)
+      scopedUsageMatchesModelFamily(limit, modelFamily, account.extendedQuotaScopes, account.fableQuotaCompat)
       && usageBucketConfirmsQuota(limit, threshold, nowMs)
     ));
 }
 
-function scopedUsageMatchesModelFamily(limit, modelFamily, extended = false) {
+function scopedUsageMatchesModelFamily(limit, modelFamily, extended = false, fableCompat = false) {
   if (modelFamily !== 'fable') return false;
   const key = String(limit?.key || '').trim().toLowerCase();
-  if (key) return isFableScopeIdentity(key, extended);
+  if (key) return isFableScopeIdentity(key, extended, fableCompat);
   const label = String(limit?.label || '').trim().toLowerCase();
-  return isFableScopeIdentity(label, extended);
+  return isFableScopeIdentity(label, extended, fableCompat);
 }
 
 function unifiedQuotaHeaderEvidence(headers, threshold, nowMs) {
@@ -3451,7 +3484,7 @@ async function forwardWithRotation(options) {
   }
 }
 
-function quotaRecoveryDeadline(headers, now, modelFamily, threshold) {
+function quotaRecoveryDeadline(headers, now, modelFamily, threshold, fableCompat = false) {
   const times = [];
   const retry = headerValue(headers['retry-after']);
   if (typeof retry === 'string' && /^\d+(?:\.\d+)?$/.test(retry.trim())) times.push(now + Number(retry) * 1000);
@@ -3463,7 +3496,7 @@ function quotaRecoveryDeadline(headers, now, modelFamily, threshold) {
   const windows = [
     [parsed.unified5h, parsed.unified5hReset],
     [parsed.unified7d, parsed.unified7dReset],
-    ...(parsed.weeklyScoped || []).filter(limit => scopeMatchesModelFamily(limit, modelFamily, true))
+    ...(parsed.weeklyScoped || []).filter(limit => scopeMatchesModelFamily(limit, modelFamily, true, fableCompat))
       .map(limit => [limit.utilization, limit.resetAt]),
   ];
   for (const [utilization, resetAt] of windows) {
@@ -3477,7 +3510,7 @@ function quotaRecoveryDeadline(headers, now, modelFamily, threshold) {
   else if (claim === 'seven_day') resets.push(parsed.unified7dReset);
   else if (claim?.startsWith('seven_day_')) {
     const scope = claim.slice('seven_day_'.length);
-    if (scopeMatchesModelFamily({ key: scope }, modelFamily, true)) {
+    if (scopeMatchesModelFamily({ key: scope }, modelFamily, true, fableCompat)) {
       for (const key of new Set([scope, scope.replace(/_/g, '-')])) {
         for (const separator of ['-', '_']) {
           const reset = finiteHeaderNumber(headers[`anthropic-ratelimit-unified-7d${separator}${key}-reset`]);
@@ -4319,7 +4352,7 @@ async function forwardOnceInner({
           status: upstreamRes.statusCode,
           notBefore: upstreamRes.statusCode === 429 && probeNow !== null
             ? quotaRecoveryDeadline(upstreamRes.headers, probeNow, quotaRecoveryProbe.modelFamily,
-              Math.min(0.97, accountManager.configuredSwitchThreshold)) : null,
+              Math.min(0.97, accountManager.configuredSwitchThreshold), accountManager.fableQuotaCompat) : null,
         } : null;
         if (quotaRecoveryProbe && !quotaRecoveryProbe.isCurrent()) {
           quotaRecoveryProbe.onResponse(probeObservation);
@@ -4379,7 +4412,7 @@ async function forwardOnceInner({
             && req.method === 'POST'
             && target.pathname === '/v1/messages'
             && account.type !== 'apikey'
-            && requestModelFamily(body) === 'fable'
+            && requestModelFamily(body, accountManager.fableQuotaCompat) === 'fable'
             && !responseQuotaEvidence.hasIncompleteExhaustion
             && typeof secret?.accessToken === 'string'
             && secret.accessToken.length > 0
