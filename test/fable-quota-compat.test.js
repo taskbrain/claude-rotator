@@ -6,8 +6,7 @@ import { AccountManager } from '../src/account-manager.js';
 import { parseUsageResponse } from '../src/oauth.js';
 import { createProxyServer } from '../src/proxy-server.js';
 import {
-  configureFableQuotaCompat,
-  fableQuotaCompatEnabled,
+  fableQuotaCompatMode,
   isFableScopeIdentity,
   parseRateLimitHeaders,
   scopeMatchesModelFamily,
@@ -20,76 +19,83 @@ const cleanups = [];
 
 afterEach(async () => {
   for (const callback of cleanups.splice(0).reverse()) await callback();
-  configureFableQuotaCompat(undefined);
 });
+
+function oiHeaders(utilization, resetSeconds = futureSeconds) {
+  return {
+    'anthropic-ratelimit-unified-7d_oi-utilization': utilization,
+    'anthropic-ratelimit-unified-7d_oi-reset': resetSeconds,
+  };
+}
+
+function overageUsage(utilization, resetAt = START + 3_600_000) {
+  return parseUsageResponse({
+    seven_day_overage_included: { utilization, resets_at: new Date(resetAt).toISOString() },
+  });
+}
 
 describe('fableQuotaCompat scope names', () => {
   const compatNames = ['oi', 'OI', 'overage_included', 'Overage Included', 'overage-included'];
 
-  it('leaves the compat names unrecognised by default', () => {
-    assert.equal(fableQuotaCompatEnabled(), false);
+  it('leaves the compat names unrecognised unless the caller passes the setting', () => {
     for (const name of compatNames) {
       assert.equal(isFableScopeIdentity(name), false, name);
       assert.equal(isFableScopeIdentity(name, true), false, name);
+      assert.equal(isFableScopeIdentity(name, true, false), false, name);
       assert.equal(scopeMatchesModelFamily({ key: name }, 'fable', true), false, name);
+      assert.equal(scopeMatchesModelFamily({ key: name }, 'fable', true, false), false, name);
     }
   });
 
-  it('treats the compat names as the Fable weekly limit when on', () => {
-    assert.equal(configureFableQuotaCompat({ mode: 'on' }), 'on');
-    assert.equal(fableQuotaCompatEnabled(), true);
+  it('treats the compat names as the Fable weekly limit when the caller passes the setting', () => {
     for (const name of compatNames) {
-      assert.equal(isFableScopeIdentity(name), true, name);
-      assert.equal(scopeMatchesModelFamily({ key: name }, 'fable'), true, name);
-      assert.equal(scopeMatchesModelFamily({ key: name }, null, true), false, name);
+      assert.equal(isFableScopeIdentity(name, false, true), true, name);
+      assert.equal(scopeMatchesModelFamily({ key: name }, 'fable', false, true), true, name);
+      assert.equal(scopeMatchesModelFamily({ key: 'unrelated', label: name }, 'fable', false, true), true, name);
+      assert.equal(scopeMatchesModelFamily({ key: name }, null, true, true), false, name);
     }
     for (const name of ['oi_extra', 'overage', 'overage_included_2', 'sonnet']) {
-      assert.equal(isFableScopeIdentity(name, true), false, name);
+      assert.equal(isFableScopeIdentity(name, true, true), false, name);
     }
   });
 
   it('reads anything but an exact off or on as off', () => {
+    const manager = new AccountManager({ accounts: [{ id: 'sample' }], now: () => START });
     for (const raw of [undefined, null, true, 'on', {}, { mode: 'ON' }, { mode: 'yes' }, { mode: 1 }]) {
-      configureFableQuotaCompat({ mode: 'on' });
-      assert.equal(configureFableQuotaCompat(raw), 'off', JSON.stringify(raw));
-      assert.equal(fableQuotaCompatEnabled(), false);
+      assert.equal(fableQuotaCompatMode(raw), 'off', JSON.stringify(raw));
+      manager.configureFableQuotaCompat({ mode: 'on' });
+      assert.equal(manager.configureFableQuotaCompat(raw), 'off', JSON.stringify(raw));
+      assert.equal(manager.fableQuotaCompat, false);
     }
+    assert.equal(manager.configureFableQuotaCompat({ mode: 'on' }), 'on');
+    assert.equal(manager.fableQuotaCompat, true);
   });
 
-  it('labels the 7d_oi header window as Fable only when on', () => {
-    const headers = {
-      'anthropic-ratelimit-unified-7d_oi-utilization': '0.5',
-      'anthropic-ratelimit-unified-7d_oi-reset': futureSeconds,
-    };
-    const off = parseRateLimitHeaders(headers, { includeScopedWindows: true });
-    assert.deepEqual(off.weeklyScoped, [{ key: 'oi', label: 'oi', utilization: 0.5, resetAt: Number(futureSeconds) * 1000 }]);
-    configureFableQuotaCompat({ mode: 'on' });
-    const on = parseRateLimitHeaders(headers, { includeScopedWindows: true });
-    assert.deepEqual(on.weeklyScoped, [{ key: 'oi', label: 'Fable', utilization: 0.5, resetAt: Number(futureSeconds) * 1000 }]);
+  it('keeps the upstream name as the label of the 7d_oi header window', () => {
+    const parsed = parseRateLimitHeaders(oiHeaders('0.5'), { includeScopedWindows: true });
+    assert.deepEqual(parsed.weeklyScoped, [{ key: 'oi', label: 'oi', utilization: 0.5, resetAt: Number(futureSeconds) * 1000 }]);
   });
 });
 
 describe('fableQuotaCompat account availability', () => {
   for (const mode of ['off', 'on']) {
     it(`gates Fable on an exhausted 7d_oi header window only when on (compat=${mode})`, () => {
-      configureFableQuotaCompat({ mode });
-      const manager = new AccountManager({ accounts: [{ id: 'sample' }], now: () => START, planQuota: { mode: 'on' } });
-      manager.updateQuota('sample', {
-        'anthropic-ratelimit-unified-7d_oi-utilization': '1',
-        'anthropic-ratelimit-unified-7d_oi-reset': futureSeconds,
+      const manager = new AccountManager({
+        accounts: [{ id: 'sample' }], now: () => START, planQuota: { mode: 'on' }, fableQuotaCompat: { mode },
       });
+      manager.updateQuota('sample', oiHeaders('1'));
       const account = manager.find('sample');
+      assert.deepEqual(account.quota.weeklyScoped.map(limit => [limit.key, limit.label]), [['oi', 'oi']]);
       assert.equal(manager.isAvailable(account, 'fable'), mode === 'off');
       assert.equal(manager.isAvailable(account, null), true);
     });
 
     for (const planQuota of [null, { mode: 'on' }]) {
       it(`gates Fable on an exhausted seven_day_overage_included Usage bucket only when on (compat=${mode}, planQuota=${planQuota?.mode ?? 'unset'})`, () => {
-        configureFableQuotaCompat({ mode });
-        const manager = new AccountManager({ accounts: [{ id: 'sample' }], now: () => START, planQuota });
-        manager.applyUsage('sample', parseUsageResponse({
-          seven_day_overage_included: { utilization: 100, resets_at: new Date(START + 3_600_000).toISOString() },
-        }));
+        const manager = new AccountManager({
+          accounts: [{ id: 'sample' }], now: () => START, planQuota, fableQuotaCompat: { mode },
+        });
+        manager.applyUsage('sample', overageUsage(100));
         const account = manager.find('sample');
         assert.equal(account.quota.weeklyScoped[0].key, 'overage_included');
         assert.equal(manager.isAvailable(account, 'fable'), mode === 'off');
@@ -97,6 +103,87 @@ describe('fableQuotaCompat account availability', () => {
       });
     }
   }
+});
+
+describe('fableQuotaCompat belongs to one ledger', () => {
+  for (const order of [['on', 'off'], ['off', 'on']]) {
+    it(`keeps each ledger to its own setting (created ${order.join(' then ')})`, () => {
+      const managers = Object.fromEntries(order.map(mode => [mode, new AccountManager({
+        accounts: [{ id: 'header' }, { id: 'usage' }], now: () => START, planQuota: { mode: 'on' }, fableQuotaCompat: { mode },
+      })]));
+      for (const [mode, manager] of Object.entries(managers)) {
+        manager.updateQuota('header', oiHeaders('1'));
+        manager.applyUsage('usage', overageUsage(100));
+        for (const id of ['header', 'usage']) {
+          assert.equal(manager.isAvailable(manager.find(id), 'fable'), mode === 'off', `${mode}/${id}`);
+        }
+      }
+    });
+  }
+
+  it('stores the same ledger whether the setting is on or off', () => {
+    const states = ['on', 'off'].map(mode => {
+      const manager = new AccountManager({
+        accounts: [{ id: 'header' }, { id: 'usage' }], now: () => START, planQuota: { mode: 'on' }, fableQuotaCompat: { mode },
+      });
+      manager.updateQuota('header', {
+        ...oiHeaders('1'),
+        'anthropic-ratelimit-unified-7d_sonnet-utilization': '0.9',
+        'anthropic-ratelimit-unified-7d_sonnet-reset': futureSeconds,
+      });
+      manager.applyUsage('usage', overageUsage(100));
+      return JSON.stringify(manager.exportState());
+    });
+    assert.equal(states[0], states[1]);
+  });
+
+  it('stops gating Fable on windows read while on once turned off, and gates again when turned back on', () => {
+    const manager = new AccountManager({
+      accounts: [{ id: 'header' }, { id: 'usage' }], now: () => START, planQuota: { mode: 'on' }, fableQuotaCompat: { mode: 'on' },
+    });
+    manager.updateQuota('header', oiHeaders('1'));
+    manager.applyUsage('usage', overageUsage(100));
+    const accounts = ['header', 'usage'].map(id => manager.find(id));
+    for (const account of accounts) {
+      assert.equal(manager.isAvailable(account, 'fable'), false, account.id);
+      assert.equal(manager.unavailableReasonForModelFamily(account, 'fable')?.type, 'quota_exhausted', account.id);
+    }
+
+    manager.configureFableQuotaCompat({ mode: 'off' });
+    const fresh = new AccountManager({
+      accounts: [{ id: 'header' }, { id: 'usage' }], now: () => START, planQuota: { mode: 'on' },
+    });
+    fresh.updateQuota('header', oiHeaders('1'));
+    fresh.applyUsage('usage', overageUsage(100));
+    for (const account of accounts) {
+      assert.deepEqual(account.quota.weeklyScoped, fresh.find(account.id).quota.weeklyScoped, account.id);
+      assert.equal(manager.isAvailable(account, 'fable'), true, account.id);
+      assert.equal(manager.isAvailable(account, 'fable'), fresh.isAvailable(fresh.find(account.id), 'fable'), account.id);
+      assert.equal(manager.unavailableReasonForModelFamily(account, 'fable'), null, account.id);
+    }
+
+    manager.configureFableQuotaCompat({ mode: 'on' });
+    for (const account of accounts) assert.equal(manager.isAvailable(account, 'fable'), false, account.id);
+  });
+
+  it('reads a restored ledger by the setting applied after the restore', () => {
+    const source = new AccountManager({
+      accounts: [{ id: 'header' }, { id: 'usage' }], now: () => START, planQuota: { mode: 'on' }, fableQuotaCompat: { mode: 'on' },
+    });
+    source.updateQuota('header', oiHeaders('1'));
+    source.applyUsage('usage', overageUsage(100));
+    const saved = JSON.parse(JSON.stringify(source.exportState()));
+    for (const mode of ['off', 'on']) {
+      const restored = new AccountManager({
+        accounts: [{ id: 'header' }, { id: 'usage' }], now: () => START, planQuota: { mode: 'on' },
+      });
+      restored.restoreState(saved);
+      restored.configureFableQuotaCompat({ mode });
+      for (const id of ['header', 'usage']) {
+        assert.equal(restored.isAvailable(restored.find(id), 'fable'), mode === 'off', `${mode}/${id}`);
+      }
+    }
+  });
 });
 
 async function listen(server) {
@@ -122,7 +209,7 @@ async function post(url, body) {
   });
 }
 
-async function startProxy({ fableQuotaCompat, usageCalls }) {
+async function startProxy({ fableQuotaCompat, usageCalls, planQuota, reloadFableQuotaCompat = null }) {
   const seen = [];
   const upstream = await listen(http.createServer((req, res) => {
     seen.push(req.headers.authorization);
@@ -145,7 +232,13 @@ async function startProxy({ fableQuotaCompat, usageCalls }) {
     secretStore,
     allowLiveClaudeCodeCredentials: false,
     currentCredentialReader: async () => null,
-    config: { upstream: upstream.url, usagePolling: { enabled: false }, ...(fableQuotaCompat === undefined ? {} : { fableQuotaCompat }) },
+    config: {
+      upstream: upstream.url,
+      usagePolling: { enabled: false },
+      ...(fableQuotaCompat === undefined ? {} : { fableQuotaCompat }),
+      ...(planQuota === undefined ? {} : { planQuota }),
+    },
+    reloadFableQuotaCompat,
     logger: line => lines.push(line),
     usageFetcher: async () => {
       usageCalls.count += 1;
@@ -158,7 +251,7 @@ async function startProxy({ fableQuotaCompat, usageCalls }) {
     await close(proxy.server);
     await close(upstream.server);
   });
-  return { url: proxy.url, seen, lines };
+  return { url: proxy.url, seen, lines, accountManager };
 }
 
 describe('fableQuotaCompat reactive Usage confirmation', () => {
@@ -206,8 +299,49 @@ describe('fableQuotaCompat reactive Usage confirmation', () => {
     const h = await startProxy({ fableQuotaCompat: { mode: 'enabled' }, usageCalls });
     assert.deepEqual(h.lines.filter(line => line.includes('fable-quota-compat')),
       ['fable-quota-compat warning=invalid-mode mode=off']);
-    assert.equal(fableQuotaCompatEnabled(), false);
+    assert.equal(h.accountManager.fableQuotaCompat, false);
     assert.equal((await post(`${h.url}/v1/messages`, { model: 'claude-fable-5-2' })).status, 429);
     assert.equal(usageCalls.count, 0);
+  });
+});
+
+describe('fableQuotaCompat belongs to one relay', () => {
+  for (const order of [['on', 'off'], ['off', 'on']]) {
+    it(`keeps each relay in one process to its own setting (started ${order.join(' then ')})`, async () => {
+      const relays = {};
+      for (const mode of order) {
+        const usageCalls = { count: 0 };
+        relays[mode] = { usageCalls, h: await startProxy({ fableQuotaCompat: { mode }, usageCalls }) };
+      }
+      for (const [mode, { usageCalls, h }] of Object.entries(relays)) {
+        const response = await post(`${h.url}/v1/messages`, { model: 'claude-fable-5-2' });
+        assert.equal(response.status, mode === 'on' ? 200 : 429, mode);
+        assert.equal(usageCalls.count, mode === 'on' ? 1 : 0, mode);
+        h.accountManager.applyUsage('acct_1', overageUsage(100, Date.now() + 86_400_000));
+        assert.equal(h.accountManager.isAvailable(h.accountManager.find('acct_1'), 'fable'), mode === 'off', mode);
+      }
+    });
+  }
+
+  it('drops and restores the reading of stored windows across internal reloads', async () => {
+    const usageCalls = { count: 0 };
+    let next = { mode: 'on' };
+    const h = await startProxy({
+      fableQuotaCompat: { mode: 'on' }, planQuota: { mode: 'on' }, usageCalls, reloadFableQuotaCompat: async () => next,
+    });
+    const resetSeconds = String(Math.floor((Date.now() + 86_400_000) / 1000));
+    h.accountManager.updateQuota('acct_1', oiHeaders('1', resetSeconds));
+    h.accountManager.applyUsage('acct_2', overageUsage(100, Date.now() + 86_400_000));
+    const available = () => ['acct_1', 'acct_2'].map(id => h.accountManager.isAvailable(h.accountManager.find(id), 'fable'));
+    assert.deepEqual(available(), [false, false]);
+
+    next = { mode: 'off' };
+    assert.equal((await post(`${h.url}/internal/reload`, {})).status, 200);
+    assert.deepEqual(available(), [true, true]);
+    assert.equal(h.accountManager.fableQuotaCompat, false);
+
+    next = { mode: 'on' };
+    assert.equal((await post(`${h.url}/internal/reload`, {})).status, 200);
+    assert.deepEqual(available(), [false, false]);
   });
 });
