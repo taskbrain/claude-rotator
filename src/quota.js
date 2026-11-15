@@ -24,6 +24,36 @@ export function planQuotaMode(raw) {
   return ['off', 'shadow', 'on'].includes(raw?.mode) ? raw.mode : 'off';
 }
 
+// `fableQuotaCompat` setting. Newer Claude Code builds report the Fable weekly
+// limit under the scope name `oi` (header `anthropic-ratelimit-unified-7d_oi-*`)
+// and `overage_included` (Usage API `seven_day_overage_included`). With the
+// setting on, those names count as the Fable limit everywhere a scope name is
+// matched, whatever planQuota / accountUrgency say. It is process-wide because
+// the scope matchers are plain functions used by every module; the proxy
+// server sets it from its config at start-up and on reload. Off by default.
+const FABLE_QUOTA_COMPAT_SCOPE_NAMES = new Set(['oi', 'overage_included']);
+let fableQuotaCompatOn = false;
+
+export function fableQuotaCompatMode(raw) {
+  return ['off', 'on'].includes(raw?.mode) ? raw.mode : 'off';
+}
+
+export function configureFableQuotaCompat(raw) {
+  const mode = fableQuotaCompatMode(raw);
+  fableQuotaCompatOn = mode === 'on';
+  return mode;
+}
+
+export function fableQuotaCompatEnabled() {
+  return fableQuotaCompatOn;
+}
+
+/** True only while the setting is on and `value` is one of the compat scope names. */
+export function isFableQuotaCompatScope(value) {
+  return fableQuotaCompatOn && typeof value === 'string'
+    && FABLE_QUOTA_COMPAT_SCOPE_NAMES.has(value.trim().toLowerCase().replace(/[^a-z0-9]+/g, '_'));
+}
+
 export function isValidQuotaWindow(utilization, resetAt, now) {
   return Number.isFinite(utilization) && utilization >= 0 && Number.isFinite(resetAt) && resetAt > now;
 }
@@ -274,7 +304,8 @@ export function isFableScopeIdentity(value, extended = false) {
   if (typeof value !== 'string') return false;
   const identity = value.trim().toLowerCase();
   return ['fable', 'fable 5', 'fable5', 'fable_5', 'claude-fable-5', 'claude_fable_5'].includes(identity)
-    || (extended && /^(?:claude[-_])?fable(?:[ _-]?\d+(?:[._-]\d+)*)?$/.test(identity));
+    || (extended && /^(?:claude[-_])?fable(?:[ _-]?\d+(?:[._-]\d+)*)?$/.test(identity))
+    || isFableQuotaCompatScope(identity);
 }
 
 /**

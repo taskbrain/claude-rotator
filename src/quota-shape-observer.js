@@ -2,13 +2,15 @@ import { createHash } from 'node:crypto';
 
 // Fixed names bound both key characters/length and output size. Unknown suffixes
 // and model labels never become log keys or values.
-const USAGE_KEYS = ['five_hour', 'seven_day', 'seven_day_sonnet', 'seven_day_opus', 'seven_day_fable', 'seven_day_oauth_apps', 'seven_day_cowork'];
+const USAGE_KEYS = ['five_hour', 'seven_day', 'seven_day_sonnet', 'seven_day_opus', 'seven_day_fable', 'seven_day_overage_included', 'seven_day_oauth_apps', 'seven_day_cowork'];
 const LIMIT_KINDS = ['session', 'weekly_all', 'weekly_scoped'];
 const HEADER_NAMES = [
   'anthropic-ratelimit-unified-5h-utilization',
   'anthropic-ratelimit-unified-7d-utilization',
   'anthropic-ratelimit-unified-5h-reset',
   'anthropic-ratelimit-unified-7d-reset',
+  'anthropic-ratelimit-unified-7d_oi-utilization',
+  'anthropic-ratelimit-unified-7d_oi-reset',
   'anthropic-ratelimit-unified-grace-5h-utilization',
   'anthropic-ratelimit-unified-grace-7d-utilization',
   'anthropic-ratelimit-unified-reset',

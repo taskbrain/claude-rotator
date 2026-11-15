@@ -32,7 +32,14 @@ import {
 } from './oauth.js';
 import { createNativeClaudeRefresher } from './native-claude-refresher.js';
 import { createRefreshLogFields } from './refresh-log-fields.js';
-import { isFableScopeIdentity, parseRateLimitHeaders, scopeMatchesModelFamily } from './quota.js';
+import {
+  configureFableQuotaCompat,
+  fableQuotaCompatEnabled,
+  isFableQuotaCompatScope,
+  isFableScopeIdentity,
+  parseRateLimitHeaders,
+  scopeMatchesModelFamily,
+} from './quota.js';
 import { createQuotaShapeObserver } from './quota-shape-observer.js';
 import { duplicateRefreshTokenAccountIds } from './secret-store.js';
 // 観測整備（PR #42）が sticky から切り出した純関数。実装は `./session-key.js` の
@@ -146,6 +153,7 @@ export function createProxyServer({
   reloadSessionAffinity = null,
   reloadAccountUrgency = null,
   reloadPlanQuota = null,
+  reloadFableQuotaCompat = null,
   reloadObservability = null,
   allowLiveClaudeCodeCredentials = true,
   tokenRefresher = null,
@@ -495,6 +503,22 @@ export function createProxyServer({
   }
   configureUrgency();
   accountManager.configurePlanQuota(config.planQuota);
+  // `fableQuotaCompat` (off unless the section says exactly "on"). A section
+  // with any other mode is read as off and logged once; an absent section or an
+  // explicit "off" logs nothing, so the default configuration's log is unchanged.
+  // The line is written again only when it changes across reloads.
+  let fableQuotaCompatNotice = null;
+  function applyFableQuotaCompat() {
+    const raw = config.fableQuotaCompat;
+    const mode = configureFableQuotaCompat(raw);
+    const notice = mode === 'on' ? 'fable-quota-compat mode=on'
+      : raw != null && raw.mode !== 'off' ? 'fable-quota-compat warning=invalid-mode mode=off' : null;
+    if (notice && notice !== fableQuotaCompatNotice) {
+      try { logger?.(notice); } catch {}
+    }
+    fableQuotaCompatNotice = notice;
+  }
+  applyFableQuotaCompat();
   accountManager.setQuotaRecoveryPersistence(Boolean(stateWriter), usagePollingEnabled(config));
   let pollingWarningShown = false;
   function warnWithoutUsagePolling() {
@@ -876,6 +900,8 @@ export function createProxyServer({
         configureUrgency();
         if (reloadPlanQuota) config.planQuota = await reloadPlanQuota();
         accountManager.configurePlanQuota(config.planQuota);
+        if (reloadFableQuotaCompat) config.fableQuotaCompat = await reloadFableQuotaCompat();
+        applyFableQuotaCompat();
         accountManager.setQuotaRecoveryPersistence(Boolean(stateWriter), usagePollingEnabled(config));
         warnWithoutUsagePolling();
         // キャッシュ観測の再読込。セクションが無い・config.json 自体が無い
@@ -1853,10 +1879,18 @@ function positiveTimeoutOrDefault(value, fallback) {
 function requestModelFamily(body) {
   try {
     const model = JSON.parse(body.toString('utf8'))?.model;
-    return isCanonicalFableModelId(model) ? 'fable' : null;
+    return isCanonicalFableModelId(model) || isFableQuotaCompatModelId(model) ? 'fable' : null;
   } catch {
     return null;
   }
+}
+
+// With `fableQuotaCompat` on, later Fable 5 point releases (`claude-fable-5-2`,
+// ...) also enter reactive Usage confirmation. Still an exact match: one or two
+// digits without a leading zero, no trim, no case folding, and no date or build
+// suffix (an eight-digit date such as `claude-fable-5-20260818` stays out).
+function isFableQuotaCompatModelId(value) {
+  return fableQuotaCompatEnabled() && typeof value === 'string' && /^claude-fable-5-[1-9][0-9]?$/.test(value);
 }
 
 // Exact canonical id match only (no trim/lowercase/regex). Used to gate
@@ -2512,7 +2546,9 @@ function scopedUsageIdentity(limit) {
     .toLowerCase()
     .replace(/[^a-z0-9]+/g, '_')
     .replace(/^_+|_+$/g, '');
-  return isFableScopeIdentity(value) ? 'fable' : (value || 'scoped');
+  // A `fableQuotaCompat` name keeps its own identity here, so a payload that
+  // carries both it and the `fable` scope keeps both readings when merged.
+  return isFableScopeIdentity(value) && !isFableQuotaCompatScope(value) ? 'fable' : (value || 'scoped');
 }
 
 function usageEvidenceConfirmsRequest(fields, threshold, modelFamily, nowMs, extended = false) {

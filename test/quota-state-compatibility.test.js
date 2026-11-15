@@ -78,6 +78,25 @@ describe('default-off bytes against fixed revisions', () => {
   });
   after(async () => { if (directory && !mismatch) await rm(directory, { recursive: true, force: true }); });
 
+  // Names added to the observer's fixed lists after the observation baseline.
+  // Each one adds exactly one shape key to a quota_shape line; dropping just
+  // those keys must give back the baseline bytes.
+  const LATER_OBSERVED_NAMES = [
+    'anthropic-ratelimit-unified-7d_oi-utilization',
+    'anthropic-ratelimit-unified-7d_oi-reset',
+    'seven_day_overage_included',
+  ];
+  function withoutLaterObservedNames(encodedLogs) {
+    const lines = JSON.parse(Buffer.from(encodedLogs, 'base64').toString());
+    return Buffer.from(JSON.stringify(lines.map(line => {
+      if (!line.startsWith('{')) return line;
+      const event = JSON.parse(line);
+      if (event.event !== 'quota_shape') return line;
+      for (const name of LATER_OBSERVED_NAMES) delete event.shape[name];
+      return JSON.stringify(event);
+    }))).toString('base64');
+  }
+
   function equalBytes(actual, expected, label) {
     const left = Buffer.from(actual, 'base64');
     const right = Buffer.from(expected, 'base64');
@@ -114,7 +133,8 @@ describe('default-off bytes against fixed revisions', () => {
       assert.ok(main.observation[id]);
       assert.ok(parent.observation[id]);
       for (const field of httpFields) {
-        equalBytes(current.observation[id][field], parent.observation[id][field], `${id}/parent/${field}`);
+        const actual = field === 'logs' ? withoutLaterObservedNames(current.observation[id].logs) : current.observation[id][field];
+        equalBytes(actual, parent.observation[id][field], `${id}/parent/${field}`);
         if (field !== 'logs') equalBytes(current.observation[id][field], main.observation[id][field], `${id}/main/${field}`);
       }
       const logs = JSON.parse(Buffer.from(current.observation[id].logs, 'base64').toString());
