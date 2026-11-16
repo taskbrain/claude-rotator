@@ -3057,6 +3057,87 @@ If `refresh-usage` fails for every account with `fetch failed`, `OAuth connectio
 curl -I --connect-timeout 10 --max-time 20 https://api.anthropic.com/api/oauth/usage
 ```
 
+### Separate credential swap proxy
+
+`claude-rotator credential-swap serve --config <path>` starts a separate,
+loopback-only process. It does not start the existing server, refresh credentials,
+install a service, or change Claude Code settings. The existing `server` command
+and default configuration are unchanged.
+
+The explicit config file accepts a `credentialSwap` object:
+
+```json
+{
+  "credentialSwap": {
+    "enabled": false,
+    "listenPort": 37991,
+    "expiryMarginMs": 300000,
+    "legacyProxyUrl": "http://127.0.0.1:37891",
+    "stateDir": "/absolute/separate/swap-state",
+    "callers": [],
+    "swapAccounts": []
+  }
+}
+```
+
+The feature defaults to off. Malformed explicit settings reject startup; an
+invalid reload rejects new requests until a valid configuration is restored.
+`stateDir` must be an absolute, separate directory. `legacyProxyUrl` accepts only
+numeric loopback HTTP origins. Listener port and state directory changes require
+a restart. File watching and a 250 ms periodic reread apply configuration changes
+independently of credential reads. The optional `requestTimeoutMs` defaults to
+180000 and limits upstream connection/response inactivity.
+
+Every request requires exactly one `x-claude-rotator-caller` header. A caller
+registration has `sha256` (64 lowercase hex characters), `accountId` (the display
+identity), and `expiresAt` (epoch milliseconds). Missing, unknown, duplicated or
+expired caller credentials receive a fixed 401 before any credential read or
+upstream connection. Caller generation, registration and launcher integration
+are not included. Incoming Bearer values and account selection headers do not
+establish caller identity. All `x-claude-rotator-*` headers are stripped.
+
+When enabled, exactly one `swapAccounts` entry is required. Its fields are `id`,
+`configDir`, `service`, `acct`, `keychainPath`, and `keychainAllowlist` (absolute
+file paths). `service` must equal `claudeKeychainServiceName(configDir)` from
+`src/claude-keychain.js`; the unsuffixed default service is rejected. The reader
+checks the user search list without reading passwords, enumerates attributes
+only in allowlisted files (`dump-keychain`, without decryption options), requires
+one exact service/account match, then reads it with `find-generic-password -w`
+and explicit service, account and file arguments. It compares attributes and
+search targets before and after the read. Ambiguous or unrecognised output fails
+closed. No write, refresh, alternate file or default Keychain fallback exists.
+Only access token and expiry leave the reader; no token is persisted or logged.
+Unknown, expired or within-margin expiry produces a fixed 503, with distinct
+non-secret event reason codes.
+
+Only exact `POST /v1/messages` requests (including a query, excluding a trailing
+slash) receive the selected account's Authorization. A swapped request drops
+the incoming `x-api-key` to avoid mixed authentication. Other requests go to the
+fixed Anthropic upstream with their original authentication, except `/internal`
+and `/internal/*`, which return a local 404 after caller authentication in both
+modes (queries do not affect this check). Absolute request targets are rejected.
+When off, authenticated inference goes to `legacyProxyUrl`
+with its original authentication and no Keychain read. Dispatch fixes the
+destination; failures and configuration changes never replay a sent request.
+
+A swapped upstream 401 becomes a fixed 503. A swapped 403 also persists an
+inference stop marker in `stateDir`; off and restart do not clear that stop.
+The stop blocks swapping while enabled; turning off still sends new unsent
+inference to the legacy proxy, and turning on again restores the block. Startup
+also stops swapping on leftover stop-write temporary files or a missing persist
+canary after a prior start. If all stop writes and canary deletion fail, restart
+cannot detect the failed persist. Other requests can still pass through.
+There is no automatic reset endpoint.
+SSE is streamed with backpressure and cancellation propagation. Events under
+`stateDir/events` contain only request ID, route, swap flag, display/sent account
+IDs, status code and fixed reason code. Headers, request paths/queries, bodies,
+credentials and credential hashes are excluded.
+
+The Keychain adapter and HTTP behavior are covered by fake-executor and ephemeral
+loopback tests. These do not establish live Keychain compatibility, account
+billing attribution, or atomicity with concurrent external credential updates.
+Selection policies and session affinity are outside this implementation.
+
 ### Security Design
 
 - The proxy binds only to loopback, and rejects any non-loopback `Host` and any cross-site browser request.

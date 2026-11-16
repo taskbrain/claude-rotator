@@ -137,6 +137,22 @@ export async function runCli(argv = [], deps = {}) {
       return 0;
     }
 
+    if (command === 'credential-swap') {
+      if (argv.length !== 4 || argv[1] !== 'serve' || argv[2] !== '--config' || !argv[3]) {
+        error('Usage: claude-rotator credential-swap serve --config <path>\n');
+        return 1;
+      }
+      try {
+        const serve = deps.serveCredentialSwap
+          || (await import('./credential-swap.js')).serveCredentialSwap;
+        await serve({ configPath: argv[3], write });
+        return 0;
+      } catch {
+        error('credential_swap_serve_failed\n');
+        return 1;
+      }
+    }
+
     if (command === MACOS_HIDDEN_SERVICE_ACTION) {
       if (platform !== 'darwin') throw new Error('Internal macOS service action is macOS-only');
       assertMacosServiceLockHeld(env);
@@ -330,6 +346,7 @@ export function helpText() {
   claude-rotator install [--no-start] [--force]
   claude-rotator uninstall [--purge-secrets] [--force]
   claude-rotator server
+  claude-rotator credential-swap serve --config <path>
   claude-rotator status
   claude-rotator monitor
   claude-rotator switch <account>
