@@ -12,7 +12,7 @@ import { claudeKeychainServiceName } from '../src/claude-keychain.js';
 import { createDefaultConfig, loadConfig } from '../src/config.js';
 import { runCli } from '../src/cli.js';
 import { normalizeCredentialSwap } from '../src/credential-swap-config.js';
-import { appConfigDir, runtimeStatePath } from '../src/paths.js';
+import { appConfigDir, appDataDir, linuxAccountsDir, runtimeStatePath } from '../src/paths.js';
 import { createSwapKeychainReader, credentialExpiryReason } from '../src/credential-swap-keychain.js';
 import { authenticateCaller, CALLER_HEADER, createCredentialSwapServer,
   forwardHeaders, isSwapRequest, serveCredentialSwap } from '../src/credential-swap.js';
@@ -33,7 +33,8 @@ async function sandbox(t, cleanup = true) {
   const root = await mkdtemp(join(tmpdir(), 'credential-swap-test-'));
   if (cleanup) t.after(() => rm(root, { recursive: true, force: true }));
   const account = { id: 'swap-test', configDir: join(root, 'account-config'), acct: 'test-keychain-account',
-    keychainPath: join(root, 'test.keychain-db'), keychainAllowlist: [join(root, 'test.keychain-db')] };
+    keychainPath: join(root, 'keychains', 'test.keychain-db'),
+    keychainAllowlist: [join(root, 'keychains', 'test.keychain-db')] };
   account.service = claudeKeychainServiceName(account.configDir);
   const config = { credentialSwap: { enabled: true, stateDir: join(root, 'state'),
     callers: [{ sha256: hash(CALLER), accountId: 'display-test', expiresAt: NOW + 60_000 }],
@@ -230,7 +231,8 @@ async function listen(server) {
   return `http://127.0.0.1:${server.address().port}`;
 }
 
-async function unbound(t, { keychain, now = () => NOW, watchImpl, prepare, stateIO, mockConnect = true } = {}) {
+async function unbound(t, { keychain, now = () => NOW, watchImpl, prepare, stateIO,
+  readConfigFile, pollMs, mockConnect = true } = {}) {
   const s = await sandbox(t, false);
   await prepare?.(s);
   const configPath = join(s.root, 'swap-settings.json');
@@ -244,7 +246,7 @@ async function unbound(t, { keychain, now = () => NOW, watchImpl, prepare, state
     t.mock.method(http, 'request', refuseConnect);
     t.mock.method(https, 'request', refuseConnect);
   }
-  const instance = await createCredentialSwapServer({ configPath, now, watchImpl, stateIO,
+  const instance = await createCredentialSwapServer({ configPath, now, watchImpl, stateIO, readConfigFile, pollMs,
     keychain: { read: (...args) => { reads++; return keychain?.read(...args); } } });
   t.after(async () => { await instance.close(); await rm(s.root, { recursive: true, force: true }); });
   return { ...s, instance, configPath, get reads() { return reads; }, get connects() { return connects; } };
@@ -350,6 +352,39 @@ test('expiry reasons distinguish unknown, expired, margin boundary and usable', 
   assert.equal(credentialExpiryReason(NOW, NOW, 300_000), 'credential_expired');
   assert.equal(credentialExpiryReason(NOW + 300_000, NOW, 300_000), 'credential_within_margin');
   assert.equal(credentialExpiryReason(NOW + 300_001, NOW, 300_000), null);
+});
+
+test('a reload requested during an old config read waits for a fresh read of the new config', async t => {
+  const entered = defer();
+  const release = defer();
+  let reads = 0;
+  const h = await unbound(t, { watchImpl: () => ({ close() {}, on() {} }), pollMs: 60_000,
+    readConfigFile: async (...args) => {
+      const contents = await readFile(...args);
+      reads++;
+      if (reads === 2) { entered.resolve(); await release.promise; }
+      return contents;
+    },
+  });
+  const oldReload = h.instance.reload();
+  await entered.promise;
+  try {
+    h.config.credentialSwap.enabled = false;
+    await writeFile(h.configPath, JSON.stringify(h.config));
+    let completed = false;
+    const newReload = h.instance.reload().then(() => { completed = true; });
+    await new Promise(setImmediate);
+    assert.equal(reads, 2);
+    assert.equal(completed, false);
+    assert.equal(h.instance.enabled, true);
+    release.resolve();
+    await oldReload;
+    await newReload;
+    assert.equal(reads, 3);
+    assert.equal(h.instance.enabled, false);
+    assert.equal(h.reads, 0);
+    assert.equal(h.connects, 0);
+  } finally { release.resolve(); }
 });
 
 test('a malformed persisted stop marker fences enabled inference after reopening', async t => {
@@ -866,7 +901,7 @@ test('event write failure fences only swapping and preserves off rollback and pa
   });
   const calls = stubTransport(t, 200);
   t.mock.method(https, 'request', http.request);
-  assert.equal((await directRequest(h.instance, { headers: {} })).status, 401);
+  assert.equal((await directRequest(h.instance, { path: '/internal' })).status, 404);
   await h.instance.flushEvents();
   assert.equal((await directRequest(h.instance)).status, 503);
   assert.equal(h.reads, 0);
@@ -903,7 +938,7 @@ test('off reroutes an unsent credential wait after event storage fails without r
   } });
   await entered.promise;
   try {
-    assert.equal((await directRequest(h.instance, { headers: {} })).status, 401);
+    assert.equal((await directRequest(h.instance, { path: '/internal' })).status, 404);
     await h.instance.flushEvents();
     h.config.credentialSwap.enabled = false;
     h.config.credentialSwap.legacyProxyUrl = 'http://127.0.0.1:12345';
@@ -981,6 +1016,46 @@ test('Keychain ignores unrelated null, escaped and unparseable attributes from a
   assert.equal(fake.reads, 1);
 });
 
+test('Keychain reads the anonymized dump timedate with octal NUL and one or two separator spaces', async t => {
+  const { account } = await sandbox(t);
+  const fixture = await readFile(new URL('../fixtures/credential-swap-dump-mdat.txt', import.meta.url), 'utf8');
+  const unrelated = await readFile(new URL('../fixtures/credential-swap-unrelated-attributes.txt', import.meta.url), 'utf8');
+  assert.equal(fixture.includes('\0'), false);
+  assert.match(fixture, /^ {4}"mdat"<timedate>=0x[0-9A-Fa-f]{32} {2}"\d{14}Z\\000"$/m);
+  for (const spaces of [' ', '  ']) {
+    const dump = (fixture.replace(/ {2}(?="\d{14}Z)/, spaces) + unrelated)
+      .replaceAll('@KEYCHAIN@', account.keychainPath).replaceAll('@ACCOUNT@', account.acct)
+      .replaceAll('@SERVICE@', account.service);
+    const fake = fakeExecutor(account, { dump: () => dump });
+    const reader = createSwapKeychainReader({ execute: fake.execute, now: () => NOW });
+    assert.equal((await reader.read(account, { marginMs: 300_000 })).accessToken, ACCESS);
+    assert.equal(fake.reads, 1);
+    const duplicate = fakeExecutor(account, { dump: () => dump + attributes(account) });
+    await assert.rejects(createSwapKeychainReader({ execute: duplicate.execute, now: () => NOW })
+      .read(account, { marginMs: 300_000 }), /^Error: credential_unavailable$/);
+    assert.equal(duplicate.reads, 0);
+  }
+});
+
+test('dump quotes decode octal bytes but reject JSON-only and malformed escapes on possible matches', async t => {
+  const { account } = await sandbox(t);
+  const octal = fakeExecutor(account, { dump: () => attributes(account, {
+    acct: account.acct.replaceAll('-', '\\055'),
+  }) });
+  await createSwapKeychainReader({ execute: octal.execute, now: () => NOW })
+    .read(account, { marginMs: 300_000 });
+  assert.equal(octal.reads, 1);
+  const dumps = [attributes(account, { acct: account.acct.replaceAll('-', '\\u002d') }),
+    ...['20330518033320Z\\u0000', '20330518033320Z\\0', '20330518033320Z\\400',
+      '20330518033320Z\0', '20330518033320Z\\n'].map(mdat => attributes(account, { mdat }))];
+  for (const dump of dumps) {
+    const fake = fakeExecutor(account, { dump: () => dump });
+    await assert.rejects(createSwapKeychainReader({ execute: fake.execute, now: () => NOW })
+      .read(account, { marginMs: 300_000 }), /^Error: credential_unavailable$/);
+    assert.equal(fake.reads, 0);
+  }
+});
+
 for (const malformed of ['unknown_account', 'unknown_service', 'duplicate_account']) {
   test(`Keychain rejects ambiguous potentially matching attributes: ${malformed}`, async t => {
     const { account } = await sandbox(t);
@@ -1037,17 +1112,46 @@ test('same-second attribute changes reject a credential even when mdat is unchan
 });
 
 test('state directory rejects overlaps with existing application state before filesystem access', async t => {
-  const { config, root } = await sandbox(t);
-  for (const protectedPath of [appConfigDir(), runtimeStatePath()]) {
+  const { config, root, account } = await sandbox(t);
+  for (const protectedPath of [appConfigDir(), runtimeStatePath(), appDataDir(), linuxAccountsDir(),
+    account.configDir, dirname(account.keychainPath)]) {
     for (const stateDir of [protectedPath, dirname(protectedPath), join(protectedPath, 'swap'),
       `${protectedPath}/child/..`, `${protectedPath}/`]) {
       config.credentialSwap.stateDir = stateDir;
       assert.throws(() => normalizeCredentialSwap(config), /^Error: invalid_swap_config$/);
     }
   }
-  for (const stateDir of [join(root, 'isolated'), `${appConfigDir()}-separate`]) {
+  for (const stateDir of [join(root, 'isolated'), `${appConfigDir()}-separate`,
+    `${appDataDir()}-separate`, `${account.configDir}-separate`, `${dirname(account.keychainPath)}-separate`]) {
     config.credentialSwap.stateDir = stateDir;
     assert.equal(normalizeCredentialSwap(config).stateDir, stateDir);
+  }
+});
+
+test('state separation follows this process environment for config, data and account roots', async t => {
+  const { config, root } = await sandbox(t);
+  const saved = Object.fromEntries(['XDG_CONFIG_HOME', 'XDG_DATA_HOME'].map(key => [key, process.env[key]]));
+  try {
+    process.env.XDG_CONFIG_HOME = join(root, 'config-home');
+    process.env.XDG_DATA_HOME = join(root, 'data-home');
+    assert.equal(appConfigDir(), join(root, 'config-home', 'claude-rotator'));
+    assert.equal(appDataDir(), join(root, 'data-home', 'claude-rotator'));
+    assert.equal(linuxAccountsDir(), join(root, 'data-home', 'claude-rotator', 'accounts'));
+    config.credentialSwap.enabled = false;
+    config.credentialSwap.swapAccounts = [];
+    for (const protectedPath of [appConfigDir(), appDataDir(), linuxAccountsDir()]) {
+      for (const stateDir of [protectedPath, dirname(protectedPath), join(protectedPath, 'swap')]) {
+        config.credentialSwap.stateDir = stateDir;
+        assert.throws(() => normalizeCredentialSwap(config), /^Error: invalid_swap_config$/);
+      }
+    }
+    config.credentialSwap.stateDir = join(root, 'isolated');
+    assert.equal(normalizeCredentialSwap(config).stateDir, config.credentialSwap.stateDir);
+  } finally {
+    for (const [key, value] of Object.entries(saved)) {
+      if (value === undefined) delete process.env[key];
+      else process.env[key] = value;
+    }
   }
 });
 
@@ -1093,7 +1197,77 @@ test('event retention trims oversized historical files on startup and deletion f
   } finally { await instance.close(); }
 });
 
-test('a saturated event queue stays bounded and permits off rollback', async t => {
+test('pre-authentication floods leave all authenticated event slots available and swapping enabled', async t => {
+  const entered = defer();
+  const release = defer();
+  const { writeJsonFileDurable } = await import('../src/json-file.js');
+  let eventWrites = 0;
+  const h = await unbound(t, { mockConnect: false,
+    keychain: { read: async () => ({ accessToken: ACCESS, expiresAt: NOW + 3_600_000 }) },
+    stateIO: { async writeJsonFileDurable(path, ...args) {
+      if (dirname(path).endsWith('/events')) {
+        eventWrites++;
+        entered.resolve();
+        await release.promise;
+      }
+      return writeJsonFileDurable(path, ...args);
+    } },
+  });
+  const calls = stubTransport(t, 200);
+  t.mock.method(https, 'request', http.request);
+  assert.equal((await directRequest(h.instance, { headers: {} })).status, 401);
+  await entered.promise;
+  try {
+    const replies = await Promise.all(Array.from({ length: 512 }, (_, index) => directRequest(h.instance,
+      index % 2 ? { headers: {} } : { path: 'http://example.invalid/v1/messages' })));
+    assert.equal(replies.filter(reply => reply.status === 401).length, 256);
+    assert.equal(replies.filter(reply => reply.status === 400).length, 256);
+    assert.equal(h.reads, 0);
+    assert.equal(calls.length, 0);
+    const authenticated = await Promise.all(Array.from({ length: 127 }, () =>
+      directRequest(h.instance, { path: '/internal' })));
+    assert.equal(authenticated.every(reply => reply.status === 404), true);
+    assert.equal((await directRequest(h.instance)).status, 200);
+    assert.equal(h.reads, 1);
+    assert.equal(calls.length, 1);
+    assert.equal(eventWrites, 1);
+  } finally { release.resolve(); }
+  await h.instance.flushEvents();
+  assert.equal(eventWrites, 129);
+  assert.equal((await readdir(join(h.config.credentialSwap.stateDir, 'events'))).length, 128);
+  assert.equal((await directRequest(h.instance)).status, 200);
+  assert.equal(h.reads, 2);
+  assert.equal(calls.length, 2);
+});
+
+test('pre-authentication event write failures do not fence later authenticated swaps', async t => {
+  const { writeJsonFileDurable } = await import('../src/json-file.js');
+  let rejectedWrites = 0;
+  const h = await unbound(t, { mockConnect: false,
+    keychain: { read: async () => ({ accessToken: ACCESS, expiresAt: NOW + 3_600_000 }) },
+    stateIO: { writeJsonFileDurable(path, event, ...args) {
+      if (dirname(path).endsWith('/events') && event.displayAccountId === null) {
+        rejectedWrites++;
+        throw new Error('injected_rejection_write_failure');
+      }
+      return writeJsonFileDurable(path, event, ...args);
+    } },
+  });
+  const calls = stubTransport(t, 200);
+  t.mock.method(https, 'request', http.request);
+  for (const [options, status] of [[{ headers: {} }, 401], [{ path: '//example.invalid/v1/messages' }, 400]]) {
+    assert.equal((await directRequest(h.instance, options)).status, status);
+    await h.instance.flushEvents();
+    assert.equal((await directRequest(h.instance)).status, 200);
+    await h.instance.flushEvents();
+  }
+  assert.equal(rejectedWrites, 2);
+  assert.equal(h.reads, 2);
+  assert.equal(calls.length, 2);
+  assert.equal((await readdir(join(h.config.credentialSwap.stateDir, 'events'))).length, 2);
+});
+
+test('a saturated authenticated event queue stays bounded and permits off rollback', async t => {
   const entered = defer();
   const release = defer();
   const { writeJsonFileDurable } = await import('../src/json-file.js');
@@ -1108,11 +1282,11 @@ test('a saturated event queue stays bounded and permits off rollback', async t =
       return writeJsonFileDurable(path, ...args);
     },
   } });
-  assert.equal((await directRequest(h.instance, { headers: {} })).status, 401);
+  assert.equal((await directRequest(h.instance, { path: '/internal' })).status, 404);
   await entered.promise;
   try {
-    const replies = await Promise.all(Array.from({ length: 128 }, () => directRequest(h.instance, { headers: {} })));
-    assert.equal(replies.every(reply => reply.status === 401), true);
+    const replies = await Promise.all(Array.from({ length: 128 }, () => directRequest(h.instance, { path: '/internal' })));
+    assert.equal(replies.every(reply => reply.status === 404), true);
     assert.equal((await directRequest(h.instance)).status, 503);
     h.config.credentialSwap.enabled = false;
     h.config.credentialSwap.legacyProxyUrl = 'http://127.0.0.1:12345';

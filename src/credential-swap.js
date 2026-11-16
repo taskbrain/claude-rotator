@@ -43,8 +43,9 @@ export function forwardHeaders(headers) {
 // The CLI supplies neither transport nor credential overrides. Tests can use
 // an ephemeral loopback upstream and a fake read-only Keychain executor.
 export async function createCredentialSwapServer({ configPath, keychain = createSwapKeychainReader(),
-  upstream = UPSTREAM, now = Date.now, pollMs = 250, watchImpl = watch, stateIO = {} } = {}) {
-  let config = await readSettings(configPath);
+  upstream = UPSTREAM, now = Date.now, pollMs = 250, watchImpl = watch, stateIO = {},
+  readConfigFile = readFile } = {}) {
+  let config = await readSettings(configPath, readConfigFile);
   if (!config) throw swapError('swap_config_required');
   const initial = config;
   let valid = true;
@@ -95,6 +96,7 @@ export async function createCredentialSwapServer({ configPath, keychain = create
   let eventBytes = 0;
   let eventTail = Promise.resolve();
   let queuedEvents = 0;
+  let rejectionPending = false;
   async function trimEvents(extraFiles = 0, extraBytes = 0) {
     while (eventFiles.length + extraFiles > MAX_EVENT_FILES || eventBytes + extraBytes > MAX_EVENT_BYTES) {
       const oldest = eventFiles[0];
@@ -120,7 +122,7 @@ export async function createCredentialSwapServer({ configPath, keychain = create
     // followed by await reload() cannot join a read that began against the old file.
     const run = reloadChain.then(async () => {
       try {
-        const next = await readSettings(configPath);
+        const next = await readSettings(configPath, readConfigFile);
         if (!next || next.stateDir !== initial.stateDir || next.listenPort !== initial.listenPort)
           throw swapError();
         if (!valid || JSON.stringify(next) !== JSON.stringify(config)) {
@@ -148,8 +150,16 @@ export async function createCredentialSwapServer({ configPath, keychain = create
 
   function record(event) {
     if (stateFailed) return;
-    if (queuedEvents >= MAX_EVENT_FILES) { stateFailed = true; return; }
-    queuedEvents++;
+    const authenticated = event.displayAccountId !== null;
+    if (authenticated) {
+      if (queuedEvents >= MAX_EVENT_FILES) { stateFailed = true; return; }
+      queuedEvents++;
+    } else {
+      // Best-effort rejections cannot consume authenticated queue capacity or
+      // stop inference. Keep at most one outstanding pre-authentication record.
+      if (rejectionPending) return;
+      rejectionPending = true;
+    }
     const pending = eventTail.then(async () => {
       if (stateFailed) return;
       const size = Buffer.byteLength(`${JSON.stringify(event, null, 2)}\n`);
@@ -159,8 +169,9 @@ export async function createCredentialSwapServer({ configPath, keychain = create
       await writeStateDurable(join(eventsDir, name), event);
       eventFiles.push({ name, size });
       eventBytes += size;
-    }).catch(() => { stateFailed = true; }).finally(() => {
-      queuedEvents--;
+    }).catch(() => { if (authenticated) stateFailed = true; }).finally(() => {
+      if (authenticated) queuedEvents--;
+      else rejectionPending = false;
       pendingEvents.delete(pending);
     });
     eventTail = pending;
@@ -248,7 +259,8 @@ export async function createCredentialSwapServer({ configPath, keychain = create
             fail(503, EXPIRY_REASONS.has(error?.message) ? error.message : 'credential_unavailable'); return;
           }
           if (generation.aborted) continue;
-          if (stopped || stateFailed) { fail(503, 'inference_stopped'); return; }
+          if (stopped) { fail(503, 'inference_stopped'); return; }
+          if (stateFailed) { fail(503, 'state_unavailable'); return; }
           if (!authenticateCaller(req, selected, now())) { fail(401, 'caller_unauthorized'); return; }
           const expiryReason = credentialExpiryReason(credential.expiresAt, now(), selected.expiryMarginMs);
           if (expiryReason) {
@@ -322,8 +334,8 @@ export async function createCredentialSwapServer({ configPath, keychain = create
   };
 }
 
-async function readSettings(path) {
-  try { return normalizeCredentialSwap(JSON.parse(await readFile(path, 'utf8'))); }
+async function readSettings(path, readConfigFile) {
+  try { return normalizeCredentialSwap(JSON.parse(await readConfigFile(path, 'utf8'))); }
   catch { throw swapError('invalid_swap_config'); }
 }
 

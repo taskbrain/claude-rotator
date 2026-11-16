@@ -3083,8 +3083,11 @@ The explicit config file accepts a `credentialSwap` object:
 The feature defaults to off. Malformed explicit settings reject startup; an
 invalid reload rejects new requests until a valid configuration is restored.
 `stateDir` must be an absolute, separate directory. After lexical normalization,
-the application config directory and runtime state path, their descendants and
-their ancestors are rejected. This check does not resolve filesystem aliases;
+the application config directory, runtime state path, application data directory,
+account storage root, each swap account's `configDir`, and the parent directory
+of each `keychainPath`, their descendants and their ancestors are rejected.
+Environment-dependent paths are resolved using this process's environment.
+This check does not resolve filesystem aliases;
 use a dedicated directory without symlink aliases to existing application state.
 `legacyProxyUrl` accepts only
 numeric loopback HTTP origins. Listener port and state directory changes require
@@ -3118,6 +3121,12 @@ and explicit service, account and file arguments. It compares attributes and
 search targets before and after the read. Unrelated entries with null, escaped
 or unrecognised attributes are skipped when either identity field proves a
 mismatch. An unrecognised field on a possible match still fails closed.
+Dump attribute quotes accept escaped quotes, backslashes and three-digit octal
+bytes, including the literal trailing `\000` in modification times. Hex prefixes
+may be separated from the quoted value by one or more spaces or tabs. The
+simplified quoted modification time without `\000` is also accepted. JSON-only
+escapes such as `\u0000` are not interpreted as dump escapes; unknown or malformed
+escapes on a possible match fail closed.
 No write, refresh, alternate file or default Keychain fallback exists.
 Only access token and expiry leave the reader; no token is persisted or logged.
 Unknown, expired or within-margin expiry produces a fixed 503, with distinct
@@ -3163,9 +3172,16 @@ credentials and credential hashes are excluded.
 Oldest events are removed before each durable write to retain at most 128 files
 and 64 KiB in total; startup also trims existing files to those limits. A single
 temporary write may add one event's size until rename completes. Event writes
-and eviction are serialized, with at most 128 queued records. Write, eviction
-or queue-capacity failure disables further event recording and blocks new
-enabled inference until restart. Turning off still forwards new unsent
+and eviction are serialized, with at most 128 authenticated records plus one
+best-effort pre-authentication rejection outstanding. Further pre-authentication
+records are dropped while that slot is occupied. Their write or eviction failures
+do not stop inference or disable authenticated recording. They can therefore be
+absent from the event history, and no complete count of rejected requests is
+retained. Authenticated write, eviction or queue-capacity failure, and startup
+retention failure, disable further event recording and block new enabled
+inference until restart. State failures use `state_unavailable`; a persisted
+403 stop uses `inference_stopped`. Slow storage and an authenticated flood can
+still exhaust the authenticated queue. Turning off still forwards new unsent
 inference to legacy with its original authentication and no Keychain read,
 even when events cannot be recorded; other authenticated passthrough also
 remains available. Already dispatched requests are never replayed.

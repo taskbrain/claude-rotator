@@ -96,11 +96,12 @@ async function snapshot(account, execute, signal) {
 function attribute(block, key, kind) {
   const lines = block.split('\n').filter(line => line.trimStart().startsWith(`"${key}"`));
   if (lines.length !== 1) return undefined;
-  const value = lines[0].trim().replace(new RegExp(`^"${key}"<${kind}>=`), '');
+  const value = lines[0].trim().match(new RegExp(`^"${key}"<${kind}>=(.*)$`))?.[1];
   if (value === '<NULL>') return null;
-  const quoted = value.replace(/^0x[0-9A-Fa-f]+\s+/, '');
-  try {
-    const parsed = JSON.parse(quoted);
-    return typeof parsed === 'string' ? parsed : undefined;
-  } catch { return undefined; }
+  const quoted = value?.replace(/^0x[0-9A-Fa-f]+[ \t]+/, '');
+  // Attribute dumps use quoted characters and three-digit octal byte escapes,
+  // including a timedate's trailing \\000. JSON escapes are a different grammar.
+  const match = quoted?.match(/^"((?:[^"\\\x00-\x1f\x7f]|\\(?:["\\]|[0-3][0-7]{2}))*)"$/);
+  return match?.[1].replace(/\\(["\\]|[0-3][0-7]{2})/g, (_escape, escaped) =>
+    escaped.length === 3 ? String.fromCharCode(parseInt(escaped, 8)) : escaped);
 }

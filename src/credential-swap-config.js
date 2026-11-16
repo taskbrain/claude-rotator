@@ -1,6 +1,6 @@
-import { isAbsolute, resolve, sep } from 'node:path';
+import { dirname, isAbsolute, resolve, sep } from 'node:path';
 import { claudeKeychainServiceName, DEFAULT_CLAUDE_KEYCHAIN_SERVICE } from './claude-keychain.js';
-import { appConfigDir, runtimeStatePath } from './paths.js';
+import { appConfigDir, appDataDir, linuxAccountsDir, runtimeStatePath } from './paths.js';
 
 const object = value => value !== null && typeof value === 'object' && !Array.isArray(value);
 const text = value => typeof value === 'string' && value.length > 0 && !/[\x00-\x1f\x7f"\\]/.test(value);
@@ -52,8 +52,6 @@ export function normalizeCredentialSwap(config) {
     || result.swapAccounts.length > 1
     || (result.enabled && result.swapAccounts.length !== 1)) throw swapError('invalid_swap_config');
   result.stateDir = resolve(result.stateDir);
-  if ([appConfigDir(), runtimeStatePath()].some(protectedPath =>
-    overlaps(result.stateDir, resolve(protectedPath)))) throw swapError('invalid_swap_config');
   try {
     if (typeof result.legacyProxyUrl !== 'string') throw swapError();
     const url = new URL(result.legacyProxyUrl);
@@ -69,6 +67,10 @@ export function normalizeCredentialSwap(config) {
     hashes.add(caller.sha256);
   }
   for (const account of result.swapAccounts) validateSwapAccount(account);
+  const protectedPaths = [appConfigDir(), runtimeStatePath(), appDataDir(), linuxAccountsDir(),
+    ...result.swapAccounts.flatMap(account => [account.configDir, dirname(account.keychainPath)])];
+  if (protectedPaths.some(protectedPath => overlaps(result.stateDir, resolve(protectedPath))))
+    throw swapError('invalid_swap_config');
   return structuredClone(result);
 }
 
