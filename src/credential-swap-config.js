@@ -1,5 +1,6 @@
-import { isAbsolute } from 'node:path';
+import { isAbsolute, resolve, sep } from 'node:path';
 import { claudeKeychainServiceName, DEFAULT_CLAUDE_KEYCHAIN_SERVICE } from './claude-keychain.js';
+import { appConfigDir, runtimeStatePath } from './paths.js';
 
 const object = value => value !== null && typeof value === 'object' && !Array.isArray(value);
 const text = value => typeof value === 'string' && value.length > 0 && !/[\x00-\x1f\x7f"\\]/.test(value);
@@ -9,6 +10,21 @@ const integer = (value, min, max = Number.MAX_SAFE_INTEGER) => Number.isSafeInte
 
 export function swapError(reason = 'credential_unavailable') {
   return new Error(reason);
+}
+
+const STARTUP_REASONS = new Set(['invalid_swap_config', 'swap_config_required',
+  'swap_state_unavailable', 'swap_port_in_use', 'swap_listen_unavailable']);
+
+export function credentialSwapStartupReason(error) {
+  if (STARTUP_REASONS.has(error?.message)) return error.message;
+  if (error?.code === 'EADDRINUSE') return 'swap_port_in_use';
+  if (['EACCES', 'EPERM', 'EADDRNOTAVAIL'].includes(error?.code)) return 'swap_listen_unavailable';
+  return 'credential_swap_serve_failed';
+}
+
+function overlaps(left, right) {
+  return left === right || left.startsWith(right.endsWith(sep) ? right : right + sep)
+    || right.startsWith(left.endsWith(sep) ? left : left + sep);
 }
 
 export function normalizeCredentialSwap(config) {
@@ -35,6 +51,9 @@ export function normalizeCredentialSwap(config) {
     || !Array.isArray(result.swapAccounts)
     || result.swapAccounts.length > 1
     || (result.enabled && result.swapAccounts.length !== 1)) throw swapError('invalid_swap_config');
+  result.stateDir = resolve(result.stateDir);
+  if ([appConfigDir(), runtimeStatePath()].some(protectedPath =>
+    overlaps(result.stateDir, resolve(protectedPath)))) throw swapError('invalid_swap_config');
   try {
     if (typeof result.legacyProxyUrl !== 'string') throw swapError();
     const url = new URL(result.legacyProxyUrl);

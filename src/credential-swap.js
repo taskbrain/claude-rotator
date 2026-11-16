@@ -1,15 +1,17 @@
 import { createHash, randomUUID, timingSafeEqual } from 'node:crypto';
-import { watch } from 'node:fs';
-import { mkdir, readFile, readdir, writeFile } from 'node:fs/promises';
+import { constants as fsConstants, watch } from 'node:fs';
+import { lstat, mkdir, open, readFile, readdir, writeFile } from 'node:fs/promises';
 import http from 'node:http';
 import https from 'node:https';
-import { dirname, join, resolve } from 'node:path';
-import { normalizeCredentialSwap, swapError } from './credential-swap-config.js';
+import { dirname, join, posix, resolve } from 'node:path';
+import { credentialSwapStartupReason, normalizeCredentialSwap, swapError } from './credential-swap-config.js';
 import { createSwapKeychainReader, credentialExpiryReason, EXPIRY_REASONS } from './credential-swap-keychain.js';
 import { removeFileDurable, writeJsonFileDurable } from './json-file.js';
 
 export const CALLER_HEADER = 'x-claude-rotator-caller';
 const UPSTREAM = 'https://api.anthropic.com';
+const MAX_EVENT_FILES = 128;
+const MAX_EVENT_BYTES = 64 * 1024;
 const HOP_HEADERS = ['connection', 'keep-alive', 'proxy-authenticate', 'proxy-authorization',
   'te', 'trailer', 'transfer-encoding', 'upgrade'];
 
@@ -56,12 +58,16 @@ export async function createCredentialSwapServer({ configPath, keychain = create
   const startedPath = join(config.stateDir, 'started-once');
   const canaryPath = join(config.stateDir, 'persist-canary');
   const writeStopFile = stateIO.writeFile || writeFile;
+  const openState = stateIO.open || open;
   const writeStateDurable = stateIO.writeJsonFileDurable || writeJsonFileDurable;
   const removeStateDurable = stateIO.removeFileDurable || removeFileDurable;
   async function persistStop() {
     try {
       // Establish presence before the temporary-file/rename sequence can fail.
-      await writeStopFile(stoppedPath, '', { mode: 0o600 });
+      await writeStopFile(stoppedPath, '', { mode: 0o600, flush: true });
+      const directory = await openState(config.stateDir, fsConstants.O_RDONLY);
+      try { await directory.sync(); }
+      finally { await directory.close(); }
       await writeStateDurable(stoppedPath, { stopped: true, reason: 'upstream_forbidden' });
     } catch {
       // A missing canary fences a later start even if no stop file was created.
@@ -83,10 +89,36 @@ export async function createCredentialSwapServer({ configPath, keychain = create
     }
   } catch { throw swapError('swap_state_unavailable'); }
 
-  let reloading;
-  async function reload() {
-    if (reloading) return reloading;
-    reloading = (async () => {
+  // Serialize writes and evictions so concurrent completions cannot exceed
+  // either retention bound. Temporary files share the same dedicated directory.
+  const eventFiles = [];
+  let eventBytes = 0;
+  let eventTail = Promise.resolve();
+  let queuedEvents = 0;
+  async function trimEvents(extraFiles = 0, extraBytes = 0) {
+    while (eventFiles.length + extraFiles > MAX_EVENT_FILES || eventBytes + extraBytes > MAX_EVENT_BYTES) {
+      const oldest = eventFiles[0];
+      await removeStateDurable(join(eventsDir, oldest.name));
+      eventFiles.shift();
+      eventBytes -= oldest.size;
+    }
+  }
+  try {
+    for (const name of await readdir(eventsDir)) {
+      const info = await lstat(join(eventsDir, name));
+      if (!info.isFile()) throw swapError();
+      eventFiles.push({ name, size: info.size, mtime: info.mtimeMs });
+      eventBytes += info.size;
+    }
+    eventFiles.sort((a, b) => a.mtime - b.mtime || a.name.localeCompare(b.name));
+    await trimEvents();
+  } catch { stateFailed = true; }
+
+  let reloadChain = Promise.resolve();
+  function reload() {
+    // Each caller waits for a pass that starts after this request, so a write
+    // followed by await reload() cannot join a read that began against the old file.
+    const run = reloadChain.then(async () => {
       try {
         const next = await readSettings(configPath);
         if (!next || next.stateDir !== initial.stateDir || next.listenPort !== initial.listenPort)
@@ -102,8 +134,9 @@ export async function createCredentialSwapServer({ configPath, keychain = create
         epoch.abort();
         epoch = new AbortController();
       }
-    })().finally(() => { reloading = null; });
-    return reloading;
+    });
+    reloadChain = run.catch(() => {});
+    return run;
   }
   let watcher;
   try {
@@ -114,8 +147,23 @@ export async function createCredentialSwapServer({ configPath, keychain = create
   timer.unref();
 
   function record(event) {
-    const pending = writeJsonFileDurable(join(eventsDir, `${event.requestId}.json`), event)
-      .catch(() => { stateFailed = true; }).finally(() => pendingEvents.delete(pending));
+    if (stateFailed) return;
+    if (queuedEvents >= MAX_EVENT_FILES) { stateFailed = true; return; }
+    queuedEvents++;
+    const pending = eventTail.then(async () => {
+      if (stateFailed) return;
+      const size = Buffer.byteLength(`${JSON.stringify(event, null, 2)}\n`);
+      if (size > MAX_EVENT_BYTES) throw swapError();
+      await trimEvents(1, size);
+      const name = `${event.requestId}.json`;
+      await writeStateDurable(join(eventsDir, name), event);
+      eventFiles.push({ name, size });
+      eventBytes += size;
+    }).catch(() => { stateFailed = true; }).finally(() => {
+      queuedEvents--;
+      pendingEvents.delete(pending);
+    });
+    eventTail = pending;
     pendingEvents.add(pending);
   }
 
@@ -165,15 +213,24 @@ export async function createCredentialSwapServer({ configPath, keychain = create
       while (!logged) {
         const selected = config;
         const generation = epoch.signal;
-        if (!valid || stateFailed || closed) { fail(503, 'config_unavailable'); return; }
+        if (!valid || closed) { fail(503, 'config_unavailable'); return; }
         const display = authenticateCaller(req, selected, now());
         if (!display) { fail(401, 'caller_unauthorized'); return; }
         event.displayAccountId = display;
         const path = req.url.split('?', 1)[0];
+        // Keep routing exact: reject encoded or noncanonical paths rather than
+        // forwarding a target that another HTTP layer could interpret differently.
+        let decoded;
+        try { decoded = decodeURIComponent(path); }
+        catch { fail(400, 'invalid_target'); return; }
+        if (decoded !== path || posix.normalize(decoded) !== path) {
+          fail(400, 'invalid_target'); return;
+        }
         if (path === '/internal' || path.startsWith('/internal/')) {
           fail(404, 'internal_target'); return;
         }
         if (inference && stopped && selected.enabled) { fail(503, 'inference_stopped'); return; }
+        if (inference && stateFailed && selected.enabled) { fail(503, 'state_unavailable'); return; }
         const headers = forwardHeaders(req.headers);
         let destination = upstream;
         event.route = inference ? (selected.enabled ? 'swap' : 'legacy') : 'passthrough';
@@ -294,6 +351,6 @@ export async function serveCredentialSwap({ configPath, write = text => process.
       process.once('SIGINT', stop);
       process.once('SIGTERM', stop);
     });
-  } catch { throw swapError('credential_swap_serve_failed'); }
+  } catch (error) { throw swapError(credentialSwapStartupReason(error)); }
   finally { await instance?.close(); }
 }

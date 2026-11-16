@@ -147,8 +147,9 @@ export async function runCli(argv = [], deps = {}) {
           || (await import('./credential-swap.js')).serveCredentialSwap;
         await serve({ configPath: argv[3], write });
         return 0;
-      } catch {
-        error('credential_swap_serve_failed\n');
+      } catch (caught) {
+        const { credentialSwapStartupReason } = await import('./credential-swap-config.js');
+        error(`${credentialSwapStartupReason(caught)}\n`);
         return 1;
       }
     }

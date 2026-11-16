@@ -3,7 +3,8 @@ import { promisify } from 'node:util';
 import { swapError, validateSwapAccount } from './credential-swap-config.js';
 
 const exec = promisify(execFile);
-export const EXPIRY_REASONS = new Set(['credential_expiry_unknown', 'credential_expired', 'credential_within_margin']);
+export const EXPIRY_REASONS = new Set(['credential_expiry_unknown', 'credential_expired',
+  'credential_within_margin', 'credential_expiry_rollback']);
 
 export function credentialExpiryReason(expiresAt, now, marginMs) {
   if (!Number.isSafeInteger(expiresAt) || expiresAt <= 0) return 'credential_expiry_unknown';
@@ -16,6 +17,7 @@ export function credentialExpiryReason(expiresAt, now, marginMs) {
 // request decryption; password reads always name the exact service, acct and file.
 export function createSwapKeychainReader({ execute = exec, now = Date.now } = {}) {
   let tail = Promise.resolve();
+  const latestExpiry = new Map();
   return {
     async read(account, { marginMs, signal } = {}) {
       validateSwapAccount(account);
@@ -42,6 +44,9 @@ export function createSwapKeychainReader({ execute = exec, now = Date.now } = {}
           || !/^[\x21-\x7e]+$/.test(credential.accessToken)) throw swapError();
         const reason = credentialExpiryReason(credential.expiresAt, now(), marginMs);
         if (reason) throw swapError(reason);
+        const identity = JSON.stringify([account.configDir, account.service, account.acct, account.keychainPath]);
+        if (credential.expiresAt < (latestExpiry.get(identity) ?? 0)) throw swapError('credential_expiry_rollback');
+        latestExpiry.set(identity, credential.expiresAt);
         return { accessToken: credential.accessToken, expiresAt: credential.expiresAt };
       } catch (error) { throw swapError(EXPIRY_REASONS.has(error?.message) ? error.message : undefined); }
       finally { release(); }
@@ -75,8 +80,11 @@ async function snapshot(account, execute, signal) {
       if (!/^class: "genp"$/m.test(block)) continue;
       const acct = attribute(block, 'acct', 'blob');
       const service = attribute(block, 'svce', 'blob');
-      if (acct === null || service === null) throw swapError();
-      if (acct !== account.acct || service !== account.service) continue;
+      // A known mismatch proves the item unrelated even if its other field is
+      // unrecognised. Unknown fields on a possible match must still fail closed.
+      if ((acct !== undefined && acct !== account.acct)
+        || (service !== undefined && service !== account.service)) continue;
+      if (acct === undefined || service === undefined) throw swapError();
       if (file !== account.keychainPath || !attribute(block, 'mdat', 'timedate')) throw swapError();
       matches.push(block.trim());
     }
@@ -86,6 +94,13 @@ async function snapshot(account, execute, signal) {
 }
 
 function attribute(block, key, kind) {
-  const matches = [...block.matchAll(new RegExp(`^\\s*"${key}"<${kind}>=(?:0x[0-9A-Fa-f]+ )?"([^"\\\\]*)"\\s*$`, 'gm'))];
-  return matches.length === 1 ? matches[0][1] : null;
+  const lines = block.split('\n').filter(line => line.trimStart().startsWith(`"${key}"`));
+  if (lines.length !== 1) return undefined;
+  const value = lines[0].trim().replace(new RegExp(`^"${key}"<${kind}>=`), '');
+  if (value === '<NULL>') return null;
+  const quoted = value.replace(/^0x[0-9A-Fa-f]+\s+/, '');
+  try {
+    const parsed = JSON.parse(quoted);
+    return typeof parsed === 'string' ? parsed : undefined;
+  } catch { return undefined; }
 }

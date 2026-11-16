@@ -1,20 +1,21 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
-import { mkdir, mkdtemp, readFile, readdir, rename, rm, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, open, readFile, readdir, rename, rm, stat, writeFile } from 'node:fs/promises';
 import http from 'node:http';
 import https from 'node:https';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
-import { PassThrough, Writable } from 'node:stream';
+import { dirname, join } from 'node:path';
+import { PassThrough, Readable, Writable } from 'node:stream';
 import { setTimeout as delay } from 'node:timers/promises';
 import { claudeKeychainServiceName } from '../src/claude-keychain.js';
 import { createDefaultConfig, loadConfig } from '../src/config.js';
 import { runCli } from '../src/cli.js';
 import { normalizeCredentialSwap } from '../src/credential-swap-config.js';
+import { appConfigDir, runtimeStatePath } from '../src/paths.js';
 import { createSwapKeychainReader, credentialExpiryReason } from '../src/credential-swap-keychain.js';
 import { authenticateCaller, CALLER_HEADER, createCredentialSwapServer,
-  forwardHeaders, isSwapRequest } from '../src/credential-swap.js';
+  forwardHeaders, isSwapRequest, serveCredentialSwap } from '../src/credential-swap.js';
 
 const CALLER = 'test-caller-credential-not-real';
 const ACCESS = 'test-access-token-not-real';
@@ -838,4 +839,378 @@ test('HTTP events and errors contain no dummy secrets, request bodies, queries o
   assert.equal(event.displayAccountId, 'display-test');
   assert.equal(event.sentAccountId, 'swap-test');
   assert.equal(event.reason, 'upstream_unauthorized');
+});
+
+for (const enabled of [true, false]) {
+  test(`noncanonical internal paths are rejected after authentication (enabled=${enabled})`, async t => {
+    const h = await unbound(t, { prepare: s => { s.config.credentialSwap.enabled = enabled; } });
+    for (const path of ['/v1/../internal/reload', '/%69nternal/reload', '/%2e/internal',
+      '/v1/%2e%2e/internal/reload', '/internal%2freload', '/internal//reload',
+      '/%2569nternal/reload', '/internal%5creload', '/bad%xx']) {
+      assert.equal((await directRequest(h.instance, { path, headers: {} })).status, 401, path);
+      assert.equal((await directRequest(h.instance, { path })).status, 400, path);
+    }
+    assert.equal(h.reads, 0);
+    assert.equal(h.connects, 0);
+  });
+}
+
+test('event write failure fences only swapping and preserves off rollback and passthrough', async t => {
+  const { writeJsonFileDurable } = await import('../src/json-file.js');
+  const h = await unbound(t, { mockConnect: false,
+    keychain: { read: async () => ({ accessToken: ACCESS, expiresAt: NOW + 3_600_000 }) },
+    stateIO: { writeJsonFileDurable(path, ...args) {
+      if (dirname(path).endsWith('/events')) throw new Error(ACCESS);
+      return writeJsonFileDurable(path, ...args);
+    } },
+  });
+  const calls = stubTransport(t, 200);
+  t.mock.method(https, 'request', http.request);
+  assert.equal((await directRequest(h.instance, { headers: {} })).status, 401);
+  await h.instance.flushEvents();
+  assert.equal((await directRequest(h.instance)).status, 503);
+  assert.equal(h.reads, 0);
+  h.config.credentialSwap.enabled = false;
+  h.config.credentialSwap.legacyProxyUrl = 'http://127.0.0.1:12345';
+  await writeFile(h.configPath, JSON.stringify(h.config));
+  await h.instance.reload();
+  const headers = { [CALLER_HEADER]: CALLER, authorization: `Bearer ${DISPLAY}`, 'x-api-key': DISPLAY };
+  assert.equal((await directRequest(h.instance, { headers })).status, 200);
+  assert.equal((await directRequest(h.instance, { headers, path: '/api/hello' })).status, 200);
+  assert.equal(calls.length, 2);
+  assert.equal(calls[0].target, 'http://127.0.0.1:12345/');
+  assert.equal(calls[0].headers.authorization, `Bearer ${DISPLAY}`);
+  assert.equal(calls[0].headers['x-api-key'], DISPLAY);
+  assert.equal(calls[1].headers.authorization, `Bearer ${DISPLAY}`);
+  assert.equal(h.reads, 0);
+});
+
+test('off reroutes an unsent credential wait after event storage fails without replay', async t => {
+  const entered = defer();
+  const release = defer();
+  const { writeJsonFileDurable } = await import('../src/json-file.js');
+  const h = await unbound(t, { mockConnect: false, keychain: { read: async () => {
+    entered.resolve(); await release.promise;
+    return { accessToken: ACCESS, expiresAt: NOW + 3_600_000 };
+  } }, stateIO: { writeJsonFileDurable(path, ...args) {
+    if (dirname(path).endsWith('/events')) throw new Error('injected_event_failure');
+    return writeJsonFileDurable(path, ...args);
+  } } });
+  const calls = stubTransport(t, 200);
+  t.mock.method(https, 'request', http.request);
+  const pending = directRequest(h.instance, { headers: {
+    [CALLER_HEADER]: CALLER, authorization: `Bearer ${DISPLAY}`,
+  } });
+  await entered.promise;
+  try {
+    assert.equal((await directRequest(h.instance, { headers: {} })).status, 401);
+    await h.instance.flushEvents();
+    h.config.credentialSwap.enabled = false;
+    h.config.credentialSwap.legacyProxyUrl = 'http://127.0.0.1:12345';
+    await writeFile(h.configPath, JSON.stringify(h.config));
+    await h.instance.reload();
+    assert.equal((await pending).status, 200);
+    assert.equal(calls.length, 1);
+    assert.equal(calls[0].target, 'http://127.0.0.1:12345/');
+    assert.equal(calls[0].headers.authorization, `Bearer ${DISPLAY}`);
+    assert.equal(h.reads, 1);
+  } finally { release.resolve(); }
+  await new Promise(setImmediate);
+  assert.equal(calls.length, 1);
+});
+
+for (const failure of [null, 'file_sync', 'directory_sync']) {
+  test(`empty stop marker is durable before replacement (${failure || 'success'})`, async t => {
+    const operations = [];
+    let injected = false;
+    const { writeJsonFileDurable, removeFileDurable } = await import('../src/json-file.js');
+    const h = await unbound(t, { mockConnect: false,
+      keychain: { read: async () => ({ accessToken: ACCESS, expiresAt: NOW + 3_600_000 }) },
+      stateIO: {
+        async writeFile(path, body, options) {
+          operations.push('empty_file');
+          assert.equal(body, '');
+          assert.equal(options.flush, true);
+          await writeFile(path, body, options);
+          if (failure === 'file_sync') { injected = true; throw new Error('injected_sync_failure'); }
+        },
+        async open(path, flags) {
+          const handle = await open(path, flags);
+          return { async sync() {
+            operations.push('directory_sync');
+            if (failure === 'directory_sync') { injected = true; throw new Error('injected_sync_failure'); }
+            await handle.sync();
+          }, close: () => handle.close() };
+        },
+        writeJsonFileDurable(path, ...args) {
+          if (path.endsWith('/stopped.json')) operations.push('replace');
+          return writeJsonFileDurable(path, ...args);
+        },
+        async removeFileDurable(path) {
+          operations.push('remove_canary');
+          assert.ok(path.endsWith('/persist-canary'));
+          return removeFileDurable(path);
+        },
+      },
+    });
+    stubTransport(t, 403);
+    t.mock.method(https, 'request', http.request);
+    assert.equal((await directRequest(h.instance)).status, 503);
+    assert.equal(injected, Boolean(failure));
+    assert.deepEqual(operations, failure === 'file_sync' ? ['empty_file', 'remove_canary']
+      : failure === 'directory_sync' ? ['empty_file', 'directory_sync', 'remove_canary']
+        : ['empty_file', 'directory_sync', 'replace']);
+    const dir = h.config.credentialSwap.stateDir;
+    assert.equal((await readdir(dir)).includes('persist-canary'), !failure);
+    await h.instance.close();
+    const reopened = await createCredentialSwapServer({ configPath: h.configPath, now: () => NOW,
+      keychain: { read() { throw new Error('unexpected_test_read'); } } });
+    try { assert.equal((await directRequest(reopened)).status, 503); }
+    finally { await reopened.close(); }
+  });
+}
+
+test('Keychain ignores unrelated null, escaped and unparseable attributes from a fixture', async t => {
+  const { account } = await sandbox(t);
+  const fixture = (await readFile(new URL('../fixtures/credential-swap-unrelated-attributes.txt', import.meta.url), 'utf8'))
+    .replaceAll('@KEYCHAIN@', account.keychainPath);
+  const fake = fakeExecutor(account, { dump: () => fixture + attributes(account) });
+  const credential = await createSwapKeychainReader({ execute: fake.execute, now: () => NOW })
+    .read(account, { marginMs: 300_000 });
+  assert.equal(credential.accessToken, ACCESS);
+  assert.equal(fake.reads, 1);
+});
+
+for (const malformed of ['unknown_account', 'unknown_service', 'duplicate_account']) {
+  test(`Keychain rejects ambiguous potentially matching attributes: ${malformed}`, async t => {
+    const { account } = await sandbox(t);
+    let ambiguous = attributes(account);
+    if (malformed === 'unknown_account') ambiguous = ambiguous.replace(`="${account.acct}"`, '=unrecognised-test-format');
+    if (malformed === 'unknown_service') ambiguous = ambiguous.replace(`="${account.service}"`, '=unrecognised-test-format');
+    if (malformed === 'duplicate_account') ambiguous += `    "acct"<blob>="unrelated-test-account"\n`;
+    const fake = fakeExecutor(account, { dump: () => attributes(account) + ambiguous });
+    await assert.rejects(createSwapKeychainReader({ execute: fake.execute, now: () => NOW })
+      .read(account, { marginMs: 300_000 }), /^Error: credential_unavailable$/);
+    assert.equal(fake.reads, 0);
+  });
+}
+
+test('expiry rollback is rejected without dispatch and a fresh reader accepts a valid shorter reissue', async t => {
+  let expiry = NOW + 3_600_000;
+  let token = ACCESS;
+  const h = await sandbox(t, false);
+  const fake = fakeExecutor(h.account, { read: () => ({ stdout: JSON.stringify({ claudeAiOauth: {
+    accessToken: token, expiresAt: expiry,
+  } }) }) });
+  const reader = createSwapKeychainReader({ execute: fake.execute, now: () => NOW });
+  const configPath = join(h.root, 'swap-settings.json');
+  await writeFile(configPath, JSON.stringify(h.config));
+  const instance = await createCredentialSwapServer({ configPath, now: () => NOW, keychain: reader });
+  t.after(async () => { await instance.close(); await rm(h.root, { recursive: true, force: true }); });
+  const calls = stubTransport(t, 200);
+  t.mock.method(https, 'request', http.request);
+  assert.equal((await directRequest(instance)).status, 200);
+  expiry = NOW + 1_800_000;
+  token = 'test-reissued-token-not-real';
+  assert.equal((await directRequest(instance)).status, 503);
+  assert.equal((await directRequest(instance)).status, 503);
+  assert.equal(calls.length, 1);
+  await instance.flushEvents();
+  const reasons = await Promise.all((await readdir(join(h.config.credentialSwap.stateDir, 'events')))
+    .map(async name => JSON.parse(await readFile(join(h.config.credentialSwap.stateDir, 'events', name), 'utf8')).reason));
+  assert.equal(reasons.filter(reason => reason === 'credential_expiry_rollback').length, 2);
+  const fresh = createSwapKeychainReader({ execute: fake.execute, now: () => NOW });
+  assert.equal((await fresh.read(h.account, { marginMs: 300_000 })).expiresAt, expiry);
+  expiry = NOW + 3_600_000;
+  assert.equal((await reader.read(h.account, { marginMs: 300_000 })).expiresAt, expiry);
+  expiry++;
+  assert.equal((await reader.read(h.account, { marginMs: 300_000 })).expiresAt, expiry);
+});
+
+test('same-second attribute changes reject a credential even when mdat is unchanged', async t => {
+  const { account } = await sandbox(t);
+  const fake = fakeExecutor(account, { dump: ({ reads }) => attributes(account)
+    + `    "labl"<blob>="test-label-${reads}"\n` });
+  await assert.rejects(createSwapKeychainReader({ execute: fake.execute, now: () => NOW })
+    .read(account, { marginMs: 300_000 }), /^Error: credential_unavailable$/);
+  assert.equal(fake.reads, 1);
+});
+
+test('state directory rejects overlaps with existing application state before filesystem access', async t => {
+  const { config, root } = await sandbox(t);
+  for (const protectedPath of [appConfigDir(), runtimeStatePath()]) {
+    for (const stateDir of [protectedPath, dirname(protectedPath), join(protectedPath, 'swap'),
+      `${protectedPath}/child/..`, `${protectedPath}/`]) {
+      config.credentialSwap.stateDir = stateDir;
+      assert.throws(() => normalizeCredentialSwap(config), /^Error: invalid_swap_config$/);
+    }
+  }
+  for (const stateDir of [join(root, 'isolated'), `${appConfigDir()}-separate`]) {
+    config.credentialSwap.stateDir = stateDir;
+    assert.equal(normalizeCredentialSwap(config).stateDir, stateDir);
+  }
+});
+
+test('event retention bounds file count and bytes while continuing to record recent requests', async t => {
+  const h = await unbound(t);
+  for (let i = 0; i < 150; i++) {
+    assert.equal((await directRequest(h.instance, { headers: {} })).status, 401);
+    await h.instance.flushEvents();
+  }
+  const directory = join(h.config.credentialSwap.stateDir, 'events');
+  const names = await readdir(directory);
+  assert.ok(names.length > 0 && names.length <= 128);
+  const sizes = await Promise.all(names.map(name => stat(join(directory, name))));
+  assert.ok(sizes.reduce((total, info) => total + info.size, 0) <= 64 * 1024);
+  assert.equal((await directRequest(h.instance, { headers: {} })).status, 401);
+  await h.instance.flushEvents();
+  const latest = await readdir(directory);
+  assert.ok(latest.some(name => !names.includes(name)));
+});
+
+test('event retention trims oversized historical files on startup and deletion failure preserves off rollback', async t => {
+  const h = await unbound(t, { mockConnect: false, prepare: async s => {
+    const dir = join(s.config.credentialSwap.stateDir, 'events');
+    await mkdir(dir, { recursive: true });
+    await writeFile(join(dir, 'test-old.json'), ' '.repeat(70 * 1024));
+  } });
+  assert.deepEqual(await readdir(join(h.config.credentialSwap.stateDir, 'events')), []);
+  await h.instance.close();
+  const directory = join(h.config.credentialSwap.stateDir, 'events');
+  await writeFile(join(directory, 'test-old.json'), ' '.repeat(70 * 1024));
+  const instance = await createCredentialSwapServer({ configPath: h.configPath, now: () => NOW,
+    stateIO: { removeFileDurable() { throw new Error(ACCESS); } },
+    keychain: { read() { throw new Error('unexpected_test_read'); } } });
+  try {
+    assert.equal((await directRequest(instance)).status, 503);
+    h.config.credentialSwap.enabled = false;
+    h.config.credentialSwap.legacyProxyUrl = 'http://127.0.0.1:12345';
+    await writeFile(h.configPath, JSON.stringify(h.config));
+    await instance.reload();
+    const calls = stubTransport(t, 200);
+    assert.equal((await directRequest(instance)).status, 200);
+    assert.equal(calls.length, 1);
+  } finally { await instance.close(); }
+});
+
+test('a saturated event queue stays bounded and permits off rollback', async t => {
+  const entered = defer();
+  const release = defer();
+  const { writeJsonFileDurable } = await import('../src/json-file.js');
+  let eventWrites = 0;
+  const h = await unbound(t, { mockConnect: false, stateIO: {
+    async writeJsonFileDurable(path, ...args) {
+      if (dirname(path).endsWith('/events')) {
+        eventWrites++;
+        entered.resolve();
+        await release.promise;
+      }
+      return writeJsonFileDurable(path, ...args);
+    },
+  } });
+  assert.equal((await directRequest(h.instance, { headers: {} })).status, 401);
+  await entered.promise;
+  try {
+    const replies = await Promise.all(Array.from({ length: 128 }, () => directRequest(h.instance, { headers: {} })));
+    assert.equal(replies.every(reply => reply.status === 401), true);
+    assert.equal((await directRequest(h.instance)).status, 503);
+    h.config.credentialSwap.enabled = false;
+    h.config.credentialSwap.legacyProxyUrl = 'http://127.0.0.1:12345';
+    await writeFile(h.configPath, JSON.stringify(h.config));
+    await h.instance.reload();
+    const calls = stubTransport(t, 200);
+    assert.equal((await directRequest(h.instance)).status, 200);
+    assert.equal(calls.length, 1);
+    assert.equal(h.reads, 0);
+  } finally { release.resolve(); }
+  await h.instance.flushEvents();
+  assert.equal(eventWrites, 1);
+  assert.equal((await readdir(join(h.config.credentialSwap.stateDir, 'events'))).length, 1);
+});
+
+for (const [code, reason] of [['EADDRINUSE', 'swap_port_in_use'], ['EPERM', 'swap_listen_unavailable']]) {
+  test(`CLI reports a fixed startup reason for ${code} without opening a socket`, async t => {
+    const { root, config } = await sandbox(t);
+    config.credentialSwap.listenPort = 12345;
+    const configPath = join(root, 'swap-settings.json');
+    await writeFile(configPath, JSON.stringify(config));
+    t.mock.method(http.Server.prototype, 'listen', function (port, host) {
+      assert.equal(port, 12345);
+      assert.equal(host, '127.0.0.1');
+      queueMicrotask(() => this.emit('error', Object.assign(new Error(ACCESS), { code })));
+      return this;
+    });
+    const errors = [];
+    assert.equal(await runCli(['credential-swap', 'serve', '--config', configPath], {
+      error: text => errors.push(text), serveCredentialSwap,
+    }), 1);
+    assert.deepEqual(errors, [`${reason}\n`]);
+  });
+}
+
+for (const scenario of ['invalid', 'absent', 'state']) {
+  test(`CLI distinguishes ${scenario} startup failure without disclosing raw errors`, async t => {
+    const { root, config } = await sandbox(t);
+    if (scenario === 'absent') delete config.credentialSwap;
+    if (scenario === 'state') {
+      await writeFile(config.credentialSwap.stateDir, 'test-file-not-directory');
+    }
+    const configPath = join(root, 'swap-settings.json');
+    await writeFile(configPath, scenario === 'invalid' ? ACCESS : JSON.stringify(config));
+    const errors = [];
+    assert.equal(await runCli(['credential-swap', 'serve', '--config', configPath], {
+      error: text => errors.push(text), serveCredentialSwap,
+    }), 1);
+    assert.deepEqual(errors, [`${{ invalid: 'invalid_swap_config', absent: 'swap_config_required',
+      state: 'swap_state_unavailable' }[scenario]}\n`]);
+  });
+}
+
+test('slow downstream backpressure pauses the upstream and preserves every byte without replay', async t => {
+  const h = await unbound(t, { mockConnect: false });
+  let incoming;
+  let connects = 0;
+  const entered = defer();
+  const release = defer();
+  const chunk = Buffer.alloc(4096, 0x78);
+  let produced = 0;
+  const total = 128;
+  t.mock.method(https, 'request', (_target, _options, callback) => {
+    connects++;
+    const outgoing = new Writable({ write(_data, _encoding, next) { next(); } });
+    outgoing.on('finish', () => {
+      incoming = new Readable({ highWaterMark: 4096, read() {
+        if (produced === total) this.push(null);
+        else { produced++; this.push(chunk); }
+      } });
+      Object.assign(incoming, { statusCode: 200, headers: {} });
+      callback(incoming);
+    });
+    return outgoing;
+  });
+  let bytes = 0;
+  const response = new Writable({ highWaterMark: 4096, write(data, _encoding, next) {
+    bytes += data.length;
+    assert.ok(data.equals(chunk));
+    entered.resolve();
+    void release.promise.then(next);
+  } });
+  response.writeHead = status => { response.statusCode = status; response.headersSent = true; };
+  const finished = new Promise((done, reject) => { response.on('finish', done); response.on('error', reject); });
+  const req = new PassThrough();
+  Object.assign(req, { method: 'POST', url: '/api/hello', headers: { [CALLER_HEADER]: CALLER },
+    rawHeaders: [CALLER_HEADER, CALLER] });
+  h.instance.server.emit('request', req, response);
+  req.end('test-body');
+  await entered.promise;
+  await new Promise(setImmediate);
+  const stalledAt = produced;
+  assert.ok(stalledAt < total);
+  assert.equal(incoming.isPaused(), true);
+  await new Promise(setImmediate);
+  assert.equal(produced, stalledAt);
+  release.resolve();
+  await finished;
+  assert.equal(bytes, total * chunk.length);
+  assert.equal(connects, 1);
 });
