@@ -93,7 +93,7 @@ async function snapshot(account, execute, signal) {
   return JSON.stringify([search, matches[0]]);
 }
 
-function attribute(block, key, kind) {
+export function attribute(block, key, kind) {
   const lines = block.split('\n').filter(line => line.trimStart().startsWith(`"${key}"`));
   if (lines.length !== 1) return undefined;
   const value = lines[0].trim().match(new RegExp(`^"${key}"<${kind}>=(.*)$`))?.[1];

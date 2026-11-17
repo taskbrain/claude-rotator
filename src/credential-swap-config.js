@@ -22,7 +22,7 @@ export function credentialSwapStartupReason(error) {
   return 'credential_swap_serve_failed';
 }
 
-function overlaps(left, right) {
+export function overlaps(left, right) {
   return left === right || left.startsWith(right.endsWith(sep) ? right : right + sep)
     || right.startsWith(left.endsWith(sep) ? left : left + sep);
 }

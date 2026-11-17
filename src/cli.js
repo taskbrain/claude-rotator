@@ -9,6 +9,7 @@ import { text as readStdinText } from 'node:stream/consumers';
 import { isDeepStrictEqual, promisify } from 'node:util';
 
 import { AccountManager } from './account-manager.js';
+import { CLAUDE_PROVIDER_OVERRIDE_ENV_VARS } from './claude-provider-env.js';
 import { createAlertSender } from './alert-sender.js';
 import { createAlertWatch, normalizeAlertSettings } from './alert-watch.js';
 import { attachDriftWatch } from './drift-watch.js';
@@ -84,14 +85,6 @@ const execFileAsync = promisify(execFile);
 const CURRENT_ACCOUNT_ID = 'current';
 const DEFAULT_SHUTDOWN_GRACE_MS = 5_000;
 const MACOS_HIDDEN_SERVICE_ACTION = '__macos-service-action';
-const CLAUDE_PROVIDER_OVERRIDE_ENV_VARS = Object.freeze([
-  'CLAUDE_CODE_USE_BEDROCK',
-  'CLAUDE_CODE_USE_VERTEX',
-  'CLAUDE_CODE_USE_FOUNDRY',
-  'CLAUDE_CODE_USE_ANTHROPIC_AWS',
-  'CLAUDE_CODE_USE_ANTHROPIC_GOOGLE_CLOUD',
-  'CLAUDE_CODE_USE_MANTLE',
-]);
 const CLAUDE_LOGIN_OVERRIDE_ENV_VARS = Object.freeze([
   ...CLAUDE_PROVIDER_OVERRIDE_ENV_VARS,
   'ANTHROPIC_AUTH_TOKEN',
@@ -135,6 +128,25 @@ export async function runCli(argv = [], deps = {}) {
     if (command === 'server') {
       await runServer({ write });
       return 0;
+    }
+
+    if (command === 'credential-swap' && argv[1] === 'refresh-supervisor') {
+      const apply = argv.length === 5 && argv[4] === '--apply';
+      if ((argv.length !== 4 && !apply) || argv[2] !== '--config' || !argv[3]) {
+        error('Usage: claude-rotator credential-swap refresh-supervisor --config <path> [--apply]\n');
+        return 1;
+      }
+      try {
+        const supervisor = await import('./credential-swap-refresh-supervisor.js');
+        const config = await (deps.loadRefreshSupervisorConfig || supervisor.loadRefreshSupervisorConfig)(argv[3]);
+        const report = await (deps.runRefreshSupervisor || supervisor.runRefreshSupervisor)({ config, apply });
+        write(`${JSON.stringify(report, null, 2)}\n`);
+        return 0;
+      } catch (caught) {
+        const { refreshSupervisorCliReason } = await import('./credential-swap-refresh-supervisor.js');
+        error(`${refreshSupervisorCliReason(caught)}\n`);
+        return 1;
+      }
     }
 
     if (command === 'credential-swap') {
@@ -348,6 +360,7 @@ export function helpText() {
   claude-rotator uninstall [--purge-secrets] [--force]
   claude-rotator server
   claude-rotator credential-swap serve --config <path>
+  claude-rotator credential-swap refresh-supervisor --config <path> [--apply]
   claude-rotator status
   claude-rotator monitor
   claude-rotator switch <account>
