@@ -11,7 +11,7 @@ import {
   buildFallbackAPlan, buildResidentPlan, decide, DEFAULT_FALLBACK_A_PROMPT, defaultRunner, loadRefreshSupervisorConfig,
   refreshLockPath, REASON_CODES,
   mdatFromDumps, normalizeRefreshSupervisor, notificationText, parseKeychainMdat, planEnvironment,
-  probeExpiryEvents, probeOtherUsers, probeResident, refreshStatePath, runRefreshSupervisor,
+  parsePsStart, probeExpiryEvents, probeOtherUsers, probeResident, refreshStatePath, runRefreshSupervisor,
 } from '../src/credential-swap-refresh-supervisor.js';
 
 const HOUR = 3_600_000;
@@ -772,4 +772,160 @@ test('a state write failing after a launch or an A run keeps the lock and stops 
   /^Error: refresh_state_write_failed$/);
   assert.equal(ranA.record.runner.length, 1);
   await stat(refreshLockPath(config));
+});
+
+// Local time of LSTART; a session name created one second after the process started.
+const LSTART_MS = new Date(2033, 4, 18, 3, 0, 0).getTime();
+
+function sessionsIO(account, answer, { createdMs = LSTART_MS + 1000, lstat } = {}) {
+  const io = { readdirCalls: [], readFileCalls: [], lstatCalls: [] };
+  io.lstat = async path => {
+    io.lstatCalls.push(path);
+    if (lstat) return lstat(path);
+    return { birthtimeMs: createdMs, mtimeMs: createdMs + 5000 };
+  };
+  io.readdir = async path => {
+    io.readdirCalls.push(path);
+    assert.equal(path, join(account.configDir, 'sessions'));
+    if (answer instanceof Error) throw answer;
+    return answer;
+  };
+  // Present only to prove the probe never opens a session file or key.
+  io.readFile = async path => { io.readFileCalls.push(path); throw new Error('must not be read'); };
+  return io;
+}
+
+const SESSION_NAMES = ['74132.json', '74132.0123abcd.key'];
+
+async function sessionPass(t, { names = SESSION_NAMES, ps, offset = HOUR, enabled = false, lsof,
+  claudeBin, created } = {}) {
+  const { raw, account } = await sandbox(t);
+  const base = claudeBin ? { refreshSupervisor: { ...raw.refreshSupervisor, claudeBin } } : raw;
+  const config = enabled ? await enabledConfig(base) : normalizeRefreshSupervisor(base);
+  const fake = fakeExecute(account, { ps, lsof });
+  const io = sessionsIO(account, names, created);
+  const effects = sideEffects();
+  const report = await runRefreshSupervisor({ config, now: () => MDAT + offset, execute: fake.execute,
+    sessionsIO: io, env: SECRET_ENV, ...effects });
+  return { report, entry: report.accounts[0], io, fake, effects, account };
+}
+
+test('a live official client found by its session name is left to refresh by itself', async t => {
+  const { report, entry, io, fake } = await sessionPass(t, { ps: pid => {
+    assert.equal(pid, '74132');
+    return { stdout: `${LSTART} claude\n` };
+  } });
+  assert.deepEqual([entry.action, entry.reason], ['none', 'external_client_present']);
+  assert.equal(entry.observation.externalClient, true);
+  assert.equal(entry.observation.otherUsers, 'present');
+  assert.equal(io.readFileCalls.length, 0);
+  assert.equal(io.readdirCalls.length, 1);
+  // The key file name is never passed to any command.
+  assert.equal(fake.calls.some(call => call.some(arg => /0123abcd|sessions/.test(String(arg)))), false);
+  const text = JSON.stringify(report);
+  for (const leaked of ['74132', '.json', '.key', 'claude', LSTART]) assert.equal(text.includes(leaked), false, leaked);
+});
+
+test('session clients match the claude command name, claudeBin or its version folder only', async t => {
+  for (const command of [CLAUDE, `${CLAUDE} --resume`, '/opt/test-claude/bin/2.1.326']) {
+    const { entry } = await sessionPass(t, { ps: () => ({ stdout: `${LSTART} ${command}\n` }) });
+    assert.equal(entry.reason, 'external_client_present', command);
+  }
+  // A live process under a session name that cannot be identified is unknown, never absence.
+  for (const command of ['/usr/bin/vim', '/opt/other/claude', 'claude-imposter']) {
+    const { entry, effects } = await sessionPass(t, { ps: () => ({ stdout: `${LSTART} ${command}\n` }) });
+    assert.deepEqual([entry.action, entry.reason], ['notify_unknown', 'other_users_unknown'], command);
+    assert.equal(entry.observation.externalClient, false);
+    assert.equal(effects.record.launcher.length, 0);
+  }
+  // A claudeBin path with spaces, followed by arguments.
+  const spaced = '/opt/test claude/bin/claude';
+  const { entry } = await sessionPass(t, { claudeBin: spaced,
+    ps: () => ({ stdout: `${LSTART} ${spaced} --resume x\n` }) });
+  assert.equal(entry.reason, 'external_client_present');
+});
+
+test('stale session names, unknown processes and unreadable session folders are handled', async t => {
+  // ps says gone: the name is stale and nobody else is there.
+  let result = await sessionPass(t);
+  assert.deepEqual([result.entry.action, result.entry.reason], ['start_resident', 'resident_missing']);
+  assert.equal(result.entry.observation.externalClient, false);
+  // ps cannot tell: the whole answer is unknown.
+  result = await sessionPass(t, { ps: () => { throw Object.assign(new Error('x'), { code: 2 }); } });
+  assert.deepEqual([result.entry.action, result.entry.reason], ['notify_unknown', 'other_users_unknown']);
+  assert.equal(result.entry.observation.otherUsers, 'unknown');
+  // A session folder that exists but cannot be read is unknown; a missing one is no detection.
+  result = await sessionPass(t, { names: Object.assign(new Error('denied'), { code: 'EACCES' }) });
+  assert.equal(result.entry.observation.otherUsers, 'unknown');
+  assert.equal(result.entry.action, 'notify_unknown');
+  result = await sessionPass(t, { names: Object.assign(new Error('missing'), { code: 'ENOENT' }) });
+  assert.deepEqual([result.entry.action, result.entry.reason], ['start_resident', 'resident_missing']);
+  // Only <pid>.json names are considered; others are never checked with ps.
+  result = await sessionPass(t, { names: ['notes.json', '74132.0123abcd.key', 'x74132.json'],
+    ps: () => { throw new Error('ps must not run'); } });
+  assert.equal(result.entry.action, 'start_resident');
+  // lsof alone (no session name) still notifies as before.
+  result = await sessionPass(t, { names: [], lsof: () => ({ stdout: '5151\n' }) });
+  assert.deepEqual([result.entry.action, result.entry.reason], ['notify_unknown', 'other_users_present']);
+});
+
+test('after staleness an external client still blocks A and gives a stale notice', async t => {
+  const { entry, effects } = await sessionPass(t, { enabled: true, offset: 10 * HOUR,
+    ps: () => ({ stdout: `${LSTART} claude\n` }) });
+  assert.deepEqual([entry.action, entry.reason], ['notify_stale', 'other_users_present']);
+  assert.equal(effects.record.runner.length, 0);
+});
+
+test('a session name older than the process start is a reused pid and is ignored', async t => {
+  // Process started 121 s after the name was created: another process reused the pid.
+  let result = await sessionPass(t, { created: { createdMs: LSTART_MS - 121_000 },
+    ps: () => ({ stdout: `${LSTART} claude\n` }) });
+  assert.deepEqual([result.entry.action, result.entry.reason], ['start_resident', 'resident_missing']);
+  assert.equal(result.entry.observation.externalClient, false);
+  // The same holds for a non-matching command: a reused pid is ignored before identification.
+  result = await sessionPass(t, { created: { createdMs: LSTART_MS - 121_000 },
+    ps: () => ({ stdout: `${LSTART} /usr/bin/vim\n` }) });
+  assert.equal(result.entry.action, 'start_resident');
+  // Within the slack it still counts; birthtime missing falls back to mtime.
+  result = await sessionPass(t, { created: { createdMs: LSTART_MS - 119_000 },
+    ps: () => ({ stdout: `${LSTART} claude\n` }) });
+  assert.equal(result.entry.reason, 'external_client_present');
+  result = await sessionPass(t, { created: { lstat: () => ({ birthtimeMs: 0, mtimeMs: LSTART_MS }) },
+    ps: () => ({ stdout: `${LSTART} claude\n` }) });
+  assert.equal(result.entry.reason, 'external_client_present');
+  // An unparseable start time or unreadable metadata is unknown.
+  result = await sessionPass(t, { ps: () => ({ stdout: 'Xyz Foo 99 99:99:99 2033 claude\n' }) });
+  assert.equal(result.entry.observation.otherUsers, 'unknown');
+  result = await sessionPass(t, { created: { lstat: () => { throw Object.assign(new Error('x'), { code: 'EACCES' }); } },
+    ps: () => ({ stdout: `${LSTART} claude\n` }) });
+  assert.equal(result.entry.observation.otherUsers, 'unknown');
+  assert.equal(parsePsStart(LSTART), LSTART_MS);
+  assert.equal(parsePsStart('Wed Feb 30 03:00:00 2033'), null);
+});
+
+test('out-of-range session pids are ignored without ps, and too many names are unknown', async t => {
+  const names = ['0.json', '1.json', '2147483648.json', '9999999999.json'];
+  let result = await sessionPass(t, { names, ps: () => { throw new Error('ps must not run'); } });
+  assert.deepEqual([result.entry.action, result.entry.reason], ['start_resident', 'resident_missing']);
+  assert.equal(result.io.lstatCalls.length, 0);
+  const many = Array.from({ length: 65 }, (_, index) => `${1000 + index}.json`);
+  result = await sessionPass(t, { names: many, ps: () => { throw new Error('ps must not run'); } });
+  assert.deepEqual([result.entry.action, result.entry.reason], ['notify_unknown', 'other_users_unknown']);
+  result = await sessionPass(t, { names: many.slice(0, 64), ps: () => { throw Object.assign(new Error('x'),
+    { code: 1, stdout: '' }); } });
+  assert.equal(result.entry.action, 'start_resident');
+});
+
+test('an lsof pid outside the confirmed session clients still notifies', async t => {
+  let result = await sessionPass(t, { ps: () => ({ stdout: `${LSTART} claude\n` }),
+    lsof: () => ({ stdout: '74132\n5151\n' }) });
+  assert.deepEqual([result.entry.action, result.entry.reason], ['notify_unknown', 'other_users_present']);
+  assert.equal(result.entry.observation.externalClient, true);
+  result = await sessionPass(t, { ps: () => ({ stdout: `${LSTART} claude\n` }),
+    lsof: () => ({ stdout: '74132\n' }) });
+  assert.deepEqual([result.entry.action, result.entry.reason], ['none', 'external_client_present']);
+  for (const leaked of ['74132', '5151', '.json', '.key', 'claude']) {
+    assert.equal(JSON.stringify(result.report).includes(leaked), false, leaked);
+  }
+  assert.equal(result.io.readFileCalls.length, 0);
 });

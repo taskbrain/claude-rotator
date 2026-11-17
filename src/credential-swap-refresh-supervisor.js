@@ -40,7 +40,7 @@ export const REASON_CODES = Object.freeze(['fresh', 'resident_missing', 'residen
   'expiry_events_unreadable', 'refresh_state_invalid', 'fallback_a_disabled', 'fallback_a_no_progress',
   'fallback_a_daily_limit', 'fallback_a_interval', 'mdat_stale', 'credential_expired', 'work_dir_not_empty',
   'work_dir_unavailable', 'resident_launcher_unconfigured', 'resident_launch_failed', 'fallback_a_failed',
-  'fallback_a_unfinished']);
+  'fallback_a_unfinished', 'external_client_present']);
 export const CLI_REASON_CODES = Object.freeze(['invalid_refresh_config', 'refresh_state_unavailable',
   'refresh_supervisor_locked', 'refresh_state_write_failed']);
 const NOTICE_SUCCESS = new Set(['exited-0', 'sent']);
@@ -276,34 +276,129 @@ export async function probeResident(account, accountState, config, execute) {
 }
 
 // -t prints only process ids. Any other line, or a diagnostic on stderr, makes
-// the answer unknown.
-export async function probeOtherUsers(account, residentPid, execute) {
+// the answer unknown. The detailed form also returns the pids it found.
+export async function probeOtherUsersDetailed(account, residentPid, execute) {
   let stdout;
   try {
     ({ stdout } = await execute(LSOF, ['-nP', '-t', '+D', account.configDir],
       { ...probeOptions(), timeout: LSOF_TIMEOUT_MS }));
   } catch (error) {
     // lsof exits 1 when no process has a file open below the directory.
-    if (error?.code !== 1 || error.killed || error.signal || String(error.stderr ?? '').trim()) return 'unknown';
+    if (error?.code !== 1 || error.killed || error.signal || String(error.stderr ?? '').trim())
+      return { status: 'unknown', pids: new Set() };
     stdout = error.stdout ?? '';
   }
   const pids = new Set();
   for (const line of String(stdout).split('\n').filter(Boolean)) {
-    if (!/^\d{1,10}$/.test(line)) return 'unknown';
+    if (!/^\d{1,10}$/.test(line)) return { status: 'unknown', pids: new Set() };
     pids.add(Number(line));
   }
   pids.delete(process.pid);
   if (residentPid !== null) pids.delete(residentPid);
-  return pids.size === 0 ? 'none' : 'present';
+  return { status: pids.size === 0 ? 'none' : 'present', pids };
 }
 
-export async function observeAccount(account, accountState, config, { execute, eventsIO } = {}) {
+export async function probeOtherUsers(account, residentPid, execute) {
+  return (await probeOtherUsersDetailed(account, residentPid, execute)).status;
+}
+
+const MAX_SESSION_NAMES = 64;
+const SESSION_REUSE_SLACK_MS = 120_000;
+const MONTHS = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
+
+// ps prints lstart in the C locale as local time, e.g. 'Wed May 18 03:00:00 2033'.
+export function parsePsStart(text) {
+  const match = typeof text === 'string'
+    && text.match(/^[A-Z][a-z]{2} ([A-Z][a-z]{2}) (\d{1,2}) (\d{2}):(\d{2}):(\d{2}) (\d{4})$/);
+  const month = match ? MONTHS.indexOf(match[1]) : -1;
+  if (month < 0) return null;
+  const [day, hour, minute, second, year] = match.slice(2).map(Number);
+  const date = new Date(year, month, day, hour, minute, second);
+  if (date.getFullYear() !== year || date.getMonth() !== month || date.getDate() !== day
+    || date.getHours() !== hour || date.getMinutes() !== minute || date.getSeconds() !== second) return null;
+  return date.getTime();
+}
+
+// A running official client does not necessarily keep a file open below its
+// configuration folder, so lsof alone can miss it. The client names a file
+// sessions/<pid>.json there. Only entry names and their metadata (lstat) are
+// read; no file is opened and other names such as keys are ignored. Each pid
+// is checked with ps:
+// - gone: a stale name, ignored;
+// - started more than a short slack after the name was created: the pid was
+//   reused by another process, ignored;
+// - running as the official client: found;
+// - running as anything else, or not determinable: the answer is unknown.
+export async function probeSessionClientsDetailed(account, residentPid, config, execute, io = {}) {
+  const unknown = { status: 'unknown', pids: new Set() };
+  const readdirImpl = io.readdir || readdir;
+  const lstatImpl = io.lstat || lstat;
+  const sessionsDir = join(account.configDir, 'sessions');
+  let names;
+  try { names = await readdirImpl(sessionsDir); }
+  catch (error) { return error?.code === 'ENOENT' ? { status: 'none', pids: new Set() } : unknown; }
+  if (!Array.isArray(names)) return unknown;
+  const candidates = new Map();
+  for (const name of names) {
+    const match = typeof name === 'string' && name.match(/^(\d{1,10})\.json$/);
+    if (!match) continue;
+    const pid = Number(match[1]);
+    if (!integer(pid, 2, 2 ** 31 - 1) || pid === process.pid || pid === residentPid) continue;
+    candidates.set(name, pid);
+  }
+  if (candidates.size > MAX_SESSION_NAMES) return unknown;
+  const found = new Set();
+  for (const [name, pid] of candidates) {
+    let createdMs;
+    try {
+      const info = await lstatImpl(join(sessionsDir, name));
+      createdMs = info.birthtimeMs > 0 ? info.birthtimeMs : info.mtimeMs;
+    } catch (error) {
+      if (error?.code === 'ENOENT') continue;
+      return unknown;
+    }
+    if (!Number.isFinite(createdMs) || createdMs <= 0) return unknown;
+    const seen = await probeResidentProcess(pid, execute);
+    if (seen.status === 'unknown') return unknown;
+    if (seen.status === 'absent') continue;
+    const startedMs = parsePsStart(seen.startedAt);
+    if (startedMs === null) return unknown;
+    if (startedMs > createdMs + SESSION_REUSE_SLACK_MS) continue;
+    if (!officialClientCommand(seen.command, config.claudeBin)) return unknown;
+    found.add(pid);
+  }
+  return { status: found.size ? 'present' : 'none', pids: found };
+}
+
+export async function probeSessionClients(account, residentPid, config, execute, io = {}) {
+  return (await probeSessionClientsDetailed(account, residentPid, config, execute, io)).status;
+}
+
+// The command column shows argv[0] and the arguments as launched: 'claude'
+// from a shell, or a path. A path must be claudeBin (which may contain spaces,
+// so it is matched as a prefix followed by a space) or an executable in
+// claudeBin's folder.
+function officialClientCommand(command, claudeBin) {
+  const text = String(command);
+  if (text === claudeBin || text.startsWith(`${claudeBin} `)) return true;
+  const first = text.split(/\s+/, 1)[0];
+  if (first === 'claude') return true;
+  return isAbsolute(first) && dirname(first) === dirname(claudeBin);
+}
+
+export async function observeAccount(account, accountState, config, { execute, eventsIO, sessionsIO } = {}) {
   const mdat = await probeMdat(account, execute);
   const expiry = await probeExpiryEvents(account, eventsIO);
   const resident = await probeResident(account, accountState, config, execute);
-  const otherUsers = await probeOtherUsers(account, resident.pid, execute);
+  const lsofUsers = await probeOtherUsersDetailed(account, resident.pid, execute);
+  const sessions = await probeSessionClientsDetailed(account, resident.pid, config, execute, sessionsIO);
+  const otherUsers = lsofUsers.status === 'unknown' || sessions.status === 'unknown' ? 'unknown'
+    : lsofUsers.status === 'present' || sessions.status === 'present' ? 'present' : 'none';
+  // A process lsof saw that is not a confirmed official client is someone else.
+  const otherThanClients = [...lsofUsers.pids].some(pid => !sessions.pids.has(pid));
   return { mdat, expiry, resident: resident.status, residentPid: resident.pid,
-    clearUnverified: resident.clearUnverified, otherUsers };
+    clearUnverified: resident.clearUnverified, otherUsers,
+    externalClient: sessions.status === 'present', otherThanClients };
 }
 
 // ---------------------------------------------------------------------------
@@ -326,8 +421,13 @@ export function decide(observation, state = {}, policy, now) {
     return { action: 'none', reason: expiredAfterMdat ? 'resident_refresh_pending' : 'fresh' };
   }
   if (!aged && !expiredAfterMdat) {
+    if (observation.otherUsers === 'unknown' || !['none', 'present'].includes(observation.otherUsers))
+      return { action: 'notify_unknown', reason: 'other_users_unknown' };
+    // An official client found by its session name refreshes by itself; leave
+    // the folder to it rather than starting a second client or notifying.
+    if (observation.externalClient === true && observation.otherThanClients !== true)
+      return { action: 'none', reason: 'external_client_present' };
     if (observation.otherUsers === 'present') return { action: 'notify_unknown', reason: 'other_users_present' };
-    if (observation.otherUsers !== 'none') return { action: 'notify_unknown', reason: 'other_users_unknown' };
     return { action: 'start_resident', reason: 'resident_missing' };
   }
   const fallback = policy.fallbackA;
@@ -597,6 +697,7 @@ function publicObservation(observation, now) {
     unreadableEvents: observation.expiry.unreadable,
     resident: observation.resident,
     otherUsers: observation.otherUsers,
+    externalClient: observation.externalClient === true,
   };
 }
 
@@ -619,6 +720,7 @@ async function supervisePass({
   now,
   execute = promisify(execFile),
   eventsIO,
+  sessionsIO,
   launcher = defaultLauncher,
   runner = defaultRunner,
   notify,
@@ -659,7 +761,7 @@ async function supervisePass({
       if (apply) entry.notice = await deliver(account.id, decision.action, decision.reason);
       continue;
     }
-    const observed = await observeAccount(account, accountState, config, { execute, eventsIO });
+    const observed = await observeAccount(account, accountState, config, { execute, eventsIO, sessionsIO });
     const at = now();
     const decision = decide(observed, accountState, config, at);
     const entry = { id: account.id, ...decision, observation: publicObservation(observed, at) };
