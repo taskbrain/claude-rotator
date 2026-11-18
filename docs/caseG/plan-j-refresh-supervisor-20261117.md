@@ -82,6 +82,13 @@ S3 で見つかった課題：j に更新者がおらず一晩で失効し、差
 - 作業フォルダは空の専用フォルダ。空でなければ起動しない。
 - 対話の公式クライアントは端末（TTY）が要るので、起動は差し替え可能な launcher で行う。今回の実装は「起動計画（argv・env の差分・cwd）を作る」ところまでと、注入された launcher を呼ぶところまで。実機での常駐起動は、坂根さんの承認後の試験で行う。
 - 起動後の初回画面（テーマ選択・注意事項・フォルダの信頼確認）は、人が一度だけ進める前提。監督は画面へ入力しない。
+- launcher の実装（設定 `refreshSupervisor.launcher` に `{ kind: "orca", orcaBin, worktree, title }` があるときだけ。**実機未検証**）：
+  - `--apply` で start_resident のときだけ、`<orcaBin> terminal create --worktree <worktree> --title <title> --command <文字列> --json` をシェルなしで 1 回呼び、Orca の端末で起動する（`--focus` なし）。
+  - 端末へ渡す文字列：`cd '<workDir>' && exec /usr/bin/env -i HOME="$HOME" USER="$USER" LOGNAME="$LOGNAME" SHELL="$SHELL" TERM="$TERM" LANG=en_US.UTF-8 TMPDIR="$TMPDIR" PATH=/usr/bin:/bin:/usr/sbin:/sbin CLAUDE_CONFIG_DIR='<configDir>' '<claudeBin>'`。端末の環境は監督の環境と別なので、除去リストではなく env -i と許可リストで、`ANTHROPIC_*`・`CLAUDE_CODE_*`・プロキシなどをすべて落とす。単一引用符を含むパスは設定の検証で拒否する。orca CLI 自身へは HOME・USER・LOGNAME・PATH・TMPDIR・LANG だけを渡す。
+  - 端末のログインシェルが zsh/bash で、rc に対話が無いことが前提（実機で確認）。
+  - processId は端末ごとの /usr/bin/login（実機 2026-11-18 の観測）。そうでなければ確定しない。
+  - PID の特定：出力の `result.terminal.processId` から、`pgrep -P` で子孫をたどり（その pid 自身を含む）、`ps` の command が claudeBin と一致し、開始時刻が orca を呼ぶ直前の 2 秒前以降のもの（それより前に始まったものは別のプロセスとして数えない）が、最大 30 秒（1 秒ごと。期限は探索の途中でも確かめ、各 pgrep・ps の timeout を残り時間で抑える）の間にちょうど 1 つ見つかればその pid を常駐とする。見つからない・複数・開始時刻が読めない・観測できないときは、端末の pid を人が確かめるまで消えない未確認の記録（`manual: true`）に残す。記録した pid が端末の親で、子の claude が残っていることがあるので、ps で不在になっても自動では消さない。他のプロセスの環境は読まない。
+  - 監督は端末へ入力・送信せず、端末を閉じず、プロセスを止めない。端末の handle は報告にも状態ファイルにも出さない。
 
 ### 4.4 A：1 回実行の条件
 

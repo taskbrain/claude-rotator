@@ -139,7 +139,11 @@ export async function runCli(argv = [], deps = {}) {
       try {
         const supervisor = await import('./credential-swap-refresh-supervisor.js');
         const config = await (deps.loadRefreshSupervisorConfig || supervisor.loadRefreshSupervisorConfig)(argv[3]);
-        const report = await (deps.runRefreshSupervisor || supervisor.runRefreshSupervisor)({ config, apply });
+        const options = { config, apply };
+        // Creating the launcher has no side effect; only an --apply pass that
+        // decides start_resident calls it.
+        if (config.launcher) options.launcher = (deps.createOrcaLauncher || supervisor.createOrcaLauncher)({ config });
+        const report = await (deps.runRefreshSupervisor || supervisor.runRefreshSupervisor)(options);
         write(`${JSON.stringify(report, null, 2)}\n`);
         return 0;
       } catch (caught) {

@@ -8,7 +8,7 @@ import { claudeKeychainServiceName } from '../src/claude-keychain.js';
 import { CLAUDE_PROVIDER_OVERRIDE_ENV_VARS } from '../src/claude-provider-env.js';
 import { runCli } from '../src/cli.js';
 import {
-  buildFallbackAPlan, buildResidentPlan, decide, DEFAULT_FALLBACK_A_PROMPT, defaultRunner, loadRefreshSupervisorConfig,
+  buildFallbackAPlan, buildOrcaCommand, buildResidentPlan, createOrcaLauncher, decide, DEFAULT_FALLBACK_A_PROMPT, defaultRunner, loadRefreshSupervisorConfig,
   refreshLockPath, REASON_CODES,
   mdatFromDumps, normalizeRefreshSupervisor, notificationText, parseKeychainMdat, planEnvironment,
   parsePsStart, probeExpiryEvents, probeOtherUsers, probeResident, refreshStatePath, runRefreshSupervisor,
@@ -460,7 +460,7 @@ test('an unknown resident probe keeps the record and takes no automatic action',
   assert.deepEqual(saved.accounts[account.id].resident, { pid: 4242, startedAt: LSTART });
 });
 
-test('an unverified launch is recorded, blocks relaunch, and clears only when ps proves it gone', async t => {
+test('an unidentified launch is a manual record that ps absence does not clear; only an older record clears', async t => {
   const { account, config } = await sandbox(t);
   let psAnswer = () => ({ stdout: `${LSTART} /bin/unexpected\n` });
   const fake = fakeExecute(account, { ps: () => psAnswer() });
@@ -470,7 +470,7 @@ test('an unverified launch is recorded, blocks relaunch, and clears only when ps
   assert.equal(first.accounts[0].result, 'resident_unverified');
   let saved = JSON.parse(await readFile(refreshStatePath(config), 'utf8'));
   assert.deepEqual(saved.accounts[account.id].residentUnverified,
-    { pid: 4242, startedAt: LSTART, pendingSince: MDAT + HOUR });
+    { pid: 4242, startedAt: LSTART, pendingSince: MDAT + HOUR, manual: true });
   assert.equal(saved.accounts[account.id].resident, null);
 
   const second = await runRefreshSupervisor({ config, apply: true, now: () => MDAT + 2 * HOUR,
@@ -478,14 +478,23 @@ test('an unverified launch is recorded, blocks relaunch, and clears only when ps
   assert.deepEqual([second.accounts[0].action, second.accounts[0].reason], ['notify_unknown', 'resident_unverified']);
   assert.equal(effects.record.launcher.length, 1);
 
+  // The recorded pid is gone, but a client child may live on: still no relaunch.
   psAnswer = () => { throw Object.assign(new Error('x'), { code: 1, stdout: '' }); };
   const third = await runRefreshSupervisor({ config, apply: true, now: () => MDAT + 3 * HOUR,
-    execute: fake.execute, env: SECRET_ENV, ...effects, launcher: async () => ({ pid: 5151 }) });
-  assert.equal(third.accounts[0].action, 'start_resident');
+    execute: fake.execute, env: SECRET_ENV, ...effects });
+  assert.deepEqual([third.accounts[0].action, third.accounts[0].reason], ['notify_unknown', 'resident_unverified']);
+  assert.equal(effects.record.launcher.length, 1);
   saved = JSON.parse(await readFile(refreshStatePath(config), 'utf8'));
-  // The new launch is again unverified (ps reports absent), and the old record is gone.
+  assert.equal(saved.accounts[account.id].residentUnverified.manual, true);
+
+  // An older record without manual still clears once ps proves it gone.
+  await writeState(config, { [account.id]: { residentUnverified: { pid: 4242, startedAt: LSTART } } });
+  const fourth = await runRefreshSupervisor({ config, apply: true, now: () => MDAT + 4 * HOUR,
+    execute: fake.execute, env: SECRET_ENV, ...effects, launcher: async () => ({ pid: 5151 }) });
+  assert.equal(fourth.accounts[0].action, 'start_resident');
+  saved = JSON.parse(await readFile(refreshStatePath(config), 'utf8'));
   assert.deepEqual(saved.accounts[account.id].residentUnverified,
-    { pid: 5151, startedAt: null, pendingSince: MDAT + 3 * HOUR });
+    { pid: 5151, startedAt: null, pendingSince: MDAT + 4 * HOUR, manual: true });
 });
 
 test('apply is exclusive: concurrent passes run A once and a leftover lock stops all action', async t => {
@@ -928,4 +937,416 @@ test('an lsof pid outside the confirmed session clients still notifies', async t
     assert.equal(JSON.stringify(result.report).includes(leaked), false, leaked);
   }
   assert.equal(result.io.readFileCalls.length, 0);
+});
+
+// ---------------------------------------------------------------------------
+// Orca terminal launcher. Every orca, pgrep and ps call is a fake.
+
+const ORCA = '/opt/test-orca/bin/orca';
+const HANDLE = 'term_dummy_handle_0001';
+const LAUNCHER = { kind: 'orca', orcaBin: ORCA, worktree: 'path:/opt/test-worktree', title: 'j refresh resident' };
+const LOGIN_CMD = '/usr/bin/login -pf test-user';
+const ORCA_OK = { stdout: JSON.stringify({ ok: true, result: { terminal: { processId: 7000, handle: HANDLE,
+  title: 'j refresh resident' } } }) };
+
+async function launcherSandbox(t, launcher = LAUNCHER) {
+  const box = await sandbox(t);
+  box.raw.refreshSupervisor.launcher = launcher;
+  box.config = normalizeRefreshSupervisor(box.raw);
+  return box;
+}
+
+// A fake process world. commands(pid, tick) gives the ps command or undefined
+// (absent); children maps a pid to its child pids. tick advances on each sleep.
+function orcaWorld(account, { orca = () => ORCA_OK, children = { 7000: [7001], 7001: [7002] },
+  commands = { 7000: LOGIN_CMD, 7001: '-/bin/zsh', 7002: CLAUDE }, pgrep, starts = {}, clockStart = LSTART_MS - 1000,
+  probeCostMs = 0, nowStepMs = 0 } = {}) {
+  const base = fakeExecute(account);
+  const calls = [];
+  const orcaCalls = [];
+  let tick = 0;
+  let clock = clockStart;
+  const probes = [];
+  const command = pid => (typeof commands === 'function' ? commands(pid, tick) : commands[pid]);
+  const execute = async (file, args, options) => {
+    if (file === ORCA) {
+      orcaCalls.push({ args, options });
+      calls.push([file, ...args]);
+      return orca(args);
+    }
+    if (file === '/usr/bin/pgrep') {
+      calls.push([file, ...args]);
+      probes.push({ at: clock, timeout: options.timeout });
+      clock += probeCostMs;
+      assert.deepEqual(args.slice(0, 1), ['-P']);
+      assert.equal(args.length, 2);
+      assert.equal(options.encoding, 'utf8');
+      assert.ok(options.timeout > 0);
+      if (pgrep) return pgrep(Number(args[1]));
+      const list = (typeof children === 'function' ? children(Number(args[1]), tick) : children[args[1]]) ?? [];
+      if (!list.length) throw Object.assign(new Error('none'), { code: 1, stdout: '' });
+      return { stdout: `${list.join('\n')}\n` };
+    }
+    if (file === '/bin/ps') {
+      calls.push([file, ...args]);
+      assert.equal(options.env.LC_ALL, 'C');
+      probes.push({ at: clock, timeout: options.timeout });
+      clock += probeCostMs;
+      const value = command(Number(args[1]));
+      if (value === undefined) throw Object.assign(new Error('no process'), { code: 1, stdout: '' });
+      return { stdout: `${starts[args[1]] ?? LSTART} ${value}\n` };
+    }
+    calls.push([file, ...args]);
+    return base.execute(file, args, options);
+  };
+  const sleeps = [];
+  return { execute, calls, orcaCalls, sleeps, probes, now: () => { const at = clock; clock += nowStepMs; return at; },
+    sleep: async ms => { sleeps.push(ms); clock += ms; tick++; } };
+}
+
+function orcaLauncher(config, world) {
+  return createOrcaLauncher({ config, execute: world.execute, sleep: world.sleep, now: world.now });
+}
+
+async function runWithOrca(config, world, extra = {}) {
+  const effects = sideEffects();
+  const report = await runRefreshSupervisor({ config, apply: true, now: () => MDAT + HOUR, execute: world.execute,
+    env: SECRET_ENV, notify: effects.notify, runner: effects.runner, launcher: orcaLauncher(config, world), ...extra });
+  return { report, effects };
+}
+
+test('the Orca launcher setting is optional, orca-only and free of shell-unsafe characters', async t => {
+  const { raw, config, account, root } = await launcherSandbox(t);
+  assert.deepEqual(config.launcher, LAUNCHER);
+  assert.equal(normalizeRefreshSupervisor({ refreshSupervisor: { ...raw.refreshSupervisor, launcher: undefined } })
+    .launcher, undefined);
+  for (const worktree of ['path:/opt/x', 'id:abc-123', 'folder:work']) {
+    assert.equal(normalizeRefreshSupervisor({ refreshSupervisor: { ...raw.refreshSupervisor,
+      launcher: { ...LAUNCHER, worktree } } }).launcher.worktree, worktree);
+  }
+  // A quote in a path is allowed without the launcher, refused with it.
+  const quotedWork = { ...account, workDir: join(root, "it's") };
+  assert.equal(normalizeRefreshSupervisor({ refreshSupervisor: { ...raw.refreshSupervisor, launcher: undefined,
+    accounts: [quotedWork] } }).accounts[0].workDir, quotedWork.workDir);
+  const quotedConfigDir = join(root, "conf'ig");
+  const invalid = [
+    { ...LAUNCHER, kind: 'tmux' }, { ...LAUNCHER, kind: undefined }, { ...LAUNCHER, extra: 1 }, 'orca', null,
+    { ...LAUNCHER, orcaBin: 'orca' }, { ...LAUNCHER, orcaBin: "/opt/o'rca" }, { ...LAUNCHER, orcaBin: '/opt/or\nca' },
+    { ...LAUNCHER, worktree: 'path:relative' }, { ...LAUNCHER, worktree: 'name:x' }, { ...LAUNCHER, worktree: 'id:' },
+    ...[';', '&', '|', '$', '`', "'", '"', '\n', '\x07', '\\'].map(c => ({ ...LAUNCHER, worktree: `id:a${c}b` })),
+    { ...LAUNCHER, title: '' }, { ...LAUNCHER, title: 'x'.repeat(61) }, { ...LAUNCHER, title: '-x' },
+    ...[';', '&', '|', '$', '`', "'", '"', '\n'].map(c => ({ ...LAUNCHER, title: `a${c}b` })),
+  ];
+  for (const launcher of invalid) {
+    assert.throws(() => normalizeRefreshSupervisor({ refreshSupervisor: { ...raw.refreshSupervisor, launcher } }),
+      /^Error: invalid_refresh_config$/, JSON.stringify(launcher));
+  }
+  assert.equal(normalizeRefreshSupervisor({ refreshSupervisor: { ...raw.refreshSupervisor,
+    launcher: { ...LAUNCHER, title: 'x'.repeat(60) } } }).launcher.title.length, 60);
+  for (const value of [{ claudeBin: "/opt/cl'aude" }, { accounts: [quotedWork] },
+    { accounts: [{ ...account, configDir: quotedConfigDir, service: claudeKeychainServiceName(quotedConfigDir) }] }]) {
+    assert.throws(() => normalizeRefreshSupervisor({ refreshSupervisor: { ...raw.refreshSupervisor, ...value } }),
+      /^Error: invalid_refresh_config$/);
+  }
+});
+
+test('the Orca command empties the environment and runs the absolute client path without arguments', async t => {
+  const { account, config } = await launcherSandbox(t);
+  const env = { ...SECRET_ENV, CLAUDE_CODE_USE_BEDROCK: '1', ANTHROPIC_BASE_URL: `http://127.0.0.1/${SECRET}`,
+    http_proxy: `http://${SECRET}@p` };
+  const plan = await buildResidentPlan(account, config, { env });
+  const command = buildOrcaCommand(plan);
+  assert.equal(command, `cd '${account.workDir}' && exec /usr/bin/env -i HOME="$HOME" USER="$USER" `
+    + 'LOGNAME="$LOGNAME" SHELL="$SHELL" TERM="$TERM" LANG=en_US.UTF-8 TMPDIR="$TMPDIR" '
+    + `PATH=/usr/bin:/bin:/usr/sbin:/sbin CLAUDE_CONFIG_DIR='${account.configDir}' '${CLAUDE}'`);
+  for (const text of [SECRET, 'ANTHROPIC_', 'CLAUDE_CODE_', 'PROXY', 'proxy', 'BEDROCK']) {
+    assert.equal(command.includes(text), false, text);
+  }
+  assert.ok(command.endsWith(` '${CLAUDE}'`));
+  assert.match(command, /&& exec \/usr\/bin\/env -i /);
+  assert.equal(command.includes('${'), false);
+  for (const bad of [{ ...plan, args: ['-p', 'x'] }, { ...plan, envSet: { ...plan.envSet, EXTRA: '1' } },
+    { ...plan, cwd: "/opt/it's" }, { ...plan, file: 'claude' }, { ...plan, envSet: {} }]) {
+    assert.throws(() => buildOrcaCommand(bad), /^Error: resident_launch_failed$/);
+  }
+});
+
+test('the Orca launcher opens one unfocused terminal without a shell and finds the client among descendants',
+  async t => {
+    const { account, config } = await launcherSandbox(t);
+    const world = orcaWorld(account);
+    const { report, effects } = await runWithOrca(config, world);
+    assert.equal(report.accounts[0].result, 'started');
+    assert.equal(world.orcaCalls.length, 1);
+    const [{ args, options }] = world.orcaCalls;
+    const plan = await buildResidentPlan(account, config, { env: SECRET_ENV });
+    assert.deepEqual(args, ['terminal', 'create', '--worktree', LAUNCHER.worktree, '--title', LAUNCHER.title,
+      '--command', buildOrcaCommand(plan), '--json']);
+    assert.equal(args.includes('--focus'), false);
+    assert.equal(options.shell, undefined);
+    assert.equal(options.timeout, 20_000);
+    assert.deepEqual(options.env, { PATH: '/usr/bin' });
+    assert.equal(JSON.stringify(options.env).includes(SECRET), false);
+    // Only fixed read-only probes and the one orca call ran; nothing was sent to or closed in the terminal.
+    assert.deepEqual([...new Set(world.calls.map(call => call[0]))].sort(),
+      ['/bin/ps', '/usr/bin/pgrep', '/usr/bin/security', '/usr/sbin/lsof', ORCA].sort());
+    assert.equal(world.calls.filter(call => call[0] === ORCA).length, 1);
+    assertNoForbiddenCommands(world.calls);
+    const saved = await readFile(refreshStatePath(config), 'utf8');
+    assert.deepEqual(JSON.parse(saved).accounts[account.id].resident, { pid: 7002, startedAt: LSTART });
+    for (const text of [SECRET, HANDLE]) {
+      assert.equal(saved.includes(text), false);
+      assert.equal(JSON.stringify(report).includes(text), false);
+    }
+    assert.deepEqual(effects.record.notify, []);
+    await assert.rejects(stat(refreshLockPath(config)), { code: 'ENOENT' });
+  });
+
+test('the Orca launcher waits for the client, then records the terminal as unverified when none or two appear',
+  async t => {
+    // Appears on the third poll.
+    {
+      const { account, config } = await launcherSandbox(t);
+      const world = orcaWorld(account, { commands: (pid, tick) => (pid === 7000 ? LOGIN_CMD
+        : pid === 7001 ? '/usr/bin/env' : pid === 7002 && tick >= 3 ? CLAUDE : undefined) });
+      const { report } = await runWithOrca(config, world);
+      assert.equal(report.accounts[0].result, 'started');
+      assert.deepEqual(world.sleeps, [1000, 1000, 1000]);
+    }
+    // Never appears: 30 seconds of one-second polls, then the terminal's pid is kept as unverified.
+    {
+      const { account, config } = await launcherSandbox(t);
+      const world = orcaWorld(account, { commands: { 7000: LOGIN_CMD, 7001: '-/bin/zsh', 7002: '/usr/bin/vim' } });
+      const { report, effects } = await runWithOrca(config, world);
+      assert.equal(report.accounts[0].result, 'resident_unverified');
+      assert.equal(world.sleeps.length, 30);
+      assert.ok(world.sleeps.every(ms => ms === 1000));
+      const state = JSON.parse(await readFile(refreshStatePath(config), 'utf8')).accounts[account.id];
+      assert.equal(state.resident, null);
+      assert.deepEqual(state.residentUnverified,
+        { pid: 7000, startedAt: LSTART, pendingSince: MDAT + HOUR, manual: true });
+      assert.deepEqual(effects.record.notify, [notificationText(account.id, 'notify_unknown', 'resident_unverified')]);
+      for (const text of [SECRET, HANDLE]) assert.equal(JSON.stringify([report, state, effects.record]).includes(text), false);
+    }
+    // Two clients below the terminal: unverified at once, never trusted.
+    {
+      const { account, config } = await launcherSandbox(t);
+      const world = orcaWorld(account, { children: { 7000: [7001, 7002] },
+        commands: { 7000: LOGIN_CMD, 7001: CLAUDE, 7002: CLAUDE } });
+      const { report } = await runWithOrca(config, world);
+      assert.equal(report.accounts[0].result, 'resident_unverified');
+      assert.deepEqual(world.sleeps, []);
+      const state = JSON.parse(await readFile(refreshStatePath(config), 'utf8')).accounts[account.id];
+      assert.equal(state.resident, null);
+      assert.equal(state.residentUnverified.pid, 7000);
+    }
+    // A pgrep failure is unobservable, not "no children".
+    {
+      const { account, config } = await launcherSandbox(t);
+      const world = orcaWorld(account, { pgrep: () => { throw Object.assign(new Error('x'), { code: 2, stdout: '',
+        stderr: 'pgrep: failed' }); } });
+      const { report } = await runWithOrca(config, world);
+      assert.equal(report.accounts[0].result, 'resident_unverified');
+      assert.deepEqual(world.sleeps, []);
+    }
+  });
+
+test('an Orca failure is resident_launch_failed with a notice and leaves the pid-less record', async t => {
+  const failures = [
+    () => ({ stdout: JSON.stringify({ ok: false, error: { message: `boom ${SECRET}` } }) }),
+    () => ({ stdout: 'not json' }),
+    () => { throw Object.assign(new Error('timeout'), { killed: true, signal: 'SIGTERM', code: null }); },
+    () => ({ stdout: JSON.stringify({ ok: true, result: { terminal: { handle: HANDLE } } }) }),
+    () => ({ stdout: JSON.stringify({ ok: true, result: { terminal: { processId: '7000', handle: HANDLE } } }) }),
+    () => ({ stdout: JSON.stringify({ ok: true, result: { terminal: { processId: 7000 } } }) }),
+  ];
+  for (const orca of failures) {
+    const { account, config } = await launcherSandbox(t);
+    const world = orcaWorld(account, { orca });
+    const { report, effects } = await runWithOrca(config, world);
+    assert.equal(report.accounts[0].result, 'resident_launch_failed');
+    assert.deepEqual(effects.record.notify, [notificationText(account.id, 'notify_unknown', 'resident_launch_failed')]);
+    assert.equal(world.calls.some(call => call[0] === '/usr/bin/pgrep'), false);
+    const state = JSON.parse(await readFile(refreshStatePath(config), 'utf8')).accounts[account.id];
+    assert.deepEqual(state.residentUnverified, { pid: null, startedAt: null, pendingSince: MDAT + HOUR });
+    // The state was saved, so the lock is released as before.
+    await assert.rejects(stat(refreshLockPath(config)), { code: 'ENOENT' });
+    for (const text of [SECRET, HANDLE]) assert.equal(JSON.stringify([report, state]).includes(text), false);
+  }
+});
+
+test('orca is never called in dry-run or when the decision is not start_resident', async t => {
+  const { account, config } = await launcherSandbox(t);
+  const world = orcaWorld(account);
+  const report = await runRefreshSupervisor({ config, now: () => MDAT + HOUR, execute: world.execute,
+    env: SECRET_ENV, launcher: orcaLauncher(config, world) });
+  assert.deepEqual([report.accounts[0].action, report.accounts[0].reason], ['start_resident', 'resident_missing']);
+  assert.equal(world.orcaCalls.length, 0);
+  await writeState(config, { [account.id]: { resident: { pid: 4242, startedAt: LSTART } } });
+  const alive = orcaWorld(account, { commands: { 4242: CLAUDE } });
+  const { report: next } = await runWithOrca(config, alive);
+  assert.deepEqual([next.accounts[0].action, next.accounts[0].reason], ['none', 'fresh']);
+  assert.equal(alive.orcaCalls.length, 0);
+  assert.equal(alive.calls.some(call => call[0] === '/usr/bin/pgrep'), false);
+});
+
+test('the CLI passes an Orca launcher only when the setting has one', async t => {
+  const { raw, root } = await sandbox(t);
+  const options = [];
+  const deps = { write: () => {}, error: () => {},
+    runRefreshSupervisor: async value => { options.push(value); return { mode: 'dry-run', accounts: [] }; } };
+  const plain = join(root, 'plain.json');
+  await writeFile(plain, JSON.stringify(raw));
+  const withLauncher = join(root, 'launcher.json');
+  await writeFile(withLauncher, JSON.stringify({ refreshSupervisor: { ...raw.refreshSupervisor, launcher: LAUNCHER } }));
+  const created = [];
+  assert.equal(await runCli(['credential-swap', 'refresh-supervisor', '--config', plain, '--apply'], deps), 0);
+  assert.equal(await runCli(['credential-swap', 'refresh-supervisor', '--config', withLauncher], {
+    ...deps, createOrcaLauncher: value => { created.push(value.config.launcher); return async () => ({}); } }), 0);
+  assert.equal(await runCli(['credential-swap', 'refresh-supervisor', '--config', withLauncher, '--apply'], deps), 0);
+  assert.equal(options[0].launcher, undefined);
+  assert.equal(typeof options[1].launcher, 'function');
+  assert.deepEqual(created, [LAUNCHER]);
+  assert.equal(typeof options[2].launcher, 'function');
+  assert.equal(options[2].apply, true);
+});
+
+test('a client that started before the orca call is another process and is not counted', async t => {
+  // Started 10 seconds before the call: ignored, so the search runs out and the terminal stays unverified.
+  {
+    const { account, config } = await launcherSandbox(t);
+    const world = orcaWorld(account, { clockStart: LSTART_MS + 10_000 });
+    const { report } = await runWithOrca(config, world);
+    assert.equal(report.accounts[0].result, 'resident_unverified');
+    assert.equal(world.sleeps.length, 30);
+  }
+  // An old client beside a new one: only the new one counts.
+  {
+    const { account, config } = await launcherSandbox(t);
+    const world = orcaWorld(account, { clockStart: LSTART_MS + 10_000, children: { 7000: [7001, 7003] },
+      commands: { 7000: LOGIN_CMD, 7001: CLAUDE, 7003: CLAUDE }, starts: { 7003: 'Wed May 18 03:00:09 2033' } });
+    const { report } = await runWithOrca(config, world);
+    assert.equal(report.accounts[0].result, 'started');
+    const state = JSON.parse(await readFile(refreshStatePath(config), 'utf8')).accounts[account.id];
+    assert.equal(state.resident.pid, 7003);
+  }
+  // The terminal process itself as claudeBin, started long before: not trusted.
+  {
+    const { account, config } = await launcherSandbox(t);
+    const world = orcaWorld(account, { clockStart: LSTART_MS + 10_000, children: {}, commands: { 7000: CLAUDE } });
+    const { report } = await runWithOrca(config, world);
+    assert.equal(report.accounts[0].result, 'resident_unverified');
+  }
+  // A start time that cannot be parsed: unverified at once.
+  {
+    const { account, config } = await launcherSandbox(t);
+    const world = orcaWorld(account, { starts: { 7002: 'Wed Xyz 18 03:00:00 2033' } });
+    const { report } = await runWithOrca(config, world);
+    assert.equal(report.accounts[0].result, 'resident_unverified');
+    assert.deepEqual(world.sleeps, []);
+  }
+});
+
+test('a manual record survives the terminal parent going away and blocks the next launch', async t => {
+  const { account, config } = await launcherSandbox(t);
+  const world = orcaWorld(account, { commands: { 7000: LOGIN_CMD, 7001: '-/bin/zsh', 7002: '/usr/bin/vim' } });
+  await runWithOrca(config, world);
+  const recorded = JSON.parse(await readFile(refreshStatePath(config), 'utf8')).accounts[account.id];
+  assert.equal(recorded.residentUnverified.manual, true);
+  assert.equal(recorded.residentUnverified.pid, 7000);
+  // Next pass: the parent 7000 is gone, its child lives on.
+  const next = orcaWorld(account, { commands: { 7002: CLAUDE } });
+  // Later than the notice dedupe window, so the notice is sent again.
+  const { report, effects } = await runWithOrca(config, next, { now: () => MDAT + 7 * HOUR });
+  assert.deepEqual([report.accounts[0].action, report.accounts[0].reason], ['notify_unknown', 'resident_unverified']);
+  assert.equal(next.orcaCalls.length, 0);
+  assert.deepEqual(effects.record.notify, [notificationText(account.id, 'notify_unknown', 'resident_unverified')]);
+  const kept = JSON.parse(await readFile(refreshStatePath(config), 'utf8')).accounts[account.id];
+  assert.deepEqual(kept.residentUnverified, recorded.residentUnverified);
+  // The state parser accepts manual only as true, with a pid.
+  for (const bad of [{ pid: 7000, startedAt: null, pendingSince: 1, manual: false },
+    { pid: null, startedAt: null, pendingSince: 1, manual: true },
+    { pid: 7000, startedAt: null, manual: true }]) {
+    await writeState(config, { [account.id]: { residentUnverified: bad } });
+    const blocked = orcaWorld(account);
+    const { report: refused } = await runWithOrca(config, blocked);
+    assert.deepEqual([refused.accounts[0].action, refused.accounts[0].reason],
+      ['notify_unknown', 'refresh_state_invalid']);
+    assert.equal(blocked.orcaCalls.length, 0);
+  }
+});
+
+test('the 30 second search limit is checked during a walk and caps each probe timeout', async t => {
+  const { account, config } = await launcherSandbox(t);
+  // Every probe costs 4 seconds; no client ever appears.
+  const world = orcaWorld(account, { probeCostMs: 4_000,
+    commands: { 7000: LOGIN_CMD, 7001: '-/bin/zsh', 7002: '/usr/bin/vim' } });
+  const launcher = orcaLauncher(config, world);
+  const plan = await buildResidentPlan(account, config, { env: SECRET_ENV });
+  const start = world.now();
+  const result = await launcher(plan, { PATH: '/usr/bin' });
+  assert.deepEqual(result, { pid: 7000, verified: false });
+  const deadline = start + 30_000;
+  const probes = world.probes.filter(probe => probe.at >= start);
+  assert.ok(probes.length > 0);
+  for (const probe of probes) {
+    assert.ok(probe.at < deadline);
+    assert.ok(probe.timeout > 0 && probe.timeout <= Math.min(10_000, deadline - probe.at), JSON.stringify(probe));
+  }
+  assert.ok(probes.some(probe => probe.timeout < 10_000));
+  // The walk stopped within one probe of the limit.
+  assert.ok(world.now() <= deadline + 4_000);
+});
+
+test('the orca CLI gets only HOME, USER, LOGNAME, PATH, TMPDIR and LANG', async t => {
+  const { account, config } = await launcherSandbox(t);
+  const world = orcaWorld(account);
+  const launcher = orcaLauncher(config, world);
+  const plan = await buildResidentPlan(account, config, { env: SECRET_ENV });
+  await launcher(plan, { HOME: '/Users/test', USER: 'test', LOGNAME: 'test', PATH: '/usr/bin', TMPDIR: '/tmp/x',
+    LANG: 'C', ANTHROPIC_API_KEY: SECRET, CLAUDE_CODE_OAUTH_TOKEN: SECRET, HTTPS_PROXY: SECRET,
+    CLAUDE_CONFIG_DIR: account.configDir, SHELL: '/bin/zsh' });
+  assert.deepEqual(world.orcaCalls[0].options.env, { HOME: '/Users/test', USER: 'test', LOGNAME: 'test',
+    PATH: '/usr/bin', TMPDIR: '/tmp/x', LANG: 'C' });
+});
+
+test('only a terminal whose process is /usr/bin/login is searched for the client', async t => {
+  // A bare login (no arguments) is accepted as well.
+  {
+    const { account, config } = await launcherSandbox(t);
+    const world = orcaWorld(account, { commands: { 7000: '/usr/bin/login', 7001: '-/bin/zsh', 7002: CLAUDE } });
+    const { report } = await runWithOrca(config, world);
+    assert.equal(report.accounts[0].result, 'started');
+  }
+  for (const root of ['/Applications/Orca.app/Contents/MacOS/orca-terminal-host', '-/bin/zsh',
+    '/usr/bin/loginx', CLAUDE, undefined]) {
+    const { account, config } = await launcherSandbox(t);
+    const world = orcaWorld(account, { commands: { 7000: root, 7001: '-/bin/zsh', 7002: CLAUDE } });
+    const { report } = await runWithOrca(config, world);
+    assert.equal(report.accounts[0].result, 'resident_unverified', String(root));
+    assert.equal(world.orcaCalls.length, 1);
+    assert.equal(world.calls.some(call => call[0] === '/usr/bin/pgrep'), false);
+    assert.deepEqual(world.sleeps, []);
+    const state = JSON.parse(await readFile(refreshStatePath(config), 'utf8')).accounts[account.id];
+    assert.equal(state.resident, null);
+    assert.equal(state.residentUnverified.pid, 7000);
+    assert.equal(state.residentUnverified.manual, true);
+  }
+});
+
+test('no probe gets a zero or negative timeout when the deadline arrives between reads', async t => {
+  // The clock moves on every read, so a check and a recomputation would straddle the deadline.
+  for (const nowStepMs of [700, 900, 1000, 1500]) {
+    const { account, config } = await launcherSandbox(t);
+    const world = orcaWorld(account, { nowStepMs, commands: { 7000: LOGIN_CMD, 7001: '-/bin/zsh',
+      7002: '/usr/bin/vim' } });
+    const launcher = orcaLauncher(config, world);
+    const plan = await buildResidentPlan(account, config, { env: SECRET_ENV });
+    assert.deepEqual(await launcher(plan, { PATH: '/usr/bin' }), { pid: 7000, verified: false });
+    assert.ok(world.probes.length > 0);
+    for (const probe of world.probes) {
+      assert.ok(Number.isInteger(probe.timeout) && probe.timeout >= 1 && probe.timeout <= 10_000,
+        `${nowStepMs}: ${probe.timeout}`);
+    }
+  }
 });

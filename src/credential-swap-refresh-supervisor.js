@@ -90,6 +90,7 @@ export function normalizeRefreshSupervisor(config) {
     || !integer(fallback.timeoutMs, 1_000, 30 * 60_000)
     || !validPrompt(fallback.prompt)
     || !Array.isArray(result.accounts) || result.accounts.length === 0) throw refreshError();
+  if (raw.launcher !== undefined) result.launcher = normalizeLauncher(raw.launcher);
   result.stateDir = resolve(result.stateDir);
   const ids = new Set();
   const workDirs = [];
@@ -104,13 +105,36 @@ export function normalizeRefreshSupervisor(config) {
       ...(account.swapStateDir ? [account.swapStateDir] : []), ...workDirs];
     if (guarded.some(path => overlaps(workDir, resolve(path)))) throw refreshError();
     workDirs.push(workDir);
+    // The Orca launcher puts these paths inside single quotes of a shell command.
+    if (result.launcher && [account.workDir, account.configDir].some(path => path.includes("'")))
+      throw refreshError();
   }
+  if (result.launcher && result.claudeBin.includes("'")) throw refreshError();
   const protectedPaths = [appConfigDir(), runtimeStatePath(), appDataDir(), linuxAccountsDir(),
     ...result.accounts.flatMap(account => [account.configDir,
       ...account.keychainAllowlist.map(file => dirname(file)),
       ...(account.swapStateDir ? [account.swapStateDir] : [])])];
   if (protectedPaths.some(path => overlaps(result.stateDir, resolve(path)))) throw refreshError();
   return structuredClone(result);
+}
+
+// Values that reach the Orca command line or the terminal shell carry no
+// quote, control character, escape or shell operator.
+const LAUNCHER_KEYS = ['kind', 'orcaBin', 'worktree', 'title'];
+const SHELL_UNSAFE = /[\x00-\x1f\x7f'"`$;&|\\]/;
+
+function validWorktree(value) {
+  const match = /^(path|id|folder):(.+)$/.exec(value);
+  return Boolean(match) && (match[1] !== 'path' || isAbsolute(match[2]));
+}
+
+function normalizeLauncher(value) {
+  if (!exactKeys(value, LAUNCHER_KEYS) || value.kind !== 'orca'
+    || !pathText(value.orcaBin) || value.orcaBin.includes("'")
+    || typeof value.worktree !== 'string' || SHELL_UNSAFE.test(value.worktree) || !validWorktree(value.worktree)
+    || typeof value.title !== 'string' || value.title.length < 1 || value.title.length > 60
+    || SHELL_UNSAFE.test(value.title) || value.title.startsWith('-')) throw refreshError();
+  return { kind: 'orca', orcaBin: value.orcaBin, worktree: value.worktree, title: value.title };
 }
 
 // The prompt is one fixed sentence. A leading '-' would read as an option and a
@@ -233,12 +257,12 @@ export function parsePsLine(stdout) {
 
 // Only start time and command are read. Environments of other processes are
 // never requested.
-export async function probeResidentProcess(pid, execute) {
+export async function probeResidentProcess(pid, execute, timeoutMs = PROBE_TIMEOUT_MS) {
   if (!integer(pid, 2, 2 ** 31 - 1)) return { status: 'unknown' };
   try {
     // lstart follows the locale; a fixed locale keeps the recorded start comparable.
     const { stdout } = await execute(PS, ['-p', String(pid), '-o', 'lstart=,command='],
-      { ...probeOptions(), env: { ...process.env, LC_ALL: 'C' } });
+      { ...probeOptions(), timeout: timeoutMs, env: { ...process.env, LC_ALL: 'C' } });
     const parsed = parsePsLine(stdout);
     return parsed ? { status: 'running', ...parsed } : { status: 'unknown' };
   } catch (error) {
@@ -256,9 +280,12 @@ export async function probeResidentProcess(pid, execute) {
 // 'unverified' until ps proves that process gone.
 export async function probeResident(account, accountState, config, execute) {
   const unverified = accountState?.residentUnverified;
-  // A launch recorded before its pid was known is never cleared automatically;
-  // a person checks the process and corrects the state file.
-  if (unverified?.pid === null) return { status: 'unverified', pid: null, clearUnverified: false };
+  // A launch recorded before its pid was known, or one whose client could not
+  // be identified (manual), is never cleared automatically: the recorded pid
+  // may be the terminal's parent while its client child lives on. A person
+  // checks the processes and corrects the state file.
+  if (unverified?.pid === null || unverified?.manual === true)
+    return { status: 'unverified', pid: unverified.pid, clearUnverified: false };
   if (unverified) {
     const seen = await probeResidentProcess(unverified.pid, execute);
     const replaced = seen.status === 'running' && unverified.startedAt !== null
@@ -502,6 +529,130 @@ export async function defaultLauncher() {
   throw refreshError('resident_launcher_unconfigured');
 }
 
+// The terminal's shell is not the supervisor's, so its environment is emptied
+// with env -i and rebuilt from this allow list instead of removing names: every
+// ANTHROPIC_*, CLAUDE_CODE_*, proxy or other variable of the terminal is
+// dropped. exec with an absolute path bypasses shell aliases.
+// The terminal's login shell is assumed to be zsh or bash.
+const ORCA_ENV_ALLOW = 'HOME="$HOME" USER="$USER" LOGNAME="$LOGNAME" SHELL="$SHELL" TERM="$TERM" '
+  + 'LANG=en_US.UTF-8 TMPDIR="$TMPDIR" PATH=/usr/bin:/bin:/usr/sbin:/sbin';
+// The orca CLI itself gets only these names from the supervisor's environment.
+const ORCA_CLI_ENV = ['HOME', 'USER', 'LOGNAME', 'PATH', 'TMPDIR', 'LANG'];
+// ps prints whole seconds; a client started before the orca call minus this
+// slack is some other process.
+const LAUNCH_START_SLACK_MS = 2_000;
+const PGREP = '/usr/bin/pgrep';
+const LOGIN = '/usr/bin/login';
+const ORCA_TIMEOUT_MS = 20_000;
+const FIND_WAIT_MS = 30_000;
+const FIND_STEP_MS = 1_000;
+const MAX_DESCENDANTS = 64;
+
+export function buildOrcaCommand(plan) {
+  const configDir = plan?.envSet?.CLAUDE_CONFIG_DIR;
+  if (!Array.isArray(plan?.args) || plan.args.length !== 0 || !object(plan.envSet)
+    || Object.keys(plan.envSet).length !== 1
+    || [plan.cwd, configDir, plan.file].some(value => !pathText(value) || value.includes("'")))
+    throw refreshError('resident_launch_failed');
+  return `cd '${plan.cwd}' && exec /usr/bin/env -i ${ORCA_ENV_ALLOW} CLAUDE_CONFIG_DIR='${configDir}' '${plan.file}'`;
+}
+
+// pgrep exits 1 with no output when a process has no children; anything else
+// is a failed observation.
+async function childPids(pid, execute, timeoutMs) {
+  try {
+    const { stdout } = await execute(PGREP, ['-P', String(pid)], { ...probeOptions(), timeout: timeoutMs });
+    const lines = String(stdout).split('\n').map(line => line.trim()).filter(Boolean);
+    const pids = lines.map(Number);
+    return lines.every(line => /^\d{1,10}$/.test(line)) && pids.every(child => integer(child, 2, 2 ** 31 - 1))
+      ? pids : null;
+  } catch (error) {
+    if (error?.code === 1 && !error.killed && !error.signal && !String(error.stdout ?? '').trim()
+      && !String(error.stderr ?? '').trim()) return [];
+    return null;
+  }
+}
+
+// Walks the terminal's process and its descendants (parent to child from
+// rootPid) with pgrep and ps only. A candidate is a process whose command is
+// exactly claudeBin and that started no earlier than notBeforeMs. Returns the
+// candidate pids, null when any step could not be observed, or 'expired' when
+// the deadline passed. Each probe's timeout is limited to the time left, read
+// once per probe; with less than 1 ms left no probe is made.
+// The terminal process Orca reports is that terminal's own /usr/bin/login (its
+// child is the login shell). Anything else is not a terminal this launcher can
+// vouch for, and nothing below it is searched.
+const isLoginCommand = command => command === LOGIN || command.startsWith(`${LOGIN} `);
+
+async function claudeDescendants(rootPid, claudeBin, execute, { notBeforeMs, deadline, now }) {
+  const seen = new Set([rootPid]);
+  const queue = [rootPid];
+  const matches = [];
+  const probeTimeout = () => {
+    const left = Math.floor(deadline - now());
+    return left >= 1 ? Math.min(PROBE_TIMEOUT_MS, left) : null;
+  };
+  while (queue.length) {
+    const pid = queue.shift();
+    const psTimeout = probeTimeout();
+    if (psTimeout === null) return 'expired';
+    const proc = await probeResidentProcess(pid, execute, psTimeout);
+    if (proc.status === 'unknown') return null;
+    if (pid === rootPid && (proc.status !== 'running' || !isLoginCommand(proc.command))) return 'not_login';
+    if (proc.status === 'running' && proc.command === claudeBin) {
+      const startedMs = parsePsStart(proc.startedAt);
+      if (startedMs === null) return null;
+      if (startedMs >= notBeforeMs) matches.push(pid);
+    }
+    const pgrepTimeout = probeTimeout();
+    if (pgrepTimeout === null) return 'expired';
+    const children = await childPids(pid, execute, pgrepTimeout);
+    if (children === null) return null;
+    for (const child of children) {
+      if (seen.has(child)) continue;
+      if (seen.size >= MAX_DESCENDANTS) return null;
+      seen.add(child);
+      queue.push(child);
+    }
+  }
+  return matches;
+}
+
+// Opens one Orca terminal that runs the official client and only identifies
+// it afterwards. Nothing is ever typed into, sent to or closed in the terminal.
+// The terminal handle is not returned, reported or stored.
+export function createOrcaLauncher({ config, execute = promisify(execFile),
+  sleep = ms => new Promise(resolveSleep => setTimeout(resolveSleep, ms)), now = Date.now } = {}) {
+  const { orcaBin, worktree, title } = config.launcher;
+  return async (plan, env = {}) => {
+    const command = buildOrcaCommand(plan);
+    const orcaEnv = {};
+    for (const name of ORCA_CLI_ENV) if (typeof env[name] === 'string') orcaEnv[name] = env[name];
+    const notBeforeMs = now() - LAUNCH_START_SLACK_MS;
+    let parsed;
+    try {
+      const { stdout } = await execute(orcaBin, ['terminal', 'create', '--worktree', worktree, '--title', title,
+        '--command', command, '--json'], { encoding: 'utf8', maxBuffer: 1024 * 1024, timeout: ORCA_TIMEOUT_MS,
+        env: orcaEnv });
+      parsed = JSON.parse(stdout);
+    } catch { throw refreshError('resident_launch_failed'); }
+    const terminal = parsed?.ok === true && object(parsed.result) ? parsed.result.terminal : null;
+    const rootPid = terminal?.processId;
+    if (!object(terminal) || !integer(rootPid, 2, 2 ** 31 - 1)
+      || typeof terminal.handle !== 'string' || !terminal.handle) throw refreshError('resident_launch_failed');
+    const deadline = now() + FIND_WAIT_MS;
+    for (;;) {
+      const found = await claudeDescendants(rootPid, plan.file, execute, { notBeforeMs, deadline, now });
+      // Unobservable, not a login terminal, ambiguous or out of time: the
+      // terminal's pid is kept as unverified.
+      if (!Array.isArray(found) || found.length > 1) return { pid: rootPid, verified: false };
+      if (found.length === 1) return { pid: found[0], verified: true };
+      if (now() >= deadline) return { pid: rootPid, verified: false };
+      await sleep(FIND_STEP_MS);
+    }
+  };
+}
+
 // No shell; stdin is closed; output is counted and discarded. At the time limit
 // the child gets SIGTERM, then SIGKILL after a grace period; if it still does
 // not close, the run resolves as unfinished instead of waiting forever.
@@ -576,9 +727,13 @@ const exactKeys = (value, keys) => object(value)
   && Object.keys(value).length === keys.length && keys.every(key => Object.hasOwn(value, key));
 
 // Either a launch whose pid is not yet known ({ pid: null, startedAt: null,
-// pendingSince }) or a launched pid whose identity was not confirmed.
+// pendingSince }), a launched pid whose client could not be identified
+// ({ pid, startedAt, pendingSince, manual: true }), or an older record of a
+// launched pid whose identity was not confirmed.
 function validUnverified(value) {
-  if (exactKeys(value, ['pid', 'startedAt', 'pendingSince'])) {
+  if (exactKeys(value, ['pid', 'startedAt', 'pendingSince', 'manual'])) {
+    if (value.manual !== true || !integer(value.pendingSince, 0)) return false;
+  } else if (exactKeys(value, ['pid', 'startedAt', 'pendingSince'])) {
     if (!integer(value.pendingSince, 0)) return false;
     if (value.pid === null) return value.startedAt === null;
   } else if (!exactKeys(value, ['pid', 'startedAt'])) return false;
@@ -797,11 +952,12 @@ async function supervisePass({
         const launched = await launcher(plan, planEnvironment(plan, env));
         if (!integer(launched?.pid, 2)) throw refreshError('resident_launch_failed');
         const seen = await probeResidentProcess(launched.pid, execute);
-        if (seen.status !== 'running' || seen.command !== config.claudeBin) {
+        if (launched.verified === false || seen.status !== 'running' || seen.command !== config.claudeBin) {
           // The launched process is neither trusted nor stopped. Its record
-          // blocks further launches until ps proves it gone.
+          // blocks further launches until a person has looked (manual), even
+          // if ps later reports the recorded pid gone.
           accountState.residentUnverified = { pid: launched.pid,
-            startedAt: seen.status === 'running' ? seen.startedAt : null, pendingSince };
+            startedAt: seen.status === 'running' ? seen.startedAt : null, pendingSince, manual: true };
           throw refreshError('resident_unverified');
         }
         accountState.resident = { pid: launched.pid, startedAt: seen.startedAt };
