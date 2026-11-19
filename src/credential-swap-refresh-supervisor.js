@@ -347,10 +347,14 @@ export function parsePsStart(text) {
 }
 
 // A running official client does not necessarily keep a file open below its
-// configuration folder, so lsof alone can miss it. The client names a file
-// sessions/<pid>.json there. Only entry names and their metadata (lstat) are
-// read; no file is opened and other names such as keys are ignored. Each pid
-// is checked with ps:
+// configuration folder, so lsof alone can miss it. The client names files
+// sessions/<pid>.json and sessions/<pid>.<64 hex>.key there. While the client
+// waits on its first confirmation screen only the .key name exists (observed
+// 2026-11-18), so both shapes name a client. Only entry names and their
+// metadata (lstat) are read; no file is opened. Any other name that starts
+// with a pid is an unexpected shape and makes the answer unknown; names that
+// do not start with digits are ignored. Each pid (whichever of its names was
+// created last) is checked with ps:
 // - gone: a stale name, ignored;
 // - started more than a short slack after the name was created: the pid was
 //   reused by another process, ignored;
@@ -366,25 +370,35 @@ export async function probeSessionClientsDetailed(account, residentPid, config, 
   catch (error) { return error?.code === 'ENOENT' ? { status: 'none', pids: new Set() } : unknown; }
   if (!Array.isArray(names)) return unknown;
   const candidates = new Map();
+  let nameCount = 0;
   for (const name of names) {
-    const match = typeof name === 'string' && name.match(/^(\d{1,10})\.json$/);
-    if (!match) continue;
+    if (typeof name !== 'string') return unknown;
+    const match = name.match(/^(\d{1,10})\.(?:json|[0-9a-fA-F]{64}\.key)$/);
+    if (!match) {
+      if (/^\d+\./.test(name)) return unknown;
+      continue;
+    }
     const pid = Number(match[1]);
     if (!integer(pid, 2, 2 ** 31 - 1) || pid === process.pid || pid === residentPid) continue;
-    candidates.set(name, pid);
+    nameCount++;
+    candidates.set(pid, [...(candidates.get(pid) ?? []), name]);
   }
-  if (candidates.size > MAX_SESSION_NAMES) return unknown;
+  if (nameCount > MAX_SESSION_NAMES) return unknown;
   const found = new Set();
-  for (const [name, pid] of candidates) {
-    let createdMs;
-    try {
-      const info = await lstatImpl(join(sessionsDir, name));
-      createdMs = info.birthtimeMs > 0 ? info.birthtimeMs : info.mtimeMs;
-    } catch (error) {
-      if (error?.code === 'ENOENT') continue;
-      return unknown;
+  for (const [pid, pidNames] of candidates) {
+    let createdMs = null;
+    for (const name of pidNames) {
+      let info;
+      try { info = await lstatImpl(join(sessionsDir, name)); }
+      catch (error) {
+        if (error?.code === 'ENOENT') continue;
+        return unknown;
+      }
+      const at = info.birthtimeMs > 0 ? info.birthtimeMs : info.mtimeMs;
+      if (!Number.isFinite(at) || at <= 0) return unknown;
+      createdMs = Math.max(createdMs ?? at, at);
     }
-    if (!Number.isFinite(createdMs) || createdMs <= 0) return unknown;
+    if (createdMs === null) continue;
     const seen = await probeResidentProcess(pid, execute);
     if (seen.status === 'unknown') return unknown;
     if (seen.status === 'absent') continue;

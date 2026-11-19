@@ -804,7 +804,8 @@ function sessionsIO(account, answer, { createdMs = LSTART_MS + 1000, lstat } = {
   return io;
 }
 
-const SESSION_NAMES = ['74132.json', '74132.0123abcd.key'];
+const KEY_HEX = '0123abcd'.repeat(8);
+const SESSION_NAMES = ['74132.json', `74132.${KEY_HEX}.key`];
 
 async function sessionPass(t, { names = SESSION_NAMES, ps, offset = HOUR, enabled = false, lsof,
   claudeBin, created } = {}) {
@@ -869,10 +870,11 @@ test('stale session names, unknown processes and unreadable session folders are 
   assert.equal(result.entry.action, 'notify_unknown');
   result = await sessionPass(t, { names: Object.assign(new Error('missing'), { code: 'ENOENT' }) });
   assert.deepEqual([result.entry.action, result.entry.reason], ['start_resident', 'resident_missing']);
-  // Only <pid>.json names are considered; others are never checked with ps.
-  result = await sessionPass(t, { names: ['notes.json', '74132.0123abcd.key', 'x74132.json'],
+  // Names that do not start with a pid are ignored and never checked with ps.
+  result = await sessionPass(t, { names: ['notes.json', 'x74132.json', `x74132.${KEY_HEX}.key`, '.DS_Store'],
     ps: () => { throw new Error('ps must not run'); } });
   assert.equal(result.entry.action, 'start_resident');
+  assert.equal(result.io.lstatCalls.length, 0);
   // lsof alone (no session name) still notifies as before.
   result = await sessionPass(t, { names: [], lsof: () => ({ stdout: '5151\n' }) });
   assert.deepEqual([result.entry.action, result.entry.reason], ['notify_unknown', 'other_users_present']);
@@ -1348,5 +1350,59 @@ test('no probe gets a zero or negative timeout when the deadline arrives between
       assert.ok(Number.isInteger(probe.timeout) && probe.timeout >= 1 && probe.timeout <= 10_000,
         `${nowStepMs}: ${probe.timeout}`);
     }
+  }
+});
+
+test('a client on its first confirmation screen, named only by its key file, is not launched twice', async t => {
+  const keyOnly = [`74132.${KEY_HEX}.key`];
+  // Live official client: left alone, never a second launch.
+  let result = await sessionPass(t, { names: keyOnly, ps: pid => {
+    assert.equal(pid, '74132');
+    return { stdout: `${LSTART} ${CLAUDE}\n` };
+  } });
+  assert.deepEqual([result.entry.action, result.entry.reason], ['none', 'external_client_present']);
+  assert.equal(result.entry.observation.externalClient, true);
+  assert.equal(result.io.readFileCalls.length, 0);
+  assert.deepEqual(result.io.lstatCalls, [join(result.account.configDir, 'sessions', keyOnly[0])]);
+  assert.equal(result.fake.calls.some(call => call.some(arg => /0123abcd|sessions/.test(String(arg)))), false);
+  for (const leaked of ['74132', '.key', KEY_HEX]) {
+    assert.equal(JSON.stringify(result.report).includes(leaked), false, leaked);
+  }
+  // Also with --apply: the launcher is never called.
+  {
+    const { account, config } = await sandbox(t);
+    const fake = fakeExecute(account, { ps: () => ({ stdout: `${LSTART} ${CLAUDE}\n` }) });
+    const effects = sideEffects();
+    const report = await runRefreshSupervisor({ config, apply: true, now: () => MDAT + HOUR, execute: fake.execute,
+      sessionsIO: sessionsIO(account, keyOnly), env: SECRET_ENV, ...effects });
+    assert.deepEqual([report.accounts[0].action, report.accounts[0].reason], ['none', 'external_client_present']);
+    assert.equal(effects.record.launcher.length, 0);
+  }
+  // The pid is gone: a stale name, as before.
+  result = await sessionPass(t, { names: keyOnly });
+  assert.deepEqual([result.entry.action, result.entry.reason], ['start_resident', 'resident_missing']);
+  // The pid was reused by a process that started after the name: ignored.
+  result = await sessionPass(t, { names: keyOnly, created: { createdMs: LSTART_MS - 121_000 },
+    ps: () => ({ stdout: `${LSTART} /usr/bin/vim\n` }) });
+  assert.deepEqual([result.entry.action, result.entry.reason], ['start_resident', 'resident_missing']);
+  // A live process under the key name that is not the official client: unknown, no launch.
+  result = await sessionPass(t, { names: keyOnly, ps: () => ({ stdout: `${LSTART} /usr/bin/vim\n` }) });
+  assert.deepEqual([result.entry.action, result.entry.reason], ['notify_unknown', 'other_users_unknown']);
+  // Both names for one pid: one ps call, judged by the later name.
+  result = await sessionPass(t, { names: SESSION_NAMES, created: { lstat: path => ({
+    birthtimeMs: path.endsWith('.json') ? LSTART_MS + 360_000 : LSTART_MS - 300_000, mtimeMs: 0 }) },
+  ps: () => ({ stdout: `${LSTART} ${CLAUDE}\n` }) });
+  assert.equal(result.entry.reason, 'external_client_present');
+  assert.equal(result.fake.calls.filter(call => call[0] === '/bin/ps').length, 1);
+});
+
+test('a session name of an unexpected shape stops automatic launching', async t => {
+  for (const name of ['74132.0123abcd.key', `74132.${KEY_HEX}.json`, '74132.key', '74132.json.tmp',
+    `74132.${KEY_HEX}g.key`, `74132.${KEY_HEX}.key.bak`, '74132.']) {
+    const result = await sessionPass(t, { names: [name], ps: () => { throw new Error('ps must not run'); } });
+    assert.deepEqual([result.entry.action, result.entry.reason], ['notify_unknown', 'other_users_unknown'], name);
+    assert.equal(result.effects.record.launcher.length, 0);
+    assert.equal(result.io.lstatCalls.length, 0);
+    assert.equal(JSON.stringify(result.report).includes('74132'), false);
   }
 });
