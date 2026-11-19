@@ -3057,6 +3057,146 @@ If `refresh-usage` fails for every account with `fetch failed`, `OAuth connectio
 curl -I --connect-timeout 10 --max-time 20 https://api.anthropic.com/api/oauth/usage
 ```
 
+### Separate credential swap proxy
+
+`claude-rotator credential-swap serve --config <path>` starts a separate,
+loopback-only process. It does not start the existing server, refresh credentials,
+install a service, or change Claude Code settings. The existing `server` command
+and default configuration are unchanged.
+
+The explicit config file accepts a `credentialSwap` object:
+
+```json
+{
+  "credentialSwap": {
+    "enabled": false,
+    "listenPort": 37991,
+    "expiryMarginMs": 300000,
+    "legacyProxyUrl": "http://127.0.0.1:37891",
+    "stateDir": "/absolute/separate/swap-state",
+    "callers": [],
+    "swapAccounts": []
+  }
+}
+```
+
+The feature defaults to off. Malformed explicit settings reject startup; an
+invalid reload rejects new requests until a valid configuration is restored.
+`stateDir` must be an absolute, separate directory. After lexical normalization,
+the application config directory, runtime state path, application data directory,
+account storage root, each swap account's `configDir`, and the parent directory
+of each `keychainPath`, their descendants and their ancestors are rejected.
+Environment-dependent paths are resolved using this process's environment.
+This check does not resolve filesystem aliases;
+use a dedicated directory without symlink aliases to existing application state.
+`legacyProxyUrl` accepts only
+numeric loopback HTTP origins. Listener port and state directory changes require
+a restart. Changing `stateDir` on restart does not carry over a previous
+directory's 403 stop marker; preserve that directory when retaining a stop.
+File watching and a 250 ms periodic reread apply configuration changes
+independently of credential reads. The optional `requestTimeoutMs` defaults to
+180000 and limits upstream connection/response inactivity.
+Startup failures print only a fixed reason code to standard error:
+`invalid_swap_config`, `swap_config_required`, `swap_state_unavailable`,
+`swap_port_in_use`, `swap_listen_unavailable`, or the fallback
+`credential_swap_serve_failed`. Raw operating system errors and config values
+are not printed.
+
+Every request requires exactly one `x-claude-rotator-caller` header. A caller
+registration has `sha256` (64 lowercase hex characters), `accountId` (the display
+identity), and `expiresAt` (epoch milliseconds). Missing, unknown, duplicated or
+expired caller credentials receive a fixed 401 before any credential read or
+upstream connection. Caller generation, registration and launcher integration
+are not included. Incoming Bearer values and account selection headers do not
+establish caller identity. All `x-claude-rotator-*` headers are stripped.
+
+When enabled, exactly one `swapAccounts` entry is required. Its fields are `id`,
+`configDir`, `service`, `acct`, `keychainPath`, and `keychainAllowlist` (absolute
+file paths). `service` must equal `claudeKeychainServiceName(configDir)` from
+`src/claude-keychain.js`; the unsuffixed default service is rejected. The reader
+checks the user search list without reading passwords, enumerates attributes
+only in allowlisted files (`dump-keychain`, without decryption options), requires
+one exact service/account match, then reads it with `find-generic-password -w`
+and explicit service, account and file arguments. It compares attributes and
+search targets before and after the read. Unrelated entries with null, escaped
+or unrecognised attributes are skipped when either identity field proves a
+mismatch. An unrecognised field on a possible match still fails closed.
+Dump attribute quotes accept escaped quotes, backslashes and three-digit octal
+bytes, including the literal trailing `\000` in modification times. Hex prefixes
+may be separated from the quoted value by one or more spaces or tabs. The
+simplified quoted modification time without `\000` is also accepted. JSON-only
+escapes such as `\u0000` are not interpreted as dump escapes; unknown or malformed
+escapes on a possible match fail closed.
+No write, refresh, alternate file or default Keychain fallback exists.
+Only access token and expiry leave the reader; no token is persisted or logged.
+Unknown, expired or within-margin expiry produces a fixed 503, with distinct
+non-secret event reason codes.
+The reader remembers the greatest accepted expiry per exact credential target
+for its process lifetime. A lower expiry returns 503 with
+`credential_expiry_rollback`, even if the token or attributes changed. A
+legitimate reissue with a shorter expiry is also rejected until reviewed and
+the process explicitly restarted; equal or later valid expiries are accepted.
+Restart clears this in-memory history, so rollback before the first read of a
+new process cannot be detected. This does not clear a persisted 403 stop.
+
+Only exact `POST /v1/messages` requests (including a query, excluding a trailing
+slash) receive the selected account's Authorization. A swapped request drops
+the incoming `x-api-key` to avoid mixed authentication. Other requests go to the
+fixed Anthropic upstream with their original authentication, except `/internal`
+and `/internal/*`, which return a local 404 after caller authentication in both
+modes (queries do not affect this check). After caller authentication, encoded
+pathnames and paths changed by dot-segment or repeated-slash normalization are
+rejected with 400, before Keychain access or connection. Query strings are not
+subject to this pathname check. Absolute request targets are rejected.
+When off, authenticated inference goes to `legacyProxyUrl`
+with its original authentication and no Keychain read. Dispatch fixes the
+destination; failures and configuration changes never replay a sent request.
+
+A swapped upstream 401 becomes a fixed 503. A swapped 403 also persists an
+inference stop marker in `stateDir`; off and restart do not clear that stop.
+The stop blocks swapping while enabled; turning off still sends new unsent
+inference to the legacy proxy, and turning on again restores the block. Startup
+also stops swapping on leftover stop-write temporary files or a missing persist
+canary after a prior start. If all stop writes and canary deletion fail, restart
+cannot detect the failed persist. The initial empty stop file is synced before
+syncing its parent directory and replacing it with the durable JSON marker.
+Any failure in that sequence also attempts durable canary deletion. A crash
+before either a stop marker or canary deletion becomes durable, or storage that
+does not honor sync, can still lose the stop on restart. Other requests can
+still pass through.
+There is no automatic reset endpoint.
+SSE is streamed with backpressure and cancellation propagation. Events under
+`stateDir/events` contain only request ID, route, swap flag, display/sent account
+IDs, status code and fixed reason code. Headers, request paths/queries, bodies,
+credentials and credential hashes are excluded.
+Oldest events are removed before each durable write to retain at most 128 files
+and 64 KiB in total; startup also trims existing files to those limits. A single
+temporary write may add one event's size until rename completes. Event writes
+and eviction are serialized, with at most 128 authenticated records plus one
+best-effort pre-authentication rejection outstanding. Further pre-authentication
+records are dropped while that slot is occupied. Their write or eviction failures
+do not stop inference or disable authenticated recording. They can therefore be
+absent from the event history, and no complete count of rejected requests is
+retained. Authenticated write, eviction or queue-capacity failure, and startup
+retention failure, disable further event recording and block new enabled
+inference until restart. State failures use `state_unavailable`; a persisted
+403 stop uses `inference_stopped`. Slow storage and an authenticated flood can
+still exhaust the authenticated queue. Turning off still forwards new unsent
+inference to legacy with its original authentication and no Keychain read,
+even when events cannot be recorded; other authenticated passthrough also
+remains available. Already dispatched requests are never replayed.
+
+The Keychain adapter and HTTP behavior are covered by fake-executor and ephemeral
+loopback tests. These do not establish live Keychain compatibility, account
+billing attribution, or atomicity with concurrent external credential updates.
+The complete matching attribute block is compared, so changes to other
+attributes within the same modification-time second are detected. A value-only
+update with identical attributes, an update that changes and restores the
+attributes between snapshots, or an update after the final snapshot can still
+escape detection. Expiry history does not detect such updates when expiry does
+not decrease. No atomic lock is shared with external Keychain writers.
+Selection policies and session affinity are outside this implementation.
+
 ### Security Design
 
 - The proxy binds only to loopback, and rejects any non-loopback `Host` and any cross-site browser request.

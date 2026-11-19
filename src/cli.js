@@ -9,6 +9,7 @@ import { text as readStdinText } from 'node:stream/consumers';
 import { isDeepStrictEqual, promisify } from 'node:util';
 
 import { AccountManager } from './account-manager.js';
+import { CLAUDE_PROVIDER_OVERRIDE_ENV_VARS } from './claude-provider-env.js';
 import { createAlertSender } from './alert-sender.js';
 import { createAlertWatch, normalizeAlertSettings } from './alert-watch.js';
 import { attachDriftWatch } from './drift-watch.js';
@@ -84,14 +85,6 @@ const execFileAsync = promisify(execFile);
 const CURRENT_ACCOUNT_ID = 'current';
 const DEFAULT_SHUTDOWN_GRACE_MS = 5_000;
 const MACOS_HIDDEN_SERVICE_ACTION = '__macos-service-action';
-const CLAUDE_PROVIDER_OVERRIDE_ENV_VARS = Object.freeze([
-  'CLAUDE_CODE_USE_BEDROCK',
-  'CLAUDE_CODE_USE_VERTEX',
-  'CLAUDE_CODE_USE_FOUNDRY',
-  'CLAUDE_CODE_USE_ANTHROPIC_AWS',
-  'CLAUDE_CODE_USE_ANTHROPIC_GOOGLE_CLOUD',
-  'CLAUDE_CODE_USE_MANTLE',
-]);
 const CLAUDE_LOGIN_OVERRIDE_ENV_VARS = Object.freeze([
   ...CLAUDE_PROVIDER_OVERRIDE_ENV_VARS,
   'ANTHROPIC_AUTH_TOKEN',
@@ -135,6 +128,46 @@ export async function runCli(argv = [], deps = {}) {
     if (command === 'server') {
       await runServer({ write });
       return 0;
+    }
+
+    if (command === 'credential-swap' && argv[1] === 'refresh-supervisor') {
+      const apply = argv.length === 5 && argv[4] === '--apply';
+      if ((argv.length !== 4 && !apply) || argv[2] !== '--config' || !argv[3]) {
+        error('Usage: claude-rotator credential-swap refresh-supervisor --config <path> [--apply]\n');
+        return 1;
+      }
+      try {
+        const supervisor = await import('./credential-swap-refresh-supervisor.js');
+        const config = await (deps.loadRefreshSupervisorConfig || supervisor.loadRefreshSupervisorConfig)(argv[3]);
+        const options = { config, apply };
+        // Creating the launcher has no side effect; only an --apply pass that
+        // decides start_resident calls it.
+        if (config.launcher) options.launcher = (deps.createOrcaLauncher || supervisor.createOrcaLauncher)({ config });
+        const report = await (deps.runRefreshSupervisor || supervisor.runRefreshSupervisor)(options);
+        write(`${JSON.stringify(report, null, 2)}\n`);
+        return 0;
+      } catch (caught) {
+        const { refreshSupervisorCliReason } = await import('./credential-swap-refresh-supervisor.js');
+        error(`${refreshSupervisorCliReason(caught)}\n`);
+        return 1;
+      }
+    }
+
+    if (command === 'credential-swap') {
+      if (argv.length !== 4 || argv[1] !== 'serve' || argv[2] !== '--config' || !argv[3]) {
+        error('Usage: claude-rotator credential-swap serve --config <path>\n');
+        return 1;
+      }
+      try {
+        const serve = deps.serveCredentialSwap
+          || (await import('./credential-swap.js')).serveCredentialSwap;
+        await serve({ configPath: argv[3], write });
+        return 0;
+      } catch (caught) {
+        const { credentialSwapStartupReason } = await import('./credential-swap-config.js');
+        error(`${credentialSwapStartupReason(caught)}\n`);
+        return 1;
+      }
     }
 
     if (command === MACOS_HIDDEN_SERVICE_ACTION) {
@@ -330,6 +363,8 @@ export function helpText() {
   claude-rotator install [--no-start] [--force]
   claude-rotator uninstall [--purge-secrets] [--force]
   claude-rotator server
+  claude-rotator credential-swap serve --config <path>
+  claude-rotator credential-swap refresh-supervisor --config <path> [--apply]
   claude-rotator status
   claude-rotator monitor
   claude-rotator switch <account>
