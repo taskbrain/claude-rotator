@@ -329,7 +329,8 @@ export async function probeOtherUsers(account, residentPid, execute) {
   return (await probeOtherUsersDetailed(account, residentPid, execute)).status;
 }
 
-const MAX_SESSION_NAMES = 64;
+// Counted in pids: one client may own both a .json and a .key name.
+const MAX_SESSION_PIDS = 64;
 const SESSION_REUSE_SLACK_MS = 120_000;
 const MONTHS = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
 
@@ -351,15 +352,20 @@ export function parsePsStart(text) {
 // sessions/<pid>.json and sessions/<pid>.<64 hex>.key there. While the client
 // waits on its first confirmation screen only the .key name exists (observed
 // 2026-11-18), so both shapes name a client. Only entry names and their
-// metadata (lstat) are read; no file is opened. Any other name that starts
-// with a pid is an unexpected shape and makes the answer unknown; names that
-// do not start with digits are ignored. Each pid (whichever of its names was
-// created last) is checked with ps:
+// metadata (lstat) of those two shapes are read; no file is opened. Names that
+// do not start with '<digits>.' are ignored. A name starting with a pid is
+// ignored, before its shape is looked at, when the pid is outside 2..2^31-1
+// (including 11 or more digits: no process can have it), is this process or is
+// the recorded resident. Any other name starting with a pid but of another
+// shape is unexpected: its pid is still checked with ps, and only a proven
+// absent process lets it be ignored as stale. Each pid (with the creation time
+// of whichever expected name was created last) is checked with ps:
 // - gone: a stale name, ignored;
 // - started more than a short slack after the name was created: the pid was
 //   reused by another process, ignored;
 // - running as the official client: found;
-// - running as anything else, or not determinable: the answer is unknown.
+// - running as anything else, running under an unexpected name, or not
+//   determinable: the answer is unknown (no name or pid is reported).
 export async function probeSessionClientsDetailed(account, residentPid, config, execute, io = {}) {
   const unknown = { status: 'unknown', pids: new Set() };
   const readdirImpl = io.readdir || readdir;
@@ -369,23 +375,23 @@ export async function probeSessionClientsDetailed(account, residentPid, config, 
   try { names = await readdirImpl(sessionsDir); }
   catch (error) { return error?.code === 'ENOENT' ? { status: 'none', pids: new Set() } : unknown; }
   if (!Array.isArray(names)) return unknown;
+  // pid -> { names: expected names, unexpected: whether another shape exists }
   const candidates = new Map();
-  let nameCount = 0;
   for (const name of names) {
     if (typeof name !== 'string') return unknown;
-    const match = name.match(/^(\d{1,10})\.(?:json|[0-9a-fA-F]{64}\.key)$/);
-    if (!match) {
-      if (/^\d+\./.test(name)) return unknown;
-      continue;
-    }
+    const match = name.match(/^(\d+)\.(.*)$/s);
+    if (!match) continue;
+    if (match[1].length > 10) continue;
     const pid = Number(match[1]);
     if (!integer(pid, 2, 2 ** 31 - 1) || pid === process.pid || pid === residentPid) continue;
-    nameCount++;
-    candidates.set(pid, [...(candidates.get(pid) ?? []), name]);
+    const entry = candidates.get(pid) ?? { names: [], unexpected: false };
+    if (/^(?:json|[0-9a-fA-F]{64}\.key)$/.test(match[2])) entry.names.push(name);
+    else entry.unexpected = true;
+    candidates.set(pid, entry);
   }
-  if (nameCount > MAX_SESSION_NAMES) return unknown;
+  if (candidates.size > MAX_SESSION_PIDS) return unknown;
   const found = new Set();
-  for (const [pid, pidNames] of candidates) {
+  for (const [pid, { names: pidNames, unexpected }] of candidates) {
     let createdMs = null;
     for (const name of pidNames) {
       let info;
@@ -398,10 +404,11 @@ export async function probeSessionClientsDetailed(account, residentPid, config, 
       if (!Number.isFinite(at) || at <= 0) return unknown;
       createdMs = Math.max(createdMs ?? at, at);
     }
-    if (createdMs === null) continue;
+    if (createdMs === null && !unexpected) continue;
     const seen = await probeResidentProcess(pid, execute);
     if (seen.status === 'unknown') return unknown;
     if (seen.status === 'absent') continue;
+    if (unexpected || createdMs === null) return unknown;
     const startedMs = parsePsStart(seen.startedAt);
     if (startedMs === null) return unknown;
     if (startedMs > createdMs + SESSION_REUSE_SLACK_MS) continue;

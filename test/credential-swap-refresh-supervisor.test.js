@@ -1396,13 +1396,72 @@ test('a client on its first confirmation screen, named only by its key file, is 
   assert.equal(result.fake.calls.filter(call => call[0] === '/bin/ps').length, 1);
 });
 
-test('a session name of an unexpected shape stops automatic launching', async t => {
-  for (const name of ['74132.0123abcd.key', `74132.${KEY_HEX}.json`, '74132.key', '74132.json.tmp',
-    `74132.${KEY_HEX}g.key`, `74132.${KEY_HEX}.key.bak`, '74132.']) {
-    const result = await sessionPass(t, { names: [name], ps: () => { throw new Error('ps must not run'); } });
-    assert.deepEqual([result.entry.action, result.entry.reason], ['notify_unknown', 'other_users_unknown'], name);
-    assert.equal(result.effects.record.launcher.length, 0);
+test('an unexpected session name is checked by pid: ignored only when the process is gone', async t => {
+  const odd = ['74132.0123abcd.key', `74132.${KEY_HEX}.json`, '74132.key', '74132.json.tmp',
+    `74132.${KEY_HEX}g.key`, `74132.${KEY_HEX}.key.bak`, '74132.', '74132.json\n'];
+  for (const name of odd) {
+    // Gone: a stale name, ignored; its metadata is never read.
+    let result = await sessionPass(t, { names: [name] });
+    assert.deepEqual([result.entry.action, result.entry.reason], ['start_resident', 'resident_missing'], name);
     assert.equal(result.io.lstatCalls.length, 0);
-    assert.equal(JSON.stringify(result.report).includes('74132'), false);
+    assert.equal(result.fake.calls.filter(call => call[0] === '/bin/ps').length, 1);
+    // Alive (even as the official client) or undeterminable: unknown, no launch.
+    for (const ps of [() => ({ stdout: `${LSTART} ${CLAUDE}\n` }),
+      () => { throw Object.assign(new Error('x'), { code: 2, stderr: 'ps: failed' }); }]) {
+      result = await sessionPass(t, { names: [name], ps });
+      assert.deepEqual([result.entry.action, result.entry.reason], ['notify_unknown', 'other_users_unknown'], name);
+      assert.equal(result.effects.record.launcher.length, 0);
+      for (const leaked of ['74132', '.key', '.json', 'tmp', 'bak']) {
+        assert.equal(JSON.stringify(result.report).includes(leaked), false, leaked);
+      }
+    }
   }
+  // An unexpected name beside expected ones of the same live pid is still unknown, with one ps call.
+  const mixed = await sessionPass(t, { names: [...SESSION_NAMES, '74132.json.tmp'],
+    ps: () => ({ stdout: `${LSTART} ${CLAUDE}\n` }) });
+  assert.equal(mixed.entry.reason, 'other_users_unknown');
+  assert.equal(mixed.fake.calls.filter(call => call[0] === '/bin/ps').length, 1);
+  // Names of this process are excluded before their shape is looked at.
+  const own = await sessionPass(t, { names: [`${process.pid}.weird`, `${process.pid}.json`],
+    ps: () => { throw new Error('ps must not run'); } });
+  assert.equal(own.entry.action, 'start_resident');
+});
+
+test('two names of one pid: a missing one is skipped, a bad creation time is unknown', async t => {
+  const [json, key] = SESSION_NAMES;
+  const alive = () => ({ stdout: `${LSTART} ${CLAUDE}\n` });
+  // .json vanished between readdir and lstat: the .key time decides.
+  let result = await sessionPass(t, { ps: alive, created: { lstat: path => {
+    if (path.endsWith(json)) throw Object.assign(new Error('gone'), { code: 'ENOENT' });
+    return { birthtimeMs: LSTART_MS + 1000, mtimeMs: 0 };
+  } } });
+  assert.equal(result.entry.reason, 'external_client_present');
+  // Both vanished: nothing to check, no ps.
+  result = await sessionPass(t, { ps: () => { throw new Error('ps must not run'); }, created: { lstat: () => {
+    throw Object.assign(new Error('gone'), { code: 'ENOENT' });
+  } } });
+  assert.equal(result.entry.action, 'start_resident');
+  // One name with an unusable creation time: unknown, even if the other is fine.
+  for (const bad of [{ birthtimeMs: 0, mtimeMs: 0 }, { birthtimeMs: 0, mtimeMs: Number.NaN }]) {
+    result = await sessionPass(t, { ps: alive, created: { lstat: path => (path.endsWith(key) ? bad
+      : { birthtimeMs: LSTART_MS + 1000, mtimeMs: 0 }) } });
+    assert.deepEqual([result.entry.action, result.entry.reason], ['notify_unknown', 'other_users_unknown']);
+  }
+});
+
+test('the session limit counts pids, and pids of 11 or more digits are out of range', async t => {
+  const pairs = count => Array.from({ length: count }, (_, index) => [`${1000 + index}.json`,
+    `${1000 + index}.${KEY_HEX}.key`]).flat();
+  // 64 clients with two names each (128 names) are within the limit.
+  let result = await sessionPass(t, { names: pairs(64) });
+  assert.deepEqual([result.entry.action, result.entry.reason], ['start_resident', 'resident_missing']);
+  assert.equal(result.fake.calls.filter(call => call[0] === '/bin/ps').length, 64);
+  // 65 pids are over it: unknown without ps.
+  result = await sessionPass(t, { names: pairs(65), ps: () => { throw new Error('ps must not run'); } });
+  assert.deepEqual([result.entry.action, result.entry.reason], ['notify_unknown', 'other_users_unknown']);
+  // 11 or more digits, of any shape, can name no process: ignored like other out-of-range pids.
+  result = await sessionPass(t, { names: ['12345678901.json', `12345678901.${KEY_HEX}.key`, '99999999999999.odd',
+    '2147483648.weird'], ps: () => { throw new Error('ps must not run'); } });
+  assert.deepEqual([result.entry.action, result.entry.reason], ['start_resident', 'resident_missing']);
+  assert.equal(result.io.lstatCalls.length, 0);
 });
