@@ -1400,10 +1400,11 @@ test('an unexpected session name is checked by pid: ignored only when the proces
   const odd = ['74132.0123abcd.key', `74132.${KEY_HEX}.json`, '74132.key', '74132.json.tmp',
     `74132.${KEY_HEX}g.key`, `74132.${KEY_HEX}.key.bak`, '74132.', '74132.json\n'];
   for (const name of odd) {
-    // Gone: a stale name, ignored; its metadata is never read.
+    // Gone: a stale name, ignored; only its metadata is read, never its content.
     let result = await sessionPass(t, { names: [name] });
     assert.deepEqual([result.entry.action, result.entry.reason], ['start_resident', 'resident_missing'], name);
-    assert.equal(result.io.lstatCalls.length, 0);
+    assert.equal(result.io.lstatCalls.length, 1);
+    assert.equal(result.io.readFileCalls.length, 0);
     assert.equal(result.fake.calls.filter(call => call[0] === '/bin/ps').length, 1);
     // Alive (even as the official client) or undeterminable: unknown, no launch.
     for (const ps of [() => ({ stdout: `${LSTART} ${CLAUDE}\n` }),
@@ -1464,4 +1465,50 @@ test('the session limit counts pids, and pids of 11 or more digits are out of ra
     '2147483648.weird'], ps: () => { throw new Error('ps must not run'); } });
   assert.deepEqual([result.entry.action, result.entry.reason], ['start_resident', 'resident_missing']);
   assert.equal(result.io.lstatCalls.length, 0);
+});
+
+test('an unexpected name gets the same pid-reuse check, and a missing one counts as absent', async t => {
+  const odd = '74132.json.tmp';
+  const alive = command => () => ({ stdout: `${LSTART} ${command}\n` });
+  const at = ms => ({ lstat: () => ({ birthtimeMs: ms, mtimeMs: 0 }) });
+  // The process started 121 s after the odd name was created: a reused pid, the name is stale.
+  for (const command of [CLAUDE, '/usr/bin/vim']) {
+    const result = await sessionPass(t, { names: [odd], ps: alive(command), created: at(LSTART_MS - 121_000) });
+    assert.deepEqual([result.entry.action, result.entry.reason], ['start_resident', 'resident_missing'], command);
+    assert.equal(result.io.readFileCalls.length, 0);
+  }
+  // Within the slack it is not reused: unknown, no launch, nothing named in the report.
+  let result = await sessionPass(t, { names: [odd], ps: alive(CLAUDE), created: at(LSTART_MS - 119_000) });
+  assert.deepEqual([result.entry.action, result.entry.reason], ['notify_unknown', 'other_users_unknown']);
+  assert.equal(result.effects.record.launcher.length, 0);
+  for (const leaked of ['74132', 'tmp', '.json']) assert.equal(JSON.stringify(result.report).includes(leaked), false);
+  // A stale odd name beside fresh expected names of a live client: the client is found.
+  result = await sessionPass(t, { names: [...SESSION_NAMES, odd], ps: alive(CLAUDE), created: { lstat: path => ({
+    birthtimeMs: path.endsWith(odd) ? LSTART_MS - 300_000 : LSTART_MS + 1000, mtimeMs: 0 }) } });
+  assert.equal(result.entry.reason, 'external_client_present');
+  // An odd name that lstat reports missing is absent: with nothing else left, no ps at all.
+  result = await sessionPass(t, { names: [odd], ps: () => { throw new Error('ps must not run'); },
+    created: { lstat: () => { throw Object.assign(new Error('gone'), { code: 'ENOENT' }); } } });
+  assert.deepEqual([result.entry.action, result.entry.reason], ['start_resident', 'resident_missing']);
+  // Any other lstat failure, or an unusable time, on an odd name is unknown without ps.
+  for (const created of [{ lstat: () => { throw Object.assign(new Error('denied'), { code: 'EACCES' }); } },
+    at(0)]) {
+    result = await sessionPass(t, { names: [odd], ps: () => { throw new Error('ps must not run'); }, created });
+    assert.deepEqual([result.entry.action, result.entry.reason], ['notify_unknown', 'other_users_unknown']);
+  }
+});
+
+test('expected names all missing beside an unexpected one of a live process is unknown with one ps', async t => {
+  const odd = '74132.json.tmp';
+  const result = await sessionPass(t, { names: [...SESSION_NAMES, odd],
+    ps: () => ({ stdout: `${LSTART} ${CLAUDE}\n` }),
+    created: { lstat: path => {
+      if (!path.endsWith(odd)) throw Object.assign(new Error('gone'), { code: 'ENOENT' });
+      return { birthtimeMs: LSTART_MS + 1000, mtimeMs: 0 };
+    } } });
+  assert.deepEqual([result.entry.action, result.entry.reason], ['notify_unknown', 'other_users_unknown']);
+  assert.equal(result.fake.calls.filter(call => call[0] === '/bin/ps').length, 1);
+  assert.equal(result.io.lstatCalls.length, 3);
+  assert.equal(result.io.readFileCalls.length, 0);
+  assert.equal(result.effects.record.launcher.length, 0);
 });

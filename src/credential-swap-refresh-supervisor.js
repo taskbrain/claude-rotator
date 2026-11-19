@@ -352,20 +352,22 @@ export function parsePsStart(text) {
 // sessions/<pid>.json and sessions/<pid>.<64 hex>.key there. While the client
 // waits on its first confirmation screen only the .key name exists (observed
 // 2026-11-18), so both shapes name a client. Only entry names and their
-// metadata (lstat) of those two shapes are read; no file is opened. Names that
+// metadata (lstat) are read; no file is opened. Names that
 // do not start with '<digits>.' are ignored. A name starting with a pid is
 // ignored, before its shape is looked at, when the pid is outside 2..2^31-1
 // (including 11 or more digits: no process can have it), is this process or is
 // the recorded resident. Any other name starting with a pid but of another
-// shape is unexpected: its pid is still checked with ps, and only a proven
-// absent process lets it be ignored as stale. Each pid (with the creation time
-// of whichever expected name was created last) is checked with ps:
-// - gone: a stale name, ignored;
-// - started more than a short slack after the name was created: the pid was
-//   reused by another process, ignored;
-// - running as the official client: found;
-// - running as anything else, running under an unexpected name, or not
-//   determinable: the answer is unknown (no name or pid is reported).
+// shape is unexpected. A name that lstat reports missing (ENOENT) is treated
+// as absent. Each pid with a remaining name is checked with ps, and creation
+// times are taken per group (expected or unexpected names), using whichever
+// name of the group was created last:
+// - gone: stale names, ignored;
+// - started more than a short slack after a group was created: the pid was
+//   reused by another process, that group is stale and ignored;
+// - an unexpected name that is not stale: unknown;
+// - expected names, running as the official client: found;
+// - running as anything else, or not determinable: the answer is unknown.
+// No name or pid is reported.
 export async function probeSessionClientsDetailed(account, residentPid, config, execute, io = {}) {
   const unknown = { status: 'unknown', pids: new Set() };
   const readdirImpl = io.readdir || readdir;
@@ -375,7 +377,7 @@ export async function probeSessionClientsDetailed(account, residentPid, config, 
   try { names = await readdirImpl(sessionsDir); }
   catch (error) { return error?.code === 'ENOENT' ? { status: 'none', pids: new Set() } : unknown; }
   if (!Array.isArray(names)) return unknown;
-  // pid -> { names: expected names, unexpected: whether another shape exists }
+  // pid -> { names: expected names, odd: names of another shape }
   const candidates = new Map();
   for (const name of names) {
     if (typeof name !== 'string') return unknown;
@@ -384,34 +386,43 @@ export async function probeSessionClientsDetailed(account, residentPid, config, 
     if (match[1].length > 10) continue;
     const pid = Number(match[1]);
     if (!integer(pid, 2, 2 ** 31 - 1) || pid === process.pid || pid === residentPid) continue;
-    const entry = candidates.get(pid) ?? { names: [], unexpected: false };
+    const entry = candidates.get(pid) ?? { names: [], odd: [] };
     if (/^(?:json|[0-9a-fA-F]{64}\.key)$/.test(match[2])) entry.names.push(name);
-    else entry.unexpected = true;
+    else entry.odd.push(name);
     candidates.set(pid, entry);
   }
   if (candidates.size > MAX_SESSION_PIDS) return unknown;
   const found = new Set();
-  for (const [pid, { names: pidNames, unexpected }] of candidates) {
-    let createdMs = null;
-    for (const name of pidNames) {
+  // Latest creation time of the names that still exist, null when none does,
+  // undefined when one cannot be read.
+  const latestCreated = async groupNames => {
+    let latest = null;
+    for (const name of groupNames) {
       let info;
       try { info = await lstatImpl(join(sessionsDir, name)); }
       catch (error) {
         if (error?.code === 'ENOENT') continue;
-        return unknown;
+        return undefined;
       }
       const at = info.birthtimeMs > 0 ? info.birthtimeMs : info.mtimeMs;
-      if (!Number.isFinite(at) || at <= 0) return unknown;
-      createdMs = Math.max(createdMs ?? at, at);
+      if (!Number.isFinite(at) || at <= 0) return undefined;
+      latest = Math.max(latest ?? at, at);
     }
-    if (createdMs === null && !unexpected) continue;
+    return latest;
+  };
+  for (const [pid, { names: pidNames, odd }] of candidates) {
+    const createdMs = await latestCreated(pidNames);
+    const oddCreatedMs = await latestCreated(odd);
+    if (createdMs === undefined || oddCreatedMs === undefined) return unknown;
+    if (createdMs === null && oddCreatedMs === null) continue;
     const seen = await probeResidentProcess(pid, execute);
     if (seen.status === 'unknown') return unknown;
     if (seen.status === 'absent') continue;
-    if (unexpected || createdMs === null) return unknown;
     const startedMs = parsePsStart(seen.startedAt);
     if (startedMs === null) return unknown;
-    if (startedMs > createdMs + SESSION_REUSE_SLACK_MS) continue;
+    const stale = created => startedMs > created + SESSION_REUSE_SLACK_MS;
+    if (oddCreatedMs !== null && !stale(oddCreatedMs)) return unknown;
+    if (createdMs === null || stale(createdMs)) continue;
     if (!officialClientCommand(seen.command, config.claudeBin)) return unknown;
     found.add(pid);
   }
