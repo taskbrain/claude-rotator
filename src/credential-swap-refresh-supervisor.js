@@ -358,7 +358,11 @@ export function parsePsStart(text) {
 // (including 11 or more digits: no process can have it), is this process or is
 // the recorded resident. Any other name starting with a pid but of another
 // shape is unexpected. A name that lstat reports missing (ENOENT) is treated
-// as absent. Each pid with a remaining name is checked with ps, and creation
+// as absent. When every name of a pid went missing between readdir and lstat
+// (for example a rename by the client), the pid is still checked with ps: a
+// gone process is ignored as before, anything else is unknown, since no
+// creation time is left to rule out a live client. Each pid with a remaining
+// name is checked with ps, and creation
 // times are taken per group (expected or unexpected names), using whichever
 // name of the group was created last:
 // - gone: stale names, ignored;
@@ -414,10 +418,10 @@ export async function probeSessionClientsDetailed(account, residentPid, config, 
     const createdMs = await latestCreated(pidNames);
     const oddCreatedMs = await latestCreated(odd);
     if (createdMs === undefined || oddCreatedMs === undefined) return unknown;
-    if (createdMs === null && oddCreatedMs === null) continue;
     const seen = await probeResidentProcess(pid, execute);
     if (seen.status === 'unknown') return unknown;
     if (seen.status === 'absent') continue;
+    if (createdMs === null && oddCreatedMs === null) return unknown;
     const startedMs = parsePsStart(seen.startedAt);
     if (startedMs === null) return unknown;
     const stale = created => startedMs > created + SESSION_REUSE_SLACK_MS;

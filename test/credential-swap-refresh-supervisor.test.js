@@ -1437,11 +1437,12 @@ test('two names of one pid: a missing one is skipped, a bad creation time is unk
     return { birthtimeMs: LSTART_MS + 1000, mtimeMs: 0 };
   } } });
   assert.equal(result.entry.reason, 'external_client_present');
-  // Both vanished: nothing to check, no ps.
-  result = await sessionPass(t, { ps: () => { throw new Error('ps must not run'); }, created: { lstat: () => {
+  // Both vanished and the process is gone: stale, ignored after one ps call.
+  result = await sessionPass(t, { created: { lstat: () => {
     throw Object.assign(new Error('gone'), { code: 'ENOENT' });
   } } });
   assert.equal(result.entry.action, 'start_resident');
+  assert.equal(result.fake.calls.filter(call => call[0] === '/bin/ps').length, 1);
   // One name with an unusable creation time: unknown, even if the other is fine.
   for (const bad of [{ birthtimeMs: 0, mtimeMs: 0 }, { birthtimeMs: 0, mtimeMs: Number.NaN }]) {
     result = await sessionPass(t, { ps: alive, created: { lstat: path => (path.endsWith(key) ? bad
@@ -1486,10 +1487,11 @@ test('an unexpected name gets the same pid-reuse check, and a missing one counts
   result = await sessionPass(t, { names: [...SESSION_NAMES, odd], ps: alive(CLAUDE), created: { lstat: path => ({
     birthtimeMs: path.endsWith(odd) ? LSTART_MS - 300_000 : LSTART_MS + 1000, mtimeMs: 0 }) } });
   assert.equal(result.entry.reason, 'external_client_present');
-  // An odd name that lstat reports missing is absent: with nothing else left, no ps at all.
-  result = await sessionPass(t, { names: [odd], ps: () => { throw new Error('ps must not run'); },
+  // An odd name that lstat reports missing is absent: with nothing else left and the process gone, ignored.
+  result = await sessionPass(t, { names: [odd],
     created: { lstat: () => { throw Object.assign(new Error('gone'), { code: 'ENOENT' }); } } });
   assert.deepEqual([result.entry.action, result.entry.reason], ['start_resident', 'resident_missing']);
+  assert.equal(result.fake.calls.filter(call => call[0] === '/bin/ps').length, 1);
   // Any other lstat failure, or an unusable time, on an odd name is unknown without ps.
   for (const created of [{ lstat: () => { throw Object.assign(new Error('denied'), { code: 'EACCES' }); } },
     at(0)]) {
@@ -1511,4 +1513,35 @@ test('expected names all missing beside an unexpected one of a live process is u
   assert.equal(result.io.lstatCalls.length, 3);
   assert.equal(result.io.readFileCalls.length, 0);
   assert.equal(result.effects.record.launcher.length, 0);
+});
+
+test('names that all vanish between readdir and lstat still get a ps check', async t => {
+  const vanished = { lstat: () => { throw Object.assign(new Error('gone'), { code: 'ENOENT' }); } };
+  for (const names of [SESSION_NAMES, [`74132.${KEY_HEX}.key`], ['74132.json'], ['74132.json.tmp']]) {
+    // A live process (here the official client): no launch, unknown, nothing named in the report.
+    let result = await sessionPass(t, { names, created: vanished, ps: () => ({ stdout: `${LSTART} ${CLAUDE}\n` }) });
+    assert.deepEqual([result.entry.action, result.entry.reason], ['notify_unknown', 'other_users_unknown'],
+      names.join());
+    assert.equal(result.effects.record.launcher.length, 0);
+    assert.equal(result.fake.calls.filter(call => call[0] === '/bin/ps').length, 1);
+    assert.equal(result.io.readFileCalls.length, 0);
+    for (const leaked of ['74132', '.json', '.key']) assert.equal(JSON.stringify(result.report).includes(leaked), false);
+    // The same with --apply: the launcher is never called.
+    {
+      const { account, config } = await sandbox(t);
+      const fake = fakeExecute(account, { ps: () => ({ stdout: `${LSTART} ${CLAUDE}\n` }) });
+      const effects = sideEffects();
+      const report = await runRefreshSupervisor({ config, apply: true, now: () => MDAT + HOUR, execute: fake.execute,
+        sessionsIO: sessionsIO(account, names, vanished), env: SECRET_ENV, ...effects });
+      assert.deepEqual([report.accounts[0].action, report.accounts[0].reason], ['notify_unknown', 'other_users_unknown']);
+      assert.equal(effects.record.launcher.length, 0);
+    }
+    // ps cannot tell: unknown as well.
+    result = await sessionPass(t, { names, created: vanished,
+      ps: () => { throw Object.assign(new Error('x'), { code: 2, stderr: 'ps: failed' }); } });
+    assert.equal(result.entry.reason, 'other_users_unknown');
+    // The process is gone: stale, ignored as before.
+    result = await sessionPass(t, { names, created: vanished });
+    assert.deepEqual([result.entry.action, result.entry.reason], ['start_resident', 'resident_missing']);
+  }
 });
