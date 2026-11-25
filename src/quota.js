@@ -50,11 +50,12 @@ export function fiveHourWindowEnabled(raw) {
   return raw == null || raw.enabled === true;
 }
 
-// The claim the upstream names in `anthropic-ratelimit-unified-representative-claim`,
-// trimmed and lower-cased; null when the header is absent.
-export function representativeClaim(headers) {
-  const value = createHeaderGetter(headers)('anthropic-ratelimit-unified-representative-claim');
-  return value == null ? null : String(value).trim().toLowerCase();
+// One response header, looked up the way `parseRateLimitHeaders` looks them up
+// (any letter case, a plain object or a Headers instance), as a string; null
+// when it is absent.
+export function responseHeader(headers, name) {
+  const value = createHeaderGetter(headers)(name);
+  return value == null ? null : String(value);
 }
 
 export function isValidQuotaWindow(utilization, resetAt, now) {

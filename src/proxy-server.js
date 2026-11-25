@@ -9,6 +9,7 @@ import {
   isAuthExpiredReason,
   isCommonQuotaExhausted,
   isCredentialRefreshCooldown,
+  isQuotaRejectionHold,
   isUnifiedQuotaExhaustion,
   requiresRelogin,
 } from './account-manager.js';
@@ -2581,6 +2582,9 @@ function usageBucketConfirmsQuota(bucket, threshold, nowMs) {
 
 function accountQuotaConfirmsModelFamily(account, modelFamily, threshold, nowMs) {
   const quota = account?.quota || {};
+  // With the five-hour window off, a rejection it explained is kept only as a
+  // short-term hold, which stands in for the used-up reading.
+  if (isQuotaRejectionHold(account, nowMs)) return true;
   if (usageBucketConfirmsQuota({
     utilization: quota.unified5h,
     resetAt: quota.unified5hReset,

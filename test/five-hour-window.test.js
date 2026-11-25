@@ -61,9 +61,9 @@ function close(server) {
   return new Promise(resolve => server.close(() => resolve()));
 }
 
-function request(url, { method = 'GET', body = null } = {}) {
+function request(url, { method = 'GET', body = null, headers = {} } = {}) {
   return new Promise((resolve, reject) => {
-    const req = http.request(url, { method, agent: false, headers: { 'content-type': 'application/json' } }, res => {
+    const req = http.request(url, { method, agent: false, headers: { 'content-type': 'application/json', ...headers } }, res => {
       const chunks = [];
       res.on('data', chunk => chunks.push(chunk));
       res.on('end', () => resolve({ status: res.statusCode, headers: res.headers, text: Buffer.concat(chunks).toString('utf8') }));
@@ -101,8 +101,9 @@ async function startProxy({ manager, upstreamHandler, logs = [], serverOptions =
     await close(proxy.server);
     await close(upstream.server);
   });
-  const send = () => request(`${proxy.url}/v1/messages`, {
-    method: 'POST', body: JSON.stringify({ model: 'claude-sonnet-4-5', messages: [{ role: 'user', content: 'hi' }] }),
+  const send = (headers = {}) => request(`${proxy.url}/v1/messages`, {
+    method: 'POST', headers,
+    body: JSON.stringify({ model: 'claude-sonnet-4-5', messages: [{ role: 'user', content: 'hi' }] }),
   });
   return { url: proxy.url, seen, logs, send };
 }
@@ -278,11 +279,15 @@ describe('five-hour window off', () => {
       config: { accountUrgency: { mode: 'shadow' } },
     });
     manager.applyUsage('sample-a', weekAndFive(clock, 0.5, 30, 1));
+    manager.applyUsage('sample-b', weekAndFive(clock, 0.5, 30, 0.4));
     assert.equal(manager.isAvailable(manager.find('sample-a')), false, 'a component told nothing keeps the window on');
     assert.equal((await request(`${h.url}/internal/reload`, { method: 'POST', body: '{}' })).status, 200);
     assert.equal(manager.fiveHourWindowEnabled, false);
-    assert.equal(manager.isAvailable(manager.find('sample-a')), true);
     assert.equal(manager.find('sample-a').quota.unified5h, null);
+    assert.equal(manager.find('sample-b').quota.unified5h, null);
+    assert.equal(manager.isAvailable(manager.find('sample-a')), false, 'a used-up window stays a hold until its reset');
+    assert.equal(manager.isAvailable(manager.find('sample-b')), true);
+    assert.equal(manager.unavailableReason(manager.find('sample-a')).type, 'temporary_throttle');
     assert.equal(Object.hasOwn(manager.getStatus().accountUrgency.accounts[0], 'fiveHour'), false);
     next = ON;
     assert.equal((await request(`${h.url}/internal/reload`, { method: 'POST', body: '{}' })).status, 200);
@@ -378,7 +383,7 @@ describe('an upstream 429 explained by the five-hour window', () => {
     });
   }
 
-  it('keeps a Usage reading fetched to confirm a 429 only until its reset while off, and no other Usage reading', () => {
+  it('holds an account until the five-hour reset when a Usage reading confirms a 429 while off, and for no other Usage reading', () => {
     const clock = { ms: START };
     const { manager } = ledger({ fiveHourWindow: OFF, ids: ['sample-a', 'sample-b'], clock });
     manager.applyUsage('sample-a', weekAndFive(clock, 0.2, 48, 1), { upstreamRateLimited: true });
@@ -391,5 +396,140 @@ describe('an upstream 429 explained by the five-hour window', () => {
     assert.equal(manager.isAvailable(manager.find('sample-a')), false, 'a later poll does not lift the rejection early');
     clock.ms += 2 * HOUR + 1000;
     assert.equal(manager.isAvailable(manager.find('sample-a')), true);
+  });
+});
+
+// The headers of an upstream 429 the five-hour window explains.
+function fiveHourRejection(clock, { fiveHourReset = clock.ms + 2 * HOUR, utilization = '1', unifiedReset = fiveHourReset, retryAfter = '60' } = {}) {
+  return {
+    'anthropic-ratelimit-unified-status': 'rejected',
+    'anthropic-ratelimit-unified-representative-claim': 'five_hour',
+    ...(retryAfter === null ? {} : { 'retry-after': retryAfter }),
+    ...(unifiedReset === null ? {} : { 'anthropic-ratelimit-unified-reset': seconds(unifiedReset) }),
+    ...(utilization === null ? {} : { 'anthropic-ratelimit-unified-5h-utilization': utilization }),
+    ...(fiveHourReset === null ? {} : { 'anthropic-ratelimit-unified-5h-reset': seconds(fiveHourReset) }),
+  };
+}
+const as429 = { atomicUnifiedWindows: true, upstreamRateLimited: true };
+
+describe('a five-hour rejection held while the window is off', () => {
+  it('ends the hold at the five-hour reset, else the unified reset, else retry-after', () => {
+    const cases = [
+      [{}, 2 * HOUR],
+      [{ fiveHourReset: null, unifiedReset: START + 3 * HOUR }, 3 * HOUR],
+      [{ fiveHourReset: null, unifiedReset: null, retryAfter: '120' }, 120_000],
+      [{ fiveHourReset: null, unifiedReset: null, retryAfter: null, utilization: null }, 60_000],
+    ];
+    for (const [options, length] of cases) {
+      const clock = { ms: START };
+      const { manager } = ledger({ fiveHourWindow: OFF, ids: ['sample-a'], clock });
+      manager.updateQuota('sample-a', fiveHourRejection(clock, options), as429);
+      const account = manager.find('sample-a');
+      assert.equal(account.rateLimitedUntil, START + length, JSON.stringify(options));
+      assert.deepEqual(account.temporaryUnavailableReason, { type: 'temporary_throttle', quotaRejected: true });
+      assert.equal(account.quota.unified5h, null);
+    }
+  });
+
+  it('keeps the hold through a save and restore: out before the five-hour reset, back after it', () => {
+    const clock = { ms: START };
+    const first = ledger({ fiveHourWindow: OFF, clock });
+    first.manager.updateQuota('sample-a', fiveHourRejection(clock), as429);
+    const state = JSON.parse(JSON.stringify(first.manager.exportState()));
+    assert.equal(state.accounts[0].quota.unified5h, null);
+    const second = ledger({ fiveHourWindow: OFF, clock });
+    second.manager.restoreState(state);
+    const account = second.manager.find('sample-a');
+    clock.ms += HOUR;
+    assert.equal(second.manager.isAvailable(account), false);
+    assert.equal(second.manager.unavailableReason(account).type, 'temporary_throttle');
+    clock.ms = START + 2 * HOUR + 1000;
+    assert.equal(second.manager.isAvailable(account), true);
+  });
+
+  it('keeps an account rejected while on out until the five-hour reset after a reload to off', () => {
+    const clock = { ms: START };
+    const { manager } = ledger({ clock });
+    manager.updateQuota('sample-a', fiveHourRejection(clock), as429);
+    const account = manager.find('sample-a');
+    assert.equal(manager.unavailableReason(account).window, '5h');
+    manager.configureFiveHourWindow(OFF);
+    assert.equal(account.quota.unified5h, null);
+    clock.ms += HOUR;
+    assert.equal(manager.isAvailable(account), false);
+    assert.deepEqual(manager.unavailableReason(account).type, 'temporary_throttle');
+    clock.ms = START + 2 * HOUR + 1000;
+    assert.equal(manager.isAvailable(account), true);
+  });
+
+  it('keeps the hold after a reload to on, where the five-hour observations start empty', () => {
+    const clock = { ms: START };
+    const { manager } = ledger({ fiveHourWindow: OFF, urgency: 'shadow', clock });
+    manager.updateQuota('sample-a', fiveHourRejection(clock), as429);
+    manager.configureFiveHourWindow(ON);
+    const account = manager.find('sample-a');
+    assert.equal(account.quota.unified5h, null);
+    const row = manager.getStatus().accountUrgency.accounts.find(entry => entry.accountId === 'sample-a');
+    assert.equal(row.fiveHour.observationState, 'missing');
+    clock.ms += HOUR;
+    assert.equal(manager.isAvailable(account), false, 'the rejection is still honored');
+    clock.ms = START + 2 * HOUR + 1000;
+    assert.equal(manager.isAvailable(account), true);
+  });
+
+  it('shows no five-hour window in the local 429, the reason, prepare-resume, events or status afterwards', async () => {
+    const clock = { ms: START };
+    const { manager, logs } = ledger({ fiveHourWindow: OFF, ids: ['sample-a'], urgency: 'on', clock });
+    manager.applyUsage('sample-a', weekAndFive(clock, 0.3, 48));
+    const h = await startProxy({
+      manager, logs,
+      config: { sessionAffinity: { mode: 'on' }, accountUrgency: { mode: 'on' } },
+      serverOptions: { stateWriter: async () => {} },
+      upstreamHandler: (req, res) => {
+        res.writeHead(429, { 'content-type': 'application/json', ...fiveHourRejection(clock) });
+        res.end(JSON.stringify({ type: 'error', error: { type: 'rate_limit_error', message: 'fixture limit' } }));
+      },
+    });
+    assert.equal((await h.send()).status, 429);
+    const local = await h.send();
+    assert.equal(local.status, 429);
+    assert.equal(h.seen.length, 1, 'the held account is not sent to again');
+    assert.equal(local.headers['anthropic-ratelimit-unified-representative-claim'], undefined);
+    assert.ok(Object.keys(local.headers).every(name => !name.startsWith('anthropic-ratelimit-unified-5h')));
+    const status = manager.getStatus();
+    assert.deepEqual(status.fiveHourWindow, { enabled: false });
+    assert.equal(status.accounts[0].quota.unified5h, null);
+    assert.equal(status.accounts[0].unavailableReason.type, 'temporary_throttle');
+    assert.equal(Object.hasOwn(status.accounts[0].unavailableReason, 'window'), false);
+    assert.ok(status.events.every(event => event.type !== 'quota-exhausted' && event.reason?.window !== '5h'));
+    const resume = JSON.parse((await request(`${h.url}/internal/prepare-resume`, { method: 'POST', body: '{}' })).text);
+    assert.notEqual(resume.window, '5h');
+    assert.notEqual(resume.resumeAtEpoch, Math.floor((START + 2 * HOUR) / 1000));
+  });
+
+  it('moves a pinned session to the next account with accountUrgency and sessionAffinity on', async () => {
+    const clock = { ms: START };
+    const { manager, logs } = ledger({ fiveHourWindow: OFF, ids: ['sample-a', 'sample-b'], urgency: 'on', clock });
+    manager.applyUsage('sample-a', weekAndFive(clock, 0.3, 24));
+    manager.applyUsage('sample-b', weekAndFive(clock, 0.3, 48));
+    const h = await startProxy({
+      manager, logs,
+      config: { sessionAffinity: { mode: 'on' }, accountUrgency: { mode: 'on' } },
+      serverOptions: { stateWriter: async () => {} },
+      upstreamHandler: (req, res) => {
+        if (req.headers['x-api-key'] !== 'key-sample-a') return okResponse(res);
+        res.writeHead(429, { 'content-type': 'application/json', ...fiveHourRejection(clock) });
+        res.end(JSON.stringify({ type: 'error', error: { type: 'rate_limit_error', message: 'fixture limit' } }));
+      },
+    });
+    const session = { 'x-claude-code-session-id': 'fixture-session-1' };
+    assert.equal((await h.send(session)).status, 200);
+    assert.deepEqual(h.seen, ['key-sample-a', 'key-sample-b']);
+    clock.ms += HOUR;
+    assert.equal(manager.isAvailable(manager.find('sample-a')), false, 'out past retry-after, before the five-hour reset');
+    assert.equal((await h.send(session)).status, 200);
+    assert.deepEqual(h.seen, ['key-sample-a', 'key-sample-b', 'key-sample-b']);
+    assert.equal(manager.getStatus().accounts[0].quota.unified5h, null);
+    assert.equal(signals(logs).length, 1);
   });
 });

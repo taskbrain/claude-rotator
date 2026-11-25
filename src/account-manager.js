@@ -5,7 +5,7 @@ import {
   emptyQuota,
   fableQuotaCompatMode,
   fiveHourWindowEnabled,
-  representativeClaim,
+  responseHeader,
   normalizeWeeklyScopedUsage,
   normalizeWeeklyScopedObservations,
   parseRateLimitHeaders,
@@ -126,16 +126,17 @@ export class AccountManager {
   }
 
   // `fiveHourWindow` for this ledger. While it is off the five-hour window is
-  // treated as absent: its readings are not judged, shown or saved. The one
-  // exception is an upstream 429 that the five-hour window explains: that
-  // reading is kept until its own reset so the rejection is honored exactly as
-  // when the window is on, and nothing about the window is kept after it.
-  // Turning the window off drops what is held in memory; turning it on starts
+  // treated as absent: no reading of it is kept, judged, shown or saved. An
+  // upstream 429 that the window explains is still honored, as a short-term
+  // hold (see `holdFiveHourRejection`). Turning the window off drops the
+  // readings held in memory, turning a known used-up window into such a hold
+  // so the account does not come back before its reset; turning it on starts
   // from nothing. Returns whether it is on.
   configureFiveHourWindow(raw) {
     const enabled = fiveHourWindowEnabled(raw);
     if (this.fiveHourWindowEnabled && !enabled) {
       for (const account of this.accounts) {
+        if (this.fiveHourUsedUp(account.quota.unified5h)) this.holdFiveHourRejection(account, account.quota.unified5hReset);
         account.quota.unified5h = null;
         account.quota.unified5hReset = null;
         if (account.windowObservations) delete account.windowObservations['5h'];
@@ -159,19 +160,35 @@ export class AccountManager {
     try { this.logger?.(`${at} five_hour_signal_while_disabled account=${hash} source=${source}`); } catch {}
   }
 
-  // True when a reading that came with an upstream 429 shows the five-hour
-  // window used up before its reset, i.e. the window explains the rejection.
-  fiveHourExplainsRejection(utilization, resetAt) {
-    return Number.isFinite(utilization) && utilization >= this.switchThreshold
-      && Number.isFinite(resetAt) && resetAt > this.now();
+  // A five-hour utilization at or over the ledger's stop line.
+  fiveHourUsedUp(utilization) {
+    return Number.isFinite(utilization) && utilization >= this.switchThreshold;
+  }
+
+  /**
+   * Keeps an upstream rejection that the five-hour window explains as a
+   * short-term hold (`rateLimitedUntil`) while the window is off. The hold
+   * lasts until `resetAt` when that is still ahead, otherwise for
+   * `fallbackSeconds`. A longer hold already in place is kept. The reason is
+   * the ordinary short-term one, marked `quotaRejected` so the legacy selector
+   * moves off the account as it does for a used-up window. It is saved and
+   * restored with the rest of the account state.
+   */
+  holdFiveHourRejection(account, resetAt, fallbackSeconds = 60) {
+    const now = this.now();
+    const until = Number.isFinite(resetAt) && resetAt > now ? resetAt : now + fallbackSeconds * 1000;
+    if (account.rateLimitedUntil >= until) return;
+    this.markTemporaryUnavailable(account.id, Math.ceil((until - now) / 1000),
+      { type: 'temporary_throttle', quotaRejected: true }, { eventType: 'throttled' });
   }
 
   /**
    * A Usage API payload as this ledger may read it. While the five-hour window
-   * is off its `five_hour` bucket is removed, unless the payload confirms an
-   * upstream 429 (`upstreamRateLimited`) and the bucket explains it; a number in
-   * the bucket is logged as a signal either way. Every other key, and the
-   * payload itself when the window is on, is returned unchanged.
+   * is off its `five_hour` bucket is removed, and a number in it is logged as a
+   * signal. When the payload confirms an upstream 429 (`upstreamRateLimited`)
+   * and the bucket shows the window used up, the rejection is held until the
+   * bucket's reset. Every other key, and the payload itself when the window is
+   * on, is returned unchanged.
    */
   screenFiveHourUsage(account, payload, upstreamRateLimited = false) {
     if (this.fiveHourWindowEnabled || !payload || typeof payload !== 'object'
@@ -179,7 +196,7 @@ export class AccountManager {
     const bucket = payload.five_hour;
     const resetAt = parseUsageReset(bucket?.resets_at);
     if (Number.isFinite(bucket?.utilization) || Number.isFinite(resetAt)) this.noteFiveHourSignal(account, 'usage');
-    if (upstreamRateLimited && this.fiveHourExplainsRejection(bucket?.utilization, resetAt)) return payload;
+    if (upstreamRateLimited && this.fiveHourUsedUp(bucket?.utilization)) this.holdFiveHourRejection(account, resetAt);
     const { five_hour: _ignored, ...rest } = payload;
     return rest;
   }
@@ -482,7 +499,8 @@ export class AccountManager {
 
     const reason = this.unavailableReason(current);
     if (current?.status === 'error' || this.hasCredentialRefreshCooldown(current)
-      || (current && this.quotaRecovery?.isHeld(this.quotaRecoveryKey(current)))) {
+      || (current && this.quotaRecovery?.isHeld(this.quotaRecoveryKey(current)))
+      || isQuotaRejectionHold(current, this.now())) {
       const next = this.selectBestAvailableSwitchTarget(modelFamily, { trigger });
       if (next) {
         next.status = 'active';
@@ -552,8 +570,10 @@ export class AccountManager {
   /**
    * @param {{ atomicUnifiedWindows?: boolean, recoveryStatus?: number|null, upstreamRateLimited?: boolean }} [options]
    *   `upstreamRateLimited` is true when these headers came with an upstream
-   *   429. While the five-hour window is off, only such a response may leave a
-   *   five-hour reading in the ledger, and only one that explains the rejection.
+   *   429. While the five-hour window is off no five-hour reading is kept; a
+   *   429 that the window explains (its utilization at the stop line, or a
+   *   `five_hour` rejection claim) holds the account until the five-hour reset,
+   *   else the response's unified reset, else `retry-after` (60 s without it).
    */
   updateQuota(accountId, headers, { atomicUnifiedWindows = false, recoveryStatus = null, upstreamRateLimited = false } = {}) {
     const account = this.find(accountId);
@@ -565,14 +585,20 @@ export class AccountManager {
       includeScopedWindows: this.planQuotaMode !== 'off' || this.urgency !== null,
     });
     if (!fiveHour) {
-      if (Number.isFinite(parsed.unified5h) || Number.isFinite(parsed.unified5hReset)
-        || (parsed.unifiedStatus === 'rejected' && representativeClaim(headers) === 'five_hour')) {
+      const claimed = parsed.unifiedStatus === 'rejected'
+        && responseHeader(headers, 'anthropic-ratelimit-unified-representative-claim')?.trim().toLowerCase() === 'five_hour';
+      if (Number.isFinite(parsed.unified5h) || Number.isFinite(parsed.unified5hReset) || claimed) {
         this.noteFiveHourSignal(account, 'header');
       }
-      if (!upstreamRateLimited || !this.fiveHourExplainsRejection(parsed.unified5h, parsed.unified5hReset)) {
-        delete parsed.unified5h;
-        delete parsed.unified5hReset;
+      if (upstreamRateLimited && (claimed || this.fiveHourUsedUp(parsed.unified5h))) {
+        const unifiedReset = Number.parseInt(responseHeader(headers, 'anthropic-ratelimit-unified-reset'), 10) * 1000;
+        const retryAfter = Number.parseInt(responseHeader(headers, 'retry-after'), 10);
+        this.holdFiveHourRejection(account,
+          Number.isFinite(parsed.unified5hReset) && parsed.unified5hReset > this.now() ? parsed.unified5hReset : unifiedReset,
+          Number.isFinite(retryAfter) && retryAfter > 0 ? retryAfter : 60);
       }
+      delete parsed.unified5h;
+      delete parsed.unified5hReset;
     }
     if (recoveryStatus !== null && (recoveryStatus < 200 || recoveryStatus >= 300)) {
       const threshold = Math.min(URGENCY_THRESHOLD, this.configuredSwitchThreshold);
@@ -969,13 +995,6 @@ export class AccountManager {
     return event;
   }
 
-  // The quota as status and the saved state show it. While the five-hour
-  // window is off its fields are null, even while a rejection's reading is held.
-  outwardQuota(account) {
-    return this.fiveHourWindowEnabled ? { ...account.quota }
-      : { ...account.quota, unified5h: null, unified5hReset: null };
-  }
-
   getStatus() {
     const active = this.accounts[this.currentIndex];
     return {
@@ -996,7 +1015,7 @@ export class AccountManager {
           type: account.type,
           accountUuid: account.accountUuid,
           status: this.displayStatus(account),
-          quota: this.outwardQuota(account),
+          quota: { ...account.quota },
           usage: { ...account.usage },
           rateLimitedUntil: account.rateLimitedUntil
             ? new Date(account.rateLimitedUntil).toISOString()
@@ -1075,7 +1094,7 @@ export class AccountManager {
         accountUuid: account.accountUuid,
         credentialRevision: account.credentialRevision,
         status: account.status,
-        quota: this.outwardQuota(account),
+        quota: { ...account.quota },
         ...(this.planQuotaMode !== 'off' || this.urgency
           ? { windowObservations: structuredClone(account.windowObservations) } : {}),
         usage: { ...account.usage },
@@ -2095,6 +2114,16 @@ export function isUnifiedQuotaExhaustion(reason) {
   return ['token_rate_limit_exhausted', 'request_rate_limit_exhausted'].includes(reason?.type)
     || (reason?.type === 'quota_exhausted'
       && (['5h', '7d'].includes(reason.window) || String(reason.window || '').startsWith('7d ')));
+}
+
+/**
+ * True while the account is on the short-term hold that an upstream 429
+ * explained by the five-hour window leaves while that window is off (see
+ * `holdFiveHourRejection`).
+ */
+export function isQuotaRejectionHold(account, now) {
+  return account?.temporaryUnavailableReason?.quotaRejected === true
+    && Number.isFinite(account.rateLimitedUntil) && account.rateLimitedUntil > now;
 }
 
 export function isCredentialRefreshCooldown(reason) {

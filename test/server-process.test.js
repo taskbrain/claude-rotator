@@ -52,6 +52,31 @@ it('removes stale runtime-state temp files of dead processes once at startup', a
   }
 });
 
+// The server reads `fiveHourWindow` from its configuration file and passes it
+// to the ledger at startup and on every reload; an absent section means off.
+it('passes the configured five-hour window to the ledger at startup and on reload, off when absent', async () => {
+  const { dir, configPath, env, port } = await prepareSandbox();
+  const child = spawnServer(env);
+  const base = `http://127.0.0.1:${port}`;
+  try {
+    await waitForOutput(child, /listening on/);
+    const config = JSON.parse(await readFile(configPath, 'utf8'));
+    assert.equal(Object.hasOwn(config, 'fiveHourWindow'), false);
+    assert.deepEqual((await getJson(`${base}/internal/status`)).fiveHourWindow, { enabled: false });
+    await writeJsonFile(configPath, { ...config, fiveHourWindow: { enabled: true } });
+    assert.equal(Object.hasOwn(await getJson(`${base}/internal/reload`, 'POST'), 'fiveHourWindow'), false);
+    await writeJsonFile(configPath, config);
+    assert.deepEqual((await getJson(`${base}/internal/reload`, 'POST')).fiveHourWindow, { enabled: false });
+    await writeJsonFile(configPath, { ...config, fiveHourWindow: { enabled: 'yes' } });
+    assert.deepEqual((await getJson(`${base}/internal/reload`, 'POST')).fiveHourWindow, { enabled: false });
+    const log = await readFile(join(dir, 'server.log'), 'utf8');
+    assert.equal(log.match(/five-hour-window warning=invalid-enabled enabled=false/g)?.length, 1);
+  } finally {
+    await stopServer(child);
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
 // 子プロセスの HOME・XDG・Claude 設定をすべて一時ディレクトリへ向ける。CLAUDE_ROTATOR_CONFIG
 // だけを差し替えると runtime-state.json・usage-events が実 ~/.config/claude-rotator を指す。
 async function prepareSandbox() {
@@ -134,14 +159,14 @@ function waitForOutput(child, pattern) {
   });
 }
 
-function getJson(url) {
+function getJson(url, method = 'GET') {
   const target = new URL(url);
   return new Promise((resolveDone, reject) => {
     const req = http.request({
       hostname: target.hostname,
       port: target.port,
       path: target.pathname,
-      method: 'GET',
+      method,
     }, res => {
       const chunks = [];
       res.on('data', chunk => chunks.push(chunk));
