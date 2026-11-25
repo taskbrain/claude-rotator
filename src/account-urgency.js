@@ -263,13 +263,22 @@ export class AccountUrgency {
       || b.requiredPace - a.requiredPace || a.weekly.resetAt - b.weekly.resetAt
       || a.accountId.localeCompare(b.accountId)
     ));
-    const tiers = new Map(pool.map(row => [row, this.orderTier(row)]));
-    return pool.sort((a, b) => (
-      tiers.get(a) - tiers.get(b)
-      || a.weekly.resetAt - b.weekly.resetAt
-      || b.remainingFraction - a.remainingFraction
-      || a.accountId.localeCompare(b.accountId)
-    ));
+    // A recovery-only account with no live weekly reading (as after a
+    // restart) is placed by its saved weekly reading, `lastKnownWeekly`.
+    const keys = new Map(pool.map(row => {
+      const live = Number.isFinite(row.weekly?.resetAt);
+      return [row, {
+        tier: this.orderTier(row),
+        resetAt: live ? row.weekly.resetAt : row.lastKnownWeekly?.resetAt ?? Number.MAX_SAFE_INTEGER,
+        remaining: (live ? row.remainingFraction : row.lastKnownWeekly?.remainingFraction) ?? 0,
+      }];
+    }));
+    return pool.sort((a, b) => {
+      const x = keys.get(a);
+      const y = keys.get(b);
+      return x.tier - y.tier || x.resetAt - y.resetAt || y.remaining - x.remaining
+        || a.accountId.localeCompare(b.accountId);
+    });
   }
 
   record(kind, data) {
@@ -334,11 +343,14 @@ export class AccountUrgency {
         windows: row.windows.map(window => window.id === '5h' ? { ...window, ...display } : window),
       };
     });
-    const familyStatus = accounts => ({
-      accounts: accounts.map(({ accountId, eligible, exclusionReason, predictedExhaustsAt, predictedBlockedUntil, recoveryOnly }) => ({
+    // Orders are ranked from the rows the selector ranks, never from the
+    // display rows above, so a saved five-hour reading shown there cannot
+    // move an account in `proposedOrder`.
+    const familyStatus = familyRows => ({
+      accounts: familyRows.map(({ accountId, eligible, exclusionReason, predictedExhaustsAt, predictedBlockedUntil, recoveryOnly }) => ({
         accountId, eligible, exclusionReason, predictedExhaustsAt, predictedBlockedUntil, recoveryOnly,
       })),
-      proposedOrder: this.rank(accounts).map(row => row.accountId),
+      proposedOrder: this.rank(familyRows).map(row => row.accountId),
     });
     return {
       schemaVersion: 2, mode: this.mode, order: this.order, activationBlock: this.activationBlock ?? null,

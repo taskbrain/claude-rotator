@@ -350,4 +350,38 @@ describe('reset-first account order', () => {
     const { manager } = four({ fiveHourWindow: { enabled: true } });
     assert.deepEqual(section(manager).proposedOrder, ['a', 'b', 'c', 'd'], 'an unknown five-hour window does not lower a tier');
   });
+  it('ranks status orders from the rows it selects with, not from saved five-hour readings shown in status', () => {
+    const clock = { ms: START };
+    const make = () => ledger({ ids: ['a', 'b', 'c'], fiveHourWindow: { enabled: true }, clock });
+    const saved = make();
+    saved.observe('a', 0.3, START + 10 * HOUR, { five_hour: { utilization: 0.95, resets_at: new Date(START + 2 * HOUR).toISOString() } });
+    const { manager, observe } = make();
+    manager.restoreState(saved.manager.exportState());
+    for (const [id, hours] of [['a', 10], ['b', 20], ['c', 30]]) observe(id, 0.3, START + hours * HOUR);
+    const status = section(manager);
+    assert.equal(row(manager, 'a').fiveHour.retainedConstraint, true, 'the saved 95% reading is shown');
+    assert.equal(row(manager, 'a').fiveHour.lastKnown.usedFraction, 0.95);
+    const selected = manager.newAssignmentOrder().map(entry => entry.account);
+    assert.deepEqual(selected, ['a', 'b', 'c']);
+    assert.deepEqual(status.proposedOrder, selected);
+    assert.deepEqual(status.byModelFamily.other.proposedOrder, selected);
+    assert.equal(row(manager, 'a').orderTier, 0);
+  });
+
+  it('places recovery-only accounts restored after a restart by their saved weekly reset', () => {
+    const clock = { ms: START };
+    const make = () => ledger({ ids: ['a', 'b', 'c'], order: 'reset-first', clock });
+    const saved = make();
+    saved.observe('a', 0.3, START + 48 * HOUR);
+    saved.observe('b', 0.3, START + 24 * HOUR);
+    saved.observe('c', 0.6, START + 36 * HOUR);
+    assert.deepEqual(section(saved.manager).proposedOrder, ['b', 'c', 'a']);
+    const { manager } = make();
+    manager.restoreState(saved.manager.exportState());
+    const status = section(manager);
+    assert.ok(status.accounts.every(entry => entry.recoveryOnly === true && entry.orderTier === 2
+      && entry.weekly.fresh === false), 'still recovery-only and stale');
+    assert.deepEqual(status.proposedOrder, ['b', 'c', 'a']);
+    assert.equal(manager.selectForNewAssignment().id, 'b');
+  });
 });

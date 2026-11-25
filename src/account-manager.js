@@ -402,8 +402,25 @@ export class AccountManager {
       modelFamily, account.quota.weeklyScoped, account.fableQuotaCompat);
       const recoveryOnly = ['weekly-unknown-or-stale', 'scoped-weekly-unknown-or-stale'].includes(row.exclusionReason)
         && this.canRecoverWeeklyQuota(account, modelFamily, Math.min(URGENCY_THRESHOLD, this.configuredSwitchThreshold));
-      return { ...row, recoveryOnly, ...(recoveryOnly ? { eligible: true, exclusionReason: null, unusedRisk: false } : {}) };
+      return { ...row, recoveryOnly, ...(recoveryOnly ? { eligible: true, exclusionReason: null, unusedRisk: false } : {}),
+        ...(recoveryOnly && !Number.isFinite(row.weekly.resetAt) ? { lastKnownWeekly: this.lastKnownWeekly(account, modelFamily) } : {}) };
     });
+  }
+
+  // The saved weekly reading of an account that has no live one (as after a
+  // restart): the common weekly reset, and the room left before the 97% line
+  // on the common window and every saved weekly window for `modelFamily`
+  // still in its cycle. It only places a recovery-only account among the
+  // others; freshness and eligibility do not depend on it.
+  lastKnownWeekly(account, modelFamily = null) {
+    const now = this.now();
+    const { unified7d, unified7dReset, weeklyScoped = [] } = account.quota;
+    if (!isValidQuotaWindow(unified7d, unified7dReset, now)) return null;
+    const used = [unified7d, ...weeklyScoped
+      .filter(limit => scopeMatchesModelFamily(limit, modelFamily, true, account.fableQuotaCompat)
+        && isValidQuotaWindow(limit.utilization, limit.resetAt, now))
+      .map(limit => limit.utilization)];
+    return { resetAt: unified7dReset, remainingFraction: Math.max(0, Math.min(...used.map(value => URGENCY_THRESHOLD - value))) };
   }
 
   canSendWithUrgency(account, modelFamily = null) {
