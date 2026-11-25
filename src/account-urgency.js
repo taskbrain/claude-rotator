@@ -5,22 +5,46 @@ const HOUR = 3_600_000;
 const MAX_AGE = 30 * 60_000;
 const MIN_HISTORY = 15 * 60_000;
 const LIMIT = 50;
-const LOG_REASONS = new Set(['required-pace', 'no-known-candidate', 'no-unused-risk', 'within-turn',
+const LOG_REASONS = new Set(['required-pace', 'reset-first', 'reset-order', 'no-known-candidate', 'no-unused-risk', 'within-turn',
   'request-in-flight', 'binding-cooldown', 'current-unknown-or-unavailable', 'pace-hysteresis', 'unused-before-reset']);
 const fingerprint = id => typeof id === 'string' ? createHash('sha256').update(id).digest('hex').slice(0, 12) : null;
 export const URGENCY_THRESHOLD = 0.97;
+// An account with less than this left before the 97% line (on any weekly
+// window that applies to the request) ranks after every account with more.
+const LOW_REMAINING = 0.10;
+// With the five-hour window on, a known five-hour reading at or above this
+// also ranks the account after those with room.
+const FIVE_HOUR_LOW = 0.90;
+// Remaining fractions are differences of decimal fractions (0.97 - 0.87 is
+// 0.0999...), so the 10-point line is compared with this tolerance.
+const FRACTION_EPSILON = 1e-9;
+const URGENCY_ORDERS = ['reset-first', 'required-pace'];
 
 export function urgencyMode(raw) {
   return ['off', 'shadow', 'on'].includes(raw?.mode) ? raw.mode : 'off';
+}
+
+// `accountUrgency.order`. Anything but exactly "required-pace" is "reset-first".
+export function urgencyOrder(raw) {
+  return raw?.order === 'required-pace' ? 'required-pace' : 'reset-first';
+}
+
+// True when `accountUrgency.order` is set to a value that is not one of the
+// orders; it is then read as "reset-first".
+export function isInvalidUrgencyOrder(raw) {
+  return raw != null && typeof raw === 'object' && raw.order != null && !URGENCY_ORDERS.includes(raw.order);
 }
 
 // No I/O and no credentials. Observations must carry utilization AND reset in
 // the same update. A shared ledger timestamp cannot establish window freshness.
 // `fiveHourWindow: false` treats the five-hour window as absent: it is neither
 // observed, nor judged, nor reported in metrics and status. Omitted, it is on.
+// `order` decides how eligible accounts are ranked (see `rank`). Omitted, or
+// anything but "required-pace", it is "reset-first".
 export class AccountUrgency {
-  constructor({ mode, now, logger, fiveHourWindow = true }) {
+  constructor({ mode, now, logger, fiveHourWindow = true, order = 'reset-first' }) {
     this.mode = mode;
+    this.order = urgencyOrder({ order });
     this.now = now;
     this.logger = logger;
     this.fiveHourWindow = fiveHourWindow !== false;
@@ -175,6 +199,14 @@ export class AccountUrgency {
     const applicableScoped = scopedWeekly.filter(limit => scopeMatchesModelFamily(limit, modelFamily, true, fableCompat));
     const hoursLeft = weekly.fresh ? (weekly.resetAt - this.now()) / HOUR : null;
     const requiredPace = hoursLeft != null ? Math.max(0, URGENCY_THRESHOLD - weekly.usedFraction) / hoursLeft : null;
+    // Room left before the 97% line on the common weekly window and on every
+    // weekly window that applies to this request's model, whichever is least.
+    // It reads the last value known even when that value is stale, so a stale
+    // account still has a place among the other stale accounts.
+    const usedFractions = [weekly.usedFraction,
+      ...applicableScoped.map(limit => limit.lastKnown?.usedFraction ?? limit.usedFraction)];
+    const remainingFraction = Number.isFinite(weekly.usedFraction)
+      ? Math.max(0, Math.min(...usedFractions.filter(Number.isFinite).map(used => URGENCY_THRESHOLD - used))) : null;
     const predictedUnusedFraction = weekly.observedPace != null
       ? Math.max(0, Math.min(1 - weekly.usedFraction,
         Math.max(1 - URGENCY_THRESHOLD, 1 - weekly.usedFraction - weekly.observedPace * (weekly.resetAt - weekly.observedAt) / HOUR))) : null;
@@ -197,7 +229,7 @@ export class AccountUrgency {
           resetAt: window.resetAt, observedAt: window.observedAt, source: window.source,
           ...(typeof window.retainedConstraint === 'boolean' ? { retainedConstraint: window.retainedConstraint, lastKnown: window.lastKnown } : {}),
         })),
-      requiredPace, observedPace: weekly.observedPace,
+      requiredPace, remainingFraction, observedPace: weekly.observedPace,
       predictedUnusedFraction,
       predictedExhaustsAt: firstExhausted?.predictedExhaustsAt ?? null,
       predictedBlockedUntil: firstExhausted?.resetAt ?? null,
@@ -206,10 +238,36 @@ export class AccountUrgency {
     };
   }
 
+  // 2: usable only to recover a stale reading. 1: less than 10 points left
+  // (or, with the five-hour window on, a known five-hour reading of 90% or
+  // more). 0: every other account.
+  orderTier(row) {
+    if (row.recoveryOnly === true) return 2;
+    if (!(row.remainingFraction >= LOW_REMAINING - FRACTION_EPSILON)) return 1;
+    const fiveHour = row.fiveHour?.usedFraction ?? row.fiveHour?.lastKnown?.usedFraction;
+    return this.fiveHourWindow && Number.isFinite(fiveHour) && fiveHour >= FIVE_HOUR_LOW ? 1 : 0;
+  }
+
+  // "reset-first": tier, then the common weekly reset (earliest first), then
+  // the room left (most first), then the account id. Using the account whose
+  // weekly allowance comes back soonest wastes the least of what would
+  // otherwise expire unused, and the order does not drift as time passes:
+  // it changes only when an account crosses a tier or resets. Resets are
+  // compared exactly, never rounded, so a near tie cannot flip at a boundary.
+  // "required-pace": fresh before stale, then the pace needed to use the
+  // allowance by its reset (largest first), then the reset, then the id.
   rank(rows, excluded = new Set()) {
-    return rows.filter(row => row.eligible && !excluded.has(row.accountId)).sort((a, b) => (
+    const pool = rows.filter(row => row.eligible && !excluded.has(row.accountId));
+    if (this.order === 'required-pace') return pool.sort((a, b) => (
       Number(a.recoveryOnly === true) - Number(b.recoveryOnly === true)
       || b.requiredPace - a.requiredPace || a.weekly.resetAt - b.weekly.resetAt
+      || a.accountId.localeCompare(b.accountId)
+    ));
+    const tiers = new Map(pool.map(row => [row, this.orderTier(row)]));
+    return pool.sort((a, b) => (
+      tiers.get(a) - tiers.get(b)
+      || a.weekly.resetAt - b.weekly.resetAt
+      || b.remainingFraction - a.remainingFraction
       || a.accountId.localeCompare(b.accountId)
     ));
   }
@@ -260,7 +318,7 @@ export class AccountUrgency {
   status(rows, fableRows = rows, savedWindows = new Map()) {
     // Saved constraints supplement the display only; policy metrics and their
     // freshness still depend on live observations, never on a status read.
-    const accounts = rows.map(row => {
+    const accounts = rows.map(row => ({ ...row, orderTier: this.orderTier(row) })).map(row => {
       if (!this.fiveHourWindow) return row;
       const saved = savedWindows.get(row.accountId)?.['5h'];
       const known = saved?.lastKnown;
@@ -283,7 +341,7 @@ export class AccountUrgency {
       proposedOrder: this.rank(accounts).map(row => row.accountId),
     });
     return {
-      schemaVersion: 2, mode: this.mode, activationBlock: this.activationBlock ?? null,
+      schemaVersion: 2, mode: this.mode, order: this.order, activationBlock: this.activationBlock ?? null,
       instanceId: this.instanceId, sequence: this.sequence,
       generatedAt: this.now(), threshold: URGENCY_THRESHOLD, paceUnit: 'fraction-per-hour', historyLimit: LIMIT,
       maxObservationAgeMs: MAX_AGE, minHistoryMs: MIN_HISTORY, accounts,

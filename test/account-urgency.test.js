@@ -5,12 +5,12 @@ import { isUserTurnBoundary } from '../src/account-urgency.js';
 
 const HOUR = 3_600_000;
 
-function setup(mode = 'shadow') {
+function setup(mode = 'shadow', order = undefined) {
   const clock = { ms: Date.parse('2026-10-29T07:30:00Z') };
   const logs = [];
   const manager = new AccountManager({
     accounts: ['soon', 'later', 'near-cap'].map(id => ({ id, type: 'oauth' })),
-    accountUrgency: { mode },
+    accountUrgency: { mode, ...(order === undefined ? {} : { order }) },
     now: () => clock.ms,
     logger: line => logs.push(line),
   });
@@ -28,7 +28,7 @@ function setup(mode = 'shadow') {
 
 describe('account urgency scheduling', () => {
   it('shadow preserves the old assignment and threshold, but records the urgent alternative', () => {
-    const { manager, logs } = setup();
+    const { manager, logs } = setup('shadow', 'required-pace');
     const before = manager.exportState();
     assert.equal(manager.selectForNewAssignment().id, 'later');
     assert.equal(manager.switchThreshold, 1);
@@ -53,7 +53,7 @@ describe('account urgency scheduling', () => {
   });
 
   it('on ranks required pace without the 90% gate and stops at 97%', () => {
-    const { manager, usage } = setup('on');
+    const { manager, usage } = setup('on', 'required-pace');
     usage('near-cap', 0.92, 0.1);
     assert.equal(manager.selectForNewAssignment().id, 'near-cap');
     assert.equal(manager.switchThreshold, 0.97);

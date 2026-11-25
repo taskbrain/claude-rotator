@@ -1,4 +1,4 @@
-import { AccountUrgency, urgencyMode, URGENCY_THRESHOLD } from './account-urgency.js';
+import { AccountUrgency, isInvalidUrgencyOrder, urgencyMode, urgencyOrder, URGENCY_THRESHOLD } from './account-urgency.js';
 import { createHash } from 'node:crypto';
 import { QuotaRecovery } from './quota-recovery.js';
 import {
@@ -116,6 +116,7 @@ export class AccountManager {
     this.currentIndex = configuredIndex >= 0 ? configuredIndex : 0;
     this.configuredSwitchThreshold = this.switchThreshold;
     this.urgency = null;
+    this.urgencyOrderWarned = false;
     this.quotaRecovery = null;
     this.quotaRecoveryPersistence = false;
     this.quotaRecoveryPolling = null;
@@ -256,15 +257,28 @@ export class AccountManager {
     };
   }
 
+  // `accountUrgency` (`mode`, and `order`: "reset-first" unless it says
+  // exactly "required-pace"). The order is applied on every call, so a reload
+  // that changes only the order takes effect. An order that is not one of the
+  // two is logged once while it stays that way.
   configureAccountUrgency(raw) {
     const mode = urgencyMode(raw);
+    const order = urgencyOrder(raw);
     if (mode === 'off') this.urgency = null;
-    else if (!this.urgency) this.urgency = new AccountUrgency({ mode, now: this.now, logger: this.logger,
+    else if (!this.urgency) this.urgency = new AccountUrgency({ mode, order, now: this.now, logger: this.logger,
       fiveHourWindow: this.fiveHourWindowEnabled });
-    else if (this.urgency.mode !== mode) {
-      this.urgency.mode = mode;
-      this.urgency.notified.clear();
+    else {
+      if (this.urgency.mode !== mode) {
+        this.urgency.mode = mode;
+        this.urgency.notified.clear();
+      }
+      this.urgency.order = order;
     }
+    const invalidOrder = mode !== 'off' && isInvalidUrgencyOrder(raw);
+    if (invalidOrder && !this.urgencyOrderWarned) {
+      try { this.logger?.('account-urgency warning=invalid-order order=reset-first'); } catch {}
+    }
+    this.urgencyOrderWarned = invalidOrder;
     this.switchThreshold = mode === 'on' ? Math.min(URGENCY_THRESHOLD, this.configuredSwitchThreshold) : this.configuredSwitchThreshold;
     for (const account of this.accounts) account.extendedQuotaScopes = mode === 'on' || this.planQuotaMode === 'on';
     this.configureQuotaRecovery();
@@ -442,8 +456,13 @@ export class AccountManager {
   planUrgencyReassignment({ bound, boundAt, modelFamily = null, turnBoundary, inFlight, sid = null, onDecision = null }) {
     if (!this.urgency || !bound) return null;
     const rows = this.urgencyRows(modelFamily);
-    const target = this.urgency.rank(rows).find(row => row.unusedRisk && row.accountId !== bound.id);
+    const ranked = this.urgency.rank(rows);
+    const target = ranked.find(row => row.unusedRisk && row.accountId !== bound.id);
     const current = rows.find(row => row.accountId === bound.id);
+    // With "reset-first", a session moves only toward an account that the
+    // order puts ahead of its current one.
+    const behind = this.urgency.order === 'reset-first' && target
+      && ranked.findIndex(row => row.accountId === bound.id) < ranked.indexOf(target);
     const reason = !target ? 'no-unused-risk'
       : !turnBoundary ? 'within-turn'
         : inFlight ? 'request-in-flight'
@@ -451,7 +470,8 @@ export class AccountManager {
             : !current?.eligible || current.recoveryOnly ? 'current-unknown-or-unavailable'
               : target.requiredPace < current.requiredPace * 1.25
                 || target.requiredPace - current.requiredPace < 0.01 ? 'pace-hysteresis'
-                : 'unused-before-reset';
+                : behind ? 'reset-order'
+                  : 'unused-before-reset';
     const wouldReassign = reason === 'unused-before-reset';
     const decision = {
       purpose: 'reassignment', sid,
@@ -479,7 +499,7 @@ export class AccountManager {
       if (!account) return null;
       const index = this.accounts.indexOf(account);
       if (index !== this.currentIndex) return this.switchToCandidate({ account, index, score: {} },
-        this.urgency?.mode === 'on' ? 'required-pace' : 'weekly-headroom', trigger);
+        this.urgency?.mode === 'on' ? this.urgency.order : 'weekly-headroom', trigger);
       return account;
     }
     const actual = this.getLegacyActiveAccount(modelFamily, { trigger });
@@ -488,7 +508,7 @@ export class AccountManager {
       this.urgency.record('decisions', {
         purpose: 'keyless-request', actualAccountId: actual?.id ?? null,
         proposedAccountId: this.urgency.rank(rows)[0]?.accountId ?? null,
-        reason: 'required-pace', metrics: rows,
+        reason: this.urgency.order, metrics: rows,
       });
     }
     return actual;
@@ -1797,7 +1817,7 @@ export class AccountManager {
     if (recordDecision) this.urgency.record('decisions', {
       purpose: 'assignment', actualAccountId: actual?.id ?? null,
       proposedAccountId: proposed?.id ?? null,
-      reason: proposed ? 'required-pace' : 'no-known-candidate', metrics: rows,
+      reason: proposed ? this.urgency.order : 'no-known-candidate', metrics: rows,
     });
     return actual;
   }
