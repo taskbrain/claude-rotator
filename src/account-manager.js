@@ -4,6 +4,8 @@ import { QuotaRecovery } from './quota-recovery.js';
 import {
   emptyQuota,
   fableQuotaCompatMode,
+  fiveHourWindowEnabled,
+  representativeClaim,
   normalizeWeeklyScopedUsage,
   normalizeWeeklyScopedObservations,
   parseRateLimitHeaders,
@@ -83,6 +85,9 @@ export class AccountManager {
     accountUrgency = null,
     planQuota = null,
     fableQuotaCompat = null,
+    // `{ enabled: false }` turns the five-hour window off. Omitted, it is on;
+    // the product default (off) comes from the configuration file reader.
+    fiveHourWindow = null,
     logger = null,
     // Keep `events` as a bounded, persisted history.
     // The ledger is told nothing about session affinity - not the instance, not
@@ -102,6 +107,8 @@ export class AccountManager {
     this.stateListener = null;
     this.events = [];
     this.quotaHeaderRejectRecordedAt = new Map();
+    this.fiveHourWindowEnabled = true;
+    this.fiveHourSignalDays = new Map();
     this.accounts = accounts.map((account, index) => this.createAccount(account, index));
     const configuredIndex = currentAccountId
       ? this.accounts.findIndex(account => account.id === currentAccountId || account.name === currentAccountId)
@@ -115,6 +122,66 @@ export class AccountManager {
     this.configureAccountUrgency(accountUrgency);
     this.configurePlanQuota(planQuota);
     this.configureFableQuotaCompat(fableQuotaCompat);
+    this.configureFiveHourWindow(fiveHourWindow);
+  }
+
+  // `fiveHourWindow` for this ledger. While it is off the five-hour window is
+  // treated as absent: its readings are not judged, shown or saved. The one
+  // exception is an upstream 429 that the five-hour window explains: that
+  // reading is kept until its own reset so the rejection is honored exactly as
+  // when the window is on, and nothing about the window is kept after it.
+  // Turning the window off drops what is held in memory; turning it on starts
+  // from nothing. Returns whether it is on.
+  configureFiveHourWindow(raw) {
+    const enabled = fiveHourWindowEnabled(raw);
+    if (this.fiveHourWindowEnabled && !enabled) {
+      for (const account of this.accounts) {
+        account.quota.unified5h = null;
+        account.quota.unified5hReset = null;
+        if (account.windowObservations) delete account.windowObservations['5h'];
+      }
+      this.urgency?.forgetFiveHour();
+    }
+    this.fiveHourWindowEnabled = enabled;
+    if (this.urgency) this.urgency.fiveHourWindow = enabled;
+    return enabled;
+  }
+
+  // While the window is off, a five-hour reading from the upstream is a sign
+  // that the window may be back. It is logged at most once per account per UTC
+  // day, with the account as a hash and without the value.
+  noteFiveHourSignal(account, source) {
+    const at = new Date(this.now()).toISOString();
+    const day = at.slice(0, 10);
+    if (this.fiveHourSignalDays.get(account.id) === day) return;
+    this.fiveHourSignalDays.set(account.id, day);
+    const hash = createHash('sha256').update(String(account.id)).digest('hex').slice(0, 12);
+    try { this.logger?.(`${at} five_hour_signal_while_disabled account=${hash} source=${source}`); } catch {}
+  }
+
+  // True when a reading that came with an upstream 429 shows the five-hour
+  // window used up before its reset, i.e. the window explains the rejection.
+  fiveHourExplainsRejection(utilization, resetAt) {
+    return Number.isFinite(utilization) && utilization >= this.switchThreshold
+      && Number.isFinite(resetAt) && resetAt > this.now();
+  }
+
+  /**
+   * A Usage API payload as this ledger may read it. While the five-hour window
+   * is off its `five_hour` bucket is removed, unless the payload confirms an
+   * upstream 429 (`upstreamRateLimited`) and the bucket explains it; a number in
+   * the bucket is logged as a signal either way. Every other key, and the
+   * payload itself when the window is on, is returned unchanged.
+   */
+  screenFiveHourUsage(account, payload, upstreamRateLimited = false) {
+    if (this.fiveHourWindowEnabled || !payload || typeof payload !== 'object'
+      || !Object.hasOwn(payload, 'five_hour')) return payload;
+    const bucket = payload.five_hour;
+    const resetAt = parseUsageReset(bucket?.resets_at);
+    if (Number.isFinite(bucket?.utilization) || Number.isFinite(resetAt)) this.noteFiveHourSignal(account, 'usage');
+    if (upstreamRateLimited && this.fiveHourExplainsRejection(bucket?.utilization, resetAt)) return payload;
+    const { five_hour: _ignored, ...rest } = payload;
+    return rest;
   }
 
   // `fableQuotaCompat` for this ledger only, copied onto every account like
@@ -153,7 +220,8 @@ export class AccountManager {
 
   observePlanQuota(account, fields, source) {
     if (this.planQuotaMode === 'off' && !this.urgency) return;
-    account.windowObservations = observeQuotaWindows(account.windowObservations, fields, this.now(), source);
+    account.windowObservations = observeQuotaWindows(account.windowObservations, fields, this.now(), source,
+      this.fiveHourWindowEnabled);
   }
 
   quotaWindowsStatus() {
@@ -161,7 +229,8 @@ export class AccountManager {
       schemaVersion: 1, mode: this.planQuotaMode, generatedAt: this.now(),
       accounts: this.accounts.map(account => ({
         accountId: account.id,
-        windows: quotaWindowsView(account.quota, account.windowObservations, this.now(), account.fableQuotaCompat),
+        windows: quotaWindowsView(account.quota, account.windowObservations, this.now(), account.fableQuotaCompat,
+          this.fiveHourWindowEnabled),
       })),
     };
   }
@@ -169,7 +238,8 @@ export class AccountManager {
   configureAccountUrgency(raw) {
     const mode = urgencyMode(raw);
     if (mode === 'off') this.urgency = null;
-    else if (!this.urgency) this.urgency = new AccountUrgency({ mode, now: this.now, logger: this.logger });
+    else if (!this.urgency) this.urgency = new AccountUrgency({ mode, now: this.now, logger: this.logger,
+      fiveHourWindow: this.fiveHourWindowEnabled });
     else if (this.urgency.mode !== mode) {
       this.urgency.mode = mode;
       this.urgency.notified.clear();
@@ -479,12 +549,31 @@ export class AccountManager {
     });
   }
 
-  updateQuota(accountId, headers, { atomicUnifiedWindows = false, recoveryStatus = null } = {}) {
+  /**
+   * @param {{ atomicUnifiedWindows?: boolean, recoveryStatus?: number|null, upstreamRateLimited?: boolean }} [options]
+   *   `upstreamRateLimited` is true when these headers came with an upstream
+   *   429. While the five-hour window is off, only such a response may leave a
+   *   five-hour reading in the ledger, and only one that explains the rejection.
+   */
+  updateQuota(accountId, headers, { atomicUnifiedWindows = false, recoveryStatus = null, upstreamRateLimited = false } = {}) {
     const account = this.find(accountId);
+    const fiveHour = this.fiveHourWindowEnabled;
     const parsed = parseRateLimitHeaders(headers, {
-      onInvalid: rejected => this.recordQuotaHeaderRejected(account, rejected),
+      onInvalid: rejected => {
+        if (fiveHour || rejected.key !== 'unified5h') this.recordQuotaHeaderRejected(account, rejected);
+      },
       includeScopedWindows: this.planQuotaMode !== 'off' || this.urgency !== null,
     });
+    if (!fiveHour) {
+      if (Number.isFinite(parsed.unified5h) || Number.isFinite(parsed.unified5hReset)
+        || (parsed.unifiedStatus === 'rejected' && representativeClaim(headers) === 'five_hour')) {
+        this.noteFiveHourSignal(account, 'header');
+      }
+      if (!upstreamRateLimited || !this.fiveHourExplainsRejection(parsed.unified5h, parsed.unified5hReset)) {
+        delete parsed.unified5h;
+        delete parsed.unified5hReset;
+      }
+    }
     if (recoveryStatus !== null && (recoveryStatus < 200 || recoveryStatus >= 300)) {
       const threshold = Math.min(URGENCY_THRESHOLD, this.configuredSwitchThreshold);
       for (const [value, reset] of [['unified5h', 'unified5hReset'], ['unified7d', 'unified7dReset']]) {
@@ -541,8 +630,11 @@ export class AccountManager {
     });
   }
 
-  applyUsage(accountId, payload) {
+  // `upstreamRateLimited` is true when the payload was fetched to confirm an
+  // upstream 429 (see `screenFiveHourUsage`).
+  applyUsage(accountId, usagePayload, { upstreamRateLimited = false } = {}) {
     const account = this.find(accountId);
+    const payload = this.screenFiveHourUsage(account, usagePayload, upstreamRateLimited);
     this.markAuthenticated(account);
     let utilizationUpdated = false;
     const atomicUsage = this.planQuotaMode === 'on' || this.urgency?.mode === 'on';
@@ -877,12 +969,21 @@ export class AccountManager {
     return event;
   }
 
+  // The quota as status and the saved state show it. While the five-hour
+  // window is off its fields are null, even while a rejection's reading is held.
+  outwardQuota(account) {
+    return this.fiveHourWindowEnabled ? { ...account.quota }
+      : { ...account.quota, unified5h: null, unified5hReset: null };
+  }
+
   getStatus() {
     const active = this.accounts[this.currentIndex];
     return {
       currentAccount: active?.id || null,
       currentAccountName: active?.name || null,
       switchThreshold: this.switchThreshold,
+      // Present only while the window is off, so the on shape is unchanged.
+      ...(this.fiveHourWindowEnabled ? {} : { fiveHourWindow: { enabled: false } }),
       routingAvailability: {
         fable: this.getRoutingAvailability('fable'),
         other: this.getRoutingAvailability(null),
@@ -895,7 +996,7 @@ export class AccountManager {
           type: account.type,
           accountUuid: account.accountUuid,
           status: this.displayStatus(account),
-          quota: { ...account.quota },
+          quota: this.outwardQuota(account),
           usage: { ...account.usage },
           rateLimitedUntil: account.rateLimitedUntil
             ? new Date(account.rateLimitedUntil).toISOString()
@@ -974,7 +1075,7 @@ export class AccountManager {
         accountUuid: account.accountUuid,
         credentialRevision: account.credentialRevision,
         status: account.status,
-        quota: { ...account.quota },
+        quota: this.outwardQuota(account),
         ...(this.planQuotaMode !== 'off' || this.urgency
           ? { windowObservations: structuredClone(account.windowObservations) } : {}),
         usage: { ...account.usage },
@@ -1031,6 +1132,13 @@ export class AccountManager {
       }
       account.windowObservations = credentialIdentityChanged || (this.planQuotaMode === 'off' && !this.urgency)
         ? {} : restoreQuotaWindowObservations(saved.windowObservations);
+      // A saved five-hour reading is never read back while the window is off;
+      // the next save writes it as absent.
+      if (!this.fiveHourWindowEnabled) {
+        account.quota.unified5h = null;
+        account.quota.unified5hReset = null;
+        delete account.windowObservations['5h'];
+      }
       account.usage = credentialIdentityChanged ? emptyAccountUsage() : restoreUsage(saved.usage);
       account.rateLimitedUntil = credentialIdentityChanged
         ? null
@@ -1662,8 +1770,14 @@ export class AccountManager {
    */
   assignmentHeadroomFor(account, modelFamily = null) {
     if (!account) return { min: null, complete: false };
-    return assignmentHeadroom(account.quota || {}, modelFamily, this.now(), this.planQuotaMode === 'on', account.extendedQuotaScopes,
-      account.fableQuotaCompat);
+    return assignmentHeadroom(account.quota || {}, modelFamily, this.now(), this.optionalFiveHourHeadroom(),
+      account.extendedQuotaScopes, account.fableQuotaCompat);
+  }
+
+  // A missing five-hour reading does not make the headroom incomplete when the
+  // weekly policy is on, nor while the five-hour window is off.
+  optionalFiveHourHeadroom() {
+    return this.planQuotaMode === 'on' || !this.fiveHourWindowEnabled;
   }
 
   /**
@@ -1733,7 +1847,7 @@ export class AccountManager {
     return {
       account,
       index,
-      headroom: assignmentHeadroom(quota, modelFamily, now, this.planQuotaMode === 'on', account.extendedQuotaScopes,
+      headroom: assignmentHeadroom(quota, modelFamily, now, this.optionalFiveHourHeadroom(), account.extendedQuotaScopes,
         account.fableQuotaCompat),
       // K1: how much of the 5h window this account has actually
       // burned, not how much is left on its tightest window. `headroom.min` can be

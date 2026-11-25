@@ -16,11 +16,14 @@ export function urgencyMode(raw) {
 
 // No I/O and no credentials. Observations must carry utilization AND reset in
 // the same update. A shared ledger timestamp cannot establish window freshness.
+// `fiveHourWindow: false` treats the five-hour window as absent: it is neither
+// observed, nor judged, nor reported in metrics and status. Omitted, it is on.
 export class AccountUrgency {
-  constructor({ mode, now, logger }) {
+  constructor({ mode, now, logger, fiveHourWindow = true }) {
     this.mode = mode;
     this.now = now;
     this.logger = logger;
+    this.fiveHourWindow = fiveHourWindow !== false;
     this.instanceId = randomUUID();
     this.sequence = 0;
     this.observations = new Map();
@@ -33,14 +36,16 @@ export class AccountUrgency {
 
   observe(id, fields, source = null) {
     const state = this.observations.get(id) || {};
-    state.fiveHourReporting = !Object.hasOwn(fields, 'unified5h') ? 'missing'
-      : fields.unified5h === null ? 'explicit_null'
-        : Number.isFinite(fields.unified5h) && fields.unified5h >= 0
-          && Number.isFinite(fields.unified5hReset) && fields.unified5hReset > this.now() ? 'value' : 'invalid';
-    state.fiveHourReportedAt = this.now();
-    state.fiveHourReportingSource = source;
+    if (this.fiveHourWindow) {
+      state.fiveHourReporting = !Object.hasOwn(fields, 'unified5h') ? 'missing'
+        : fields.unified5h === null ? 'explicit_null'
+          : Number.isFinite(fields.unified5h) && fields.unified5h >= 0
+            && Number.isFinite(fields.unified5hReset) && fields.unified5hReset > this.now() ? 'value' : 'invalid';
+      state.fiveHourReportedAt = this.now();
+      state.fiveHourReportingSource = source;
+    }
     for (const [name, valueKey, resetKey] of [
-      ['fiveHour', 'unified5h', 'unified5hReset'],
+      ...(this.fiveHourWindow ? [['fiveHour', 'unified5h', 'unified5hReset']] : []),
       ['weekly', 'unified7d', 'unified7dReset'],
     ]) {
       if (!(valueKey in fields) && !(resetKey in fields)) continue;
@@ -87,6 +92,17 @@ export class AccountUrgency {
     this.observations.set(id, state);
   }
 
+  // Drops every five-hour reading held in memory, so turning the window back
+  // on starts from nothing.
+  forgetFiveHour() {
+    for (const state of this.observations.values()) {
+      delete state.fiveHour;
+      delete state.fiveHourReporting;
+      delete state.fiveHourReportedAt;
+      delete state.fiveHourReportingSource;
+    }
+  }
+
   prune(ids) {
     const valid = new Set(ids);
     for (const id of this.observations.keys()) {
@@ -125,7 +141,7 @@ export class AccountUrgency {
     const state = this.observations.get(id);
     const weekly = this.window(state?.weekly, 168 * HOUR);
     const lastFive = this.window(state?.fiveHour, 5 * HOUR);
-    const fiveActive = Number.isFinite(lastFive.usedFraction) && lastFive.resetAt > this.now();
+    const fiveActive = this.fiveHourWindow && Number.isFinite(lastFive.usedFraction) && lastFive.resetAt > this.now();
     const fiveReported = fiveActive && state?.fiveHourReporting === 'value';
     const fiveHour = {
       ...lastFive, usedFraction: fiveReported ? lastFive.usedFraction : null,
@@ -173,8 +189,8 @@ export class AccountUrgency {
       .filter(window => window.predictedExhaustsAt != null)
       .sort((a, b) => a.predictedExhaustsAt - b.predictedExhaustsAt)[0];
     return {
-      accountId: id, weekly, fiveHour, scopedWeekly, modelFamily: modelFamily || 'other',
-      windows: [{ id: '7d', scope: 'all', ...weekly }, { id: '5h', scope: 'all', ...fiveHour },
+      accountId: id, weekly, ...(this.fiveHourWindow ? { fiveHour } : {}), scopedWeekly, modelFamily: modelFamily || 'other',
+      windows: [{ id: '7d', scope: 'all', ...weekly }, ...(this.fiveHourWindow ? [{ id: '5h', scope: 'all', ...fiveHour }] : []),
         ...scopedWeekly.map(limit => ({ id: `7d_${limit.key}`, ...limit }))].map(window => ({
           id: window.id, scope: window.scope, applicability: window.applicability,
           observationState: window.observationState, usedFraction: window.usedFraction,
@@ -245,6 +261,7 @@ export class AccountUrgency {
     // Saved constraints supplement the display only; policy metrics and their
     // freshness still depend on live observations, never on a status read.
     const accounts = rows.map(row => {
+      if (!this.fiveHourWindow) return row;
       const saved = savedWindows.get(row.accountId)?.['5h'];
       const known = saved?.lastKnown;
       if (this.observations.get(row.accountId)?.fiveHour

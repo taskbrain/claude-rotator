@@ -41,20 +41,38 @@ export function fableQuotaCompatMode(raw) {
   return ['off', 'on'].includes(raw?.mode) ? raw.mode : 'off';
 }
 
+// The five-hour window switch as a component receives it. Omitted (null or
+// undefined), the window is on, which is how every component behaved before
+// the switch existed; otherwise only `enabled: true` keeps it on. The product
+// default (off) is decided where the configuration file is read. While it is
+// off the window is treated as if the upstream did not have one.
+export function fiveHourWindowEnabled(raw) {
+  return raw == null || raw.enabled === true;
+}
+
+// The claim the upstream names in `anthropic-ratelimit-unified-representative-claim`,
+// trimmed and lower-cased; null when the header is absent.
+export function representativeClaim(headers) {
+  const value = createHeaderGetter(headers)('anthropic-ratelimit-unified-representative-claim');
+  return value == null ? null : String(value).trim().toLowerCase();
+}
+
 export function isValidQuotaWindow(utilization, resetAt, now) {
   return Number.isFinite(utilization) && utilization >= 0 && Number.isFinite(resetAt) && resetAt > now;
 }
 
 // These observations describe reporting, not a subscription entitlement. An
 // absent window never proves that a server-side restriction has been removed.
-export function observeQuotaWindows(previous, fields, now, source) {
+// With `fiveHour` false no five-hour entry is kept at all.
+export function observeQuotaWindows(previous, fields, now, source, fiveHour = true) {
   const next = { ...previous };
+  if (!fiveHour) delete next['5h'];
   if (source === 'poll' && Array.isArray(fields.weeklyScoped)) {
     const current = new Set(fields.weeklyScoped.map(limit => `7d_${limit.key}`));
     for (const id of Object.keys(next)) if (id.startsWith('7d_') && !current.has(id)) delete next[id];
   }
   const entries = [
-    ['5h', fields.unified5h, fields.unified5hReset, Object.hasOwn(fields, 'unified5h')],
+    ...(fiveHour ? [['5h', fields.unified5h, fields.unified5hReset, Object.hasOwn(fields, 'unified5h')]] : []),
     ['7d', fields.unified7d, fields.unified7dReset, Object.hasOwn(fields, 'unified7d')],
     ...(fields.weeklyScoped || []).map(limit => [`7d_${limit.key}`, limit.utilization, limit.resetAt, true]),
   ];
@@ -80,9 +98,10 @@ export function boundWeeklyScopes(scopes) {
     || (b.utilization ?? -1) - (a.utilization ?? -1)).slice(0, 16);
 }
 
-export function quotaWindowsView(quota, observations, now, fableCompat = false) {
+// With `fiveHour` false the list has no five-hour row.
+export function quotaWindowsView(quota, observations, now, fableCompat = false, fiveHour = true) {
   const limits = [
-    { id: '5h', scope: 'all', usedFraction: quota.unified5h, resetAt: quota.unified5hReset },
+    ...(fiveHour ? [{ id: '5h', scope: 'all', usedFraction: quota.unified5h, resetAt: quota.unified5hReset }] : []),
     { id: '7d', scope: 'all', usedFraction: quota.unified7d, resetAt: quota.unified7dReset },
     ...(quota.weeklyScoped || []).map(limit => ({
       id: `7d_${limit.key}`,

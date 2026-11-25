@@ -147,6 +147,9 @@ export function createProxyServer({
   reloadAccountUrgency = null,
   reloadPlanQuota = null,
   reloadFableQuotaCompat = null,
+  // Returns the `fiveHourWindow` setting to apply on POST /internal/reload. Not
+  // given, the ledger keeps the setting it was built with.
+  reloadFiveHourWindow = null,
   reloadObservability = null,
   allowLiveClaudeCodeCredentials = true,
   tokenRefresher = null,
@@ -897,6 +900,7 @@ export function createProxyServer({
         accountManager.configurePlanQuota(config.planQuota);
         if (reloadFableQuotaCompat) config.fableQuotaCompat = await reloadFableQuotaCompat();
         applyFableQuotaCompat();
+        if (reloadFiveHourWindow) accountManager.configureFiveHourWindow(await reloadFiveHourWindow());
         accountManager.setQuotaRecoveryPersistence(Boolean(stateWriter), usagePollingEnabled(config));
         warnWithoutUsagePolling();
         // キャッシュ観測の再読込。セクションが無い・config.json 自体が無い
@@ -1654,6 +1658,7 @@ function createReactiveQuotaConfirmer({
           accountManager.applyUsage(
             account.id,
             usagePayloadForFields(safeUsage, acceptedFields, account),
+            { upstreamRateLimited: true },
           );
         });
         return {
@@ -4380,6 +4385,7 @@ async function forwardOnceInner({
         );
         accountManager.updateQuota(account.id, upstreamRes.headers, {
           atomicUnifiedWindows: upstreamRes.statusCode === 429,
+          upstreamRateLimited: upstreamRes.statusCode === 429,
           ...(quotaRecoveryProbe ? { recoveryStatus: upstreamRes.statusCode } : {}),
         });
         quotaRecoveryProbe?.onResponse(probeObservation);
@@ -4617,6 +4623,7 @@ async function forwardOnceInner({
           observability,
           requestEffort,
           headersMs: headersAtMs === null ? null : Math.max(0, headersAtMs - startedAt),
+          fiveHourWindow: accountManager.fiveHourWindowEnabled,
         })
         : null,
     });
@@ -5271,6 +5278,8 @@ function buildObservationLog({
   observability,
   requestEffort = null,
   headersMs = null,
+  // false leaves the five-hour fields out of the line (see observationLogFields).
+  fiveHourWindow = true,
 }) {
   const quota = parseRateLimitHeaders(upstreamResponse.headers);
   // 既定では要求本文を読まない。本文は数百 KB〜数 MB あり、JSON.parse の追加1回が
@@ -5311,6 +5320,7 @@ function buildObservationLog({
     effort: requestEffort?.effort ?? null,
     effortMsg: requestEffort?.effortMsg ?? null,
     headersMs,
+    ...(fiveHourWindow ? {} : { fiveHourWindow: false }),
   };
 }
 
