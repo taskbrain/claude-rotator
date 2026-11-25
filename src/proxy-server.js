@@ -5142,10 +5142,10 @@ function syntheticQuotaExhaustedResponse(account, reason) {
     'x-claude-rotator-account': account?.id || '',
     'x-claude-rotator-quota-window': reason.window || '',
   };
-  if (claim) {
-    headers['anthropic-ratelimit-unified-status'] = 'rejected';
-    headers['anthropic-ratelimit-unified-representative-claim'] = claim;
-  }
+  // A five-hour rejection hold (only while that window is off) is answered as
+  // a plain rejection: no claim and no window headers name the five-hour window.
+  if (claim || reason.quotaRejected === true) headers['anthropic-ratelimit-unified-status'] = 'rejected';
+  if (claim) headers['anthropic-ratelimit-unified-representative-claim'] = claim;
   if (resetSeconds) headers['anthropic-ratelimit-unified-reset'] = resetSeconds;
   if (windowHeader) {
     headers[`anthropic-ratelimit-unified-${windowHeader}-utilization`] = String(reason.utilization ?? 1);
@@ -5207,7 +5207,8 @@ function quotaExhaustedOfficialMessage(reason) {
 
 function quotaExhaustedRotatorMessage(account, reason) {
   const reset = reason.resetAt ? ` Resets at ${reason.resetAt}.` : '';
-  return `Claude ${reason.window} usage limit exhausted for ${account?.name || account?.id || 'current account'}.${reset} No available rotation target.`;
+  const window = reason.window ? `${reason.window} ` : '';
+  return `Claude ${window}usage limit exhausted for ${account?.name || account?.id || 'current account'}.${reset} No available rotation target.`;
 }
 
 function formatClaudeResetTime(window, resetAt) {

@@ -503,8 +503,9 @@ describe('a five-hour rejection held while the window is off', () => {
     assert.equal(Object.hasOwn(status.accounts[0].unavailableReason, 'window'), false);
     assert.ok(status.events.every(event => event.type !== 'quota-exhausted' && event.reason?.window !== '5h'));
     const resume = JSON.parse((await request(`${h.url}/internal/prepare-resume`, { method: 'POST', body: '{}' })).text);
-    assert.notEqual(resume.window, '5h');
-    assert.notEqual(resume.resumeAtEpoch, Math.floor((START + 2 * HOUR) / 1000));
+    assert.equal(resume.window, null);
+    assert.equal(resume.action, 'wait');
+    assert.equal(resume.resumeAtEpoch, Math.floor((START + 2 * HOUR) / 1000), 'the hold ends at the rejection reset');
   });
 
   it('moves a pinned session to the next account with accountUrgency and sessionAffinity on', async () => {
@@ -622,29 +623,106 @@ describe('a five-hour rejection hold against the other ledger states', () => {
     assert.equal(second.manager.isAvailable(account), false);
   });
 
-  it('answers prepare-resume with no resume target while the only account is held', async () => {
+  it('answers prepare-resume with a wait until the hold ends while the only account is held, then ready', async () => {
     const clock = { ms: START };
     const { manager } = ledger({ fiveHourWindow: OFF, ids: ['sample-a'], clock });
+    manager.applyUsage('sample-a', weekAndFive(clock, 0.3, 48));
     manager.updateQuota('sample-a', fiveHourRejection(clock), as429);
     const h = await startProxy({ manager, upstreamHandler: okResponse });
-    const response = await request(`${h.url}/internal/prepare-resume`, { method: 'POST', body: '{}' });
-    assert.equal(response.status, 200);
-    const { status, ...result } = JSON.parse(response.text);
-    assert.equal(typeof status, 'object');
-    assert.deepEqual(result, {
-      ok: false,
-      action: 'unavailable',
-      reason: 'no-resume-target',
-      account: null,
-      accountName: null,
+    const prepare = async () => {
+      const response = await request(`${h.url}/internal/prepare-resume`, { method: 'POST', body: '{}' });
+      assert.equal(response.status, 200);
+      const { status, ...result } = JSON.parse(response.text);
+      assert.equal(typeof status, 'object');
+      return result;
+    };
+    const holdEnd = iso(START + 2 * HOUR);
+    const waiting = await prepare();
+    assert.deepEqual(waiting, {
+      ok: true,
+      action: 'wait',
+      reason: 'shortest-quota-reset',
+      account: 'sample-a',
+      accountName: 'sample-a',
+      switched: false,
+      window: null,
+      unavailableReason: { type: 'temporary_throttle', quotaRejected: true, retryAt: holdEnd, resetAt: holdEnd },
+      resumeAt: holdEnd,
+      resumeAtEpoch: Math.floor((START + 2 * HOUR) / 1000),
+      waitMs: 2 * HOUR,
+    });
+    assert.deepEqual(manager.prepareResumeTarget(), waiting);
+
+    clock.ms = START + 2 * HOUR + 1000;
+    assert.deepEqual(await prepare(), {
+      ok: true,
+      action: 'ready',
+      reason: 'available',
+      account: 'sample-a',
+      accountName: 'sample-a',
       switched: false,
       window: null,
       unavailableReason: null,
-      resumeAt: null,
-      resumeAtEpoch: null,
-      waitMs: null,
+      resumeAt: iso(clock.ms),
+      resumeAtEpoch: Math.floor(clock.ms / 1000),
+      waitMs: 0,
     });
-    assert.deepEqual(manager.prepareResumeTarget(), result);
-    assert.equal(status.currentAccount, 'sample-a');
+  });
+
+  it('answers locally with a plain usage-limit 429 at the earliest hold end when every account is held (off)', async () => {
+    const clock = { ms: START };
+    const { manager } = ledger({ fiveHourWindow: OFF, ids: ['sample-a', 'sample-b'], clock });
+    manager.updateQuota('sample-a', fiveHourRejection(clock, { fiveHourReset: START + 3 * HOUR }), as429);
+    manager.updateQuota('sample-b', fiveHourRejection(clock, { fiveHourReset: START + 2 * HOUR }), as429);
+    const h = await startProxy({ manager, upstreamHandler: okResponse });
+    const response = await h.send();
+    assert.equal(response.status, 429);
+    assert.deepEqual(h.seen, [], 'answered without sending upstream');
+    assert.equal(response.headers['anthropic-ratelimit-unified-status'], 'rejected');
+    assert.equal(response.headers['anthropic-ratelimit-unified-reset'], seconds(START + 2 * HOUR));
+    assert.equal(response.headers['anthropic-ratelimit-unified-representative-claim'], undefined);
+    assert.ok(Object.keys(response.headers).every(name => !/^anthropic-ratelimit-unified-(5h|7d)/.test(name)));
+    assert.equal(response.headers['x-claude-rotator-account'], 'sample-b');
+    assert.equal(response.headers['x-claude-rotator-quota-window'], '');
+    const body = JSON.parse(response.text);
+    assert.equal(body.error.type, 'rate_limit_error');
+    assert.match(body.error.message, /^You've hit your usage limit · resets \d{1,2}(:\d{2})?(am|pm)$/);
+    assert.doesNotMatch(response.text, /5h|five_hour|session limit/);
+    assert.equal(body.error.details.reset_at, iso(START + 2 * HOUR));
+    assert.equal(body.error.details.rotator_message,
+      `Claude usage limit exhausted for sample-b. Resets at ${iso(START + 2 * HOUR)}. No available rotation target.`);
+    assert.ok(h.logs.some(line => / proxy account=sample-b .* outcome=quota-exhausted-local/.test(line)), h.logs.join('\n'));
+
+    // With the 429-to-529 mapping on, it is mapped the same way as a used-up window while on.
+    const mapped = await startProxy({
+      manager, upstreamHandler: okResponse,
+      config: { openaiBridge: { enabled: false, degradeMapping: { enabled: true } } },
+    });
+    assert.equal((await mapped.send()).status, 529);
+    assert.deepEqual(mapped.seen, []);
+  });
+
+  it('keeps the five-hour local 429 when every account is used up while on', async () => {
+    const clock = { ms: START };
+    const { manager } = ledger({ fiveHourWindow: ON, ids: ['sample-a', 'sample-b'], clock });
+    manager.updateQuota('sample-a', fiveHourRejection(clock, { fiveHourReset: START + 3 * HOUR }), as429);
+    manager.updateQuota('sample-b', fiveHourRejection(clock, { fiveHourReset: START + 2 * HOUR }), as429);
+    const h = await startProxy({ manager, upstreamHandler: okResponse });
+    const response = await h.send();
+    assert.equal(response.status, 429);
+    assert.deepEqual(h.seen, []);
+    assert.equal(response.headers['anthropic-ratelimit-unified-status'], 'rejected');
+    assert.equal(response.headers['anthropic-ratelimit-unified-representative-claim'], 'five_hour');
+    assert.equal(response.headers['anthropic-ratelimit-unified-reset'], seconds(START + 2 * HOUR));
+    assert.equal(response.headers['anthropic-ratelimit-unified-5h-utilization'], '1');
+    assert.equal(response.headers['anthropic-ratelimit-unified-5h-reset'], seconds(START + 2 * HOUR));
+    assert.equal(response.headers['x-claude-rotator-quota-window'], '5h');
+    const body = JSON.parse(response.text);
+    assert.match(body.error.message, /^You've hit your session limit · resets /);
+    assert.equal(body.error.details.rotator_message,
+      `Claude 5h usage limit exhausted for sample-b. Resets at ${iso(START + 2 * HOUR)}. No available rotation target.`);
+    const resume = manager.prepareResumeTarget();
+    assert.equal(resume.window, '5h');
+    assert.equal(resume.resumeAtEpoch, Math.floor((START + 2 * HOUR) / 1000));
   });
 });

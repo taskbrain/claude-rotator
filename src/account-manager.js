@@ -1588,13 +1588,20 @@ export class AccountManager {
     }
     const quotaReason = quotaUnavailableReason(account.quota, this.switchThreshold);
     if (quotaReason) return quotaReason;
-    if (account.rateLimitedUntil && this.now() < account.rateLimitedUntil) {
-      return {
-        ...(account.temporaryUnavailableReason || { type: 'temporary_throttle' }),
-        retryAt: new Date(account.rateLimitedUntil).toISOString(),
-      };
-    }
-    return null;
+    return this.temporaryUnavailable(account);
+  }
+
+  // The short-term reason while `rateLimitedUntil` is ahead, else null. A
+  // five-hour rejection hold also names its end as `resetAt`, so it is read as
+  // a used-up limit (see `isUnifiedQuotaExhaustion`) without naming a window.
+  temporaryUnavailable(account) {
+    if (!account.rateLimitedUntil || this.now() >= account.rateLimitedUntil) return null;
+    const retryAt = new Date(account.rateLimitedUntil).toISOString();
+    return {
+      ...(account.temporaryUnavailableReason || { type: 'temporary_throttle' }),
+      retryAt,
+      ...(isQuotaRejectionHold(account, this.now()) ? { resetAt: retryAt } : {}),
+    };
   }
 
   hasCredentialRefreshCooldown(account) {
@@ -1623,13 +1630,7 @@ export class AccountManager {
     const quotaReason = quotaUnavailableReasonForModelFamily(account.quota, this.switchThreshold, modelFamily,
       account.extendedQuotaScopes, account.fableQuotaCompat);
     if (quotaReason) return quotaReason;
-    if (account.rateLimitedUntil && this.now() < account.rateLimitedUntil) {
-      return {
-        ...(account.temporaryUnavailableReason || { type: 'temporary_throttle' }),
-        retryAt: new Date(account.rateLimitedUntil).toISOString(),
-      };
-    }
-    return null;
+    return this.temporaryUnavailable(account);
   }
 
   autoSwitchReason(account) {
@@ -2122,10 +2123,14 @@ export function quotaUnavailableReasonForModelFamily(quota, threshold, modelFami
   return null;
 }
 
+// A five-hour rejection hold (`quotaRejected`, only while that window is off)
+// counts as a used-up limit too, so it is answered and waited for like one,
+// without a window name.
 export function isUnifiedQuotaExhaustion(reason) {
   return ['token_rate_limit_exhausted', 'request_rate_limit_exhausted'].includes(reason?.type)
     || (reason?.type === 'quota_exhausted'
-      && (['5h', '7d'].includes(reason.window) || String(reason.window || '').startsWith('7d ')));
+      && (['5h', '7d'].includes(reason.window) || String(reason.window || '').startsWith('7d ')))
+    || reason?.quotaRejected === true;
 }
 
 /**
