@@ -5102,15 +5102,17 @@ function sendCurrentQuotaUnavailableResponse({
   // `fallback-switch` イベントも積む。読み取りだけの `bestExhaustedFallbackCandidate` で
   // 同じ口座を選ぶので、応答の中身（合成 429 の account / window / reset）は変わらない。
   const shortestResetAccount = affinityLog?.pinned
-    ? (accountManager.bestExhaustedFallbackCandidate()?.account || null)
-    : accountManager.selectBestExhaustedFallback({ trigger: 'request' });
+    ? (accountManager.bestExhaustedFallbackCandidate({ modelFamily })?.account || null)
+    : accountManager.selectBestExhaustedFallback({ trigger: 'request', modelFamily });
   if (shortestResetAccount) {
     account = shortestResetAccount;
-    reason = accountManager.unavailableReasonForModelFamily(account, modelFamily);
+    reason = accountManager.exhaustedReasonForModelFamily(account, modelFamily);
     if (!isUnifiedQuotaExhaustion(reason)) return false;
   }
 
-  const response = syntheticQuotaExhaustedResponse(account, reason);
+  const response = syntheticQuotaExhaustedResponse(account, reason, {
+    resumeAt: accountManager.earliestUsableAt(modelFamily),
+  });
   // P-a: 合成した 429 を書き出す唯一の位置。写像はログより先に決める。
   // ログ行の status は実際に返した値（529 / 403）にし、写像前の 429 は同じ行の
   // upstreamStatus / mappedFrom として残す。
@@ -5133,10 +5135,18 @@ function sendCurrentQuotaUnavailableResponse({
   return true;
 }
 
-function syntheticQuotaExhaustedResponse(account, reason) {
+// `resumeAt` (ms) is when the first account is usable again for this request's
+// model. When it comes before the named window's reset (another account's
+// shorter hold ends first), the unified reset and the message carry it; the
+// window's own reset header keeps that window's reset.
+function syntheticQuotaExhaustedResponse(account, reason, { resumeAt = null } = {}) {
   const windowHeader = quotaWindowHeader(reason.window);
   const claim = reason.claim || quotaRepresentativeClaim(reason.window);
-  const resetSeconds = quotaResetSeconds(reason.resetAt);
+  const windowResetSeconds = quotaResetSeconds(reason.resetAt);
+  const windowResetMs = Date.parse(reason.resetAt || '');
+  const retryAt = Number.isFinite(resumeAt) && (!Number.isFinite(windowResetMs) || resumeAt < windowResetMs)
+    ? new Date(resumeAt).toISOString() : reason.resetAt;
+  const resetSeconds = quotaResetSeconds(retryAt);
   const headers = {
     'content-type': 'application/json',
     'x-claude-rotator-account': account?.id || '',
@@ -5149,10 +5159,11 @@ function syntheticQuotaExhaustedResponse(account, reason) {
   if (resetSeconds) headers['anthropic-ratelimit-unified-reset'] = resetSeconds;
   if (windowHeader) {
     headers[`anthropic-ratelimit-unified-${windowHeader}-utilization`] = String(reason.utilization ?? 1);
-    if (resetSeconds) headers[`anthropic-ratelimit-unified-${windowHeader}-reset`] = resetSeconds;
+    if (windowResetSeconds) headers[`anthropic-ratelimit-unified-${windowHeader}-reset`] = windowResetSeconds;
   }
 
-  const rotatorMessage = quotaExhaustedRotatorMessage(account, reason);
+  const retryReason = { ...reason, resetAt: retryAt };
+  const rotatorMessage = quotaExhaustedRotatorMessage(account, retryReason);
   return {
     statusCode: 429,
     headers,
@@ -5160,14 +5171,14 @@ function syntheticQuotaExhaustedResponse(account, reason) {
       type: 'error',
       error: {
         type: 'rate_limit_error',
-        message: quotaExhaustedOfficialMessage(reason),
+        message: quotaExhaustedOfficialMessage(retryReason),
         details: {
           source: 'claude-rotator',
           account: account?.id || null,
           account_name: account?.name || null,
           window: reason.window,
           utilization: reason.utilization,
-          reset_at: reason.resetAt || null,
+          reset_at: retryAt || null,
           rotator_message: rotatorMessage,
         },
       },
@@ -5601,12 +5612,14 @@ function sendUnavailableAccounts(res, accountManager = null, exhaustionMapper = 
   }
   const quotaCandidates = optionalQuota ? accountManager.accounts
     .filter(account => account.status !== 'error' && !accountManager.hasCredentialRefreshCooldown(account))
-    .map(account => ({ account, reason: accountManager.unavailableReasonForModelFamily(account, modelFamily) })) : [];
+    .map(account => ({ account, reason: accountManager.exhaustedReasonForModelFamily(account, modelFamily) })) : [];
   const quotaOnly = quotaCandidates.length > 0 && quotaCandidates.every(candidate => isUnifiedQuotaExhaustion(candidate.reason));
   const quotaTarget = quotaOnly ? quotaCandidates.sort((a, b) =>
     (finiteQuotaReset(a.reason.resetAt) ?? Number.MAX_SAFE_INTEGER)
     - (finiteQuotaReset(b.reason.resetAt) ?? Number.MAX_SAFE_INTEGER))[0] : null;
-  const quotaResponse = quotaTarget ? syntheticQuotaExhaustedResponse(quotaTarget.account, quotaTarget.reason) : null;
+  const quotaResponse = quotaTarget ? syntheticQuotaExhaustedResponse(quotaTarget.account, quotaTarget.reason, {
+    resumeAt: accountManager.earliestUsableAt(modelFamily),
+  }) : null;
   if (!quotaResponse && sendQuotaRecoveryWait(res, accountManager, modelFamily)) return;
   // P-d の写像入口。全滅時の終端は、稼働口座
   // ／固定先の個別 state（枯渇・認証失敗・資格情報 cooldown）に依らず必ずここを通す。

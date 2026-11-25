@@ -1252,13 +1252,16 @@ export class AccountManager {
       });
     }
 
-    const selected = this.bestExhaustedFallbackCandidate();
+    // A resumed session's model is not known here, so it is judged as a
+    // non-Fable request: a Fable-only limit never delays it.
+    const selected = this.bestExhaustedFallbackCandidate({ modelFamily: null });
     if (!selected) {
       return this.emptyResumeTarget('no-resume-target');
     }
 
     const account = this.switchToExhaustedFallbackCandidate(selected, 'prepare-resume');
-    const resetAt = finiteResetAt(selected.score.resetAt);
+    const unavailableReason = this.exhaustedReasonForModelFamily(account, null);
+    const resetAt = earlierTime(finiteResetAt(selected.score.resetAt), this.earliestUsableAt(null));
     if (resetAt == null) {
       return this.resumeTarget({
         account,
@@ -1266,7 +1269,7 @@ export class AccountManager {
         reason: 'quota-reset-unknown',
         resumeAt: null,
         switched: previousId !== account.id,
-        unavailableReason: this.unavailableReason(account),
+        unavailableReason,
       });
     }
 
@@ -1276,7 +1279,7 @@ export class AccountManager {
       reason: 'shortest-quota-reset',
       resumeAt: resetAt,
       switched: previousId !== account.id,
-      unavailableReason: this.unavailableReason(account),
+      unavailableReason,
     });
   }
 
@@ -1359,15 +1362,21 @@ export class AccountManager {
     return selected.account;
   }
 
-  selectBestExhaustedFallback({ trigger = 'unknown' } = {}) {
-    const selected = this.bestExhaustedFallbackCandidate();
+  selectBestExhaustedFallback({ trigger = 'unknown', modelFamily } = {}) {
+    const selected = this.bestExhaustedFallbackCandidate({ modelFamily });
     if (!selected) return null;
     return this.switchToExhaustedFallbackCandidate(selected, trigger);
   }
 
-  bestExhaustedFallbackCandidate() {
+  /**
+   * @param {{modelFamily?: string|null}} options Without `modelFamily`, every
+   *   used-up window counts (the family-agnostic reason). With it ('fable' or
+   *   null), only the windows that apply to that model count, and an account is
+   *   ranked by when it is usable again for that model.
+   */
+  bestExhaustedFallbackCandidate({ modelFamily } = {}) {
     const candidates = this.accounts
-      .map((account, index) => ({ account, index, score: this.exhaustedFallbackScore(account) }))
+      .map((account, index) => ({ account, index, score: this.exhaustedFallbackScore(account, modelFamily) }))
       .filter(candidate => candidate.score);
 
     candidates.sort((left, right) => compareExhaustedFallbackScores(left, right));
@@ -1489,9 +1498,11 @@ export class AccountManager {
     };
   }
 
-  exhaustedFallbackScore(account) {
+  exhaustedFallbackScore(account, modelFamily) {
     if (this.hasCredentialRefreshCooldown(account)) return null;
-    const reason = this.unavailableReason(account);
+    const reason = modelFamily === undefined
+      ? this.unavailableReason(account)
+      : this.exhaustedReasonForModelFamily(account, modelFamily);
     if (!isUnifiedQuotaExhaustion(reason)) return null;
     const resetAt = reason.resetAt ? Date.parse(reason.resetAt) : null;
     return {
@@ -1631,6 +1642,51 @@ export class AccountManager {
       account.extendedQuotaScopes, account.fableQuotaCompat);
     if (quotaReason) return quotaReason;
     return this.temporaryUnavailable(account);
+  }
+
+  /**
+   * The reason an account cannot take a `modelFamily` request, naming the
+   * latest end among what blocks it: a used-up window that applies to that
+   * model, or a five-hour rejection hold that ends later than it.
+   */
+  exhaustedReasonForModelFamily(account, modelFamily = null) {
+    const reason = this.unavailableReasonForModelFamily(account, modelFamily);
+    if (!reason || reason.quotaRejected === true || account.status === 'error') return reason;
+    const hold = isQuotaRejectionHold(account, this.now()) ? this.temporaryUnavailable(account) : null;
+    if (!hold || !isUnifiedQuotaExhaustion(reason)) return reason;
+    const reasonEnd = Date.parse(reason.resetAt || '');
+    return Number.isFinite(reasonEnd) && reasonEnd >= account.rateLimitedUntil ? reason : hold;
+  }
+
+  /**
+   * When the first account becomes usable again for a `modelFamily` request:
+   * the latest end of what blocks each account (a used-up window that applies
+   * to that model, and any short-term hold, plain or five-hour), earliest across
+   * accounts. Accounts whose return time is unknown (an error, a credential
+   * cooldown, a recovery probe, a window without a reset) and accounts with
+   * nothing timed to wait for are left out. Null when no time is known.
+   */
+  earliestUsableAt(modelFamily = null) {
+    const now = this.now();
+    let earliest = null;
+    for (const account of this.accounts) {
+      this.refreshQuotaState(account);
+      if (account.status === 'error' || this.hasCredentialRefreshCooldown(account)) continue;
+      if (this.quotaRecovery?.isHeld(this.quotaRecoveryKey(account))) continue;
+      const ends = [];
+      const quotaReason = quotaUnavailableReasonForModelFamily(account.quota, this.switchThreshold, modelFamily,
+        account.extendedQuotaScopes, account.fableQuotaCompat);
+      if (quotaReason) {
+        const end = Date.parse(quotaReason.resetAt || '');
+        if (!Number.isFinite(end)) continue;
+        ends.push(end);
+      }
+      if (account.rateLimitedUntil > now) ends.push(account.rateLimitedUntil);
+      if (ends.length === 0) continue;
+      const usableAt = Math.max(...ends);
+      if (earliest == null || usableAt < earliest) earliest = usableAt;
+    }
+    return earliest;
   }
 
   autoSwitchReason(account) {
@@ -2646,6 +2702,12 @@ function normalizeRotationPolicy(policy) {
 
 function finiteNumberOrNull(value) {
   return typeof value === 'number' && Number.isFinite(value) ? value : null;
+}
+
+function earlierTime(left, right) {
+  if (left == null) return right;
+  if (right == null) return left;
+  return Math.min(left, right);
 }
 
 function finiteResetAt(value) {

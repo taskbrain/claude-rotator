@@ -702,6 +702,104 @@ describe('a five-hour rejection hold against the other ledger states', () => {
     assert.deepEqual(mapped.seen, []);
   });
 
+  it('waits only until a plain 60-second hold on another account ends, on both policies (off)', async () => {
+    for (const urgency of ['off', 'on']) {
+      const clock = { ms: START };
+      const { manager } = ledger({ fiveHourWindow: OFF, ids: ['sample-a', 'sample-b'], urgency, clock });
+      for (const id of ['sample-a', 'sample-b']) manager.applyUsage(id, weekAndFive(clock, 0.3, 48));
+      manager.updateQuota('sample-a', fiveHourRejection(clock), as429);
+      manager.markRateLimited('sample-b', 60);
+      const label = `accountUrgency ${urgency}`;
+      assert.equal(manager.earliestUsableAt(null), START + 60_000, label);
+
+      const resume = manager.prepareResumeTarget();
+      assert.equal(resume.action, 'wait', label);
+      assert.equal(resume.window, null, label);
+      assert.equal(resume.resumeAt, iso(START + 60_000), label);
+      assert.equal(resume.waitMs, 60_000, label);
+
+      const h = await startProxy({
+        manager, upstreamHandler: (req, res) => okResponse(res),
+        config: urgency === 'on' ? { accountUrgency: { mode: 'on' } } : {},
+      });
+      const local = await h.send();
+      assert.equal(local.status, 429, label);
+      assert.deepEqual(h.seen, [], `${label}: answered without sending upstream`);
+      assert.equal(local.headers['anthropic-ratelimit-unified-status'], 'rejected', label);
+      assert.equal(local.headers['anthropic-ratelimit-unified-reset'], seconds(START + 60_000), label);
+      assert.equal(JSON.parse(local.text).error.details.reset_at, iso(START + 60_000), label);
+      assert.ok(Object.keys(local.headers).every(name => !name.startsWith('anthropic-ratelimit-unified-5h')), label);
+      assert.doesNotMatch(local.text, new RegExp(iso(START + 2 * HOUR).replace(/[.]/g, '\\.')), `${label}: the two-hour end is not offered`);
+
+      clock.ms = START + 61_000;
+      assert.equal(manager.getActiveAccount(null, { trigger: 'request' })?.id, 'sample-b', `${label}: b is back after 60 seconds`);
+      assert.equal((await h.send()).status, 200, label);
+      assert.deepEqual(h.seen, ['key-sample-b'], label);
+    }
+  });
+
+  it('does not make a non-Fable resume wait for a used-up Fable week on the only held account', async () => {
+    const clock = { ms: START };
+    const { manager } = ledger({ fiveHourWindow: OFF, ids: ['sample-a'], clock });
+    manager.applyUsage('sample-a', {
+      seven_day: { utilization: 0.3, resets_at: iso(clock.ms + 72 * HOUR) },
+      scoped_weekly: [{ key: 'fable', label: 'Fable', utilization: 1, resets_at: iso(clock.ms + 48 * HOUR) }],
+    });
+    manager.updateQuota('sample-a', fiveHourRejection(clock), as429);
+    const holdEnd = iso(START + 2 * HOUR);
+    assert.deepEqual(manager.prepareResumeTarget(), {
+      ok: true,
+      action: 'wait',
+      reason: 'shortest-quota-reset',
+      account: 'sample-a',
+      accountName: 'sample-a',
+      switched: false,
+      window: null,
+      unavailableReason: { type: 'temporary_throttle', quotaRejected: true, retryAt: holdEnd, resetAt: holdEnd },
+      resumeAt: holdEnd,
+      resumeAtEpoch: Math.floor((START + 2 * HOUR) / 1000),
+      waitMs: 2 * HOUR,
+    });
+    assert.equal(manager.earliestUsableAt(null), START + 2 * HOUR, 'other models: the hold end');
+    assert.equal(manager.earliestUsableAt('fable'), START + 48 * HOUR, 'Fable: the Fable week reset');
+
+    const h = await startProxy({ manager, upstreamHandler: (req, res) => okResponse(res) });
+    const other = await h.send();
+    assert.equal(other.status, 429);
+    assert.equal(other.headers['anthropic-ratelimit-unified-reset'], seconds(START + 2 * HOUR));
+    assert.equal(other.headers['anthropic-ratelimit-unified-representative-claim'], undefined);
+    assert.doesNotMatch(other.text, /Fable/);
+    const fable = await request(`${h.url}/v1/messages`, {
+      method: 'POST',
+      body: JSON.stringify({ model: 'claude-fable-5-2', messages: [{ role: 'user', content: 'hi' }] }),
+    });
+    assert.equal(fable.status, 429);
+    assert.equal(fable.headers['anthropic-ratelimit-unified-reset'], seconds(START + 48 * HOUR), 'a Fable request waits for the Fable week');
+    assert.deepEqual(h.seen, []);
+
+    clock.ms = START + 2 * HOUR + 1000;
+    assert.equal(manager.prepareResumeTarget().action, 'ready');
+    assert.equal((await h.send()).status, 200);
+    assert.deepEqual(h.seen, ['key-sample-a']);
+  });
+
+  it('keeps the five-hour reset header but offers the earlier 60-second end while on', async () => {
+    const clock = { ms: START };
+    const { manager } = ledger({ fiveHourWindow: ON, ids: ['sample-a', 'sample-b'], clock });
+    manager.updateQuota('sample-a', fiveHourRejection(clock), as429);
+    manager.markRateLimited('sample-b', 60);
+    const h = await startProxy({ manager, upstreamHandler: (req, res) => okResponse(res) });
+    const response = await h.send();
+    assert.equal(response.status, 429);
+    assert.deepEqual(h.seen, []);
+    assert.equal(response.headers['anthropic-ratelimit-unified-representative-claim'], 'five_hour');
+    assert.equal(response.headers['anthropic-ratelimit-unified-5h-reset'], seconds(START + 2 * HOUR), 'the window keeps its own reset');
+    assert.equal(response.headers['anthropic-ratelimit-unified-reset'], seconds(START + 60_000), 'the retry time is the earliest usable account');
+    const resume = manager.prepareResumeTarget();
+    assert.equal(resume.window, '5h');
+    assert.equal(resume.resumeAt, iso(START + 60_000));
+  });
+
   it('keeps the five-hour local 429 when every account is used up while on', async () => {
     const clock = { ms: START };
     const { manager } = ledger({ fiveHourWindow: ON, ids: ['sample-a', 'sample-b'], clock });
