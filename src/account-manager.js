@@ -136,7 +136,11 @@ export class AccountManager {
     const enabled = fiveHourWindowEnabled(raw);
     if (this.fiveHourWindowEnabled && !enabled) {
       for (const account of this.accounts) {
-        if (this.fiveHourUsedUp(account.quota.unified5h)) this.holdFiveHourRejection(account, account.quota.unified5hReset);
+        // Only a used-up reading whose reset is still ahead becomes a hold.
+        if (isValidQuotaWindow(account.quota.unified5h, account.quota.unified5hReset, this.now())
+          && this.fiveHourUsedUp(account.quota.unified5h)) {
+          this.holdFiveHourRejection(account, account.quota.unified5hReset);
+        }
         account.quota.unified5h = null;
         account.quota.unified5hReset = null;
         if (account.windowObservations) delete account.windowObservations['5h'];
@@ -1196,8 +1200,13 @@ export class AccountManager {
         const pending = state.quotaRecovery.pending;
         const account = this.accounts.find(entry => this.quotaRecoveryKey(entry) === pending.accountHash);
         const info = account ? this.quotaRecovery.inspect(pending.accountHash, this.quotaRecoveryIdentity(account)) : null;
-        if (account && info.nextAllowedAt > this.now()) {
-          this.markRateLimited(account.id, Math.ceil((info.nextAllowedAt - this.now()) / 1000));
+        // A restored hold that already lasts longer is kept, with its reason.
+        if (account && info.nextAllowedAt > this.now() && !(account.rateLimitedUntil >= info.nextAllowedAt)) {
+          const seconds = Math.ceil((info.nextAllowedAt - this.now()) / 1000);
+          if (isQuotaRejectionHold(account, this.now())) {
+            this.markTemporaryUnavailable(account.id, seconds, { ...account.temporaryUnavailableReason },
+              { eventType: 'throttled', retryAfterSeconds: seconds });
+          } else this.markRateLimited(account.id, seconds);
         }
       }
     }
@@ -1507,6 +1516,9 @@ export class AccountManager {
     if (this.hasCredentialRefreshCooldown(account)) return false;
     if (account.status === 'throttled') return false;
     if (account.status === 'error') return false;
+    // A five-hour rejection hold is honored on every policy and for every
+    // model, also when a scoped exhaustion masks the throttled status.
+    if (isQuotaRejectionHold(account, this.now())) return false;
     // Scoped exhaustion can mask the throttled status. On policies must honor
     // an upstream short-term hold for every model; off/shadow keep legacy routing.
     if ((this.planQuotaMode === 'on' || this.urgency?.mode === 'on' || this.quotaRecovery)

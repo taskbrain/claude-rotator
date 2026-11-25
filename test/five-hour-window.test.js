@@ -533,3 +533,118 @@ describe('a five-hour rejection held while the window is off', () => {
     assert.equal(signals(logs).length, 1);
   });
 });
+
+describe('a five-hour rejection hold against the other ledger states', () => {
+  // `sample-a`: common week 30%, Fable week used up, a five-hour 429 hold two
+  // hours ahead. `sample-b`: usable. Both policies are off (the legacy path).
+  function fableUsedUp(manager, clock) {
+    for (const id of ['sample-a', 'sample-b']) {
+      manager.applyUsage(id, {
+        seven_day: { utilization: 0.3, resets_at: iso(clock.ms + 48 * HOUR) },
+        ...(id === 'sample-a' ? { scoped_weekly: [{ key: 'fable', label: 'Fable', utilization: 1, resets_at: iso(clock.ms + 48 * HOUR) }] } : {}),
+      });
+    }
+  }
+  function assertHeldForOtherModels(manager, label) {
+    const a = manager.find('sample-a');
+    assert.equal(manager.isAvailable(a), false, `${label}: the held account takes no request`);
+    assert.equal(manager.getActiveAccount(null, { trigger: 'request' })?.id, 'sample-b', label);
+  }
+
+  it('keeps an account with a used-up Fable week out for other models after a 429, a reload to off and a restore', () => {
+    const scenarios = {
+      'a 429 while off': clock => {
+        const { manager } = ledger({ fiveHourWindow: OFF, ids: ['sample-a', 'sample-b'], clock });
+        fableUsedUp(manager, clock);
+        manager.updateQuota('sample-a', fiveHourRejection(clock), as429);
+        return manager;
+      },
+      'a reload from on to off': clock => {
+        const { manager } = ledger({ ids: ['sample-a', 'sample-b'], clock });
+        fableUsedUp(manager, clock);
+        manager.updateQuota('sample-a', fiveHourRejection(clock), as429);
+        manager.configureFiveHourWindow(OFF);
+        return manager;
+      },
+      'a save and restore': clock => {
+        const first = ledger({ fiveHourWindow: OFF, ids: ['sample-a', 'sample-b'], clock });
+        fableUsedUp(first.manager, clock);
+        first.manager.updateQuota('sample-a', fiveHourRejection(clock), as429);
+        const second = ledger({ fiveHourWindow: OFF, ids: ['sample-a', 'sample-b'], clock });
+        second.manager.restoreState(JSON.parse(JSON.stringify(first.manager.exportState())));
+        return second.manager;
+      },
+    };
+    for (const [label, build] of Object.entries(scenarios)) {
+      const clock = { ms: START };
+      const manager = build(clock);
+      assertHeldForOtherModels(manager, label);
+      clock.ms += HOUR;
+      assertHeldForOtherModels(manager, `${label}, one hour later`);
+      clock.ms = START + 2 * HOUR + 1000;
+      assert.equal(manager.isAvailable(manager.find('sample-a')), true, `${label}: back for other models after the reset`);
+      assert.equal(manager.isAvailable(manager.find('sample-a'), 'fable'), false, `${label}: the Fable week still applies`);
+    }
+  });
+
+  it('makes no hold and no throttled event from a used-up reading whose reset has passed on a reload to off', () => {
+    const clock = { ms: START };
+    const { manager } = ledger({ ids: ['sample-a'], clock });
+    manager.applyUsage('sample-a', {
+      five_hour: { utilization: 1, resets_at: iso(clock.ms + HOUR) },
+      seven_day: { utilization: 0.3, resets_at: iso(clock.ms + 48 * HOUR) },
+    });
+    clock.ms += 2 * HOUR;
+    manager.configureFiveHourWindow(OFF);
+    const account = manager.find('sample-a');
+    assert.equal(account.rateLimitedUntil, null);
+    assert.equal(account.temporaryUnavailableReason, null);
+    assert.equal(manager.getStatus().events.some(event => event.type === 'throttled'), false);
+    assert.equal(manager.isAvailable(account), true);
+  });
+
+  it('keeps the longer five-hour hold and its mark when a restored recovery reservation is pending', () => {
+    const clock = { ms: START };
+    const first = ledger({ fiveHourWindow: OFF, ids: ['sample-a', 'sample-b'], plan: 'on', clock });
+    first.manager.setQuotaRecoveryPersistence(true, true);
+    const probe = first.manager.reserveQuotaRecovery();
+    assert.equal(probe?.account.id, 'sample-a', 'the fixture needs a pending reservation on the held account');
+    first.manager.updateQuota('sample-a', fiveHourRejection(clock), as429);
+    const state = JSON.parse(JSON.stringify(first.manager.exportState()));
+    assert.ok(state.quotaRecovery?.pending, 'the saved state carries the pending reservation');
+
+    const second = ledger({ fiveHourWindow: OFF, ids: ['sample-a', 'sample-b'], plan: 'on', clock });
+    second.manager.restoreState(state);
+    const account = second.manager.find('sample-a');
+    assert.equal(account.rateLimitedUntil, START + 2 * HOUR);
+    assert.deepEqual(account.temporaryUnavailableReason, { type: 'temporary_throttle', quotaRejected: true });
+    clock.ms += HOUR;
+    assert.equal(second.manager.isAvailable(account), false);
+  });
+
+  it('answers prepare-resume with no resume target while the only account is held', async () => {
+    const clock = { ms: START };
+    const { manager } = ledger({ fiveHourWindow: OFF, ids: ['sample-a'], clock });
+    manager.updateQuota('sample-a', fiveHourRejection(clock), as429);
+    const h = await startProxy({ manager, upstreamHandler: okResponse });
+    const response = await request(`${h.url}/internal/prepare-resume`, { method: 'POST', body: '{}' });
+    assert.equal(response.status, 200);
+    const { status, ...result } = JSON.parse(response.text);
+    assert.equal(typeof status, 'object');
+    assert.deepEqual(result, {
+      ok: false,
+      action: 'unavailable',
+      reason: 'no-resume-target',
+      account: null,
+      accountName: null,
+      switched: false,
+      window: null,
+      unavailableReason: null,
+      resumeAt: null,
+      resumeAtEpoch: null,
+      waitMs: null,
+    });
+    assert.deepEqual(manager.prepareResumeTarget(), result);
+    assert.equal(status.currentAccount, 'sample-a');
+  });
+});
