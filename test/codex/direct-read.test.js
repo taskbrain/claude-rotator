@@ -33,6 +33,9 @@ function configOf(labels, overrides = {}) {
     usagePollIntervalMs: 60000, usageReadTimeoutMs: CODEX_CONFIG_DEFAULTS.usageReadTimeoutMs,
     rotationObservationTtlMs: 125000, rotationUsageCapNoResetProbeMs: 3600000,
     codexPath: CODEX_PATH, usageUserAgent: null, usageOriginator: null,
+    // 試験の上流は5時間の窓を返すので、5時間の窓を扱う設定で今の確かめを残す（扱わない設定は
+    // five-hour-window.test.js が確かめる）。
+    fiveHourWindow: { enabled: true },
     accounts: labels.map(label => ({ label, codexHome: `/zz-accounts/${label}`, usagePolicy: { ...POLICY } })),
     ...overrides,
   };

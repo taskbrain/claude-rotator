@@ -120,6 +120,9 @@ function configFor(isolation, { accounts = [{ label: 'zz-a' }], override = true,
     accountsDir,
     daemon: { port: 0 },
     ...(override ? { usageUserAgent: CONFIG_USER_AGENT, usageOriginator: CONFIG_ORIGINATOR } : {}),
+    // 試験の上流は5時間の窓を返すので、5時間の窓を扱う設定で今の確かめを残す（扱わない設定は
+    // five-hour-window.test.js が確かめる）。
+    fiveHourWindow: { enabled: true },
     accounts: accounts.map(({ label, policy = POLICY }) =>
       ({ label, codexHome: join(accountsDir, label), usagePolicy: { ...policy } })),
     ...rest,

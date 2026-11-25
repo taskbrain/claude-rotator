@@ -49,6 +49,7 @@ export const CODEX_CONFIG_DEFAULTS = Object.freeze({
   usageReadTimeoutMs: 5000,
   rotationObservationTtlMs: 125000,
   rotationUsageCapNoResetProbeMs: 3600000,
+  fiveHourWindowEnabled: false,
 });
 
 const TIMING_RANGES = Object.freeze({
@@ -61,8 +62,9 @@ const NO_RESET_PROBE_RANGE = Object.freeze([60000, 604800000]);
 
 const TOP_LEVEL_KEYS = new Set(['enabled', 'acknowledgedMultiAccountRisk', 'accountsDir', 'daemon',
   'usagePollIntervalMs', 'usageReadTimeoutMs', 'rotationObservationTtlMs', 'rotationUsageCapNoResetProbeMs',
-  'codexPath', 'usageUserAgent', 'usageOriginator', 'accounts']);
+  'codexPath', 'usageUserAgent', 'usageOriginator', 'fiveHourWindow', 'accounts']);
 const DAEMON_KEYS = new Set(['port']);
+const FIVE_HOUR_WINDOW_KEYS = new Set(['enabled']);
 const ACCOUNT_KEYS = new Set(['label', 'codexHome', 'usagePolicy']);
 const USAGE_POLICY_KEYS = new Set(['stopUsedPercent', 'resumeUsedPercent', 'blockWhenUnknown']);
 
@@ -129,6 +131,19 @@ function validateTiming(raw) {
   }
   return timing;
 }
+
+// 5時間の窓を扱うか（fiveHourWindow.enabled）。既定は扱わない（false）。真偽値でない値は false として扱い、
+// 誤りにはしない。そのときは enabledValueIgnored を付け、常駐が起動と読み直しのときにログへ1行出す。
+function validateFiveHourWindow(raw) {
+  if (raw === undefined) return { enabled: CODEX_CONFIG_DEFAULTS.fiveHourWindowEnabled };
+  assertKnownKeys(raw, FIVE_HOUR_WINDOW_KEYS, 'fiveHourWindow');
+  if (raw.enabled === undefined) return { enabled: CODEX_CONFIG_DEFAULTS.fiveHourWindowEnabled };
+  if (typeof raw.enabled === 'boolean') return { enabled: raw.enabled };
+  return { enabled: false, enabledValueIgnored: true };
+}
+
+/** 設定が5時間の窓を扱うか。キーが無い・真偽値の true でないときは扱わない。 */
+export const isFiveHourWindowEnabled = config => config?.fiveHourWindow?.enabled === true;
 
 function validateDaemon(rawDaemon) {
   if (rawDaemon === undefined) return { port: DEFAULT_DAEMON_PORT };
@@ -364,6 +379,7 @@ export function validateCodexConfig(raw, {
   const daemon = validateDaemon(raw.daemon);
   const timing = validateTiming(raw);
   const usageIdentity = validateUsageIdentity(raw);
+  const fiveHourWindow = validateFiveHourWindow(raw.fiveHourWindow);
   const fsImpl = { realpath: realpathImpl, lstat: lstatImpl };
   const context = fromEnv(() => ({
     env,
@@ -383,6 +399,7 @@ export function validateCodexConfig(raw, {
     ...timing,
     codexPath,
     ...usageIdentity,
+    fiveHourWindow,
     accounts,
   });
 }

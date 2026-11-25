@@ -285,6 +285,9 @@ async function fixture(t, {
       ...(codexInstalled ? { codexPath } : {}),
       ...(usageReadTimeoutMs ? { usageReadTimeoutMs } : {}),
       ...(port === undefined ? {} : { daemon: { port } }),
+      // 試験の上流は5時間の窓を返すので、5時間の窓を扱う設定で今の確かめを残す（扱わない設定は
+      // five-hour-window.test.js が確かめる）。
+      fiveHourWindow: { enabled: true },
       ...extraConfig,
       accounts: accounts.map(account => ({ label: account.label, codexHome: homes[account.label],
         usagePolicy: account.usagePolicy ?? policy() })),

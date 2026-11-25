@@ -988,6 +988,7 @@ usage: codex-rotator <exec|login|accounts|status> [args...]
 - **`accounts[].codexHome`（口座のフォルダ）と `codexPath`（本物の `codex` の場所。省くと `PATH` から探します）は絶対パスで書きます。`~/` の形と相対パスは設定の誤りになります。** `accountsDir`（口座のフォルダを作る場所。既定は `~/.codex-accounts`）だけは `~/` で始めてもかまいません。
 - 口座のフォルダと `accountsDir` は、`~/.codex` と重なってはいけません（同じ・含む・含まれる）。口座のフォルダどうしも重なってはいけません。
 - 口座ごとの方針 `usagePolicy` は、`stopUsedPercent`（0 より大きく 100 以下）・`resumeUsedPercent`（0 以上で `stopUsedPercent` 未満）・`blockWhenUnknown`（真偽）です。login の `--stop`・`--resume`・`--block-when-unknown` で決まります。使われ方は「[口座を選んで起動する](#口座を選んで起動するcodex-rotator-exec)」に書きました。
+- `fiveHourWindow.enabled`（真偽。既定は `false`）は、5時間の窓を扱うかを決めます。`false` のときは、上流が長さ5時間の窓を返しても捨て、口座の停止・選択・実効残量の計算に使わず、表示もしません。状態の JSON の `accounts[].windows.fiveHour` と `aggregate.fiveHourRemainingPercent` は `null` になります（キーは残ります）。上流が使えないと答えた口座（`allowed` が `false`）は、この設定に関係なく止めます。`true` にすると、5時間の窓を判定・表示・状態の JSON に使います（「[状態の JSON](#状態の-jsoncodex-rotator-status)」の例はこの形です）。真偽値でない値は `false` として扱い、常駐がログに1行出します。常駐の起動と `POST /internal/reload` で読み直し、`false` へ切り替えたときは、覚えていた5時間の窓の観測と、その窓だけによる停止を捨てます。
 
 ### 口座を登録する（codex-rotator login）
 
@@ -2498,6 +2499,7 @@ usage: codex-rotator <exec|login|accounts|status> [args...]
 - **Write `accounts[].codexHome` (the account folder) and `codexPath` (where the real `codex` is; when omitted it is looked up on `PATH`) as absolute paths. The `~/` form and relative paths are config errors.** Only `accountsDir` (where account folders are created; default `~/.codex-accounts`) may start with `~/`.
 - Account folders and `accountsDir` must not overlap `~/.codex` (the same folder, inside it, or containing it). Account folders must not overlap each other either.
 - Each account's policy `usagePolicy` has `stopUsedPercent` (greater than 0, at most 100), `resumeUsedPercent` (from 0 up to, but not including, `stopUsedPercent`) and `blockWhenUnknown` (true or false). They come from login's `--stop`, `--resume` and `--block-when-unknown`. How they are used is described in "[Launching with an Account](#launching-with-an-account-codex-rotator-exec)".
+- `fiveHourWindow.enabled` (true or false; default `false`) decides whether the five-hour window is used. When it is `false`, a window the upstream reports as five hours long is discarded: it does not stop or select accounts, does not count toward the remaining headroom, and is not shown. In the status JSON, `accounts[].windows.fiveHour` and `aggregate.fiveHourRemainingPercent` are `null` (the keys stay). An account the upstream says it cannot use (`allowed` is `false`) is stopped whatever this setting says. When it is `true`, the five-hour window is used for decisions, the display and the status JSON (the example in "[Status JSON](#status-json-codex-rotator-status)" has this shape). A value that is not true or false is treated as `false`, and the daemon logs one line about it. The daemon reads the setting at start and on `POST /internal/reload`; switching to `false` discards the remembered five-hour readings and any stop that rested on that window alone.
 
 #### Registering an Account (codex-rotator login)
 

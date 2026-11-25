@@ -46,7 +46,10 @@ async function fixture(t, { accounts = 1, respond }) {
   const scheduler = createFakeScheduler(clock);
   const entries = Array.from({ length: accounts }, (_, i) =>
     ({ key: `home:${i}`, home: join(isolation.root, 'accounts', `zz-home-${i}`), label: `zz-${i}`, models: null }));
-  const config = { usageObservationMode: 'http', usagePollIntervalMs: 60_000, usageReadTimeoutMs: 5000,
+  // 試験の上流は5時間の窓を返すので、5時間の窓を扱う設定で今の確かめを残す（扱わない設定は
+  // five-hour-window.test.js が確かめる）。
+  const config = { usageObservationMode: 'http', fiveHourWindow: { enabled: true },
+    usagePollIntervalMs: 60_000, usageReadTimeoutMs: 5000,
     rotationObservationTtlMs: 125_000,
     accounts: entries.map(entry => ({ label: entry.label, usagePolicy: { stopUsedPercent: 75, resumeUsedPercent: 70 } })) };
   const pool = createCodexAccountPool(entries, config);

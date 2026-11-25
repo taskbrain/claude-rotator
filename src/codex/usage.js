@@ -58,6 +58,33 @@ const REACHED_TYPE_PATTERN = /^[A-Za-z0-9_-]{1,64}$/;
 const JSON_CONTENT_TYPE = /\bapplication\/json\b|\+json\b/i;
 
 const WINDOW_FIELDS = [['primary', 'primary_window'], ['secondary', 'secondary_window']];
+/** 5時間の窓の長さ（秒）。 */
+export const CODEX_FIVE_HOUR_WINDOW_SECONDS = 5 * 60 * 60;
+
+// 「完全観測」= `allowed` が取れ、存在する窓がすべて矛盾なく読めたもの（復帰の判定に使える観測）。
+function isCompleteObservation(observation) {
+  const windows = WINDOW_FIELDS.map(([name]) => observation[name]).filter(Boolean);
+  return typeof observation.ordinaryUsageAllowed === 'boolean' && windows.length > 0 && windows.every(window => window.complete);
+}
+
+/**
+ * 5時間の窓を扱わない設定のときに使う。長さが5時間と申告された窓を観測から外し（null にし）、完全な
+ * 観測かどうかを残った窓だけで決め直した写しを返す（外した窓の欠けや矛盾で、観測を不完全にしない）。
+ * 長さの申告が無い窓と長さが読めない窓は、5時間の窓と決められないので残す。外す窓が無ければ、
+ * 渡された観測をそのまま返す。元の観測は変えない。
+ * @param {object|null} observation 正規化した観測（readCodexUsage の observation）
+ * @returns {object|null}
+ */
+export function withoutFiveHourWindows(observation) {
+  if (!observation || typeof observation !== 'object') return observation;
+  const fiveHour = WINDOW_FIELDS.map(([name]) => name)
+    .filter(name => observation[name]?.limitWindowSeconds === CODEX_FIVE_HOUR_WINDOW_SECONDS);
+  if (fiveHour.length === 0) return observation;
+  const copy = { ...observation };
+  for (const name of fiveHour) copy[name] = null;
+  copy.complete = isCompleteObservation(copy);
+  return copy;
+}
 
 /** 数値のみを採る。文字列・真偽・NaN・範囲外は観測として採らない（0 へ補完しない）。 */
 function readUsedPercent(raw) {
@@ -141,10 +168,7 @@ function normalizeUsagePayload(parsed, receivedAt) {
     },
   };
   for (const [name, field] of WINDOW_FIELDS) observation[name] = normalizeWindow(rateLimit[field], receivedAt);
-  const windows = WINDOW_FIELDS.map(([name]) => observation[name]).filter(Boolean);
-  // 「完全観測」= `allowed` が取れ、存在する窓がすべて矛盾なく読めたもの（復帰の判定に使える観測）。
-  observation.complete = typeof observation.ordinaryUsageAllowed === 'boolean' &&
-    windows.length > 0 && windows.every(window => window.complete);
+  observation.complete = isCompleteObservation(observation);
   return observation;
 }
 

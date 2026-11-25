@@ -151,6 +151,9 @@ async function fixture(t, {
     ...(codex !== 'missing' ? { codexPath } : {}),
     ...(identity ? { usageUserAgent: 'zz-fake-ua', usageOriginator: 'zz-fake-originator' } : {}),
     ...(daemonPort === undefined ? {} : { daemon: { port: daemonPort } }),
+    // 試験の上流は5時間の窓を返すので、5時間の窓を扱う設定で今の確かめを残す（扱わない設定は
+    // five-hour-window.test.js が確かめる）。
+    fiveHourWindow: { enabled: true },
     accounts: list.map(account => ({ label: account.label, codexHome: homes[account.label],
       usagePolicy: account.usagePolicy ?? policy() })),
   });
@@ -491,8 +494,9 @@ test('README: the status sections in Japanese and English carry every key of the
     for (const account of example.accounts) {
       assert.equal(account.headroomPercent, codexAccountHeadroom(account, { source: example.source }), `${heading}: headroom`);
     }
+    // README の例は、5時間の窓を扱う設定（fiveHourWindow.enabled が true）での出力である。
     assert.deepEqual(example.aggregate, aggregateCodexAccounts(example.accounts, { enabled: example.enabled,
-      source: example.source }), `${heading}: the aggregate of the example`);
+      source: example.source, fiveHourWindow: true }), `${heading}: the aggregate of the example`);
     // 見張りから使う節: 約束する口・全体の期限・待つ目安・断る条件。
     const watch = readmeSection(readme, watcher);
     assert.ok(fencedBlocks(watch, 'text').includes('codex-rotator status --json --section\n'), `${watcher}: the entry point`);
