@@ -494,7 +494,7 @@ export function createProxyServer({
   function configureUrgency() {
     const requested = urgencyMode(config.accountUrgency);
     const blocked = requested === 'on' && sessionAffinitySettings.mode !== 'on';
-    accountManager.configureAccountUrgency({ mode: blocked ? 'shadow' : requested });
+    accountManager.configureAccountUrgency({ mode: blocked ? 'shadow' : requested, order: config.accountUrgency?.order });
     if (accountManager.urgency) accountManager.urgency.activationBlock = blocked ? 'session-affinity-required' : null;
     accountManager.setUrgencyNotifier(notice => alertWatch?.notice?.(notice) === true);
   }
