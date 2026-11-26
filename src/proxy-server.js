@@ -5112,6 +5112,7 @@ function sendCurrentQuotaUnavailableResponse({
 
   const response = syntheticQuotaExhaustedResponse(account, reason, {
     resumeAt: accountManager.earliestUsableAt(modelFamily),
+    now: accountManager.now(),
   });
   // P-a: 合成した 429 を書き出す唯一の位置。写像はログより先に決める。
   // ログ行の status は実際に返した値（529 / 403）にし、写像前の 429 は同じ行の
@@ -5136,16 +5137,20 @@ function sendCurrentQuotaUnavailableResponse({
 }
 
 // `resumeAt` (ms) is when the first account is usable again for this request's
-// model. When it comes before the named window's reset (another account's
-// shorter hold ends first), the unified reset and the message carry it; the
-// window's own reset header keeps that window's reset.
-function syntheticQuotaExhaustedResponse(account, reason, { resumeAt = null } = {}) {
+// model; the unified reset and the message carry it, never shortened or
+// lengthened by the named window's own reset, which only its window header
+// keeps. Unknown, it falls back to that window's reset while that is ahead.
+// When the two differ, the message names no window, since the time is not
+// that window's.
+function syntheticQuotaExhaustedResponse(account, reason, { resumeAt = null, now = Date.now() } = {}) {
   const windowHeader = quotaWindowHeader(reason.window);
   const claim = reason.claim || quotaRepresentativeClaim(reason.window);
   const windowResetSeconds = quotaResetSeconds(reason.resetAt);
   const windowResetMs = Date.parse(reason.resetAt || '');
-  const retryAt = Number.isFinite(resumeAt) && (!Number.isFinite(windowResetMs) || resumeAt < windowResetMs)
-    ? new Date(resumeAt).toISOString() : reason.resetAt;
+  const retryAt = Number.isFinite(resumeAt)
+    ? new Date(resumeAt).toISOString()
+    : (Number.isFinite(windowResetMs) && windowResetMs > now ? reason.resetAt : null);
+  const ownReset = retryAt != null && Date.parse(retryAt) === windowResetMs;
   const resetSeconds = quotaResetSeconds(retryAt);
   const headers = {
     'content-type': 'application/json',
@@ -5162,8 +5167,11 @@ function syntheticQuotaExhaustedResponse(account, reason, { resumeAt = null } = 
     if (windowResetSeconds) headers[`anthropic-ratelimit-unified-${windowHeader}-reset`] = windowResetSeconds;
   }
 
-  const retryReason = { ...reason, resetAt: retryAt };
-  const rotatorMessage = quotaExhaustedRotatorMessage(account, retryReason);
+  const retryReason = ownReset || retryAt == null ? { ...reason, resetAt: retryAt } : { ...reason, window: null, resetAt: retryAt };
+  const rotatorMessage = ownReset || retryAt == null
+    ? quotaExhaustedRotatorMessage(account, retryReason)
+    : quotaExhaustedRotatorMessage(account, reason)
+      .replace(/ No available rotation target\.$/, ` No account is usable before ${retryAt}.`);
   return {
     statusCode: 429,
     headers,
@@ -5619,6 +5627,7 @@ function sendUnavailableAccounts(res, accountManager = null, exhaustionMapper = 
     - (finiteQuotaReset(b.reason.resetAt) ?? Number.MAX_SAFE_INTEGER))[0] : null;
   const quotaResponse = quotaTarget ? syntheticQuotaExhaustedResponse(quotaTarget.account, quotaTarget.reason, {
     resumeAt: accountManager.earliestUsableAt(modelFamily),
+    now: accountManager.now(),
   }) : null;
   if (!quotaResponse && sendQuotaRecoveryWait(res, accountManager, modelFamily)) return;
   // P-d の写像入口。全滅時の終端は、稼働口座

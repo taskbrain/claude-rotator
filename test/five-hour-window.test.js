@@ -207,7 +207,10 @@ describe('five-hour window off', () => {
       const resume = JSON.parse((await request(`${h.url}/internal/prepare-resume`, { method: 'POST', body: '{}' })).text);
       if (fiveHourWindow.enabled) {
         assert.equal(claim, 'five_hour');
-        assert.equal(resume.resumeAtEpoch, Math.floor((START + 2 * HOUR) / 1000));
+        assert.equal(response.headers['anthropic-ratelimit-unified-5h-reset'], seconds(START + 2 * HOUR), 'the window keeps its own reset');
+        // The account is back only when both used-up windows have reset.
+        assert.equal(response.headers['anthropic-ratelimit-unified-reset'], seconds(START + 48 * HOUR));
+        assert.equal(resume.resumeAtEpoch, Math.floor((START + 48 * HOUR) / 1000));
       } else {
         assert.equal(claim, 'seven_day');
         assert.equal(response.headers['anthropic-ratelimit-unified-5h-utilization'], undefined);
@@ -729,7 +732,9 @@ describe('a five-hour rejection hold against the other ledger states', () => {
       assert.equal(local.headers['anthropic-ratelimit-unified-reset'], seconds(START + 60_000), label);
       assert.equal(JSON.parse(local.text).error.details.reset_at, iso(START + 60_000), label);
       assert.ok(Object.keys(local.headers).every(name => !name.startsWith('anthropic-ratelimit-unified-5h')), label);
-      assert.doesNotMatch(local.text, new RegExp(iso(START + 2 * HOUR).replace(/[.]/g, '\\.')), `${label}: the two-hour end is not offered`);
+      const localBody = JSON.parse(local.text).error;
+      assert.match(localBody.message, /^You've hit your usage limit · resets /, label);
+      assert.match(localBody.details.rotator_message, new RegExp(`No account is usable before ${iso(START + 60_000).replace(/[.]/g, '\\.')}\\.$`), label);
 
       clock.ms = START + 61_000;
       assert.equal(manager.getActiveAccount(null, { trigger: 'request' })?.id, 'sample-b', `${label}: b is back after 60 seconds`);
@@ -795,10 +800,111 @@ describe('a five-hour rejection hold against the other ledger states', () => {
     assert.equal(response.headers['anthropic-ratelimit-unified-representative-claim'], 'five_hour');
     assert.equal(response.headers['anthropic-ratelimit-unified-5h-reset'], seconds(START + 2 * HOUR), 'the window keeps its own reset');
     assert.equal(response.headers['anthropic-ratelimit-unified-reset'], seconds(START + 60_000), 'the retry time is the earliest usable account');
+    const body = JSON.parse(response.text).error;
+    assert.match(body.message, /^You've hit your usage limit · resets /, 'the time is not the five-hour window\'s, so no window is named');
+    assert.equal(body.details.rotator_message,
+      `Claude 5h usage limit exhausted for sample-a. Resets at ${iso(START + 2 * HOUR)}. No account is usable before ${iso(START + 60_000)}.`);
     const resume = manager.prepareResumeTarget();
     assert.equal(resume.window, '5h');
     assert.equal(resume.resumeAt, iso(START + 60_000));
   });
+
+  it('does not answer ready from a token reset that has passed while no account is usable', () => {
+    const clock = { ms: START };
+    const { manager } = ledger({ fiveHourWindow: OFF, ids: ['sample-a', 'sample-b'], clock });
+    manager.applyUsage('sample-a', weekAndFive(clock, 0.3, 72));
+    manager.applyUsage('sample-b', {
+      seven_day: { utilization: 0.3, resets_at: iso(clock.ms + 72 * HOUR) },
+      scoped_weekly: [{ key: 'fable', label: 'Fable', utilization: 1, resets_at: iso(clock.ms + 48 * HOUR) }],
+    });
+    manager.updateQuota('sample-a', fiveHourRejection(clock), as429);
+    manager.updateQuota('sample-b', {
+      'anthropic-ratelimit-tokens-limit': '1000', 'anthropic-ratelimit-tokens-remaining': '0',
+      'anthropic-ratelimit-tokens-reset': iso(clock.ms + 60_000),
+    });
+    clock.ms = START + 61_000;
+    assert.equal(manager.getActiveAccount(null, { trigger: 'request' }), null, 'the fixture has no usable account');
+    for (let attempt = 0; attempt < 2; attempt += 1) {
+      const resume = manager.prepareResumeTarget();
+      assert.equal(resume.action, 'wait');
+      assert.equal(resume.resumeAt, iso(START + 2 * HOUR), 'the passed token reset is no resume time');
+      assert.equal(resume.account, 'sample-a');
+    }
+  });
+
+  it('keeps the earliest usable time apart from a shorter reset of the shown account', async () => {
+    const clock = { ms: START };
+    const { manager } = ledger({ fiveHourWindow: OFF, ids: ['sample-a', 'sample-b'], clock });
+    manager.applyUsage('sample-a', weekAndFive(clock, 0.3, 72));
+    manager.applyUsage('sample-b', {
+      seven_day: { utilization: 0.3, resets_at: iso(clock.ms + 72 * HOUR) },
+      scoped_weekly: [{ key: 'fable', label: 'Fable', utilization: 1, resets_at: iso(clock.ms + 48 * HOUR) }],
+    });
+    manager.updateQuota('sample-a', fiveHourRejection(clock), as429);
+    manager.updateQuota('sample-b', {
+      'anthropic-ratelimit-tokens-limit': '1000', 'anthropic-ratelimit-tokens-remaining': '0',
+      'anthropic-ratelimit-tokens-reset': iso(clock.ms + HOUR),
+    });
+    manager.markRateLimited('sample-b', 3 * 3600);
+    assert.equal(manager.earliestUsableAt(null), START + 2 * HOUR);
+    const resume = manager.prepareResumeTarget();
+    assert.equal(resume.action, 'wait');
+    assert.equal(resume.resumeAt, iso(START + 2 * HOUR), 'not the one-hour token reset of b');
+
+    const h = await startProxy({ manager, upstreamHandler: (req, res) => okResponse(res) });
+    const local = await h.send();
+    assert.equal(local.status, 429);
+    assert.deepEqual(h.seen, []);
+    assert.equal(local.headers['anthropic-ratelimit-unified-reset'], seconds(START + 2 * HOUR));
+    assert.equal(JSON.parse(local.text).error.details.reset_at, iso(START + 2 * HOUR));
+  });
+
+  it('keeps a used-up window with an unknown reset unknown under a shorter five-hour hold', async () => {
+    const clock = { ms: START };
+    const { manager } = ledger({ fiveHourWindow: OFF, ids: ['sample-a'], clock });
+    manager.updateQuota('sample-a', fiveHourRejection(clock), as429);
+    manager.updateQuota('sample-a', { 'anthropic-ratelimit-unified-7d-utilization': '1' });
+    const account = manager.find('sample-a');
+    assert.equal(account.quota.unified7d, 1, 'the fixture has a used-up week');
+    assert.equal(account.quota.unified7dReset, null, 'whose reset is unknown');
+    assert.equal(manager.earliestUsableAt(null), null);
+    assert.equal(manager.exhaustedReasonForModelFamily(account, null).window, '7d');
+    const resume = manager.prepareResumeTarget();
+    assert.equal(resume.action, 'unavailable');
+    assert.equal(resume.reason, 'quota-reset-unknown');
+    assert.equal(resume.resumeAt, null);
+
+    const h = await startProxy({ manager, upstreamHandler: (req, res) => okResponse(res) });
+    const local = await h.send();
+    assert.equal(local.status, 429);
+    assert.equal(local.headers['anthropic-ratelimit-unified-reset'], undefined, 'no reset is offered for an unknown one');
+    assert.equal(JSON.parse(local.text).error.details.reset_at, null);
+  });
+
+  const unpickable = {
+    'a weekly reading turned explicit null': manager => {
+      manager.applyUsage('sample-b', { seven_day: null });
+    },
+    'a week at 98% (the 97% stop)': manager => {
+      manager.applyUsage('sample-b', { seven_day: { utilization: 0.98, resets_at: iso(START + 48 * HOUR) } });
+    },
+  };
+  for (const [label, spoil] of Object.entries(unpickable)) {
+    it(`does not count an account the selector cannot pick once its plain hold ends: ${label}`, () => {
+      const clock = { ms: START };
+      const { manager } = ledger({ fiveHourWindow: OFF, ids: ['sample-a', 'sample-b'], urgency: 'on', clock });
+      manager.setQuotaRecoveryPersistence(true, true);
+      for (const id of ['sample-a', 'sample-b']) manager.applyUsage(id, weekAndFive(clock, 0.3, 72));
+      spoil(manager);
+      manager.updateQuota('sample-a', fiveHourRejection(clock), as429);
+      manager.markRateLimited('sample-b', 60);
+      const resume = manager.prepareResumeTarget();
+      assert.equal(resume.action, 'wait');
+      assert.equal(resume.resumeAt, iso(START + 2 * HOUR), "b's 60-second end is not offered");
+      clock.ms = START + 61_000;
+      assert.equal(manager.getActiveAccount(null, { trigger: 'request' }), null, 'b is still not picked');
+    });
+  }
 
   it('keeps the five-hour local 429 when every account is used up while on', async () => {
     const clock = { ms: START };

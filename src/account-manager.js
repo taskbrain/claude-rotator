@@ -1261,7 +1261,10 @@ export class AccountManager {
 
     const account = this.switchToExhaustedFallbackCandidate(selected, 'prepare-resume');
     const unavailableReason = this.exhaustedReasonForModelFamily(account, null);
-    const resetAt = earlierTime(finiteResetAt(selected.score.resetAt), this.earliestUsableAt(null));
+    // The resume time is when the first account is usable again, kept apart
+    // from the shown account's own reset: it is never shortened by that reset,
+    // and a reset that is unknown or already past never makes it 'ready'.
+    const resetAt = this.earliestUsableAt(null);
     if (resetAt == null) {
       return this.resumeTarget({
         account,
@@ -1505,8 +1508,11 @@ export class AccountManager {
       : this.exhaustedReasonForModelFamily(account, modelFamily);
     if (!isUnifiedQuotaExhaustion(reason)) return null;
     const resetAt = reason.resetAt ? Date.parse(reason.resetAt) : null;
+    // Ranked per model, a reset that has passed while the window still reads
+    // used up says nothing about when the account is back, like an unknown one.
+    const knownReset = Number.isFinite(resetAt) && (modelFamily === undefined || resetAt > this.now());
     return {
-      resetAt: Number.isFinite(resetAt) ? resetAt : Number.MAX_SAFE_INTEGER,
+      resetAt: knownReset ? resetAt : Number.MAX_SAFE_INTEGER,
       utilization: typeof reason.utilization === 'number' ? reason.utilization : Number.MAX_SAFE_INTEGER,
       windowRank: reason.window === '5h' ? 0 : 1,
       priority: account.priority ?? Number.MAX_SAFE_INTEGER,
@@ -1655,38 +1661,56 @@ export class AccountManager {
     const hold = isQuotaRejectionHold(account, this.now()) ? this.temporaryUnavailable(account) : null;
     if (!hold || !isUnifiedQuotaExhaustion(reason)) return reason;
     const reasonEnd = Date.parse(reason.resetAt || '');
-    return Number.isFinite(reasonEnd) && reasonEnd >= account.rateLimitedUntil ? reason : hold;
+    // A window whose reset is unknown stays the reason: the hold's end is not
+    // when that window is back.
+    return !Number.isFinite(reasonEnd) || reasonEnd >= account.rateLimitedUntil ? reason : hold;
   }
 
   /**
-   * When the first account becomes usable again for a `modelFamily` request:
-   * the latest end of what blocks each account (a used-up window that applies
-   * to that model, and any short-term hold, plain or five-hour), earliest across
-   * accounts. Accounts whose return time is unknown (an error, a credential
-   * cooldown, a recovery probe, a window without a reset) and accounts with
-   * nothing timed to wait for are left out. Null when no time is known.
+   * When the first account becomes usable again for a `modelFamily` request.
+   * For each account it takes the latest end of what blocks it: every used-up
+   * window that applies to that model (at the threshold the selector uses), and
+   * any short-term hold, plain or five-hour. The earliest of those across
+   * accounts is returned, or null when none is known.
+   *
+   * Left out, because time alone does not bring them back: an error, a
+   * credential cooldown, a recovery probe, a used-up window whose reset is
+   * unknown or already past (it needs a new reading), an account with nothing
+   * timed to wait for, and, while accountUrgency or planQuota is on, an account
+   * whose weekly reading the selector cannot use (missing, explicit null or
+   * invalid).
    */
   earliestUsableAt(modelFamily = null) {
     const now = this.now();
+    const policyOn = this.urgency?.mode === 'on' || this.planQuotaMode === 'on';
+    const threshold = this.switchThreshold;
     let earliest = null;
     for (const account of this.accounts) {
       this.refreshQuotaState(account);
       if (account.status === 'error' || this.hasCredentialRefreshCooldown(account)) continue;
       if (this.quotaRecovery?.isHeld(this.quotaRecoveryKey(account))) continue;
-      const ends = [];
-      const quotaReason = quotaUnavailableReasonForModelFamily(account.quota, this.switchThreshold, modelFamily,
-        account.extendedQuotaScopes, account.fableQuotaCompat);
-      if (quotaReason) {
-        const end = Date.parse(quotaReason.resetAt || '');
-        if (!Number.isFinite(end)) continue;
-        ends.push(end);
-      }
+      const windowEnds = blockingQuotaWindowEnds(account.quota, threshold, modelFamily, account.fableQuotaCompat);
+      if (windowEnds.some(end => !Number.isFinite(end) || end <= now)) continue;
+      const ends = [...windowEnds];
       if (account.rateLimitedUntil > now) ends.push(account.rateLimitedUntil);
       if (ends.length === 0) continue;
+      if (policyOn && !this.hasUsableWeeklyReading(account, modelFamily)) continue;
       const usableAt = Math.max(...ends);
       if (earliest == null || usableAt < earliest) earliest = usableAt;
     }
     return earliest;
+  }
+
+  // Whether the selector, once the timed blocks end, can read this account's
+  // weekly window for `modelFamily`: a value is held and no reading of it, or
+  // of a matching scoped window, is an explicit null or invalid.
+  hasUsableWeeklyReading(account, modelFamily = null) {
+    if (!Number.isFinite(account.quota.unified7d)) return false;
+    return Object.entries(account.windowObservations || {}).every(([id, observation]) => {
+      if (id !== '7d' && !(id.startsWith('7d_')
+        && scopeMatchesModelFamily({ key: id.slice(3) }, modelFamily, true, account.fableQuotaCompat))) return true;
+      return !['explicit_null', 'invalid'].includes(observation?.observationState);
+    });
   }
 
   autoSwitchReason(account) {
@@ -2704,10 +2728,21 @@ function finiteNumberOrNull(value) {
   return typeof value === 'number' && Number.isFinite(value) ? value : null;
 }
 
-function earlierTime(left, right) {
-  if (left == null) return right;
-  if (right == null) return left;
-  return Math.min(left, right);
+// The reset (ms, NaN when unknown) of every window of `quota` at or over
+// `threshold` that blocks a `modelFamily` request.
+function blockingQuotaWindowEnds(quota, threshold, modelFamily, fableCompat = false) {
+  const toMs = value => (typeof value === 'number' ? value : Date.parse(value ?? ''));
+  const ends = [];
+  if (quota.unified5h != null && quota.unified5h >= threshold) ends.push(toMs(quota.unified5hReset));
+  if (quota.unified7d != null && quota.unified7d >= threshold) ends.push(toMs(quota.unified7dReset));
+  for (const limit of quota.weeklyScoped || []) {
+    if (!limit || typeof limit.utilization !== 'number' || limit.utilization < threshold) continue;
+    if (scopeMatchesModelFamily(limit, modelFamily, true, fableCompat)) ends.push(toMs(limit.resetAt));
+  }
+  for (const [limit, remaining] of [[quota.tokensLimit, quota.tokensRemaining], [quota.requestsLimit, quota.requestsRemaining]]) {
+    if (limit != null && remaining != null && 1 - remaining / limit >= threshold) ends.push(toMs(quota.resetsAt));
+  }
+  return ends;
 }
 
 function finiteResetAt(value) {
