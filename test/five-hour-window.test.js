@@ -909,10 +909,13 @@ describe('a five-hour rejection hold against the other ledger states', () => {
   }
 
   // The local 429 and prepare-resume give the same answer when no resume time
-  // is known: no time at all, while a window header keeps its own reset.
+  // is known: no time at all, neither the overall reset nor a window's own
+  // reset header. A window header with both a usage figure and a reset can
+  // reach Claude Code's status line as that window's reset time. The window's
+  // usage figure and claim stay, so the usage-limit line keeps naming it.
   const unknownResume = {
     'a used-up week (48 hours) and used-up tokens with no reset': {
-      ids: ['sample-a'], urgency: 'off',
+      ids: ['sample-a'], urgency: 'off', fiveHourWindow: OFF,
       build: (manager, clock) => {
         manager.updateQuota('sample-a', {
           'anthropic-ratelimit-unified-7d-utilization': '1',
@@ -920,23 +923,36 @@ describe('a five-hour rejection hold against the other ledger states', () => {
           'anthropic-ratelimit-tokens-limit': '1000', 'anthropic-ratelimit-tokens-remaining': '0',
         });
       },
-      windowReset: { 'anthropic-ratelimit-unified-7d-reset': seconds(START + 48 * HOUR) },
+      window: { claim: 'seven_day', name: '7d' },
+    },
+    'a used-up five-hour window (2 hours) and used-up tokens with no reset (five-hour window on)': {
+      ids: ['sample-a'], urgency: 'off', fiveHourWindow: ON,
+      build: (manager, clock) => {
+        manager.updateQuota('sample-a', {
+          'anthropic-ratelimit-unified-5h-utilization': '1',
+          'anthropic-ratelimit-unified-5h-reset': seconds(clock.ms + 2 * HOUR),
+          'anthropic-ratelimit-unified-7d-utilization': '0.3',
+          'anthropic-ratelimit-unified-7d-reset': seconds(clock.ms + 48 * HOUR),
+          'anthropic-ratelimit-tokens-limit': '1000', 'anthropic-ratelimit-tokens-remaining': '0',
+        });
+      },
+      window: { claim: 'five_hour', name: '5h' },
     },
     'a held account and others whose weekly reading turned explicit null (accountUrgency on)': {
-      ids: ['sample-a', 'sample-b'], urgency: 'on',
+      ids: ['sample-a', 'sample-b'], urgency: 'on', fiveHourWindow: OFF,
       build: (manager, clock) => {
         manager.applyUsage('sample-b', weekAndFive(clock, 0.3, 72));
         manager.applyUsage('sample-b', { seven_day: null });
         manager.updateQuota('sample-a', fiveHourRejection(clock), as429);
         manager.markRateLimited('sample-b', 60);
       },
-      windowReset: {},
+      window: null,
     },
   };
   for (const [label, fixture] of Object.entries(unknownResume)) {
     it(`offers no resume time in the local 429 when prepare-resume has none: ${label}`, async () => {
       const clock = { ms: START };
-      const { manager } = ledger({ fiveHourWindow: OFF, ids: fixture.ids, urgency: fixture.urgency, clock });
+      const { manager } = ledger({ fiveHourWindow: fixture.fiveHourWindow, ids: fixture.ids, urgency: fixture.urgency, clock });
       fixture.build(manager, clock);
       assert.equal(manager.earliestUsableAt(null), null, 'the fixture has no known resume time');
       const resume = manager.prepareResumeTarget();
@@ -952,13 +968,44 @@ describe('a five-hour rejection hold against the other ledger states', () => {
       assert.equal(local.status, 429);
       assert.deepEqual(h.seen, []);
       assert.equal(local.headers['anthropic-ratelimit-unified-reset'], undefined, 'no overall reset');
-      for (const [name, value] of Object.entries(fixture.windowReset)) assert.equal(local.headers[name], value, `${name} keeps its own reset`);
+      const resetHeaders = Object.keys(local.headers).filter(name => /^anthropic-ratelimit-unified-.+-reset$/.test(name));
+      assert.deepEqual(resetHeaders, [], 'no window reset header either');
+      if (fixture.window) {
+        assert.equal(local.headers['anthropic-ratelimit-unified-representative-claim'], fixture.window.claim, 'the claim stays');
+        assert.equal(local.headers[`anthropic-ratelimit-unified-${fixture.window.name}-utilization`], '1', 'the usage figure stays');
+        assert.equal(local.headers['x-claude-rotator-quota-window'], fixture.window.name);
+      } else {
+        assert.equal(local.headers['anthropic-ratelimit-unified-representative-claim'], undefined);
+      }
       const body = JSON.parse(local.text).error;
       assert.equal(body.details.reset_at, null);
       assert.doesNotMatch(body.message, /resets/);
       assert.doesNotMatch(body.details.rotator_message, /Resets at|usable before/);
     });
   }
+
+  it('relays an upstream 429 with its window reset headers unchanged', async () => {
+    const clock = { ms: START };
+    const { manager } = ledger({ fiveHourWindow: OFF, ids: ['sample-a'], clock });
+    // A plain throttle (not a used-up window) is relayed as it came.
+    const upstreamHeaders = {
+      'retry-after': '60',
+      'anthropic-ratelimit-unified-7d-utilization': '0.5',
+      'anthropic-ratelimit-unified-7d-reset': seconds(clock.ms + 48 * HOUR),
+    };
+    const h = await startProxy({
+      manager,
+      upstreamHandler: (req, res) => {
+        res.writeHead(429, { 'content-type': 'application/json', ...upstreamHeaders });
+        res.end(JSON.stringify({ type: 'error', error: { type: 'rate_limit_error', message: 'fixture limit' } }));
+      },
+    });
+    const relayed = await h.send();
+    assert.equal(relayed.status, 429);
+    assert.deepEqual(h.seen, ['key-sample-a'], 'the request reached the upstream');
+    assert.equal(JSON.parse(relayed.text).error.message, 'fixture limit', 'the upstream answer is relayed');
+    for (const [name, value] of Object.entries(upstreamHeaders)) assert.equal(relayed.headers[name], value, name);
+  });
 
   it('matches a scoped window name the way the selector does when waiting for a Fable request', async () => {
     const clock = { ms: START };

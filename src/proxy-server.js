@@ -5138,7 +5138,9 @@ function sendCurrentQuotaUnavailableResponse({
 // `resumeAt` (ms) is when the first account is usable again for this request's
 // model; the unified reset and the message carry it, never shortened or
 // lengthened by the named window's own reset, which only its window header
-// keeps. Unknown, the response offers no resume time at all, like prepare-resume.
+// keeps. Unknown, the response offers no resume time at all, like prepare-resume:
+// not even the window's own reset header, since Claude Code can show a window
+// header carrying both a usage figure and a reset as that window's reset time.
 // When the two differ, the message names no window, since the time is not
 // that window's.
 function syntheticQuotaExhaustedResponse(account, reason, { resumeAt = null } = {}) {
@@ -5161,7 +5163,7 @@ function syntheticQuotaExhaustedResponse(account, reason, { resumeAt = null } = 
   if (resetSeconds) headers['anthropic-ratelimit-unified-reset'] = resetSeconds;
   if (windowHeader) {
     headers[`anthropic-ratelimit-unified-${windowHeader}-utilization`] = String(reason.utilization ?? 1);
-    if (windowResetSeconds) headers[`anthropic-ratelimit-unified-${windowHeader}-reset`] = windowResetSeconds;
+    if (windowResetSeconds && retryAt != null) headers[`anthropic-ratelimit-unified-${windowHeader}-reset`] = windowResetSeconds;
   }
 
   const retryReason = ownReset || retryAt == null ? { ...reason, resetAt: retryAt } : { ...reason, window: null, resetAt: retryAt };
