@@ -9,6 +9,7 @@ import {
   isAuthExpiredReason,
   isCommonQuotaExhausted,
   isCredentialRefreshCooldown,
+  isQuotaRejectionHold,
   isUnifiedQuotaExhaustion,
   requiresRelogin,
 } from './account-manager.js';
@@ -147,6 +148,9 @@ export function createProxyServer({
   reloadAccountUrgency = null,
   reloadPlanQuota = null,
   reloadFableQuotaCompat = null,
+  // Returns the `fiveHourWindow` setting to apply on POST /internal/reload. Not
+  // given, the ledger keeps the setting it was built with.
+  reloadFiveHourWindow = null,
   reloadObservability = null,
   allowLiveClaudeCodeCredentials = true,
   tokenRefresher = null,
@@ -897,6 +901,7 @@ export function createProxyServer({
         accountManager.configurePlanQuota(config.planQuota);
         if (reloadFableQuotaCompat) config.fableQuotaCompat = await reloadFableQuotaCompat();
         applyFableQuotaCompat();
+        if (reloadFiveHourWindow) accountManager.configureFiveHourWindow(await reloadFiveHourWindow());
         accountManager.setQuotaRecoveryPersistence(Boolean(stateWriter), usagePollingEnabled(config));
         warnWithoutUsagePolling();
         // キャッシュ観測の再読込。セクションが無い・config.json 自体が無い
@@ -1654,6 +1659,7 @@ function createReactiveQuotaConfirmer({
           accountManager.applyUsage(
             account.id,
             usagePayloadForFields(safeUsage, acceptedFields, account),
+            { upstreamRateLimited: true },
           );
         });
         return {
@@ -2576,6 +2582,9 @@ function usageBucketConfirmsQuota(bucket, threshold, nowMs) {
 
 function accountQuotaConfirmsModelFamily(account, modelFamily, threshold, nowMs) {
   const quota = account?.quota || {};
+  // With the five-hour window off, a rejection it explained is kept only as a
+  // short-term hold, which stands in for the used-up reading.
+  if (isQuotaRejectionHold(account, nowMs)) return true;
   if (usageBucketConfirmsQuota({
     utilization: quota.unified5h,
     resetAt: quota.unified5hReset,
@@ -4380,6 +4389,7 @@ async function forwardOnceInner({
         );
         accountManager.updateQuota(account.id, upstreamRes.headers, {
           atomicUnifiedWindows: upstreamRes.statusCode === 429,
+          upstreamRateLimited: upstreamRes.statusCode === 429,
           ...(quotaRecoveryProbe ? { recoveryStatus: upstreamRes.statusCode } : {}),
         });
         quotaRecoveryProbe?.onResponse(probeObservation);
@@ -4617,6 +4627,7 @@ async function forwardOnceInner({
           observability,
           requestEffort,
           headersMs: headersAtMs === null ? null : Math.max(0, headersAtMs - startedAt),
+          fiveHourWindow: accountManager.fiveHourWindowEnabled,
         })
         : null,
     });
@@ -5091,15 +5102,17 @@ function sendCurrentQuotaUnavailableResponse({
   // `fallback-switch` イベントも積む。読み取りだけの `bestExhaustedFallbackCandidate` で
   // 同じ口座を選ぶので、応答の中身（合成 429 の account / window / reset）は変わらない。
   const shortestResetAccount = affinityLog?.pinned
-    ? (accountManager.bestExhaustedFallbackCandidate()?.account || null)
-    : accountManager.selectBestExhaustedFallback({ trigger: 'request' });
+    ? (accountManager.bestExhaustedFallbackCandidate({ modelFamily })?.account || null)
+    : accountManager.selectBestExhaustedFallback({ trigger: 'request', modelFamily });
   if (shortestResetAccount) {
     account = shortestResetAccount;
-    reason = accountManager.unavailableReasonForModelFamily(account, modelFamily);
+    reason = accountManager.exhaustedReasonForModelFamily(account, modelFamily);
     if (!isUnifiedQuotaExhaustion(reason)) return false;
   }
 
-  const response = syntheticQuotaExhaustedResponse(account, reason);
+  const response = syntheticQuotaExhaustedResponse(account, reason, {
+    resumeAt: accountManager.earliestUsableAt(modelFamily),
+  });
   // P-a: 合成した 429 を書き出す唯一の位置。写像はログより先に決める。
   // ログ行の status は実際に返した値（529 / 403）にし、写像前の 429 は同じ行の
   // upstreamStatus / mappedFrom として残す。
@@ -5122,26 +5135,42 @@ function sendCurrentQuotaUnavailableResponse({
   return true;
 }
 
-function syntheticQuotaExhaustedResponse(account, reason) {
+// `resumeAt` (ms) is when the first account is usable again for this request's
+// model; the unified reset and the message carry it, never shortened or
+// lengthened by the named window's own reset, which only its window header
+// keeps. Unknown, the response offers no resume time at all, like prepare-resume:
+// not even the window's own reset header, since Claude Code can show a window
+// header carrying both a usage figure and a reset as that window's reset time.
+// When the two differ, the message names no window, since the time is not
+// that window's.
+function syntheticQuotaExhaustedResponse(account, reason, { resumeAt = null } = {}) {
   const windowHeader = quotaWindowHeader(reason.window);
   const claim = reason.claim || quotaRepresentativeClaim(reason.window);
-  const resetSeconds = quotaResetSeconds(reason.resetAt);
+  const windowResetSeconds = quotaResetSeconds(reason.resetAt);
+  const windowResetMs = Date.parse(reason.resetAt || '');
+  const retryAt = Number.isFinite(resumeAt) ? new Date(resumeAt).toISOString() : null;
+  const ownReset = retryAt != null && Date.parse(retryAt) === windowResetMs;
+  const resetSeconds = quotaResetSeconds(retryAt);
   const headers = {
     'content-type': 'application/json',
     'x-claude-rotator-account': account?.id || '',
     'x-claude-rotator-quota-window': reason.window || '',
   };
-  if (claim) {
-    headers['anthropic-ratelimit-unified-status'] = 'rejected';
-    headers['anthropic-ratelimit-unified-representative-claim'] = claim;
-  }
+  // A five-hour rejection hold (only while that window is off) is answered as
+  // a plain rejection: no claim and no window headers name the five-hour window.
+  if (claim || reason.quotaRejected === true) headers['anthropic-ratelimit-unified-status'] = 'rejected';
+  if (claim) headers['anthropic-ratelimit-unified-representative-claim'] = claim;
   if (resetSeconds) headers['anthropic-ratelimit-unified-reset'] = resetSeconds;
   if (windowHeader) {
     headers[`anthropic-ratelimit-unified-${windowHeader}-utilization`] = String(reason.utilization ?? 1);
-    if (resetSeconds) headers[`anthropic-ratelimit-unified-${windowHeader}-reset`] = resetSeconds;
+    if (windowResetSeconds && retryAt != null) headers[`anthropic-ratelimit-unified-${windowHeader}-reset`] = windowResetSeconds;
   }
 
-  const rotatorMessage = quotaExhaustedRotatorMessage(account, reason);
+  const retryReason = ownReset || retryAt == null ? { ...reason, resetAt: retryAt } : { ...reason, window: null, resetAt: retryAt };
+  const rotatorMessage = ownReset || retryAt == null
+    ? quotaExhaustedRotatorMessage(account, retryReason)
+    : quotaExhaustedRotatorMessage(account, reason)
+      .replace(/ No available rotation target\.$/, ` No account is usable before ${retryAt}.`);
   return {
     statusCode: 429,
     headers,
@@ -5149,14 +5178,14 @@ function syntheticQuotaExhaustedResponse(account, reason) {
       type: 'error',
       error: {
         type: 'rate_limit_error',
-        message: quotaExhaustedOfficialMessage(reason),
+        message: quotaExhaustedOfficialMessage(retryReason),
         details: {
           source: 'claude-rotator',
           account: account?.id || null,
           account_name: account?.name || null,
           window: reason.window,
           utilization: reason.utilization,
-          reset_at: reason.resetAt || null,
+          reset_at: retryAt || null,
           rotator_message: rotatorMessage,
         },
       },
@@ -5196,7 +5225,8 @@ function quotaExhaustedOfficialMessage(reason) {
 
 function quotaExhaustedRotatorMessage(account, reason) {
   const reset = reason.resetAt ? ` Resets at ${reason.resetAt}.` : '';
-  return `Claude ${reason.window} usage limit exhausted for ${account?.name || account?.id || 'current account'}.${reset} No available rotation target.`;
+  const window = reason.window ? `${reason.window} ` : '';
+  return `Claude ${window}usage limit exhausted for ${account?.name || account?.id || 'current account'}.${reset} No available rotation target.`;
 }
 
 function formatClaudeResetTime(window, resetAt) {
@@ -5271,6 +5301,8 @@ function buildObservationLog({
   observability,
   requestEffort = null,
   headersMs = null,
+  // false leaves the five-hour fields out of the line (see observationLogFields).
+  fiveHourWindow = true,
 }) {
   const quota = parseRateLimitHeaders(upstreamResponse.headers);
   // 既定では要求本文を読まない。本文は数百 KB〜数 MB あり、JSON.parse の追加1回が
@@ -5311,6 +5343,7 @@ function buildObservationLog({
     effort: requestEffort?.effort ?? null,
     effortMsg: requestEffort?.effortMsg ?? null,
     headersMs,
+    ...(fiveHourWindow ? {} : { fiveHourWindow: false }),
   };
 }
 
@@ -5586,12 +5619,14 @@ function sendUnavailableAccounts(res, accountManager = null, exhaustionMapper = 
   }
   const quotaCandidates = optionalQuota ? accountManager.accounts
     .filter(account => account.status !== 'error' && !accountManager.hasCredentialRefreshCooldown(account))
-    .map(account => ({ account, reason: accountManager.unavailableReasonForModelFamily(account, modelFamily) })) : [];
+    .map(account => ({ account, reason: accountManager.exhaustedReasonForModelFamily(account, modelFamily) })) : [];
   const quotaOnly = quotaCandidates.length > 0 && quotaCandidates.every(candidate => isUnifiedQuotaExhaustion(candidate.reason));
   const quotaTarget = quotaOnly ? quotaCandidates.sort((a, b) =>
     (finiteQuotaReset(a.reason.resetAt) ?? Number.MAX_SAFE_INTEGER)
     - (finiteQuotaReset(b.reason.resetAt) ?? Number.MAX_SAFE_INTEGER))[0] : null;
-  const quotaResponse = quotaTarget ? syntheticQuotaExhaustedResponse(quotaTarget.account, quotaTarget.reason) : null;
+  const quotaResponse = quotaTarget ? syntheticQuotaExhaustedResponse(quotaTarget.account, quotaTarget.reason, {
+    resumeAt: accountManager.earliestUsableAt(modelFamily),
+  }) : null;
   if (!quotaResponse && sendQuotaRecoveryWait(res, accountManager, modelFamily)) return;
   // P-d の写像入口。全滅時の終端は、稼働口座
   // ／固定先の個別 state（枯渇・認証失敗・資格情報 cooldown）に依らず必ずここを通す。

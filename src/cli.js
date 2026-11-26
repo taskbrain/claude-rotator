@@ -16,6 +16,7 @@ import { attachDriftWatch } from './drift-watch.js';
 import {
   createDefaultConfig,
   DEFAULT_PORT,
+  fiveHourWindowSetting,
   getConfigPath,
   loadConfig,
   loadOrCreateConfig,
@@ -413,6 +414,12 @@ async function runServer({ write }) {
   // server 全体で使う logger はこれ1つ。
   const driftLink = attachDriftWatch({ baseLogger });
   const logger = driftLink.logger;
+  // The five-hour window is off unless the configuration says exactly
+  // `enabled: true`. The ledger and the proxy are on when told nothing, so the
+  // setting is passed to both explicitly, here and on every reload.
+  const readFiveHourWindow = nextConfig => fiveHourWindowSetting(nextConfig?.fiveHourWindow, {
+    onInvalid: () => logger('five-hour-window warning=invalid-enabled enabled=false'),
+  });
   const secretStore = createSecretStore();
   const accountManager = new AccountManager({
     accounts: config.accounts,
@@ -421,6 +428,7 @@ async function runServer({ write }) {
     rotationPolicy: config.rotationPolicy,
     accountUrgency: config.accountUrgency,
     planQuota: config.planQuota,
+    fiveHourWindow: readFiveHourWindow(config),
     logger,
     // 切替履歴（`events`）を保存・復元し上限50件を適用するかどうか。
     // **復元は下の `restoreRuntimeState` で起きるので、その前に決めておく
@@ -484,6 +492,7 @@ async function runServer({ write }) {
     reloadAccountUrgency: () => loadConfig().then(nextConfig => nextConfig?.accountUrgency),
     reloadPlanQuota: () => loadConfig().then(nextConfig => nextConfig?.planQuota),
     reloadFableQuotaCompat: () => loadConfig().then(nextConfig => nextConfig?.fableQuotaCompat),
+    reloadFiveHourWindow: () => loadConfig().then(readFiveHourWindow),
     // logMaxBytes だけは reload では効かない（fd は起動時に開くため。README に明記）。
     reloadObservability: () => loadConfig().then(nextConfig => nextConfig?.observability),
     logger,

@@ -377,6 +377,9 @@ function parseJson(text) {
 export function observationLogFields(observationLog, affinityLog = null) {
   if (!observationLog) return '';
   const quota = observationLog.quota || {};
+  // `fiveHourWindow: false` (the five-hour window is off) leaves out u5h=,
+  // u5hReset= and g5h=, and a five-hour grace value alone adds no grace fields.
+  const fiveHour = observationLog.fiveHourWindow !== false;
   const fields = [`model=${logToken(observationLog.model)}`];
   if (!affinityLog?.sid) fields.push(`sid=${observationLog.sid || '-'}`);
   fields.push(
@@ -386,8 +389,7 @@ export function observationLogFields(observationLog, affinityLog = null) {
     `cc=${observationLog.cacheCreationTokens ?? 0}`,
     `c1h=${observationLog.cacheCreation1hTokens ?? 0}`,
     `c5m=${observationLog.cacheCreation5mTokens ?? 0}`,
-    `u5h=${numberOrDash(quota.unified5h)}`,
-    `u5hReset=${numberOrDash(quota.unified5hReset)}`,
+    ...(fiveHour ? [`u5h=${numberOrDash(quota.unified5h)}`, `u5hReset=${numberOrDash(quota.unified5hReset)}`] : []),
     `u7d=${numberOrDash(quota.unified7d)}`,
     `u7dReset=${numberOrDash(quota.unified7dReset)}`,
     `enc=${logToken(observationLog.encoding)}`,
@@ -398,9 +400,9 @@ export function observationLogFields(observationLog, affinityLog = null) {
   // 猶予（usage-limit grace）ヘッダが来た応答だけ末尾へ足す。g5h/g7d がどちらも
   // null なら何も足さず、行は現行とバイト同一になる（追記は必ず末尾へ）。
   const grace = observationLog.grace;
-  if (grace && (grace.g5h != null || grace.g7d != null)) {
+  if (grace && ((fiveHour && grace.g5h != null) || grace.g7d != null)) {
     fields.push(
-      `g5h=${numberOrDash(grace.g5h)}`,
+      ...(fiveHour ? [`g5h=${numberOrDash(grace.g5h)}`] : []),
       `g7d=${numberOrDash(grace.g7d)}`,
       `ustat=${logToken(grace.ustat)}`,
       `ovs=${logToken(grace.ovs)}`,

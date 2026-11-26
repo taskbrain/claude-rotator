@@ -65,6 +65,29 @@ export async function saveConfig(config, path = getConfigPath()) {
   await writeJsonFile(path, config);
 }
 
+/**
+ * The `fiveHourWindow` section of a loaded configuration, as the server passes
+ * it on. The product default is off: an absent section, or a section without
+ * `enabled`, gives `{ enabled: false }`. A section that is not an object, or an
+ * `enabled` that is not a boolean, also gives `{ enabled: false }` and calls
+ * `onInvalid` once. The loaded configuration itself is not changed, so saving
+ * it back never adds the section.
+ *
+ * @param {unknown} raw `config.fiveHourWindow`
+ * @param {{ onInvalid?: () => void }} [options]
+ * @returns {{ enabled: boolean }}
+ */
+export function fiveHourWindowSetting(raw, { onInvalid = null } = {}) {
+  if (raw == null) return { enabled: false };
+  const malformed = typeof raw !== 'object' || Array.isArray(raw)
+    || (Object.hasOwn(raw, 'enabled') && typeof raw.enabled !== 'boolean');
+  if (malformed) {
+    onInvalid?.();
+    return { enabled: false };
+  }
+  return { enabled: raw.enabled === true };
+}
+
 export function proxyBaseUrl(config) {
   const host = proxyListenHost(config);
   const port = config.proxy?.port || DEFAULT_PORT;

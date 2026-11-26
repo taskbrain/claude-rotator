@@ -4,6 +4,8 @@ import { QuotaRecovery } from './quota-recovery.js';
 import {
   emptyQuota,
   fableQuotaCompatMode,
+  fiveHourWindowEnabled,
+  responseHeader,
   normalizeWeeklyScopedUsage,
   normalizeWeeklyScopedObservations,
   parseRateLimitHeaders,
@@ -83,6 +85,9 @@ export class AccountManager {
     accountUrgency = null,
     planQuota = null,
     fableQuotaCompat = null,
+    // `{ enabled: false }` turns the five-hour window off. Omitted, it is on;
+    // the product default (off) comes from the configuration file reader.
+    fiveHourWindow = null,
     logger = null,
     // Keep `events` as a bounded, persisted history.
     // The ledger is told nothing about session affinity - not the instance, not
@@ -102,6 +107,8 @@ export class AccountManager {
     this.stateListener = null;
     this.events = [];
     this.quotaHeaderRejectRecordedAt = new Map();
+    this.fiveHourWindowEnabled = true;
+    this.fiveHourSignalDays = new Map();
     this.accounts = accounts.map((account, index) => this.createAccount(account, index));
     const configuredIndex = currentAccountId
       ? this.accounts.findIndex(account => account.id === currentAccountId || account.name === currentAccountId)
@@ -115,6 +122,87 @@ export class AccountManager {
     this.configureAccountUrgency(accountUrgency);
     this.configurePlanQuota(planQuota);
     this.configureFableQuotaCompat(fableQuotaCompat);
+    this.configureFiveHourWindow(fiveHourWindow);
+  }
+
+  // `fiveHourWindow` for this ledger. While it is off the five-hour window is
+  // treated as absent: no reading of it is kept, judged, shown or saved. An
+  // upstream 429 that the window explains is still honored, as a short-term
+  // hold (see `holdFiveHourRejection`). Turning the window off drops the
+  // readings held in memory, turning a known used-up window into such a hold
+  // so the account does not come back before its reset; turning it on starts
+  // from nothing. Returns whether it is on.
+  configureFiveHourWindow(raw) {
+    const enabled = fiveHourWindowEnabled(raw);
+    if (this.fiveHourWindowEnabled && !enabled) {
+      for (const account of this.accounts) {
+        // Only a used-up reading whose reset is still ahead becomes a hold.
+        if (isValidQuotaWindow(account.quota.unified5h, account.quota.unified5hReset, this.now())
+          && this.fiveHourUsedUp(account.quota.unified5h)) {
+          this.holdFiveHourRejection(account, account.quota.unified5hReset);
+        }
+        account.quota.unified5h = null;
+        account.quota.unified5hReset = null;
+        if (account.windowObservations) delete account.windowObservations['5h'];
+      }
+      this.urgency?.forgetFiveHour();
+    }
+    this.fiveHourWindowEnabled = enabled;
+    if (this.urgency) this.urgency.fiveHourWindow = enabled;
+    return enabled;
+  }
+
+  // While the window is off, a five-hour reading from the upstream is a sign
+  // that the window may be back. It is logged at most once per account per UTC
+  // day, with the account as a hash and without the value.
+  noteFiveHourSignal(account, source) {
+    const at = new Date(this.now()).toISOString();
+    const day = at.slice(0, 10);
+    if (this.fiveHourSignalDays.get(account.id) === day) return;
+    this.fiveHourSignalDays.set(account.id, day);
+    const hash = createHash('sha256').update(String(account.id)).digest('hex').slice(0, 12);
+    try { this.logger?.(`${at} five_hour_signal_while_disabled account=${hash} source=${source}`); } catch {}
+  }
+
+  // A five-hour utilization at or over the ledger's stop line.
+  fiveHourUsedUp(utilization) {
+    return Number.isFinite(utilization) && utilization >= this.switchThreshold;
+  }
+
+  /**
+   * Keeps an upstream rejection that the five-hour window explains as a
+   * short-term hold (`rateLimitedUntil`) while the window is off. The hold
+   * lasts until `resetAt` when that is still ahead, otherwise for
+   * `fallbackSeconds`. A longer hold already in place is kept. The reason is
+   * the ordinary short-term one, marked `quotaRejected` so the legacy selector
+   * moves off the account as it does for a used-up window. It is saved and
+   * restored with the rest of the account state.
+   */
+  holdFiveHourRejection(account, resetAt, fallbackSeconds = 60) {
+    const now = this.now();
+    const until = Number.isFinite(resetAt) && resetAt > now ? resetAt : now + fallbackSeconds * 1000;
+    if (account.rateLimitedUntil >= until) return;
+    this.markTemporaryUnavailable(account.id, Math.ceil((until - now) / 1000),
+      { type: 'temporary_throttle', quotaRejected: true }, { eventType: 'throttled' });
+  }
+
+  /**
+   * A Usage API payload as this ledger may read it. While the five-hour window
+   * is off its `five_hour` bucket is removed, and a number in it is logged as a
+   * signal. When the payload confirms an upstream 429 (`upstreamRateLimited`)
+   * and the bucket shows the window used up, the rejection is held until the
+   * bucket's reset. Every other key, and the payload itself when the window is
+   * on, is returned unchanged.
+   */
+  screenFiveHourUsage(account, payload, upstreamRateLimited = false) {
+    if (this.fiveHourWindowEnabled || !payload || typeof payload !== 'object'
+      || !Object.hasOwn(payload, 'five_hour')) return payload;
+    const bucket = payload.five_hour;
+    const resetAt = parseUsageReset(bucket?.resets_at);
+    if (Number.isFinite(bucket?.utilization) || Number.isFinite(resetAt)) this.noteFiveHourSignal(account, 'usage');
+    if (upstreamRateLimited && this.fiveHourUsedUp(bucket?.utilization)) this.holdFiveHourRejection(account, resetAt);
+    const { five_hour: _ignored, ...rest } = payload;
+    return rest;
   }
 
   // `fableQuotaCompat` for this ledger only, copied onto every account like
@@ -153,7 +241,8 @@ export class AccountManager {
 
   observePlanQuota(account, fields, source) {
     if (this.planQuotaMode === 'off' && !this.urgency) return;
-    account.windowObservations = observeQuotaWindows(account.windowObservations, fields, this.now(), source);
+    account.windowObservations = observeQuotaWindows(account.windowObservations, fields, this.now(), source,
+      this.fiveHourWindowEnabled);
   }
 
   quotaWindowsStatus() {
@@ -161,7 +250,8 @@ export class AccountManager {
       schemaVersion: 1, mode: this.planQuotaMode, generatedAt: this.now(),
       accounts: this.accounts.map(account => ({
         accountId: account.id,
-        windows: quotaWindowsView(account.quota, account.windowObservations, this.now(), account.fableQuotaCompat),
+        windows: quotaWindowsView(account.quota, account.windowObservations, this.now(), account.fableQuotaCompat,
+          this.fiveHourWindowEnabled),
       })),
     };
   }
@@ -169,7 +259,8 @@ export class AccountManager {
   configureAccountUrgency(raw) {
     const mode = urgencyMode(raw);
     if (mode === 'off') this.urgency = null;
-    else if (!this.urgency) this.urgency = new AccountUrgency({ mode, now: this.now, logger: this.logger });
+    else if (!this.urgency) this.urgency = new AccountUrgency({ mode, now: this.now, logger: this.logger,
+      fiveHourWindow: this.fiveHourWindowEnabled });
     else if (this.urgency.mode !== mode) {
       this.urgency.mode = mode;
       this.urgency.notified.clear();
@@ -412,7 +503,8 @@ export class AccountManager {
 
     const reason = this.unavailableReason(current);
     if (current?.status === 'error' || this.hasCredentialRefreshCooldown(current)
-      || (current && this.quotaRecovery?.isHeld(this.quotaRecoveryKey(current)))) {
+      || (current && this.quotaRecovery?.isHeld(this.quotaRecoveryKey(current)))
+      || isQuotaRejectionHold(current, this.now())) {
       const next = this.selectBestAvailableSwitchTarget(modelFamily, { trigger });
       if (next) {
         next.status = 'active';
@@ -479,12 +571,39 @@ export class AccountManager {
     });
   }
 
-  updateQuota(accountId, headers, { atomicUnifiedWindows = false, recoveryStatus = null } = {}) {
+  /**
+   * @param {{ atomicUnifiedWindows?: boolean, recoveryStatus?: number|null, upstreamRateLimited?: boolean }} [options]
+   *   `upstreamRateLimited` is true when these headers came with an upstream
+   *   429. While the five-hour window is off no five-hour reading is kept; a
+   *   429 that the window explains (its utilization at the stop line, or a
+   *   `five_hour` rejection claim) holds the account until the five-hour reset,
+   *   else the response's unified reset, else `retry-after` (60 s without it).
+   */
+  updateQuota(accountId, headers, { atomicUnifiedWindows = false, recoveryStatus = null, upstreamRateLimited = false } = {}) {
     const account = this.find(accountId);
+    const fiveHour = this.fiveHourWindowEnabled;
     const parsed = parseRateLimitHeaders(headers, {
-      onInvalid: rejected => this.recordQuotaHeaderRejected(account, rejected),
+      onInvalid: rejected => {
+        if (fiveHour || rejected.key !== 'unified5h') this.recordQuotaHeaderRejected(account, rejected);
+      },
       includeScopedWindows: this.planQuotaMode !== 'off' || this.urgency !== null,
     });
+    if (!fiveHour) {
+      const claimed = parsed.unifiedStatus === 'rejected'
+        && responseHeader(headers, 'anthropic-ratelimit-unified-representative-claim')?.trim().toLowerCase() === 'five_hour';
+      if (Number.isFinite(parsed.unified5h) || Number.isFinite(parsed.unified5hReset) || claimed) {
+        this.noteFiveHourSignal(account, 'header');
+      }
+      if (upstreamRateLimited && (claimed || this.fiveHourUsedUp(parsed.unified5h))) {
+        const unifiedReset = Number.parseInt(responseHeader(headers, 'anthropic-ratelimit-unified-reset'), 10) * 1000;
+        const retryAfter = Number.parseInt(responseHeader(headers, 'retry-after'), 10);
+        this.holdFiveHourRejection(account,
+          Number.isFinite(parsed.unified5hReset) && parsed.unified5hReset > this.now() ? parsed.unified5hReset : unifiedReset,
+          Number.isFinite(retryAfter) && retryAfter > 0 ? retryAfter : 60);
+      }
+      delete parsed.unified5h;
+      delete parsed.unified5hReset;
+    }
     if (recoveryStatus !== null && (recoveryStatus < 200 || recoveryStatus >= 300)) {
       const threshold = Math.min(URGENCY_THRESHOLD, this.configuredSwitchThreshold);
       for (const [value, reset] of [['unified5h', 'unified5hReset'], ['unified7d', 'unified7dReset']]) {
@@ -541,8 +660,11 @@ export class AccountManager {
     });
   }
 
-  applyUsage(accountId, payload) {
+  // `upstreamRateLimited` is true when the payload was fetched to confirm an
+  // upstream 429 (see `screenFiveHourUsage`).
+  applyUsage(accountId, usagePayload, { upstreamRateLimited = false } = {}) {
     const account = this.find(accountId);
+    const payload = this.screenFiveHourUsage(account, usagePayload, upstreamRateLimited);
     this.markAuthenticated(account);
     let utilizationUpdated = false;
     const atomicUsage = this.planQuotaMode === 'on' || this.urgency?.mode === 'on';
@@ -883,6 +1005,8 @@ export class AccountManager {
       currentAccount: active?.id || null,
       currentAccountName: active?.name || null,
       switchThreshold: this.switchThreshold,
+      // Present only while the window is off, so the on shape is unchanged.
+      ...(this.fiveHourWindowEnabled ? {} : { fiveHourWindow: { enabled: false } }),
       routingAvailability: {
         fable: this.getRoutingAvailability('fable'),
         other: this.getRoutingAvailability(null),
@@ -1031,6 +1155,13 @@ export class AccountManager {
       }
       account.windowObservations = credentialIdentityChanged || (this.planQuotaMode === 'off' && !this.urgency)
         ? {} : restoreQuotaWindowObservations(saved.windowObservations);
+      // A saved five-hour reading is never read back while the window is off;
+      // the next save writes it as absent.
+      if (!this.fiveHourWindowEnabled) {
+        account.quota.unified5h = null;
+        account.quota.unified5hReset = null;
+        delete account.windowObservations['5h'];
+      }
       account.usage = credentialIdentityChanged ? emptyAccountUsage() : restoreUsage(saved.usage);
       account.rateLimitedUntil = credentialIdentityChanged
         ? null
@@ -1069,8 +1200,13 @@ export class AccountManager {
         const pending = state.quotaRecovery.pending;
         const account = this.accounts.find(entry => this.quotaRecoveryKey(entry) === pending.accountHash);
         const info = account ? this.quotaRecovery.inspect(pending.accountHash, this.quotaRecoveryIdentity(account)) : null;
-        if (account && info.nextAllowedAt > this.now()) {
-          this.markRateLimited(account.id, Math.ceil((info.nextAllowedAt - this.now()) / 1000));
+        // A restored hold that already lasts longer is kept, with its reason.
+        if (account && info.nextAllowedAt > this.now() && !(account.rateLimitedUntil >= info.nextAllowedAt)) {
+          const seconds = Math.ceil((info.nextAllowedAt - this.now()) / 1000);
+          if (isQuotaRejectionHold(account, this.now())) {
+            this.markTemporaryUnavailable(account.id, seconds, { ...account.temporaryUnavailableReason },
+              { eventType: 'throttled', retryAfterSeconds: seconds });
+          } else this.markRateLimited(account.id, seconds);
         }
       }
     }
@@ -1116,13 +1252,19 @@ export class AccountManager {
       });
     }
 
-    const selected = this.bestExhaustedFallbackCandidate();
+    // A resumed session's model is not known here, so it is judged as a
+    // non-Fable request: a Fable-only limit never delays it.
+    const selected = this.bestExhaustedFallbackCandidate({ modelFamily: null });
     if (!selected) {
       return this.emptyResumeTarget('no-resume-target');
     }
 
     const account = this.switchToExhaustedFallbackCandidate(selected, 'prepare-resume');
-    const resetAt = finiteResetAt(selected.score.resetAt);
+    const unavailableReason = this.exhaustedReasonForModelFamily(account, null);
+    // The resume time is when the first account is usable again, kept apart
+    // from the shown account's own reset: it is never shortened by that reset,
+    // and a reset that is unknown or already past never makes it 'ready'.
+    const resetAt = this.earliestUsableAt(null);
     if (resetAt == null) {
       return this.resumeTarget({
         account,
@@ -1130,7 +1272,7 @@ export class AccountManager {
         reason: 'quota-reset-unknown',
         resumeAt: null,
         switched: previousId !== account.id,
-        unavailableReason: this.unavailableReason(account),
+        unavailableReason,
       });
     }
 
@@ -1140,7 +1282,7 @@ export class AccountManager {
       reason: 'shortest-quota-reset',
       resumeAt: resetAt,
       switched: previousId !== account.id,
-      unavailableReason: this.unavailableReason(account),
+      unavailableReason,
     });
   }
 
@@ -1223,15 +1365,21 @@ export class AccountManager {
     return selected.account;
   }
 
-  selectBestExhaustedFallback({ trigger = 'unknown' } = {}) {
-    const selected = this.bestExhaustedFallbackCandidate();
+  selectBestExhaustedFallback({ trigger = 'unknown', modelFamily } = {}) {
+    const selected = this.bestExhaustedFallbackCandidate({ modelFamily });
     if (!selected) return null;
     return this.switchToExhaustedFallbackCandidate(selected, trigger);
   }
 
-  bestExhaustedFallbackCandidate() {
+  /**
+   * @param {{modelFamily?: string|null}} options Without `modelFamily`, every
+   *   used-up window counts (the family-agnostic reason). With it ('fable' or
+   *   null), only the windows that apply to that model count, and an account is
+   *   ranked by when it is usable again for that model.
+   */
+  bestExhaustedFallbackCandidate({ modelFamily } = {}) {
     const candidates = this.accounts
-      .map((account, index) => ({ account, index, score: this.exhaustedFallbackScore(account) }))
+      .map((account, index) => ({ account, index, score: this.exhaustedFallbackScore(account, modelFamily) }))
       .filter(candidate => candidate.score);
 
     candidates.sort((left, right) => compareExhaustedFallbackScores(left, right));
@@ -1353,13 +1501,18 @@ export class AccountManager {
     };
   }
 
-  exhaustedFallbackScore(account) {
+  exhaustedFallbackScore(account, modelFamily) {
     if (this.hasCredentialRefreshCooldown(account)) return null;
-    const reason = this.unavailableReason(account);
+    const reason = modelFamily === undefined
+      ? this.unavailableReason(account)
+      : this.exhaustedReasonForModelFamily(account, modelFamily);
     if (!isUnifiedQuotaExhaustion(reason)) return null;
     const resetAt = reason.resetAt ? Date.parse(reason.resetAt) : null;
+    // Ranked per model, a reset that has passed while the window still reads
+    // used up says nothing about when the account is back, like an unknown one.
+    const knownReset = Number.isFinite(resetAt) && (modelFamily === undefined || resetAt > this.now());
     return {
-      resetAt: Number.isFinite(resetAt) ? resetAt : Number.MAX_SAFE_INTEGER,
+      resetAt: knownReset ? resetAt : Number.MAX_SAFE_INTEGER,
       utilization: typeof reason.utilization === 'number' ? reason.utilization : Number.MAX_SAFE_INTEGER,
       windowRank: reason.window === '5h' ? 0 : 1,
       priority: account.priority ?? Number.MAX_SAFE_INTEGER,
@@ -1380,6 +1533,9 @@ export class AccountManager {
     if (this.hasCredentialRefreshCooldown(account)) return false;
     if (account.status === 'throttled') return false;
     if (account.status === 'error') return false;
+    // A five-hour rejection hold is honored on every policy and for every
+    // model, also when a scoped exhaustion masks the throttled status.
+    if (isQuotaRejectionHold(account, this.now())) return false;
     // Scoped exhaustion can mask the throttled status. On policies must honor
     // an upstream short-term hold for every model; off/shadow keep legacy routing.
     if ((this.planQuotaMode === 'on' || this.urgency?.mode === 'on' || this.quotaRecovery)
@@ -1449,13 +1605,20 @@ export class AccountManager {
     }
     const quotaReason = quotaUnavailableReason(account.quota, this.switchThreshold);
     if (quotaReason) return quotaReason;
-    if (account.rateLimitedUntil && this.now() < account.rateLimitedUntil) {
-      return {
-        ...(account.temporaryUnavailableReason || { type: 'temporary_throttle' }),
-        retryAt: new Date(account.rateLimitedUntil).toISOString(),
-      };
-    }
-    return null;
+    return this.temporaryUnavailable(account);
+  }
+
+  // The short-term reason while `rateLimitedUntil` is ahead, else null. A
+  // five-hour rejection hold also names its end as `resetAt`, so it is read as
+  // a used-up limit (see `isUnifiedQuotaExhaustion`) without naming a window.
+  temporaryUnavailable(account) {
+    if (!account.rateLimitedUntil || this.now() >= account.rateLimitedUntil) return null;
+    const retryAt = new Date(account.rateLimitedUntil).toISOString();
+    return {
+      ...(account.temporaryUnavailableReason || { type: 'temporary_throttle' }),
+      retryAt,
+      ...(isQuotaRejectionHold(account, this.now()) ? { resetAt: retryAt } : {}),
+    };
   }
 
   hasCredentialRefreshCooldown(account) {
@@ -1484,13 +1647,71 @@ export class AccountManager {
     const quotaReason = quotaUnavailableReasonForModelFamily(account.quota, this.switchThreshold, modelFamily,
       account.extendedQuotaScopes, account.fableQuotaCompat);
     if (quotaReason) return quotaReason;
-    if (account.rateLimitedUntil && this.now() < account.rateLimitedUntil) {
-      return {
-        ...(account.temporaryUnavailableReason || { type: 'temporary_throttle' }),
-        retryAt: new Date(account.rateLimitedUntil).toISOString(),
-      };
+    return this.temporaryUnavailable(account);
+  }
+
+  /**
+   * The reason an account cannot take a `modelFamily` request, naming the
+   * latest end among what blocks it: a used-up window that applies to that
+   * model, or a five-hour rejection hold that ends later than it.
+   */
+  exhaustedReasonForModelFamily(account, modelFamily = null) {
+    const reason = this.unavailableReasonForModelFamily(account, modelFamily);
+    if (!reason || reason.quotaRejected === true || account.status === 'error') return reason;
+    const hold = isQuotaRejectionHold(account, this.now()) ? this.temporaryUnavailable(account) : null;
+    if (!hold || !isUnifiedQuotaExhaustion(reason)) return reason;
+    const reasonEnd = Date.parse(reason.resetAt || '');
+    // A window whose reset is unknown stays the reason: the hold's end is not
+    // when that window is back.
+    return !Number.isFinite(reasonEnd) || reasonEnd >= account.rateLimitedUntil ? reason : hold;
+  }
+
+  /**
+   * When the first account becomes usable again for a `modelFamily` request.
+   * For each account it takes the latest end of what blocks it: every used-up
+   * window that applies to that model (at the threshold the selector uses), and
+   * any short-term hold, plain or five-hour. The earliest of those across
+   * accounts is returned, or null when none is known.
+   *
+   * Left out, because time alone does not bring them back: an error, a
+   * credential cooldown, a recovery probe, a used-up window whose reset is
+   * unknown or already past (it needs a new reading), an account with nothing
+   * timed to wait for, and, while accountUrgency or planQuota is on, an account
+   * whose weekly reading the selector cannot use (missing, explicit null or
+   * invalid).
+   */
+  earliestUsableAt(modelFamily = null) {
+    const now = this.now();
+    const policyOn = this.urgency?.mode === 'on' || this.planQuotaMode === 'on';
+    const threshold = this.switchThreshold;
+    let earliest = null;
+    for (const account of this.accounts) {
+      this.refreshQuotaState(account);
+      if (account.status === 'error' || this.hasCredentialRefreshCooldown(account)) continue;
+      if (this.quotaRecovery?.isHeld(this.quotaRecoveryKey(account))) continue;
+      const windowEnds = blockingQuotaWindowEnds(account.quota, threshold, modelFamily, account.extendedQuotaScopes,
+        account.fableQuotaCompat);
+      if (windowEnds.some(end => !Number.isFinite(end) || end <= now)) continue;
+      const ends = [...windowEnds];
+      if (account.rateLimitedUntil > now) ends.push(account.rateLimitedUntil);
+      if (ends.length === 0) continue;
+      if (policyOn && !this.hasUsableWeeklyReading(account, modelFamily)) continue;
+      const usableAt = Math.max(...ends);
+      if (earliest == null || usableAt < earliest) earliest = usableAt;
     }
-    return null;
+    return earliest;
+  }
+
+  // Whether the selector, once the timed blocks end, can read this account's
+  // weekly window for `modelFamily`: a value is held and no reading of it, or
+  // of a matching scoped window, is an explicit null or invalid.
+  hasUsableWeeklyReading(account, modelFamily = null) {
+    if (!Number.isFinite(account.quota.unified7d)) return false;
+    return Object.entries(account.windowObservations || {}).every(([id, observation]) => {
+      if (id !== '7d' && !(id.startsWith('7d_')
+        && scopeMatchesModelFamily({ key: id.slice(3) }, modelFamily, true, account.fableQuotaCompat))) return true;
+      return !['explicit_null', 'invalid'].includes(observation?.observationState);
+    });
   }
 
   autoSwitchReason(account) {
@@ -1662,8 +1883,14 @@ export class AccountManager {
    */
   assignmentHeadroomFor(account, modelFamily = null) {
     if (!account) return { min: null, complete: false };
-    return assignmentHeadroom(account.quota || {}, modelFamily, this.now(), this.planQuotaMode === 'on', account.extendedQuotaScopes,
-      account.fableQuotaCompat);
+    return assignmentHeadroom(account.quota || {}, modelFamily, this.now(), this.optionalFiveHourHeadroom(),
+      account.extendedQuotaScopes, account.fableQuotaCompat);
+  }
+
+  // A missing five-hour reading does not make the headroom incomplete when the
+  // weekly policy is on, nor while the five-hour window is off.
+  optionalFiveHourHeadroom() {
+    return this.planQuotaMode === 'on' || !this.fiveHourWindowEnabled;
   }
 
   /**
@@ -1733,7 +1960,7 @@ export class AccountManager {
     return {
       account,
       index,
-      headroom: assignmentHeadroom(quota, modelFamily, now, this.planQuotaMode === 'on', account.extendedQuotaScopes,
+      headroom: assignmentHeadroom(quota, modelFamily, now, this.optionalFiveHourHeadroom(), account.extendedQuotaScopes,
         account.fableQuotaCompat),
       // K1: how much of the 5h window this account has actually
       // burned, not how much is left on its tightest window. `headroom.min` can be
@@ -1977,10 +2204,24 @@ export function quotaUnavailableReasonForModelFamily(quota, threshold, modelFami
   return null;
 }
 
+// A five-hour rejection hold (`quotaRejected`, only while that window is off)
+// counts as a used-up limit too, so it is answered and waited for like one,
+// without a window name.
 export function isUnifiedQuotaExhaustion(reason) {
   return ['token_rate_limit_exhausted', 'request_rate_limit_exhausted'].includes(reason?.type)
     || (reason?.type === 'quota_exhausted'
-      && (['5h', '7d'].includes(reason.window) || String(reason.window || '').startsWith('7d ')));
+      && (['5h', '7d'].includes(reason.window) || String(reason.window || '').startsWith('7d ')))
+    || reason?.quotaRejected === true;
+}
+
+/**
+ * True while the account is on the short-term hold that an upstream 429
+ * explained by the five-hour window leaves while that window is off (see
+ * `holdFiveHourRejection`).
+ */
+export function isQuotaRejectionHold(account, now) {
+  return account?.temporaryUnavailableReason?.quotaRejected === true
+    && Number.isFinite(account.rateLimitedUntil) && account.rateLimitedUntil > now;
 }
 
 export function isCredentialRefreshCooldown(reason) {
@@ -2486,6 +2727,24 @@ function normalizeRotationPolicy(policy) {
 
 function finiteNumberOrNull(value) {
   return typeof value === 'number' && Number.isFinite(value) ? value : null;
+}
+
+// The reset (ms, NaN when unknown) of every window of `quota` at or over
+// `threshold` that blocks a `modelFamily` request, matching scoped windows the
+// way the selector does (`extended` as in `quotaBlocksModelFamily`).
+function blockingQuotaWindowEnds(quota, threshold, modelFamily, extended = false, fableCompat = false) {
+  const toMs = value => (typeof value === 'number' ? value : Date.parse(value ?? ''));
+  const ends = [];
+  if (quota.unified5h != null && quota.unified5h >= threshold) ends.push(toMs(quota.unified5hReset));
+  if (quota.unified7d != null && quota.unified7d >= threshold) ends.push(toMs(quota.unified7dReset));
+  for (const limit of quota.weeklyScoped || []) {
+    if (!limit || typeof limit.utilization !== 'number' || limit.utilization < threshold) continue;
+    if (scopeMatchesModelFamily(limit, modelFamily, extended, fableCompat)) ends.push(toMs(limit.resetAt));
+  }
+  for (const [limit, remaining] of [[quota.tokensLimit, quota.tokensRemaining], [quota.requestsLimit, quota.requestsRemaining]]) {
+    if (limit != null && remaining != null && 1 - remaining / limit >= threshold) ends.push(toMs(quota.resetsAt));
+  }
+  return ends;
 }
 
 function finiteResetAt(value) {

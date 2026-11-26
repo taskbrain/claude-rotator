@@ -136,9 +136,11 @@ function renderAccountCard(account, status, now) {
   if (reason) lines.push(`reason: ${reason}`);
   const five = status.quotaWindows?.accounts?.find(row => row.accountId === account.id)?.windows?.find(window => window.id === '5h')
     || status.accountUrgency?.accounts?.find(row => row.accountId === account.id)?.fiveHour;
-  if (five?.applicability === 'unknown') {
+  // A proxy with the five-hour window off says so; it gets no 5h row at all.
+  const showFive = status.fiveHourWindow?.enabled !== false;
+  if (showFive && five?.applicability === 'unknown') {
     lines.push(`5h unknown (${five.observationState})${five.retainedConstraint ? ' - previous constraint retained' : ''}`);
-  } else lines.push(renderQuotaRow('5h', account.quota?.unified5h, account.quota?.unified5hReset, now));
+  } else if (showFive) lines.push(renderQuotaRow('5h', account.quota?.unified5h, account.quota?.unified5hReset, now));
   lines.push(renderQuotaRow('7d', account.quota?.unified7d, account.quota?.unified7dReset, now));
   for (const limit of account.quota?.weeklyScoped || []) {
     lines.push(renderQuotaRow(`7d ${limit.label || limit.key || 'scoped'}`, limit.utilization, limit.resetAt, now));
