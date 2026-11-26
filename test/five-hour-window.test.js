@@ -906,6 +906,85 @@ describe('a five-hour rejection hold against the other ledger states', () => {
     });
   }
 
+  // The local 429 and prepare-resume give the same answer when no resume time
+  // is known: no time at all, while a window header keeps its own reset.
+  const unknownResume = {
+    'a used-up week (48 hours) and used-up tokens with no reset': {
+      ids: ['sample-a'], urgency: 'off',
+      build: (manager, clock) => {
+        manager.updateQuota('sample-a', {
+          'anthropic-ratelimit-unified-7d-utilization': '1',
+          'anthropic-ratelimit-unified-7d-reset': seconds(clock.ms + 48 * HOUR),
+          'anthropic-ratelimit-tokens-limit': '1000', 'anthropic-ratelimit-tokens-remaining': '0',
+        });
+      },
+      windowReset: { 'anthropic-ratelimit-unified-7d-reset': seconds(START + 48 * HOUR) },
+    },
+    'a held account and others whose weekly reading turned explicit null (accountUrgency on)': {
+      ids: ['sample-a', 'sample-b'], urgency: 'on',
+      build: (manager, clock) => {
+        manager.applyUsage('sample-b', weekAndFive(clock, 0.3, 72));
+        manager.applyUsage('sample-b', { seven_day: null });
+        manager.updateQuota('sample-a', fiveHourRejection(clock), as429);
+        manager.markRateLimited('sample-b', 60);
+      },
+      windowReset: {},
+    },
+  };
+  for (const [label, fixture] of Object.entries(unknownResume)) {
+    it(`offers no resume time in the local 429 when prepare-resume has none: ${label}`, async () => {
+      const clock = { ms: START };
+      const { manager } = ledger({ fiveHourWindow: OFF, ids: fixture.ids, urgency: fixture.urgency, clock });
+      fixture.build(manager, clock);
+      assert.equal(manager.earliestUsableAt(null), null, 'the fixture has no known resume time');
+      const resume = manager.prepareResumeTarget();
+      assert.equal(resume.action, 'unavailable');
+      assert.equal(resume.reason, 'quota-reset-unknown');
+
+      const h = await startProxy({
+        manager, upstreamHandler: (req, res) => okResponse(res),
+        config: fixture.urgency === 'on' ? { sessionAffinity: { mode: 'on' }, accountUrgency: { mode: 'on' } } : {},
+      });
+      assert.equal(manager.urgency?.mode ?? 'off', fixture.urgency, 'the proxy keeps the policy');
+      const local = await h.send();
+      assert.equal(local.status, 429);
+      assert.deepEqual(h.seen, []);
+      assert.equal(local.headers['anthropic-ratelimit-unified-reset'], undefined, 'no overall reset');
+      for (const [name, value] of Object.entries(fixture.windowReset)) assert.equal(local.headers[name], value, `${name} keeps its own reset`);
+      const body = JSON.parse(local.text).error;
+      assert.equal(body.details.reset_at, null);
+      assert.doesNotMatch(body.message, /resets/);
+      assert.doesNotMatch(body.details.rotator_message, /Resets at|usable before/);
+    });
+  }
+
+  it('matches a scoped window name the way the selector does when waiting for a Fable request', async () => {
+    const clock = { ms: START };
+    const { manager } = ledger({ fiveHourWindow: OFF, ids: ['sample-a'], clock });
+    manager.applyUsage('sample-a', {
+      seven_day: { utilization: 0.3, resets_at: iso(clock.ms + 72 * HOUR) },
+      scoped_weekly: [{ key: 'fable_5_2', label: 'Fable 5 2', utilization: 1, resets_at: iso(clock.ms + 48 * HOUR) }],
+    });
+    manager.updateQuota('sample-a', fiveHourRejection(clock), as429);
+    assert.equal(manager.find('sample-a').extendedQuotaScopes, false, 'both policies are off');
+    assert.equal(manager.earliestUsableAt('fable'), START + 2 * HOUR, 'the selector does not count this scoped window for Fable');
+
+    const h = await startProxy({ manager, upstreamHandler: (req, res) => okResponse(res) });
+    const fable = () => request(`${h.url}/v1/messages`, {
+      method: 'POST',
+      body: JSON.stringify({ model: 'claude-fable-5-2', messages: [{ role: 'user', content: 'hi' }] }),
+    });
+    const local = await fable();
+    assert.equal(local.status, 429);
+    assert.equal(local.headers['anthropic-ratelimit-unified-reset'], seconds(START + 2 * HOUR));
+    assert.deepEqual(h.seen, []);
+
+    clock.ms = START + 2 * HOUR + 1000;
+    assert.equal(manager.getActiveAccount('fable', { trigger: 'request' })?.id, 'sample-a', 'the account takes Fable again at the offered time');
+    assert.equal((await fable()).status, 200);
+    assert.deepEqual(h.seen, ['key-sample-a']);
+  });
+
   it('keeps the five-hour local 429 when every account is used up while on', async () => {
     const clock = { ms: START };
     const { manager } = ledger({ fiveHourWindow: ON, ids: ['sample-a', 'sample-b'], clock });

@@ -1689,7 +1689,8 @@ export class AccountManager {
       this.refreshQuotaState(account);
       if (account.status === 'error' || this.hasCredentialRefreshCooldown(account)) continue;
       if (this.quotaRecovery?.isHeld(this.quotaRecoveryKey(account))) continue;
-      const windowEnds = blockingQuotaWindowEnds(account.quota, threshold, modelFamily, account.fableQuotaCompat);
+      const windowEnds = blockingQuotaWindowEnds(account.quota, threshold, modelFamily, account.extendedQuotaScopes,
+        account.fableQuotaCompat);
       if (windowEnds.some(end => !Number.isFinite(end) || end <= now)) continue;
       const ends = [...windowEnds];
       if (account.rateLimitedUntil > now) ends.push(account.rateLimitedUntil);
@@ -2729,15 +2730,16 @@ function finiteNumberOrNull(value) {
 }
 
 // The reset (ms, NaN when unknown) of every window of `quota` at or over
-// `threshold` that blocks a `modelFamily` request.
-function blockingQuotaWindowEnds(quota, threshold, modelFamily, fableCompat = false) {
+// `threshold` that blocks a `modelFamily` request, matching scoped windows the
+// way the selector does (`extended` as in `quotaBlocksModelFamily`).
+function blockingQuotaWindowEnds(quota, threshold, modelFamily, extended = false, fableCompat = false) {
   const toMs = value => (typeof value === 'number' ? value : Date.parse(value ?? ''));
   const ends = [];
   if (quota.unified5h != null && quota.unified5h >= threshold) ends.push(toMs(quota.unified5hReset));
   if (quota.unified7d != null && quota.unified7d >= threshold) ends.push(toMs(quota.unified7dReset));
   for (const limit of quota.weeklyScoped || []) {
     if (!limit || typeof limit.utilization !== 'number' || limit.utilization < threshold) continue;
-    if (scopeMatchesModelFamily(limit, modelFamily, true, fableCompat)) ends.push(toMs(limit.resetAt));
+    if (scopeMatchesModelFamily(limit, modelFamily, extended, fableCompat)) ends.push(toMs(limit.resetAt));
   }
   for (const [limit, remaining] of [[quota.tokensLimit, quota.tokensRemaining], [quota.requestsLimit, quota.requestsRemaining]]) {
     if (limit != null && remaining != null && 1 - remaining / limit >= threshold) ends.push(toMs(quota.resetsAt));
