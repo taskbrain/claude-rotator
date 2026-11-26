@@ -723,8 +723,10 @@ describe('a five-hour rejection hold against the other ledger states', () => {
 
       const h = await startProxy({
         manager, upstreamHandler: (req, res) => okResponse(res),
-        config: urgency === 'on' ? { accountUrgency: { mode: 'on' } } : {},
+        // accountUrgency 'on' needs sessionAffinity 'on', or the proxy runs it as shadow.
+        config: urgency === 'on' ? { sessionAffinity: { mode: 'on' }, accountUrgency: { mode: 'on' } } : {},
       });
+      assert.equal(manager.urgency?.mode ?? 'off', urgency, `${label}: the proxy keeps the policy`);
       const local = await h.send();
       assert.equal(local.status, 429, label);
       assert.deepEqual(h.seen, [], `${label}: answered without sending upstream`);
@@ -983,6 +985,41 @@ describe('a five-hour rejection hold against the other ledger states', () => {
     assert.equal(manager.getActiveAccount('fable', { trigger: 'request' })?.id, 'sample-a', 'the account takes Fable again at the offered time');
     assert.equal((await fable()).status, 200);
     assert.deepEqual(h.seen, ['key-sample-a']);
+  });
+
+  it('counts a scoped Fable window for a Fable request once the policies match scoped names (accountUrgency on)', async () => {
+    const clock = { ms: START };
+    const { manager } = ledger({ fiveHourWindow: OFF, ids: ['sample-a'], urgency: 'on', clock });
+    manager.applyUsage('sample-a', {
+      seven_day: { utilization: 0.3, resets_at: iso(clock.ms + 72 * HOUR) },
+      scoped_weekly: [{ key: 'fable_5_2', label: 'Fable 5 2', utilization: 1, resets_at: iso(clock.ms + 48 * HOUR) }],
+    });
+    manager.updateQuota('sample-a', fiveHourRejection(clock), as429);
+
+    const h = await startProxy({
+      manager, upstreamHandler: (req, res) => okResponse(res),
+      config: { sessionAffinity: { mode: 'on' }, accountUrgency: { mode: 'on' } },
+    });
+    assert.equal(manager.urgency?.mode, 'on', 'the proxy keeps accountUrgency on, not shadow');
+    assert.equal(manager.find('sample-a').extendedQuotaScopes, true, 'scoped names are matched');
+    assert.equal(manager.earliestUsableAt('fable'), START + 48 * HOUR, 'the Fable request waits for the scoped Fable week');
+    assert.equal(manager.earliestUsableAt(null), START + 2 * HOUR, 'other models wait only for the hold');
+
+    const fable = () => request(`${h.url}/v1/messages`, {
+      method: 'POST',
+      body: JSON.stringify({ model: 'claude-fable-5-2', messages: [{ role: 'user', content: 'hi' }] }),
+    });
+    const local = await fable();
+    assert.equal(local.status, 429);
+    assert.equal(local.headers['anthropic-ratelimit-unified-reset'], seconds(START + 48 * HOUR));
+    assert.deepEqual(h.seen, []);
+
+    for (const at of [START + 2 * HOUR + 1000, START + 24 * HOUR, START + 48 * HOUR - 1000]) {
+      clock.ms = at;
+      assert.equal(manager.getActiveAccount('fable', { trigger: 'request' }), null, `no Fable request goes to the account at ${iso(at)}`);
+    }
+    assert.equal((await fable()).status, 429);
+    assert.deepEqual(h.seen, [], 'nothing is sent upstream for Fable before the scoped reset');
   });
 
   it('keeps the five-hour local 429 when every account is used up while on', async () => {
