@@ -74,14 +74,14 @@ import {
 } from './account-config.js';
 import { CLIENT_IDENTITY_REASON, composeClientIdentity, readCodexVersion } from './client-version.js';
 import {
-  CODEX_ACCOUNT_LABEL, CONFIG_SHA256_PATTERN, isCodexRotatorActivated, isValidUsageOriginator,
+  CODEX_ACCOUNT_LABEL, CONFIG_SHA256_PATTERN, isCodexRotatorActivated, isFiveHourWindowEnabled, isValidUsageOriginator,
   isValidUsageUserAgent, loadCodexConfigSnapshot,
 } from './config.js';
 import { CONTROL_TOKEN_HEADER, readControlToken } from './control-token.js';
 import { readCodexSendSnapshot } from './credentials.js';
 import { CODEX_DAEMON_PATHS, CODEX_SELECT_OUTCOME, CODEX_SELECT_REFUSAL } from './daemon.js';
 import { findRealCodex } from './real-codex.js';
-import { readCodexUsage } from './usage.js';
+import { readCodexUsage, withoutFiveHourWindows } from './usage.js';
 import { CODEX_STATE_OF_WORD } from '../shared/codex-status-schema.js';
 import { requestLocal } from '../shared/local-http.js';
 
@@ -260,6 +260,7 @@ async function resolveOneShotIdentity({ config, codexPath, spawn, readVersion })
  *
  * 返す関数 readAccount(account) は { word, observation, sent } を返し、例外を投げない。word は判定の語、
  * observation は読めた観測（読取を送らなかった・失敗したときは null）、sent は読取を送ったか。
+ * 設定が5時間の窓を扱わない（既定）ときは、長さが5時間と申告された窓を観測から捨ててから判定の語を決める。
  *
  * @param {{
  *   config: object, codexPath: string|null, spawn?: Function, readVersion?: Function,
@@ -285,8 +286,10 @@ export function createOneShotUsageReader({ config, codexPath, spawn = spawnChild
     const client = await identityOnce();
     if (client.reason) return notSent(client.reason);
     try {
-      const result = await readUsage({ credentials, userAgent: client.userAgent, originator: client.originator,
+      const received = await readUsage({ credentials, userAgent: client.userAgent, originator: client.originator,
         fetchImpl, now, timeoutMs: config.usageReadTimeoutMs });
+      const result = isFiveHourWindowEnabled(config) || !received?.observation ? received
+        : { ...received, observation: withoutFiveHourWindows(received.observation) };
       return { word: verdictWordOf(result), observation: result?.observation ?? null, sent: true };
     } catch {
       return notSent(VERDICT.internalError);

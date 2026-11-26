@@ -30,7 +30,7 @@
 // 資格情報は読むだけで、更新も書込みもしない。
 import { request as httpRequest } from 'node:http';
 import { readCodexVersion } from './client-version.js';
-import { isCodexRotatorActivated, loadCodexConfigSnapshot } from './config.js';
+import { isCodexRotatorActivated, isFiveHourWindowEnabled, loadCodexConfigSnapshot } from './config.js';
 import { CODEX_DAEMON_PATHS, codexAccountEntries } from './daemon.js';
 import { createOneShotUsageReader } from './exec.js';
 import { findRealCodex } from './real-codex.js';
@@ -246,7 +246,8 @@ export async function readCodexStatus({ config, env, deadlineAt = null, deps = {
   const health = applyReadings(pool, entries, readings, at);
   const poller = { accountHealth: key => health.get(key) ?? NOT_READ, observation: () => ({ gate: null }) };
   return projectCodexStatus({ enabled: true, pool, poller, userAgentSource: userAgentSourceOf(readings, config),
-    events: [], daemon: { reachable: false, startedAt: null }, source: 'direct', nowMs: at });
+    events: [], daemon: { reachable: false, startedAt: null }, source: 'direct', nowMs: at,
+    fiveHourWindow: isFiveHourWindowEnabled(config) });
 }
 
 /**

@@ -21,13 +21,17 @@
 //   - 完全な観測かどうかは使用量の正規化（usage.js）の判定だけで決める。primary 窓があることは
 //     条件に足さない（足すと、primary 窓の無い応答を完全な観測として扱えない）。
 //   - プールが上流から消えた窓の停止だけを外したとき（出来事 window-cap-dropped）を info に出す。
+//   - 設定が5時間の窓を扱わない（fiveHourWindow.enabled が false。既定）ときは、長さが5時間と申告された
+//     窓を観測から捨ててから使う（プールへ渡さず、完全な観測かどうかの判定にもログにも使わない）。
+//     上流が使えないと答えたこと（allowed:false）は、窓と別の事実なので捨てない。
 import { statSync } from 'node:fs';
 import { join } from 'node:path';
 import { WINDOW_CAP_DROPPED } from './account-pool.js';
 import { CREDENTIALS_OUTCOME, createAuthTracker } from './auth-tracker.js';
 import { createClientIdentityResolver } from './client-version.js';
 import { readCodexSendSnapshot } from './credentials.js';
-import { readCodexUsage } from './usage.js';
+import { isFiveHourWindowEnabled } from './config.js';
+import { readCodexUsage, withoutFiveHourWindows } from './usage.js';
 
 // 設定キーにしない固定の規則: 同時の読取は2口座まで／同じ口座の読取は1本だけ／同じ口座の次の
 // 読取は前回の開始から30秒以内に始めない／失敗したら 60→120→300 秒の間隔を空ける／5回続けて
@@ -156,6 +160,7 @@ export function createUsagePoller({ pool, resolveClientIdentity, env, registerSe
   }
   const auth = createAuthTracker({ pool, now, log });
   let descriptors = [], intervalMs = DEFAULT_POLL_INTERVAL_MS, timeoutMs = DEFAULT_READ_TIMEOUT_MS, stopped = false;
+  let fiveHourWindow = false;
   const states = new Map();
   // 口座のキー → 進行中の読取（中断用）。reload をまたいで持ち越す: 状態のオブジェクトごと
   // 作り直しても、同じ口座の読取は1本に保たれる。
@@ -232,11 +237,12 @@ export function createUsagePoller({ pool, resolveClientIdentity, env, registerSe
     logUnavailable(key, state, code);
     return USAGE_BACKOFF_MS[Math.min(state.failures, USAGE_BACKOFF_MS.length) - 1];
   }
-  function settle(account, state, result, context) {
-    if (result.classification !== 'success' || !result.observation) {
-      return failed(account.key, state, result.failure ?? result.errorCode ?? result.classification, result);
+  function settle(account, state, received, context) {
+    if (received.classification !== 'success' || !received.observation) {
+      return failed(account.key, state, received.failure ?? received.errorCode ?? received.classification, received);
     }
-    const observation = result.observation;
+    const observation = fiveHourWindow ? received.observation : withoutFiveHourWindows(received.observation);
+    const result = { ...received, observation };
     // 完全かどうかは正規化の判定だけで決める（primary 窓の無い応答も完全な観測になりうる）。
     const complete = observation.complete === true;
     // 不完全な観測でも停止は掛かるので、完全かどうかの判定より前に遷移を見る。
@@ -364,6 +370,7 @@ export function createUsagePoller({ pool, resolveClientIdentity, env, registerSe
       descriptors = accounts;
       intervalMs = config.usagePollIntervalMs ?? DEFAULT_POLL_INTERVAL_MS;
       timeoutMs = config.usageReadTimeoutMs ?? DEFAULT_READ_TIMEOUT_MS;
+      fiveHourWindow = isFiveHourWindowEnabled(config);
       auth.configure(accounts, { usagePollIntervalMs: intervalMs });
       queue.length = 0;
       for (const account of accounts) {

@@ -11,6 +11,8 @@
 //     値が食い違う時点を作らない。読み直しの検証が失敗したときは、世代も値も旧いまま。
 //   - select の応答（どの判定でも）と、reload の 200・422 の応答に、その値を configSha256 として入れる。
 //   - 設定を読み直すのは reload のときだけ（ファイルの変化を見て自動では読み直さない）。
+//   - 5時間の窓を扱うか（fiveHourWindow.enabled）も、起動と reload で読む。扱わない世代へ読み直したら、
+//     プールが持つ5時間の窓の観測と停止を捨てる。真偽値でない値（false として扱う）はログに1行出す。
 //
 // 守り:
 //   - 待受のホストはループバックだけ。起動の関数の引数で確かめ、待受の後にも実際の待受のアドレスを確かめる。
@@ -29,10 +31,12 @@
 import { createServer as createHttpServer } from 'node:http';
 import { finished } from 'node:stream';
 import { createClientIdentityResolver } from './client-version.js';
-import { CONFIG_SHA256_PATTERN, isCodexRotatorActivated, loadCodexConfigSnapshot } from './config.js';
+import {
+  CONFIG_SHA256_PATTERN, isCodexRotatorActivated, isFiveHourWindowEnabled, loadCodexConfigSnapshot,
+} from './config.js';
 import { CONTROL_TOKEN_HEADER, controlTokenMatches, createControlTokenFile } from './control-token.js';
 import { createCodexEventLog } from './events.js';
-import { createCodexPool, projectCodexStatus } from './snapshot.js';
+import { CODEX_FIVE_HOUR_WINDOW_MINUTES, createCodexPool, projectCodexStatus } from './snapshot.js';
 import { createUsagePoller } from './usage-poller.js';
 import { CODEX_PROVIDER, CODEX_USER_AGENT_SOURCES, codexIsoTime, isCodexLabel } from '../shared/codex-status-schema.js';
 import { LOCAL_SERVICE_HOST, isLoopbackHostname, isTrustedLocalHttpRequest } from '../shared/local-http.js';
@@ -133,7 +137,10 @@ const LOG_EVENT = Object.freeze({
   reloadFailed: 'codex_daemon_reload_failed',
   selected: 'codex_daemon_selected',
   requestFailed: 'codex_daemon_request_failed',
+  settingIgnored: 'codex_daemon_setting_ignored',
 });
+// 設定の値を使わずに既定へ倒したときの reason の語。
+const IGNORED_SETTING_REASON = Object.freeze({ fiveHourWindowEnabled: 'five-hour-window-enabled-not-boolean' });
 
 const LOGGER_METHODS = Object.freeze(['debug', 'info', 'warn', 'error', 'registerSecret']);
 
@@ -490,7 +497,13 @@ export async function startCodexDaemon(options) {
   }
 
   const project = eventList => projectCodexStatus({ enabled: true, pool, poller, userAgentSource, events: eventList,
-    daemon: { reachable: true, startedAt }, source: 'daemon', nowMs: now() });
+    daemon: { reachable: true, startedAt }, source: 'daemon', nowMs: now(),
+    fiveHourWindow: isFiveHourWindowEnabled(config) });
+  const noteIgnoredSettings = applied => {
+    if (applied.fiveHourWindow?.enabledValueIgnored === true) {
+      note('warn', LOG_EVENT.settingIgnored, { reason: IGNORED_SETTING_REASON.fiveHourWindowEnabled });
+    }
+  };
 
   const status = res => {
     let body;
@@ -556,6 +569,7 @@ export async function startCodexDaemon(options) {
         const at = now();
         reconcileCalls++;
         pool.reconcile(next.pool, at);
+        if (!isFiveHourWindowEnabled(candidate)) pool.forgetWindowLength(CODEX_FIVE_HOUR_WINDOW_MINUTES);
         pool.configure(candidate, at);
         resolver.reload(candidate);
         poller.configure(next.poller, candidate);
@@ -577,6 +591,7 @@ export async function startCodexDaemon(options) {
       configGeneration++;
       events.record('reloaded');
       note('info', LOG_EVENT.reloaded, { config_generation: configGeneration });
+      noteIgnoredSettings(config);
       sendJson(res, 200, { reloaded: true, configGeneration, configSha256 });
     } finally {
       reloading = false;
@@ -677,6 +692,7 @@ export async function startCodexDaemon(options) {
   // 待受の後の error は記録だけする（受け手が無いとプロセスが落ちる）。中身は出さない。
   server.on('error', () => note('error', LOG_EVENT.requestFailed, { reason: 'server-error' }));
   note('info', LOG_EVENT.started, { port });
+  noteIgnoredSettings(config);
 
   let resolveStopped;
   const stopped = new Promise(resolve => { resolveStopped = resolve; });

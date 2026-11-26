@@ -22,7 +22,8 @@ import { CLIENT_IDENTITY_REASON, USER_AGENT_SOURCE } from '../../src/codex/clien
 import { CODEX_ACCOUNT_LABEL, CodexConfigError, validateCodexConfig } from '../../src/codex/config.js';
 import { createCodexEventLog } from '../../src/codex/events.js';
 import {
-  CODEX_USAGE_OBSERVATION_MODE, aggregateCodexAccounts, codexAccountHeadroom, createCodexPool, projectCodexStatus,
+  CODEX_USAGE_OBSERVATION_MODE, aggregateCodexAccounts as aggregateWithSetting, codexAccountHeadroom, createCodexPool,
+  projectCodexStatus as projectWithSetting,
 } from '../../src/codex/snapshot.js';
 import { readCodexUsage } from '../../src/codex/usage.js';
 import { createUsagePoller } from '../../src/codex/usage-poller.js';
@@ -44,6 +45,11 @@ const POLICY = Object.freeze({ stopUsedPercent: 75, resumeUsedPercent: 60, block
 const RESERVED_POLICY = Object.freeze({ ...POLICY, blockWhenUnknown: true });
 const TIMING = Object.freeze({ usagePollIntervalMs: 60_000, usageReadTimeoutMs: 5000, rotationObservationTtlMs: 125_000,
   rotationUsageCapNoResetProbeMs: 3_600_000 });
+// このファイルの確かめは、5時間の窓を扱う設定（fiveHourWindow.enabled が true）での射影を固定する。扱わない
+// 設定（既定）での射影は five-hour-window.test.js が確かめる。
+const FIVE_HOUR_ON = Object.freeze({ fiveHourWindow: Object.freeze({ enabled: true }) });
+const projectCodexStatus = input => projectWithSetting({ fiveHourWindow: true, ...input });
+const aggregateCodexAccounts = (accounts, options) => aggregateWithSetting(accounts, { fiveHourWindow: true, ...options });
 // clock.advance は同期で、読取の続き（マイクロタスクと本文の読取）を流さない。
 const flush = async (turns = 30) => { for (let i = 0; i < turns; i++) await new Promise(setImmediate); };
 const keyOf = label => `zz-key:${label}`;
@@ -114,7 +120,7 @@ async function harness(t, { accounts = [{ label: 'zz-a' }], respond = () => { th
   const scheduler = createFakeScheduler(clock);
   const descriptors = accounts.map(({ label, models = null }) =>
     ({ key: keyOf(label), label, home: join(isolation.root, 'accounts', label), models }));
-  const config = { ...TIMING,
+  const config = { ...TIMING, ...FIVE_HOUR_ON,
     accounts: accounts.map(({ label, policy = POLICY }) => ({ label, usagePolicy: { ...policy } })) };
   const pool = rawPool ? createCodexAccountPool(descriptors, config) : createCodexPool(descriptors, config);
   const events = createCodexEventLog({ now: clock.now });

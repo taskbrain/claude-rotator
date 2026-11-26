@@ -18,7 +18,12 @@
 //     消さないため）。外すのは、取得処理が「前回の読み直しの後に成功が1回以上あり、最後の読取は失敗して
 //     いない」と示すときだけ。停止中の窓は外さない（判定の表は stillDeclared の直前）。
 //   - 状態語は、以前の版の `claude-rotator status` の Codex の節と同じ規則（選択を止める理由と口座の状態から12語を導く）で決める。
+//   - 5時間の窓を扱わない設定（fiveHourWindow が false。既定）では、5時間の窓は無いものとして射影する。
+//     windows.fiveHour と aggregate.fiveHourRemainingPercent は null（キーは残す）。長さが5時間と申告された
+//     窓は、windows にも otherWindows にも停止の記録にも実効残量の計算にも入れない。長さの申告が無い窓は
+//     5時間の窓と決められないので、位置で5時間の枠へは置かず、otherWindows に置く。
 import { createCodexAccountPool, USAGE_AUTH_REJECTION_REASONS } from './account-pool.js';
+import { CODEX_FIVE_HOUR_WINDOW_SECONDS } from './usage.js';
 import {
   CODEX_ACCOUNT_REASONS, CODEX_AGGREGATE_UNIT, CODEX_CLEAN_READS_NEEDED, CODEX_EVENTS_LIMIT, CODEX_EVENT_TYPES,
   CODEX_OBSERVATION_METHOD, CODEX_POOL_STATES, CODEX_PROVIDER, CODEX_STARTUP_CHECKS, CODEX_STATE_OF_WORD,
@@ -46,7 +51,8 @@ export function createCodexPool(initialAccounts = [], options = {}) {
 }
 
 // 窓の長さ（分）。5時間窓と週次窓。それ以外の長さは otherWindows。
-const FIVE_HOUR_MINUTES = 300;
+export const CODEX_FIVE_HOUR_WINDOW_MINUTES = CODEX_FIVE_HOUR_WINDOW_SECONDS / 60;
+const FIVE_HOUR_MINUTES = CODEX_FIVE_HOUR_WINDOW_MINUTES;
 const WEEK_MINUTES = 10080;
 // 長さの申告が無い窓は、報告された位置で振り分ける。
 const CLASS_OF_POSITION = Object.freeze({ primary: 'fiveHour', secondary: 'weekly' });
@@ -62,10 +68,20 @@ const percentOrNull = value => (typeof value === 'number' && Number.isFinite(val
 const classOfMinutes = minutes => (minutes === FIVE_HOUR_MINUTES ? 'fiveHour'
   : minutes === WEEK_MINUTES ? 'weekly' : 'other');
 
+// 長さの申告が無い窓の区分。5時間の窓を扱わないときは、位置だけでは5時間の窓と決めない。
+const classOfPosition = (position, fiveHourWindow) => {
+  const windowClass = CLASS_OF_POSITION[position] ?? 'other';
+  return windowClass === 'fiveHour' && !fiveHourWindow ? 'other' : windowClass;
+};
+
 // 窓の鍵（len:<分> か pos:<位置>）だけから区分を決める。保存した窓が無い停止の鍵にだけ使う。
-function classOfWindowKey(key) {
-  if (key.startsWith('len:')) return classOfMinutes(Number(key.slice(4)));
-  if (key.startsWith('pos:')) return CLASS_OF_POSITION[key.slice(4)] ?? 'other';
+// 5時間の窓を扱わないときの長さ5時間の鍵は null（どの区分にも入れない）。
+function classOfWindowKey(key, fiveHourWindow) {
+  if (key.startsWith('len:')) {
+    const windowClass = classOfMinutes(Number(key.slice(4)));
+    return windowClass === 'fiveHour' && !fiveHourWindow ? null : windowClass;
+  }
+  if (key.startsWith('pos:')) return classOfPosition(key.slice(4), fiveHourWindow);
   return 'other';
 }
 
@@ -139,7 +155,7 @@ function stillDeclared(entry, window, cappedKeys, health) {
 
 // 保存した窓を振り分ける。長さを申告した窓を先に置き、長さの申告が無い窓は位置で空いた枠へ置く
 // （枠が埋まっていれば otherWindows）。classOfKey は窓の鍵 → 区分（停止中の窓の区分に使う）。
-function projectWindows(entry, health, freshnessMs, nowMs) {
+function projectWindows(entry, health, freshnessMs, nowMs, fiveHourWindow) {
   const cappedKeys = new Set(Object.keys(isRecord(entry.windowCaps) ? entry.windowCaps : {}));
   const stored = Object.values(isRecord(entry.windows) ? entry.windows : {})
     .filter(window => isRecord(window) && typeof window.key === 'string'
@@ -160,9 +176,13 @@ function projectWindows(entry, health, freshnessMs, nowMs) {
     classOfKey.set(window.key, 'other');
   };
   const reported = window => Number.isFinite(window.windowDurationMins);
-  for (const window of stored.filter(reported)) place(window, classOfMinutes(window.windowDurationMins), 'reported');
+  for (const window of stored.filter(reported)) {
+    const windowClass = classOfMinutes(window.windowDurationMins);
+    if (windowClass === 'fiveHour' && !fiveHourWindow) continue;
+    place(window, windowClass, 'reported');
+  }
   for (const window of stored.filter(window => !reported(window))) {
-    place(window, CLASS_OF_POSITION[window.position] ?? 'other', 'position');
+    place(window, classOfPosition(window.position, fiveHourWindow), 'position');
   }
   // 並びは長さの短い順（長さが無いものは後ろ）、同じなら鍵の順。
   const order = item => item.projected.windowMinutes ?? Infinity;
@@ -174,10 +194,10 @@ function projectWindows(entry, health, freshnessMs, nowMs) {
 // 数えた復帰の票は、方針を持つ口座では停止中に0か1（2つそろえば解除される）。上限を越えて見せない。
 // 停止した時刻は、窓の停止が始まった時刻（cappedSince）。上流の拒否だけで止まったときは null。プールの
 // stoppedAt は停止を記録し直すたび（拒否を読むたび）に進むので、停止の始まりとしては使わない。
-function projectLatch(entry, classOfKey) {
+function projectLatch(entry, classOfKey, fiveHourWindow) {
   const capKeys = Object.keys(isRecord(entry.windowCaps) ? entry.windowCaps : {});
   if (capKeys.length === 0 && entry.upstreamBlocked !== true && entry.resumePending !== true) return null;
-  const classes = new Set(capKeys.map(key => classOfKey.get(key) ?? classOfWindowKey(key)));
+  const classes = new Set(capKeys.map(key => classOfKey.get(key) ?? classOfWindowKey(key, fiveHourWindow)));
   const streak = Number.isInteger(entry.resumeStreak) && entry.resumeStreak > 0 ? entry.resumeStreak : 0;
   return {
     stopped: true,
@@ -234,10 +254,11 @@ function reasonOf(entry, view, health) {
 
 // order は設定の口座の並び順（1から）。プールは設定の並びのまま口座を持つ（reconcile に渡した順）ので、
 // snapshot() の並びの位置から付ける。
-function projectAccount(entry, view, health, { source, nowMs, order }) {
+function projectAccount(entry, view, health, { source, nowMs, order, fiveHourWindow }) {
   if (!isCodexLabel(entry.label)) throw new TypeError('every account needs a label of the account label form');
   const policy = projectPolicy(view);
-  const { windows, otherWindows, classOfKey, lastObservedAt } = projectWindows(entry, health, view.freshnessMs, nowMs);
+  const { windows, otherWindows, classOfKey, lastObservedAt } = projectWindows(entry, health, view.freshnessMs, nowMs,
+    fiveHourWindow);
   let stateWord = stateWordOf(entry, view, policy.stopUsedPercent);
   if (stateWord === 'unread' && beforeFirstRead(health)) stateWord = 'starting';
   const account = {
@@ -254,7 +275,7 @@ function projectAccount(entry, view, health, { source, nowMs, order }) {
       ? health.ordinaryUsageAllowed : null,
     nextObservationAt: isRecord(health) ? codexIsoTime(health.nextObservationAt) : null,
     policy,
-    latch: projectLatch(entry, classOfKey),
+    latch: projectLatch(entry, classOfKey, fiveHourWindow),
     windows,
     otherWindows,
     observedAt: codexIsoTime(lastObservedAt),
@@ -333,13 +354,15 @@ export function codexAccountHeadroom(account, { source, part = 'all' } = {}) {
  * 全口座の実効残量と件数（JSON の aggregate）。
  *   4. 全体の値: 無効なら null。口座0件なら 0。寄与に1つでも null があれば null。それ以外は寄与の合計。
  *   5. 下限: null でない寄与の合計（常に数値）。
- *   6. 窓ごとの合計: 同じ規則を、その窓だけを申告された窓として当てはめる。
+ *   6. 窓ごとの合計: 同じ規則を、その窓だけを申告された窓として当てはめる。5時間の窓の合計は、5時間の
+ *      窓を扱わない（fiveHourWindow が false）なら null。
  * @param {object[]} accounts 射影した口座（JSON の形）
- * @param {{ enabled: boolean, source: 'daemon'|'direct' }} options
+ * @param {{ enabled: boolean, source: 'daemon'|'direct', fiveHourWindow?: boolean }} options
  */
-export function aggregateCodexAccounts(accounts, { enabled, source }) {
+export function aggregateCodexAccounts(accounts, { enabled, source, fiveHourWindow = false }) {
   if (!Array.isArray(accounts)) throw new TypeError('accounts must be an array');
   if (typeof enabled !== 'boolean') throw new TypeError('enabled must be true or false');
+  if (typeof fiveHourWindow !== 'boolean') throw new TypeError('fiveHourWindow must be true or false');
   if (!CODEX_STATUS_SOURCES.includes(source)) throw new TypeError('source must be daemon or direct');
   const sum = values => values.reduce((total, value) => total + value, 0);
   const contributions = part => accounts.map(account => codexAccountHeadroom(account, { source, part }));
@@ -352,7 +375,7 @@ export function aggregateCodexAccounts(accounts, { enabled, source }) {
   return {
     effectiveRemainingPercent: overall('all'),
     lowerBoundPercent: sum(contributions('all').filter(value => value !== null)),
-    fiveHourRemainingPercent: overall('fiveHour'),
+    fiveHourRemainingPercent: fiveHourWindow ? overall('fiveHour') : null,
     weeklyRemainingPercent: overall('weekly'),
     accountsTotal: accounts.length,
     accountsAvailable: count(account => account.state === 'available'),
@@ -373,11 +396,14 @@ export function aggregateCodexAccounts(accounts, { enabled, source }) {
  *   daemon?: { reachable: boolean, startedAt: number|null },
  *   source: 'daemon'|'direct',
  *   nowMs: number,
- * }} input enabled は有効化の二重ゲートの結果。daemon.startedAt は常駐の起動時刻（ミリ秒）。
+ *   fiveHourWindow?: boolean,
+ * }} input enabled は有効化の二重ゲートの結果。daemon.startedAt は常駐の起動時刻（ミリ秒）。fiveHourWindow は
+ *   設定 fiveHourWindow.enabled の値（既定は false で、5時間の窓を無いものとして射影する）。
  */
 export function projectCodexStatus({ enabled, pool, poller = null, userAgentSource = null, events = [],
-  daemon = { reachable: false, startedAt: null }, source, nowMs } = {}) {
+  daemon = { reachable: false, startedAt: null }, source, nowMs, fiveHourWindow = false } = {}) {
   if (typeof enabled !== 'boolean') throw new TypeError('enabled must be true or false');
+  if (typeof fiveHourWindow !== 'boolean') throw new TypeError('fiveHourWindow must be true or false');
   if (!pool || ['snapshot', 'inspect', 'health', 'select', 'lastResort'].some(name => typeof pool[name] !== 'function')) {
     throw new TypeError('a codex account pool is required');
   }
@@ -401,7 +427,7 @@ export function projectCodexStatus({ enabled, pool, poller = null, userAgentSour
     const view = views.get(entry.key);
     if (!view) throw new TypeError('the pool inspection must describe every account');
     const health = poller === null ? null : poller.accountHealth(entry.key);
-    return projectAccount(entry, view, health, { source, nowMs, order: index + 1 });
+    return projectAccount(entry, view, health, { source, nowMs, order: index + 1, fiveHourWindow });
   });
   const eligibleCount = entries.filter(entry => views.get(entry.key).selectionEligible === true).length;
   const labelOfKey = new Map(entries.map(entry => [entry.key, entry.label]));
@@ -428,7 +454,7 @@ export function projectCodexStatus({ enabled, pool, poller = null, userAgentSour
     },
     next: nextOf(pool, { enabled, nowMs, labelOfKey }),
     accounts,
-    aggregate: aggregateCodexAccounts(accounts, { enabled, source }),
+    aggregate: aggregateCodexAccounts(accounts, { enabled, source, fiveHourWindow }),
     events: projectEvents(events),
   };
 }

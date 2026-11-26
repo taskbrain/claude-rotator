@@ -71,6 +71,7 @@ test('config: an empty config validates and every default is filled in once, her
     codexPath: null,
     usageUserAgent: null,
     usageOriginator: null,
+    fiveHourWindow: { enabled: false },
     accounts: [],
   });
   assert.ok(Object.isFrozen(config) && Object.isFrozen(config.daemon) && Object.isFrozen(config.accounts));

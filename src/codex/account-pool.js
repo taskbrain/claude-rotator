@@ -287,6 +287,24 @@ export function createCodexAccountPool(initialAccounts = [], options = {}) {
         else { delete entry.cleanReads; clearMisses(entry); }
       }
     },
+    // 長さ minutes の窓を、全口座の記録から捨てる（設定がその長さの窓を扱わなくなった読み直しで使う）。
+    // 保存した観測と窓の停止の両方を消す。ほかの窓の停止・上流の拒否・復帰待ちが残らない口座は、その窓
+    // だけで止まっていたので停止を解く。残る口座は、その理由で止まったままにする。
+    forgetWindowLength(minutes) {
+      const windowKey = windowKeyOf(undefined, minutes);
+      for (const entry of accounts.values()) {
+        const window = entry.windows?.[windowKey];
+        if (window) {
+          delete entry.windows[windowKey];
+          if (entry.positions?.[window.position] === windowKey) delete entry.positions[window.position];
+        }
+        if (!entry.windowCaps?.[windowKey]) continue;
+        delete entry.windowCaps[windowKey];
+        if (capped(entry)) continue;
+        delete entry.windowCaps;
+        if (entry.upstreamBlocked !== true && entry.resumePending !== true) release(entry);
+      }
+    },
     terminal(model, nowMs) {
       time(nowMs);
       const all = [...accounts.values()];
